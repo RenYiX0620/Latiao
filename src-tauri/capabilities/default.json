@@ -1,0 +1,16 @@
+{
+  "identifier": "default",
+  "description": "Default capability allowing HTTP requests to sidecar",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "http:default",
+    {
+      "identifier": "http:allow-fetch",
+      "allow": [
+        { "url": "http://127.0.0.1:8000/**" },
+        { "url": "http://localhost:8000/**" }
+      ]
+    }
+  ]
+}
