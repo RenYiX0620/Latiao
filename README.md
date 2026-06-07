@@ -1,6 +1,8 @@
 # 🌶️ Latiao — Your Local AI Agent Desktop App
 
 > **跑在你本机上的中文 AI Agent。不需要联网，不偷你的代码，用你自己的模型。**
+>
+> ⚠️ **当前仅支持 macOS**。Windows 用户可参考下方说明。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Tauri](https://img.shields.io/badge/Tauri-2.0-blue)](https://tauri.app)
@@ -24,20 +26,28 @@ Latiao（辣条）是一个桌面 AI Agent 应用，基于 Tauri + React + Pytho
 - ⏰ **定时任务** — Cron 风格的定时自动化
 - 🌐 **多语言** — 界面支持中文 / English / 日本語
 
+## 📥 下载到本地
+
+```bash
+# 安装 Git 后运行（Git 下载: https://git-scm.com）
+git clone https://github.com/RenYiX0620/Latiao.git
+cd Latiao
+```
+
 ## 🚀 快速开始
 
 ### 环境要求
 
+- **操作系统**：macOS（暂不支持 Windows / Linux）
 - Python 3.10+
 - Node.js 20+
 - Rust (for Tauri)
 
-### 安装运行
+### macOS 安装运行
 
 ```bash
-# 1. 克隆仓库
-git clone https://github.com/yourusername/latiao.git
-cd latiao
+# 1. 进入项目
+cd Latiao
 
 # 2. 安装前端依赖
 npm install
@@ -59,6 +69,22 @@ npm run tauri dev
 npm run deploy
 # 输出: ./Latiao.app (macOS)
 ```
+
+## 🪟 Windows 用户说明
+
+Latiao 目前**仅支持 macOS**，原因：
+
+- 使用了 macOS 专属 API（如系统钥匙串 Keychain 存储密钥）
+- 文件路径和权限模型与 Windows 不同
+- Tauri build 未配置 Windows target
+
+**临时替代方案：**
+
+1. 使用 WSL2（Windows Subsystem for Linux）
+2. 使用虚拟机（VMware / VirtualBox 装 macOS）
+3. 等待社区贡献 Windows 版本（欢迎 PR！）
+
+有兴趣移植到 Windows？请查看 [CONTRIBUTING](#) 或提交 Issue。
 
 ## 🧩 技能系统
 
