@@ -2253,6 +2253,8 @@ def _is_duplicate_learning(summary: str, threshold: float = 0.7) -> bool:
             if overlap > threshold:
                 return True
         return False
+    except Exception:
+        return False  # On error, allow the learning
 
 
 # ── Auto-Skill Generation (MUSE-Autoskill inspired) ──
