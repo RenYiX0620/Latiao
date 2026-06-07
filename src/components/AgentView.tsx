@@ -38,6 +38,15 @@ const DEFAULT_AGENTS: AgentInfo[] = [
   { id: "translator", name: "agent.translator", display: "agent.translator_display", role: "specialist", tools: ["read_file", "list_dir", "search_files", "write_file"], custom: false },
 ];
 
+// Map sidecar agent id to i18n keys so names/display translate with the UI language
+const BUILTIN_AGENT_I18N: Record<string, { name: string; display: string }> = {
+  latiao: { name: "agent.latiao", display: "agent.latiao_display" },
+  "code-reviewer": { name: "agent.code_reviewer", display: "agent.code_reviewer_display" },
+  "doc-generator": { name: "agent.doc_generator", display: "agent.doc_generator_display" },
+  debugger: { name: "agent.debugger", display: "agent.debugger_display" },
+  translator: { name: "agent.translator", display: "agent.translator_display" },
+};
+
 export default function AgentView({ activeAgent, setActiveAgent, showToast }: AgentViewProps) {
   const { t } = useTranslation();
   const [agents, setAgents] = useState<AgentInfo[]>(DEFAULT_AGENTS);
@@ -48,7 +57,16 @@ export default function AgentView({ activeAgent, setActiveAgent, showToast }: Ag
   const fetchAgents = async () => {
     try {
       const data = await sidecarFetch("/v1/agents");
-      if (data.status === "ok") setAgents(data.agents as AgentInfo[]);
+      if (data.status === "ok") {
+        const agents = (data.agents as AgentInfo[]).map((a: AgentInfo) => {
+          const i18n = BUILTIN_AGENT_I18N[a.id];
+          if (i18n && !a.custom) {
+            return { ...a, name: i18n.name, display: i18n.display };
+          }
+          return a;
+        });
+        setAgents(agents);
+      }
     } catch { /* sidecar not running */ }
   };
 
