@@ -21,6 +21,13 @@ import "./App.css";
 
 /* ═══════════ Constants ═══════════ */
 
+const LANG_PROMPTS: Record<string, string> = {
+  zh: "请始终用简体中文回复用户，无论用户消息使用哪种语言。",
+  en: "Always respond in English regardless of the language of the user's message.",
+  ja: "ユーザーのメッセージの言語に関わらず、必ず日本語で回答してください。",
+  ru: "Всегда отвечайте на русском языке независимо от языка сообщения пользователя.",
+};
+
 const PLAN_MODE_PROMPT =
   "【Structured Workflow — 阶段门控】\n" +
   "你必须按以下阶段顺序执行，不得跳步。\n\n" +
@@ -53,8 +60,10 @@ const NAV_ITEMS: { id: ViewId; icon: string; key: string }[] = [
   { id: "logs", icon: "📋", key: "nav.logs" },
 ];
 
-function buildApiMessages(session: SessionInfo, extraUser?: Message, planMode?: boolean): Record<string, unknown>[] {
+function buildApiMessages(session: SessionInfo, extraUser?: Message, planMode?: boolean, lang?: string): Record<string, unknown>[] {
   const msgs: Record<string, unknown>[] = [];
+  const langPrompt = lang ? LANG_PROMPTS[lang] : undefined;
+  if (langPrompt) msgs.push({ role: "system", content: langPrompt });
   if (planMode) msgs.push({ role: "system", content: PLAN_MODE_PROMPT });
   const allMsgs = extraUser ? [...session.messages, extraUser] : session.messages;
   // Truncate long history: keep system messages + last 30 user/assistant pairs
@@ -88,7 +97,7 @@ function App() {
     sessions, setSessions, currentIdx, setCurrentIdx,
     session, messages, setSelectedModel, setMessages, newSession,
   } = useSessions();
-  const { t } = useTranslation();
+  const { t, lang } = useTranslation();
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [activeView, setActiveView] = useState<ViewId>("chat");
   const [modelTab, setModelTab] = useState<"cloud" | "local">("cloud");
@@ -651,7 +660,7 @@ function App() {
     setMessages((prev) => [...prev, assistantPlaceholder]);
 
     try {
-      const apiMessages = buildApiMessages(session, userMsg, planMode);
+      const apiMessages = buildApiMessages(session, userMsg, planMode, lang);
       const cloudCfg = session.selectedModel
         ? cloudModels.find((m) => m.name === session.selectedModel)
         : undefined;
