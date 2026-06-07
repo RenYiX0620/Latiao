@@ -188,7 +188,7 @@ export default memo(function ChatView({
           <button className="btn btn-sm btn-ghost"
             style={{ padding: "4px 10px", fontSize: 10, marginRight: 4, background: planMode ? "var(--accent-soft)" : "transparent", borderColor: planMode ? "var(--border-accent)" : undefined, color: planMode ? "var(--accent)" : undefined }}
             onClick={() => setPlanMode(!planMode)} title={t("chat.plan_mode")}>
-            📋 计划
+            📋 {t("chat.plan_mode_btn")}
           </button>
           <button className="btn-send" onClick={handleSend} disabled={isProcessing}>{t("chat.send")}</button>
         </div>
