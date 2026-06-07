@@ -304,6 +304,28 @@ const T: Record<string, Record<Lang, string>> = {
   "error.reload": { zh: "重新加载", en: "Reload", ja: "再読み込み", ru: "Перезагрузить" },
   // ── Default session name ──
   "session.default": { zh: "新会话", en: "New Session", ja: "新規セッション", ru: "Новая сессия" },
+  // ── Local Models Tab extras ──
+  "local.redetect": { zh: "🔄 重新检测", en: "🔄 Re-detect", ja: "🔄 再検出", ru: "🔄 Перепроверить" },
+  "local.reload_model": { zh: "🔄 重新加载模型", en: "🔄 Reload Model", ja: "🔄 モデル再読込", ru: "🔄 Перезагрузить" },
+  "local.max_safe": { zh: "最大安全", en: "Max safe", ja: "最大安全", ru: "Макс. безоп." },
+  "local.restart_effect": { zh: "重启模型后生效", en: "Takes effect after restart", ja: "再起動後に反映", ru: "После перезапуска" },
+  "local.context_warning": { zh: "⚠️ 当前设置超过安全上限（{limit}），可能导致内存不足！", en: "⚠️ Setting exceeds safe limit ({limit}), may cause OOM!", ja: "⚠️ 設定が安全上限({limit})を超えています。メモリ不足の可能性！", ru: "⚠️ Превышен лимит ({limit}), возможна нехватка памяти!" },
+  "local.browse_hint": { zh: "浏览和搜索 HuggingFace 上的 GGUF/MLX 模型", en: "Browse and search GGUF/MLX models on HuggingFace", ja: "HuggingFaceでGGUF/MLXモデルを検索", ru: "Поиск GGUF/MLX моделей на HF" },
+  "local.no_results": { zh: "无结果", en: "No results", ja: "結果なし", ru: "Нет результатов" },
+  "local.trending": { zh: "热门 GGUF 模型 · 输入关键词搜索更多", en: "Trending GGUF models · type to search", ja: "人気GGUFモデル · キーワード検索", ru: "Популярные GGUF · поиск" },
+  "local.searching": { zh: "搜索中...", en: "Searching...", ja: "検索中...", ru: "Поиск..." },
+  "local.loading": { zh: "加载中...", en: "Loading...", ja: "読み込み中...", ru: "Загрузка..." },
+  "local.load_fail": { zh: "加载失败", en: "Load failed", ja: "読込失敗", ru: "Ошибка загрузки" },
+  "local.select_model_first": { zh: "从左侧列表选择一个模型", en: "Select a model from the list", ja: "リストからモデルを選択", ru: "Выберите модель" },
+  "local.view_details": { zh: "查看详情、可用版本和 README", en: "View details, versions and README", ja: "詳細・バージョン・README", ru: "Подробности и README" },
+  "local.delete_model_confirm": { zh: "确定要删除该模型吗？", en: "Are you sure you want to delete this model?", ja: "このモデルを削除しますか？", ru: "Удалить эту модель?" },
+  "local.delete_confirm_gguf": { zh: "确定要删除 {name} 吗？", en: "Delete {name}?", ja: "{name}を削除しますか？", ru: "Удалить {name}?" },
+  "local.deleted": { zh: "已删除", en: "Deleted", ja: "削除済", ru: "Удалено" },
+  "local.delete_fail": { zh: "删除失败", en: "Delete failed", ja: "削除失敗", ru: "Ошибка удаления" },
+  "local.cancelled": { zh: "已取消", en: "Cancelled", ja: "キャンセル済", ru: "Отменено" },
+  "local.failed": { zh: "失败", en: "Failed", ja: "失敗", ru: "Ошибка" },
+  "local.delete_model_btn": { zh: "🗑 删除模型", en: "🗑 Delete Model", ja: "🗑 モデル削除", ru: "🗑 Удалить" },
+  "local.show_cmd": { zh: "查看命令", en: "Show Cmd", ja: "コマンド表示", ru: "Команда" },
 };
 
 export default T;
