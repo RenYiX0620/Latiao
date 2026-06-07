@@ -1,5 +1,7 @@
 node_modules/
 dist/
+# Build output
+Latiao.app/
 src-tauri/target/
 sidecar/venv/
 sidecar/__pycache__/
