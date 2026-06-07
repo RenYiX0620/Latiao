@@ -3621,6 +3621,14 @@ def _build_chat_messages(body: dict, messages: list, matched_skill: str|None = N
         })
         system_parts.append(memory_label + "\n" + "\n".join(recent))
 
+    # Language enforcement: when user speaks non-Chinese, add strong override
+    if user_lang != "zh":
+        lang_override = _get_localized_text(user_lang, {
+            "en": "CRITICAL LANGUAGE RULE: The user is speaking English. You MUST respond in English only. Do NOT reply in Chinese even if other instructions are in Chinese. This rule overrides all other language preferences.",
+            "ja": "【重要】ユーザーは日本語で話しています。必ず日本語で返信してください。他の指示が中国語でも、日本語で応答すること。このルールは他のすべての言語設定より優先されます。",
+        })
+        system_parts.append(lang_override)
+
     # Merge all system parts into one message
     merged_system = "\n\n".join(system_parts)
     messages = [{"role": "system", "content": merged_system}] + messages
