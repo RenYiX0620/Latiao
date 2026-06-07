@@ -161,7 +161,7 @@ export default function CloudModelsTab({
           {recentLearnings.slice(0, 5).map((l, i) => (
             <div key={i} style={{ background: "var(--bg-card)", border: "1px solid var(--border-default)", borderRadius: "var(--radius-md)", padding: "8px 12px", display: "flex", gap: 10, alignItems: "center" }}>
               <span style={{ fontSize: 12 }}>{l.confidence > 0.7 ? "🧠" : "📝"}</span>
-              <div style={{ flex: 1, minWidth: 0, fontSize: 11 }}>{l.topic}: {l.content.slice(0, 80)}{l.content.length > 80 ? "..." : ""}</div>
+              <div style={{ flex: 1, minWidth: 0, fontSize: 11 }}>{l.topic}: {(l.content || "").slice(0, 80)}{(l.content || "").length > 80 ? "..." : ""}</div>
               <span style={{ fontSize: 10, color: "var(--text-muted)" }}>{Math.round(l.confidence * 100)}%</span>
             </div>
           ))}

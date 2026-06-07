@@ -1,7 +1,6 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
+import { sidecarFetch } from "../utils/api";
 import { useTranslation } from "../i18n";
-
-const SIDECAR = "http://127.0.0.1:8000";
 
 interface AgentInfo {
   id: string;
@@ -31,15 +30,16 @@ const TOOL_OPTIONS = [
   "open_folder", "open_app", "search_files",
 ];
 
+const DEFAULT_AGENTS: AgentInfo[] = [
+  { id: "latiao", name: "agent.latiao", display: "agent.latiao_display", role: "orchestrator", tools: "all", custom: false },
+  { id: "code-reviewer", name: "agent.code_reviewer", display: "agent.code_reviewer_display", role: "specialist", tools: ["read_file", "list_dir", "search_files"], custom: false },
+  { id: "doc-generator", name: "agent.doc_generator", display: "agent.doc_generator_display", role: "specialist", tools: ["read_file", "list_dir", "search_files", "write_file"], custom: false },
+  { id: "debugger", name: "agent.debugger", display: "agent.debugger_display", role: "specialist", tools: "all", custom: false },
+  { id: "translator", name: "agent.translator", display: "agent.translator_display", role: "specialist", tools: ["read_file", "list_dir", "search_files", "write_file"], custom: false },
+];
+
 export default function AgentView({ activeAgent, setActiveAgent, showToast }: AgentViewProps) {
   const { t } = useTranslation();
-  const DEFAULT_AGENTS: AgentInfo[] = [
-    { id: "latiao", name: "agent.latiao", display: "agent.latiao_display", role: "orchestrator", tools: "all", custom: false },
-    { id: "code-reviewer", name: "agent.code_reviewer", display: "code_reviewer_display", role: "specialist", tools: ["read_file", "list_dir", "search_files"], custom: false },
-    { id: "doc-generator", name: "agent.doc_generator", display: "doc_generator_display", role: "specialist", tools: ["read_file", "list_dir", "search_files", "write_file"], custom: false },
-    { id: "debugger", name: "agent.debugger", display: "debugger_display", role: "specialist", tools: "all", custom: false },
-    { id: "translator", name: "agent.translator", display: "translator_display", role: "specialist", tools: ["read_file", "list_dir", "search_files", "write_file"], custom: false },
-  ];
   const [agents, setAgents] = useState<AgentInfo[]>(DEFAULT_AGENTS);
   const [showForm, setShowForm] = useState(false);
   const [pendingSwitch, setPendingSwitch] = useState<string | null>(null);
@@ -47,11 +47,12 @@ export default function AgentView({ activeAgent, setActiveAgent, showToast }: Ag
 
   const fetchAgents = async () => {
     try {
-      const resp = await fetch(SIDECAR + "/v1/agents");
-      const data = await resp.json();
-      if (data.status === "ok") setAgents(data.agents);
+      const data = await sidecarFetch("/v1/agents");
+      if (data.status === "ok") setAgents(data.agents as AgentInfo[]);
     } catch { /* sidecar not running */ }
   };
+
+  useEffect(() => { fetchAgents(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const toggleTool = (tool: string) => {
     setNewAgent(prev => ({
@@ -68,18 +69,13 @@ export default function AgentView({ activeAgent, setActiveAgent, showToast }: Ag
       return;
     }
     try {
-      const resp = await fetch(SIDECAR + "/v1/agents/save", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          id: newAgent.id,
-          name: newAgent.name,
-          display: newAgent.name,
-          identity: newAgent.identity || `You are ${newAgent.name}, a specialist agent.`,
-          tools: newAgent.tools,
-        }),
+      const data = await sidecarFetch("/v1/agents/save", "POST", {
+        id: newAgent.id,
+        name: newAgent.name,
+        display: newAgent.name,
+        identity: newAgent.identity || `You are ${newAgent.name}, a specialist agent.`,
+        tools: newAgent.tools,
       });
-      const data = await resp.json();
       if (data.status === "ok") {
         showToast(t("agent.created", { name: newAgent.name }));
         setShowForm(false);
@@ -88,19 +84,18 @@ export default function AgentView({ activeAgent, setActiveAgent, showToast }: Ag
       } else {
         showToast(t("agent.create_fail", { msg: data.message || "" }));
       }
-    } catch { showToast(t("agent.conn_fail")); }
+    } catch (e) { console.error("Agent operation failed:", e); showToast(t("agent.conn_fail")); }
   };
 
   const handleDelete = async (id: string) => {
     try {
-      const resp = await fetch(SIDECAR + "/v1/agents/" + id, { method: "DELETE" });
-      const data = await resp.json();
+      const data = await sidecarFetch("/v1/agents/" + id, "DELETE");
       if (data.status === "ok") {
         showToast(t("agent.deleted"));
         if (activeAgent === id) setActiveAgent("latiao");
         fetchAgents();
       }
-    } catch { showToast(t("agent.conn_fail")); }
+    } catch (e) { console.error("Agent operation failed:", e); showToast(t("agent.conn_fail")); }
   };
 
   return (

@@ -24,7 +24,7 @@ interface ModelsViewProps {
   setHfSearch: (s: string) => void;
   hfResults: HFModelResult[];
   searching: boolean;
-  searchHF: (query?: string) => void;
+  searchHF: (query?: string, library?: string) => void;
   downloadProgress: Record<string, DownloadState>;
   downloadModel: (modelId: string) => void;
   pauseDownload: (modelId: string) => void;
@@ -35,6 +35,10 @@ interface ModelsViewProps {
   fixing: string;
   runFix: (fixType: string, fixPkg: string) => void;
   showToast: (msg: string, type?: string) => void;
+  contextLimit: number;
+  setContextLimit: (limit: number) => void;
+  contextEstimate: { max_context: number; recommended_context: number; ram_available_gb: number; memory_for_context_gb: number } | null;
+  fetchContextEstimate: (modelPath?: string) => void;
 }
 
 export default function ModelsView(props: ModelsViewProps) {
@@ -74,6 +78,10 @@ export default function ModelsView(props: ModelsViewProps) {
     fixing: props.fixing,
     runFix: props.runFix,
     showToast: props.showToast,
+    contextLimit: props.contextLimit,
+    setContextLimit: props.setContextLimit,
+    contextEstimate: props.contextEstimate,
+    fetchContextEstimate: props.fetchContextEstimate,
   };
 
   return (

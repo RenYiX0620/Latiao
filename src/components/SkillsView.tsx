@@ -2,7 +2,7 @@ import { useState } from "react";
 import { useTranslation } from "../i18n";
 
 interface SkillsViewProps {
-  skills: { name: string; file: string; key: string; enabled: boolean }[];
+  skills: { name: string; file: string; key: string; enabled: boolean; builtin?: boolean }[];
   newSkill: { name: string; content: string };
   setNewSkill: (s: { name: string; content: string }) => void;
   toggleSkill: (key: string) => void;
@@ -41,8 +41,10 @@ export default function SkillsView({
               onClick={(e) => { e.stopPropagation(); toggleSkill(sk.key); }}>
               {sk.enabled ? t("skills.disable") : t("skills.enable")}
             </button>
-            <button className="btn-icon" style={{ position: "absolute", top: 8, right: 8, fontSize: 12, color: "var(--text-muted)" }}
-              onClick={(e) => { e.stopPropagation(); deleteSkill(sk.key); }} title={t("skills.delete")}>✕</button>
+            {!sk.builtin && (
+              <button className="btn-icon" style={{ position: "absolute", top: 8, right: 8, fontSize: 12, color: "var(--text-muted)" }}
+                onClick={(e) => { e.stopPropagation(); deleteSkill(sk.key); }} title={t("skills.delete")}>✕</button>
+            )}
           </div>
         ))}
       </div>
@@ -50,13 +52,13 @@ export default function SkillsView({
       {/* Tavily API Key configuration section */}
       {hasTavily && (
         <div style={{ marginTop: 16, padding: 12, background: "var(--bg-card)", border: "1px solid var(--border-default)", borderRadius: "var(--radius-lg)" }}>
-          <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 8 }}>🔍 Tavily Search API Key</div>
+          <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 8 }}>{t("skills.tavily_title")}</div>
           <div style={{ fontSize: 10, color: "var(--text-muted)", marginBottom: 8 }}>
-            用于联网搜索能力。免费注册 → tavily.com（每月 1000 次免费搜索）
+            {t("skills.tavily_desc")}
           </div>
           {!showInput && !tavilyKey.hasKey && (
             <button className="btn btn-sm btn-primary" onClick={() => setShowInput(true)}>
-              🔑 配置 API Key
+              {t("skills.tavily_configure")}
             </button>
           )}
           {!showInput && tavilyKey.hasKey && (
@@ -65,11 +67,11 @@ export default function SkillsView({
                 🔑 {tavilyKey.masked}
               </span>
               <button className="btn btn-sm btn-ghost" onClick={() => { setKeyInput(""); setShowInput(true); }}>
-                修改
+                {t("skills.tavily_modify")}
               </button>
               <button className="btn btn-sm btn-ghost" style={{ color: "var(--danger)" }}
                 onClick={onDeleteTavilyKey} disabled={tavilyKey.loading}>
-                删除
+                {t("skills.tavily_delete")}
               </button>
             </div>
           )}
@@ -83,9 +85,9 @@ export default function SkillsView({
               <button className="btn btn-sm btn-primary"
                 onClick={() => { onSaveTavilyKey(keyInput); setShowInput(false); }}
                 disabled={tavilyKey.loading || !keyInput.trim()}>
-                {tavilyKey.loading ? "..." : "保存"}
+                {tavilyKey.loading ? "..." : t("skills.tavily_save")}
               </button>
-              <button className="btn btn-sm btn-ghost" onClick={() => setShowInput(false)}>取消</button>
+              <button className="btn btn-sm btn-ghost" onClick={() => setShowInput(false)}>{t("skills.tavily_cancel")}</button>
             </div>
           )}
         </div>

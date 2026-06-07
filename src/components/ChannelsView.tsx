@@ -1,5 +1,8 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { useTranslation } from "../i18n";
+
+const CHANNEL_KEYCHAIN_KEY = "channel_tokens";
 
 const CHANNELS = [
   { name: "Telegram", icon: "💬", key: "telegram", color: "var(--accent)", placeholder: "Bot Token (from @BotFather)" },
@@ -14,24 +17,48 @@ const CHANNELS = [
 
 export default function ChannelsView() {
   const { t } = useTranslation();
-  const [configs, setConfigs] = useState<Record<string, string>>(() => {
-    try {
-      return JSON.parse(localStorage.getItem("latiao_channels") || "{}");
-    } catch { return {}; }
-  });
+  const [configs, setConfigs] = useState<Record<string, string>>({});
+  const [loaded, setLoaded] = useState(false);
   const [activeChannel, setActiveChannel] = useState<string | null>(null);
 
+  // Load channel tokens from OS keychain on mount
+  useEffect(() => {
+    (async () => {
+      try {
+        const saved = await invoke("get_secret", { key: CHANNEL_KEYCHAIN_KEY }).catch(() => null) as string | null;
+        if (saved) setConfigs(JSON.parse(saved));
+      } catch { /* keychain not available */ }
+      setLoaded(true);
+    })();
+  }, []);
+
+  // Persist to keychain (debounced)
+  useEffect(() => {
+    if (!loaded) return;
+    const timer = setTimeout(async () => {
+      try {
+        if (Object.keys(configs).length > 0) {
+          await invoke("store_secret", { key: CHANNEL_KEYCHAIN_KEY, value: JSON.stringify(configs) });
+        }
+      } catch { /* ignore */ }
+    }, 1000);
+    return () => clearTimeout(timer);
+  }, [configs, loaded]);
+
   const saveConfig = (key: string, value: string) => {
-    const next = { ...configs, [key]: value };
-    setConfigs(next);
-    localStorage.setItem("latiao_channels", JSON.stringify(next));
+    setConfigs(prev => ({ ...prev, [key]: value }));
   };
 
   const clearConfig = (key: string) => {
-    const next = { ...configs };
-    delete next[key];
-    setConfigs(next);
-    localStorage.setItem("latiao_channels", JSON.stringify(next));
+    setConfigs(prev => {
+      const next = { ...prev };
+      delete next[key];
+      // If all configs cleared, delete from keychain
+      if (Object.keys(next).length === 0) {
+        invoke("delete_secret", { key: CHANNEL_KEYCHAIN_KEY }).catch(() => {});
+      }
+      return next;
+    });
   };
 
   return (

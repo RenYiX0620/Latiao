@@ -6,7 +6,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import collections
+from collections import deque
+import contextvars
 import fnmatch
 import importlib.util
 import io
@@ -18,8 +19,18 @@ import re
 import shlex
 import sqlite3
 import subprocess
+import sys
 import threading
 import uuid
+
+# Fix SSL certificate verification for Python 3.14 on macOS
+# (httpx/huggingface_hub don't find system certs by default)
+try:
+    import certifi
+    os.environ.setdefault("SSL_CERT_FILE", certifi.where())
+    os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
+except ImportError:
+    pass
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -32,10 +43,9 @@ from fastapi.responses import JSONResponse, StreamingResponse
 import local_llm
 
 logger = logging.getLogger("latiao-sidecar")
-logging.basicConfig(level=logging.WARNING, format="[%(levelname)s] %(name)s: %(message)s")
 
 # In-memory ring buffer for recent log entries (accessible via /v1/logs)
-_log_buffer: collections.deque = collections.deque(maxlen=500)
+_log_buffer: deque = deque(maxlen=500)
 
 
 class _DequeHandler(logging.Handler):
@@ -60,6 +70,110 @@ logger.info("Sidecar 启动")
 # huggingface — 国内网络可用 hf-mirror.com 镜像
 # os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
+# ═══════════════════════════════════════════════════════
+#  Smart Skill System: Auto-match & load skills on demand
+# ═══════════════════════════════════════════════════════
+
+SKILL_INDEX: dict[str, dict] = {}
+PROJECT_ROOT = Path(__file__).parent  # sidecar/
+SKILLS_DIR = PROJECT_ROOT / "skills"
+
+def _load_skill_index():
+    """Scan all skills in ./skills/ directory and build index of their metadata."""
+    global SKILL_INDEX
+    SKILL_INDEX.clear()
+    # Pre-import yaml at the top so we don't import inside the loop
+    try:
+        import yaml  # noqa: F811
+    except ImportError:
+        logger.error("PyYAML not installed — skills system disabled. Install: pip install pyyaml")
+        return
+    if not SKILLS_DIR.exists():
+        logger.info("No skills directory found, skill system disabled")
+        return
+    for skill_dir in SKILLS_DIR.iterdir():
+        if not skill_dir.is_dir():
+            continue
+        skill_md = skill_dir / "SKILL.md"
+        if not skill_md.exists():
+            continue
+        try:
+            content = skill_md.read_text(encoding="utf-8")
+            # Parse YAML frontmatter
+            if content.startswith("---"):
+                parts = content.split("---", 2)
+                if len(parts) >= 3:
+                    frontmatter = yaml.load(parts[1], Loader=yaml.SafeLoader)
+                    name = frontmatter.get("name", skill_dir.name)
+                    description = frontmatter.get("description", "")
+                    skill_content = parts[2].strip()
+                    SKILL_INDEX[name] = {
+                        "name": name,
+                        "description": description,
+                        "content": skill_content,
+                        "path": skill_dir,
+                    }
+                    logger.info(f"Indexed skill: {name}")
+        except Exception as e:
+            logger.warning(f"Failed to load skill {skill_dir.name}: {e}")
+    logger.info(f"Loaded {len(SKILL_INDEX)} skills into index")
+
+def _match_skill_keywords(user_query: str) -> str | None:
+    """Simple keyword-based skill matching for local models (no API call)."""
+    lower = user_query.lower()
+    for name, skill in SKILL_INDEX.items():
+        desc = skill.get("description", "").lower()
+        # Match skill name or keywords from description
+        if name.lower() in lower or any(
+            kw in lower for kw in desc.replace("—", " ").replace("-", " ").split()
+            if len(kw) > 2
+        ):
+            return name
+    return None
+
+async def _match_skill(user_query: str) -> str | None:
+    """Intelligently match user query to the most appropriate skill."""
+    if not SKILL_INDEX:
+        return None
+    # For local models, use keyword matching to avoid sending user text to external API
+    cfg = _last_cloud_config.get()
+    if not cfg or not cfg.get("key"):
+        return _match_skill_keywords(user_query)
+    # Build skill list for LLM to choose from
+    skill_list = []
+    for name, skill in SKILL_INDEX.items():
+        skill_list.append(f"- {name}: {skill['description']}")
+    skill_list_str = "\n".join(skill_list)
+    # Lightweight prompt to match skill, no tool calls needed
+    prompt = f"""用户的问题是：{user_query}
+下面是所有可用的技能列表：
+{skill_list_str}
+请判断用户的问题是否需要用到某个技能，如果需要，返回技能的名字，如果不需要，返回NONE。
+只返回一个结果，不需要解释。"""
+    try:
+        protocol, api_url, skill_headers, _is_local = _resolve_api_target(_last_cloud_config.get())
+        if not api_url:
+            return None
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10)) as client:
+            r = await client.post(api_url, json={
+                "model": SUBAGENT_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 10,
+                "temperature": 0,
+                "stream": False,
+            }, headers=skill_headers)
+            if r.status_code != 200:
+                return None
+            data = r.json()
+            result = data.get("choices", [{}])[0].get("message", {}).get("content", "NONE").strip()
+            if result in SKILL_INDEX:
+                logger.info(f"Matched skill: {result} for query: {user_query[:50]}...")
+                return result
+            return None
+    except Exception as e:
+        logger.warning(f"Skill matching failed: {e}")
+        return None
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """FastAPI lifespan: startup + shutdown hooks."""
@@ -67,6 +181,7 @@ async def lifespan(app: FastAPI):
     _create_default_identity()
     _init_db()
     _seed_default_cron()
+    _load_skill_index()  # Load skill index at startup
     # Write PID file so the Rust process manager can find us (after _init_db creates dir)
     SIDECAR_PID = PROGRESS_DIR / "sidecar.pid"
     SIDECAR_PID.write_text(str(os.getpid()))
@@ -81,14 +196,24 @@ app = FastAPI(title="Local AI OS Sidecar", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:1420", "tauri://localhost", "https://tauri.localhost", "http://127.0.0.1:1420"],
+    allow_origins=[
+        "http://localhost:1420",
+        "http://tauri.localhost",
+        "https://tauri.localhost",
+        "tauri://localhost",
+        "http://127.0.0.1:1420",
+        "http://127.0.0.1:8000",
+    ],
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["Content-Type", "Authorization"],
 )
 
 LM_STUDIO_URL = os.environ.get("LATIAO_LM_STUDIO_URL", "http://localhost:1234/v1/chat/completions")
-SUBAGENT_MODEL = os.environ.get("LATIAO_SUBAGENT_MODEL", "google/gemma-4-26b-a4b")
+SUBAGENT_MODEL = os.environ.get("LATIAO_SUBAGENT_MODEL", "gpt-4o-mini")
+TAVILY_API_URL = os.environ.get("TAVILY_API_URL", "https://api.tavily.com/search")
+# Per-request cloud config — contextvars isolates concurrent requests
+_last_cloud_config: contextvars.ContextVar = contextvars.ContextVar("cloud_config", default=None)
 MAX_UPLOAD_SIZE = 50 * 1024 * 1024  # 50 MB
 IS_MACOS = platform.system() == "Darwin"
 
@@ -96,92 +221,60 @@ IS_MACOS = platform.system() == "Darwin"
 #  Multi-Agent System: LaTiao orchestrator + specialists
 # ═══════════════════════════════════════════════════════
 
+AGENTS_DIR = Path(__file__).parent / "agents"
+
+def _load_agent_identity(agent_id: str, fallback: str) -> str:
+    """Load agent identity from agents/{agent_id}.txt, falling back to hardcoded string."""
+    agent_file = AGENTS_DIR / f"{agent_id}.txt"
+    if agent_file.exists():
+        try:
+            return agent_file.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeDecodeError) as e:
+            logger.warning("Failed to load agent identity from %s: %s", agent_file, e)
+    return fallback
+
+
 AGENT_PROFILES: dict[str, dict] = {
     "latiao": {
         "name": "辣条",
         "display": "LaTiao · 总指挥",
         "role": "orchestrator",
-        "identity": (
+        "identity": _load_agent_identity("latiao",
             "你是 LaTiao（辣条），本机 AI Agent 的总指挥。\n"
-            "始终用与用户相同的语言回复。如果用户用英文发消息，你就用英文回复；用日文则回日文；用中文则回中文。\n\n"
-            "职责：接收用户指令 → 分析任务类型 → 协调专家 Agent 执行。\n"
-            "你拥有完整的工具权限，可以直接处理简单任务，复杂任务分发给专家。\n\n"
-            "你的团队：\n"
-            "- 代码审查员：专注代码审查、安全分析、只读代码检查\n"
-            "- 文档生成器：生成项目文档、API 文档、变更日志\n"
-            "- 调试专家：分析日志、定位 Bug、提供修复方案\n"
-            "- 翻译助手：多语言翻译与本地化\n\n"
-            "工作流程：\n"
-            "1. 分析用户意图，判断属于哪个专家领域\n"
-            "2. 如果是专家领域，以该专家的视角和约束来执行任务\n"
-            "3. 执行完成后汇报使用了哪个专家能力\n"
-            "4. 简单对话或跨领域任务直接由你处理"
-        ),
+            "始终用与用户相同的语言回复。\n"
+            "你拥有完整的工具权限。"),
         "tools": "all",
     },
     "code-reviewer": {
         "name": "代码审查员",
         "display": "代码审查员 · 安全分析",
         "role": "specialist",
-        "identity": (
-            "你是代码审查员，专注代码审查和安全分析。\n\n"
-            "权限：只读。你只能读取、搜索、列出文件，不能修改任何文件或执行命令。\n\n"
-            "审查标准：\n"
-            "1. 安全漏洞：SQL 注入、XSS、命令注入、硬编码密钥\n"
-            "2. 代码质量：命名规范、函数长度、复杂度\n"
-            "3. 类型安全：TypeScript 类型是否正确\n"
-            "4. 错误处理：异常是否正确捕获和处理\n\n"
-            "每次审查给出：问题列表 + 严重程度 + 修复建议。"
-        ),
+        "identity": _load_agent_identity("code-reviewer",
+            "你是代码审查员，专注代码审查和安全分析。权限：只读。"),
         "tools": ["read_file", "list_dir", "search_files"],
     },
     "doc-generator": {
         "name": "文档生成器",
         "display": "文档生成器 · 文档专家",
         "role": "specialist",
-        "identity": (
-            "你是文档生成器，自动生成项目文档、API 文档和变更日志。\n\n"
-            "能力：\n"
-            "1. 分析代码生成 API 文档（参数、返回值、异常）\n"
-            "2. 从 git log 生成 CHANGELOG\n"
-            "3. 生成 README、架构文档\n"
-            "4. 更新已有文档\n\n"
-            "规范：Markdown 格式、代码块标注语言、中文描述。"
-        ),
+        "identity": _load_agent_identity("doc-generator",
+            "你是文档生成器，生成项目文档、API 文档和变更日志。"),
         "tools": ["read_file", "list_dir", "search_files", "write_file"],
     },
     "debugger": {
         "name": "调试专家",
         "display": "调试专家 · Bug 猎手",
         "role": "specialist",
-        "identity": (
-            "你是调试专家，分析日志、定位 Bug、提供修复方案。\n\n"
-            "工作流程：\n"
-            "1. 复现：先理解症状，查看错误日志和堆栈\n"
-            "2. 定位：用 read_file/search_files 追踪代码路径\n"
-            "3. 诊断：确定根因（不是表面症状）\n"
-            "4. 修复：给出具体修复方案和代码变更\n"
-            "5. 验证：修复后检查是否引入新问题\n\n"
-            "原则：不确定时不瞎猜，先收集更多信息。"
-        ),
+        "identity": _load_agent_identity("debugger",
+            "你是调试专家，分析日志、定位 Bug、提供修复方案。"),
         "tools": "all",
     },
     "translator": {
         "name": "翻译助手",
         "display": "翻译助手 · 多语言",
         "role": "specialist",
-        "identity": (
-            "你是翻译助手，负责多语言翻译与本地化。\n\n"
-            "能力：\n"
-            "1. 代码注释/文档中英互译\n"
-            "2. UI 文案多语言翻译（保留变量占位符如 {count}）\n"
-            "3. 技术文档本地化\n"
-            "4. i18n 文件生成和维护\n\n"
-            "规则：\n"
-            "- 代码关键字和 API 名称不翻译\n"
-            "- 保留原始格式和缩进\n"
-            "- 不确定的术语保留原文并标注"
-        ),
+        "identity": _load_agent_identity("translator",
+            "你是翻译助手，负责多语言翻译与本地化。"),
         "tools": ["read_file", "list_dir", "search_files", "write_file"],
     },
 }
@@ -237,6 +330,8 @@ _FALLBACK_PERMISSIONS = {
     "open_app": "confirm",
     "open_folder": "confirm",
     "delegate_task": "safe",
+    "tavily_search": "safe",
+    "web_search": "safe",
 }
 
 # Plugin system globals — populated by _load_plugins()
@@ -375,18 +470,39 @@ def _create_default_identity():
 #  工具执行函数
 # ═══════════════════════════════════════════════════════
 
-MAX_READ_SIZE = 10000  # chars before truncation (~300 lines)
+MAX_READ_SIZE = 50000  # chars before truncation (~1500 lines)
 
-def read_file(path: str) -> str:
+def read_file(path: str, offset: int = 0, limit: int = 0) -> str:
+    """Read file contents. Supports offset/limit for large files.
+    - offset: start reading from this line (1-indexed)
+    - limit: max lines to return (0 = up to MAX_READ_SIZE chars)"""
+    # Block path traversal
+    if ".." in path.split("/") or ".." in path.split("\\"):
+        return "⛔ Blocked: path traversal not allowed"
     try:
         with open(path, "r", encoding="utf-8") as f:
+            if offset > 1:
+                for _ in range(offset - 1):
+                    if not f.readline():
+                        return f"错误：偏移超出文件范围（第 {offset} 行不存在）"
+            if limit > 0:
+                lines = []
+                for _ in range(limit):
+                    line = f.readline()
+                    if not line:
+                        break
+                    lines.append(line)
+                content = "".join(lines)
+                if len(lines) == limit and f.readline():
+                    content += f"\n... (继续读取请使用 offset={offset + limit})"
+                return content or "(空)"
             content = f.read(MAX_READ_SIZE + 1)
         if len(content) > MAX_READ_SIZE:
-            est_lines = content.count("\n")  # approximate from the truncated content
+            est_lines = content.count("\n")
             return (
                 content[:MAX_READ_SIZE]
-                + f"\n\n... (文件过长，已截断。约 {est_lines}+ 行，"
-                + f"仅显示前 {MAX_READ_SIZE} 字符。如需完整内容请分段读取)"
+                + f"\n\n... (文件过长，已截断。约 {est_lines}+ 行，仅显示前 {MAX_READ_SIZE} 字符。"
+                + f"分段读取：read_file(path=\"{path}\", offset={est_lines + 1})"
             )
         return content
     except FileNotFoundError:
@@ -396,6 +512,11 @@ def read_file(path: str) -> str:
 
 
 def write_file(path: str, content: str) -> str:
+    # Block path traversal
+    if ".." in path.split("/") or ".." in path.split("\\"):
+        return "⛔ Blocked: path traversal not allowed"
+    if len(content) > 10 * 1024 * 1024:  # 10 MB limit
+        return f"⛔ File too large ({len(content)} bytes, max 10 MB)"
     try:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
@@ -406,6 +527,9 @@ def write_file(path: str, content: str) -> str:
 
 
 def list_dir(path: str) -> str:
+    # Block path traversal
+    if ".." in path.split("/") or ".." in path.split("\\"):
+        return "⛔ Blocked: path traversal not allowed"
     try:
         entries = os.listdir(path)
         lines = [f"  {'📁' if os.path.isdir(os.path.join(path, e)) else '📄'} {e}"
@@ -426,6 +550,10 @@ _DANGEROUS = [
 
 
 def run_cmd(cmd: str) -> str:
+    # Strip shell comment lines (models sometimes prepend "# comment\n")
+    cmd = "\n".join(line for line in cmd.split("\n") if not line.strip().startswith("#")).strip()
+    if not cmd:
+        return "错误：命令为空（可能只包含注释行）"
     # Safety check before execution (fallback version — plugin has fuller check)
     cmd_lower = cmd.lower().strip()
     for pattern in _DANGEROUS:
@@ -433,8 +561,20 @@ def run_cmd(cmd: str) -> str:
             return f"⛔ Blocked unsafe command: {cmd}"
     if len(cmd) > 1000:
         return f"⛔ Command too long ({len(cmd)} chars, max 1000)"
+    # Redirect: if the model is trying to do web search via Python code, tell it to use the tool
+    if re.search(r'(tavily|requests\.|urllib|httpx|aiohttp)', cmd_lower) and re.search(r'(search|api|get|post)', cmd_lower):
+        return (
+            "⛔ 不要用 Python 代码做网络搜索或 API 请求！\n"
+            "请使用 web_search 工具来做网络搜索，例如：\n"
+            "  web_search({query: \"你的搜索词\"})\n"
+            "对于文件操作，使用 read_file、list_dir、write_file 等工具。"
+        )
     try:
-        r = subprocess.run(shlex.split(cmd), shell=False, capture_output=True, text=True, timeout=30)
+        try:
+            tokens = shlex.split(cmd)
+        except ValueError as e:
+            return f"命令格式错误: {e}"
+        r = subprocess.run(tokens, shell=False, capture_output=True, text=True, timeout=30)
         out = r.stdout.strip()
         if r.returncode != 0:
             out += f"\n(退出码: {r.returncode})"
@@ -492,6 +632,8 @@ def open_app(name: str) -> str:
 
 def search_files(directory: str, pattern: str) -> str:
     """Search for files matching a glob pattern in a directory."""
+    if ".." in directory.split("/"):
+        return "⛔ Blocked: path traversal not allowed"
     import glob as glob_mod
     try:
         search_path = os.path.join(os.path.expanduser(directory), pattern)
@@ -510,14 +652,25 @@ def search_files(directory: str, pattern: str) -> str:
         return f"Error searching files: {e}"
 
 
-def tavily_search(args: dict) -> str:
+async def tavily_search(args: dict) -> str:
     """Search the web using Tavily API."""
     import json
 
-    import httpx
-
     config_file = Path.home() / ".local-ai-os" / "config.json"
+    # Priority: env var → macOS Keychain → config.json (legacy)
     api_key = os.environ.get("TAVILY_API_KEY")
+
+    if not api_key:
+        # Try macOS Keychain via security CLI
+        try:
+            result = subprocess.run(
+                ["security", "find-generic-password", "-s", "com.latiao.desktop", "-a", "tavily_api_key", "-w"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                api_key = result.stdout.strip()
+        except Exception:
+            pass
 
     if not api_key:
         try:
@@ -539,18 +692,18 @@ def tavily_search(args: dict) -> str:
     max_results = min(args.get("max_results", 5), 10)
 
     try:
-        resp = httpx.post(
-            "https://api.tavily.com/search",
-            json={
-                "api_key": api_key,
-                "query": query,
-                "search_depth": search_depth,
-                "max_results": max_results,
-            },
-            timeout=30,
-        )
-        resp.raise_for_status()
-        data = resp.json()
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30)) as client:
+            resp = await client.post(
+                TAVILY_API_URL,
+                json={
+                    "api_key": api_key,
+                    "query": query,
+                    "search_depth": search_depth,
+                    "max_results": max_results,
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
 
         results = data.get("results", [])
         answer = data.get("answer", "")
@@ -615,10 +768,9 @@ async def _delegate_task(agent_type: str, task: str) -> str:
         {"role": "user", "content": task},
     ]
 
-    api_url = LM_STUDIO_URL
-    local_api = local_llm.get_api_url()
-    if local_api:
-        api_url = local_api + "/chat/completions"
+    protocol, api_url, sub_headers, _is_local = _resolve_api_target(_last_cloud_config.get())
+    if not api_url:
+        return f"[Sub-agent: {agent_type}] 错误: 无法连接模型服务（请配置云端模型或启动本地 LLM）"
 
     current_msgs = list(messages)
 
@@ -633,7 +785,7 @@ async def _delegate_task(agent_type: str, task: str) -> str:
                     "max_tokens": 2048,
                     "stream": False,
                 }
-                r = await client.post(api_url, json=body, headers={"Content-Type": "application/json"})
+                r = await client.post(api_url, json=body, headers=sub_headers)
                 if r.status_code != 200:
                     return f"[Sub-agent: {agent_type}] HTTP {r.status_code}"
 
@@ -669,11 +821,13 @@ _FALLBACK_TOOLS = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read the contents of a file at the given path.",
+            "description": "Read the contents of a file at the given path. Supports offset and limit for large files. File truncated at 50000 chars — use offset to continue reading.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "Absolute path to the file."}
+                    "path": {"type": "string", "description": "Absolute path to the file."},
+                    "offset": {"type": "integer", "description": "Line number to start reading from (1-indexed). Use this with limit to read large files in chunks."},
+                    "limit": {"type": "integer", "description": "Maximum number of lines to return. Use with offset for chunked reading."}
                 },
                 "required": ["path"]
             }
@@ -768,8 +922,8 @@ _FALLBACK_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "tavily_search",
-            "description": "Search the web for real-time information using Tavily. Use when you need current events, news, or facts beyond your training data. Returns relevant results with titles, URLs, and content summaries.",
+            "name": "web_search",
+            "description": "搜索互联网获取实时信息。当你需要最新新闻、事实、或超出你训练数据的信息时使用。返回标题、URL和内容摘要。不要用 run_cmd 或手写代码来做网络搜索——直接用这个工具。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -814,6 +968,7 @@ _FALLBACK_DISPATCH = {
     "open_app": lambda args: open_app(args["name"]),
     "search_files": lambda args: search_files(args["directory"], args["pattern"]),
     "tavily_search": lambda args: tavily_search(args),
+    "web_search": lambda args: tavily_search(args),
     "delegate_task": lambda args: _delegate_task(args.get("agent", "code-reviewer"), args.get("task", "")),
 }
 
@@ -835,11 +990,13 @@ DEFINITION = {
     "type": "function",
     "function": {
         "name": "read_file",
-        "description": "Read the contents of a file at the given path.",
+        "description": "Read the contents of a file at the given path. Supports offset and limit for large files. File truncated at 50000 chars — use offset to continue reading.",
         "parameters": {
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "Absolute path to the file."}
+                "path": {"type": "string", "description": "Absolute path to the file."},
+                "offset": {"type": "integer", "description": "Line number to start reading from (1-indexed)."},
+                "limit": {"type": "integer", "description": "Maximum number of lines to return."}
             },
             "required": ["path"]
         }
@@ -962,7 +1119,11 @@ def execute(args: dict) -> str:
     if len(cmd) > 1000:
         return f"⛔ Command too long"
     try:
-        r = subprocess.run(shlex.split(cmd), shell=False, capture_output=True, text=True, timeout=30)
+        try:
+            tokens = shlex.split(cmd)
+        except ValueError as e:
+            return f"命令格式错误: {e}"
+        r = subprocess.run(tokens, shell=False, capture_output=True, text=True, timeout=30)
         out = r.stdout.strip()
         if r.returncode != 0:
             out += f"\\n(退出码: {r.returncode})"
@@ -1136,6 +1297,16 @@ def _get_api_key() -> str | None:
     env_key = os.environ.get("TAVILY_API_KEY")
     if env_key:
         return env_key
+    # Try macOS Keychain via security CLI
+    try:
+        result = subprocess.run(
+            ["security", "find-generic-password", "-s", "com.latiao.desktop", "-a", "tavily_api_key", "-w"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except Exception:
+        pass
     try:
         if CONFIG_FILE.exists():
             cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
@@ -1145,7 +1316,7 @@ def _get_api_key() -> str | None:
     return None
 
 
-def execute(args: dict) -> str:
+async def execute(args: dict) -> str:
     api_key = _get_api_key()
     if not api_key:
         return "⚠️ Tavily API Key 未配置。请在应用的「技能」界面中找到 Web Search (Tavily)，填写 API Key。免费注册：https://tavily.com"
@@ -1155,13 +1326,13 @@ def execute(args: dict) -> str:
     max_results = min(args.get("max_results", 5), 10)
 
     try:
-        resp = httpx.post(
-            "https://api.tavily.com/search",
-            json={"api_key": api_key, "query": query, "search_depth": search_depth, "max_results": max_results},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        data = resp.json()
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30)) as client:
+            resp = await client.post(
+                TAVILY_API_URL,
+                json={"api_key": api_key, "query": query, "search_depth": search_depth, "max_results": max_results},
+            )
+            resp.raise_for_status()
+            data = resp.json()
         results = data.get("results", [])
         answer = data.get("answer", "")
         if not results and not answer:
@@ -1265,6 +1436,53 @@ async def _auto_verify(tool_name: str, args: dict, result: str) -> str:
                 checks.append(("INFO", "Git 变更", "\n" + stdout.decode("utf-8", errors="replace").strip()))
         except Exception:
             logger.warning("Git diff check failed in auto-verify", exc_info=True)
+
+        # ── ESLint check for JS/TS files ──
+        if path.endswith((".ts", ".tsx", ".js", ".jsx")):
+            p = Path(path)
+            for parent in [p.parent, p.parent.parent, p.parent.parent.parent]:
+                if (parent / "eslint.config.js").exists() or (parent / ".eslintrc").exists():
+                    try:
+                        proc = await asyncio.create_subprocess_exec(
+                            "npx", "eslint", str(p),
+                            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                        )
+                        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+                        output = (stdout or stderr or b"").decode("utf-8", errors="replace").strip()
+                        if proc.returncode == 0 and not output:
+                            checks.append(("OK", "ESLint", "无警告"))
+                        elif output:
+                            errs = [l for l in output.split("\n") if l.strip()][:5]
+                            checks.append(("FAIL", "ESLint", f"发现 {len(errs)} 个问题"))
+                            for el in errs[:3]:
+                                checks.append(("  ", "  ↳", el[:120]))
+                    except FileNotFoundError:
+                        pass
+                    except asyncio.TimeoutError:
+                        checks.append(("FAIL", "ESLint", "超时"))
+                    except Exception:
+                        pass
+                    break
+
+        # ── Python syntax check ──
+        if path.endswith(".py"):
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    sys.executable, "-m", "py_compile", str(Path(path)),
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                )
+                _, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
+                if proc.returncode == 0:
+                    checks.append(("OK", "Python 语法", "编译通过"))
+                else:
+                    err_text = (stderr or b"").decode("utf-8", errors="replace")[:300]
+                    checks.append(("FAIL", "Python 语法", err_text[:150]))
+            except FileNotFoundError:
+                pass
+            except asyncio.TimeoutError:
+                checks.append(("FAIL", "Python 语法", "超时"))
+            except Exception:
+                pass
 
     # ── Semgrep security scan ──
     await _enhance_auto_verify(tool_name, args, result, checks)
@@ -1524,7 +1742,8 @@ LEARNING_CONFIDENCE_THRESHOLD = 0.3  # Minimum confidence to inject a learning
 
 
 _db_conn: sqlite3.Connection | None = None
-_db_write_lock = threading.Lock()
+_db_write_lock = threading.Lock()  # protects sync write paths
+_async_db_lock = asyncio.Lock()    # protects async write paths
 
 
 def _get_db() -> sqlite3.Connection:
@@ -1640,14 +1859,154 @@ def _get_recent_learnings(limit: int = 10) -> list[dict]:
         return []
 
 
-def _retrieve_relevant_learnings(query: str, limit: int = MAX_LEARNINGS_INJECT) -> list[dict]:
-    """Search past learnings that are semantically relevant to the current query.
-    Uses FTS5 full-text search with a fallback to recent high-confidence learnings."""
+# ═══════════════════════════════════════════════════════
+#  Lightweight Embedding Search (no external deps)
+#  Uses character n-gram TF-IDF for Chinese semantic similarity.
+#  For < 1000 learnings this is fast enough — ~5ms per query.
+# ═══════════════════════════════════════════════════════
+
+def _tokenize_zh(text: str) -> list[str]:
+    """Simple Chinese tokenizer: bigram characters + whole words.
+    E.g. '项目结构' → ['项目', '目结', '结构', '项目结构']"""
+    # Extract Chinese chars and alphanumeric tokens
+    import unicodedata
+    tokens = []
+    # Chinese bigrams
+    chinese_chars = []
+    for ch in text:
+        if '\u4e00' <= ch <= '\u9fff' or '\u3400' <= ch <= '\u4dbf':
+            chinese_chars.append(ch)
+    for i in range(len(chinese_chars)):
+        tokens.append(chinese_chars[i])
+        if i + 1 < len(chinese_chars):
+            tokens.append(chinese_chars[i] + chinese_chars[i + 1])
+    # English/alphanumeric tokens (split on non-alphanumeric)
+    eng_tokens = re.findall(r'[a-zA-Z0-9_]+', text.lower())
+    tokens.extend(eng_tokens)
+    return tokens
+
+
+def _build_tfidf_index():
+    """Build an in-memory TF-IDF index from all learnings."""
     try:
         conn = _get_db()
-        results = []
-        # FTS5 search on learnings
-        # Sanitize query for FTS5: remove special chars and use simple terms
+        rows = conn.execute(
+            "SELECT id, topic, content, confidence, hit_count, source_type FROM learnings"
+        ).fetchall()
+    except Exception:
+        return [], {}, {}
+    
+    if not rows:
+        return [], {}, {}
+    
+    # Build vocabulary and document vectors
+    docs = []
+    doc_info = []
+    all_tokens = set()
+    
+    for row in rows:
+        text = f"{row[1]} {row[2]}"
+        tokens = _tokenize_zh(text)
+        if not tokens:
+            continue
+        # Count term frequencies
+        tf = {}
+        for t in tokens:
+            tf[t] = tf.get(t, 0) + 1
+        docs.append(tf)
+        doc_info.append({
+            "id": row[0], "topic": row[1], "content": row[2],
+            "confidence": row[3], "hit_count": row[4], "source_type": row[5],
+        })
+        all_tokens.update(tf.keys())
+    
+    # Compute IDF
+    import math
+    N = len(docs)
+    idf = {}
+    for token in all_tokens:
+        df = sum(1 for d in docs if token in d)
+        idf[token] = math.log((N + 1) / (df + 1)) + 1
+    
+    # Build document vectors (sparse as dict)
+    doc_vectors = []
+    for doc in docs:
+        vec = {}
+        norm = 0
+        for token, tf in doc.items():
+            w = tf * idf[token]
+            vec[token] = w
+            norm += w * w
+        norm = math.sqrt(norm) if norm > 0 else 1
+        # Normalize
+        doc_vectors.append({k: v / norm for k, v in vec.items()})
+    
+    return doc_info, doc_vectors, idf
+
+
+def _tfidf_search(query: str, limit: int = 5) -> list[dict]:
+    """Search learnings using TF-IDF cosine similarity."""
+    doc_info, doc_vectors, idf = _build_tfidf_index()
+    if not doc_vectors:
+        return []
+    
+    # Build query vector
+    query_tokens = _tokenize_zh(query)
+    if not query_tokens:
+        return []
+    
+    import math
+    q_tf = {}
+    for t in query_tokens:
+        q_tf[t] = q_tf.get(t, 0) + 1
+    
+    q_vec = {}
+    q_norm = 0
+    for token, tf in q_tf.items():
+        w = tf * idf.get(token, 1.0)
+        q_vec[token] = w
+        q_norm += w * w
+    q_norm = math.sqrt(q_norm) if q_norm > 0 else 1
+    q_vec = {k: v / q_norm for k, v in q_vec.items()}
+    
+    # Score all documents
+    scores = []
+    for i, dv in enumerate(doc_vectors):
+        # Cosine similarity
+        dot = 0
+        for token, w in q_vec.items():
+            if token in dv:
+                dot += w * dv[token]
+        # Boost by confidence and hit_count
+        boost = doc_info[i]["confidence"] * (1.0 + doc_info[i]["hit_count"] * 0.05)
+        scores.append((dot * boost, i))
+    
+    scores.sort(reverse=True)
+    
+    results = []
+    for score, idx in scores[:limit]:
+        if score < 0.01:  # Skip near-zero matches
+            continue
+        results.append(doc_info[idx])
+    
+    return results
+
+
+# ── Original functions ──
+
+def _retrieve_relevant_learnings(query: str, limit: int = MAX_LEARNINGS_INJECT) -> list[dict]:
+    """Search past learnings using TF-IDF semantic similarity.
+    Falls back to FTS5/LIKE if TF-IDF returns nothing."""
+    # Priority 1: TF-IDF semantic search (handles Chinese well)
+    results = _tfidf_search(query, limit)
+    
+    if results:
+        return results
+    
+    # Fallback: FTS5 + LIKE for backward compatibility
+    try:
+        conn = _get_db()
+        # FTS5 search
         safe_query = " ".join(
             w for w in re.findall(r'[一-鿿\w]+', query.lower())
             if len(w) > 1
@@ -1831,6 +2190,148 @@ def _quick_reflect(tool_name: str, result: str) -> str:
     return ""  # Everything looks fine, no reflection needed
 
 
+async def _refine_learnings(tool_name: str, args: dict, result: str, session_id: str):
+    """After tool execution, ask LLM to extract a reusable learning in 1-2 sentences.
+    Runs as fire-and-forget background task so it doesn't slow down the agent loop.
+    Prioritizes cloud LLM (better quality), falls back to local model."""
+    if len(result) < 20 or result.startswith("Error") or result.startswith("⛔"):
+        return  # Don't learn from errors or empty results
+    try:
+        prompt = (
+            "从以下工具执行结果中提炼一条可复用的知识或发现，用一句中文总结（不超过50字），"
+            "聚焦于项目结构、代码模式、配置习惯或用户偏好。\n\n"
+            f"工具: {tool_name}\n"
+            f"参数: {json.dumps(args, ensure_ascii=False)[:200]}\n"
+            f"结果摘要: {result[:800]}\n\n"
+            "总结:"
+        )
+        # Try cloud LLM first (best quality), fall back to local model
+        cloud_config = _last_cloud_config.get()
+        protocol, api_url, headers, is_local = _resolve_api_target(cloud_config)
+        if not api_url:
+            return
+        # Prefer cloud model for refinement (SUBAGENT_MODEL may be a local 12B)
+        refine_model = SUBAGENT_MODEL
+        if cloud_config and cloud_config.get("endpoint"):
+            refine_model = cloud_config.get("model", SUBAGENT_MODEL)
+        async with httpx.AsyncClient(timeout=httpx.Timeout(15)) as client:
+            r = await client.post(api_url, json={
+                "model": refine_model,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 80,
+                "temperature": 0.3,
+                "stream": False,
+            }, headers=headers)
+            if r.status_code == 200:
+                data = r.json()
+                summary = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+                if summary and len(summary) > 5:
+                    # Dedup: skip if nearly identical to existing learnings
+                    if not _is_duplicate_learning(summary):
+                        _record_reflection(session_id, tool_name, args, result[:200], summary, True)
+                        logger.info("Learning refined: %s", summary[:100])
+    except Exception:
+        pass  # Fire-and-forget — never block the agent loop
+
+
+def _is_duplicate_learning(summary: str, threshold: float = 0.7) -> bool:
+    """Check if a learning summary is nearly identical to an existing one.
+    Uses simple token overlap for speed (full embedding check would be overkill for <50 chars)."""
+    try:
+        conn = _get_db()
+        rows = conn.execute(
+            "SELECT content FROM learnings ORDER BY created_at DESC LIMIT 20"
+        ).fetchall()
+        summary_tokens = set(summary.lower().split())
+        if not summary_tokens:
+            return False
+        for (existing,) in rows:
+            existing_tokens = set(existing.lower().split())
+            if not existing_tokens:
+                continue
+            overlap = len(summary_tokens & existing_tokens) / len(summary_tokens | existing_tokens)
+            if overlap > threshold:
+                return True
+        return False
+
+
+# ── Auto-Skill Generation (MUSE-Autoskill inspired) ──
+
+_SKILL_GENERATION_THRESHOLD = 3  # Consecutive successes before generating a skill
+_skill_gen_tracker: dict[str, int] = {}  # tool_name → consecutive success count
+
+
+async def _maybe_generate_skill(tool_name: str, args: dict, result: str):
+    """Auto-generate a SKILL.md when the same tool succeeds repeatedly.
+    Inspired by MUSE-Autoskill: Agent self-evolves by creating reusable skills."""
+    # Only track read_file for skill generation (most reusable pattern)
+    if tool_name not in ("read_file", "write_file", "run_cmd"):
+        return
+    # Count consecutive successes
+    is_success = not (result.startswith("Error") or result.startswith("错误") or result.startswith("⛔"))
+    if not is_success:
+        _skill_gen_tracker[tool_name] = 0
+        return
+    
+    count = _skill_gen_tracker.get(tool_name, 0) + 1
+    _skill_gen_tracker[tool_name] = count
+    if count < _SKILL_GENERATION_THRESHOLD:
+        return
+    
+    # Generate skill from accumulated learnings about this tool pattern
+    _skill_gen_tracker[tool_name] = 0  # Reset counter
+    try:
+        conn = _get_db()
+        rows = conn.execute(
+            "SELECT topic, content FROM learnings WHERE content LIKE ? ORDER BY created_at DESC LIMIT 5",
+            (f"%{tool_name}%",),
+        ).fetchall()
+        if not rows:
+            return
+        
+        # Build SKILL.md content from learnings
+        skill_name = f"{tool_name}-patterns"
+        skill_content = f"# {tool_name} 使用模式\n\n"
+        skill_content += f"自动生成于 {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
+        skill_content += "## 已知模式\n\n"
+        for topic, content in rows:
+            skill_content += f"- **{topic}**: {content}\n"
+        skill_content += f"\n## 注意事项\n\n- 此技能由 Agent 自动生成，基于 {len(rows)} 次成功调用\n"
+        skill_content += "- 使用前请确认适用场景\n"
+        
+        # Write to skills directory
+        skill_key = re.sub(r'[^a-z0-9-]', '', skill_name.lower().replace(" ", "-"))[:40]
+        filepath = SKILLS_DIR / f"{skill_key}.md"
+        if not filepath.exists():
+            SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+            filepath.write_text(skill_content, encoding="utf-8")
+            logger.info("Auto-generated skill: %s (%d learnings)", skill_key, len(rows))
+            # Reload skills
+            global _loaded_skills
+            _loaded_skills = _load_skills()
+    except Exception:
+        logger.warning("Auto-skill generation failed for %s", tool_name, exc_info=True)
+    except Exception:
+        return False  # On error, allow the learning
+
+
+def _get_recent_learnings(limit: int = 5) -> list[str]:
+    """Get the most recent learning summaries for cross-session context injection."""
+    learnings = []
+    try:
+        db = _get_db()
+        rows = db.execute(
+            "SELECT topic, content FROM learnings_fts ORDER BY rowid DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        for topic, content in rows:
+            if topic and content and len(content) > 10:
+                learnings.append(f"- {topic}: {content[:200]}")
+    except Exception:
+        pass
+    return learnings
+
+
 def _build_learning_context(user_query: str) -> str:
     """Build a context string from relevant learnings + preferences to inject into system prompt."""
     parts = []
@@ -1948,17 +2449,30 @@ def _load_skills() -> list[dict]:
 
 
 def _build_skill_prompt() -> str:
-    """Build a system message from ENABLED skills to inject engineering constraints."""
+    """Build a lightweight skill directory for system prompt.
+    Only injects name + description (progressive disclosure).
+    Agent loads full SKILL.md via read_file when it needs a specific skill."""
     global _loaded_skills
     _loaded_skills = _load_skills()
     enabled = [s for s in _loaded_skills if s.get("enabled", True)]
     if not enabled:
         return ""
-    lines = ["## 工程技能卡约束 (必须遵守)"]
+    lines = ["## 可用技能（按需加载）"]
+    lines.append("以下技能可用。需要使用特定技能时，用 read_file 读取对应的 SKILL.md。\n")
     for s in enabled:
-        lines.append(f"\n### {s['name']}")
-        lines.append(s["content"])
-    lines.append("\n---\n以上所有技能的退出标准都是硬性要求，未满足不得声称任务完成。")
+        # Extract first meaningful line as description
+        desc = s.get("description", "")
+        if not desc:
+            # Fallback: first non-empty line of content
+            for line in s.get("content", "").split("\n"):
+                stripped = line.strip()
+                if stripped and not stripped.startswith("#") and not stripped.startswith("---"):
+                    desc = stripped[:100]
+                    break
+            if not desc:
+                desc = s["name"]
+        lines.append(f"- **{s['name']}** (`{s['key']}`): {desc[:120]}")
+    lines.append(f"\n技能文件路径: {SKILLS_DIR}/*.md")
     return "\n".join(lines)
 
 
@@ -2185,6 +2699,22 @@ async def _await_tool_confirmation(call_id: str, tool_name: str, args: dict) -> 
     return approved, events
 
 
+def _check_skill_permission(skill_name: str, args: dict) -> tuple[bool, list[dict], str]:
+    """Check skill permission level. Returns (need_confirm, events, confirm_prompt)."""
+    if skill_name not in SKILL_INDEX:
+        return False, [], ""
+    level = SKILL_INDEX[skill_name].get("security_level", "safe")
+    if level == "safe":
+        return False, [], ""
+    elif level == "confirm":
+        call_id = str(uuid.uuid4())
+        prompt = f"⚠️ 你正在使用 {skill_name} 技能，该操作会修改你的本地文件或访问外部服务，是否确认执行？"
+        events = [{"event": "tool_confirm", "call_id": call_id, "tool": skill_name, "args": args, "prompt": prompt}]
+        return True, events, prompt
+    elif level == "danger":
+        return True, [], f"⛔ {skill_name} 是高危技能，已被系统禁止调用，请联系管理员。"
+    return False, [], ""
+
 def _check_pre_hooks(tool_name: str, args: dict) -> tuple[bool, list[dict], str]:
     """Run pre-tool hooks. Returns (vetoed, events, result_if_vetoed)."""
     hooks = TOOL_HOOKS.get(tool_name, {})
@@ -2249,6 +2779,10 @@ async def _handle_tool_execution(tc: dict, current_msgs: list, session_id: str,
     _record_progress(f"**{tool_name}**\nArgs: `{json.dumps(args)}`\nResult: {result[:200]}")
     _record_tool_call_db(session_id, tool_name, args, result)
 
+    # Self-evolution: background-refine learning + auto-skill generation
+    asyncio.create_task(_refine_learnings(tool_name, args, result, session_id))
+    asyncio.create_task(_maybe_generate_skill(tool_name, args, result))
+
     verify_report = await _auto_verify(tool_name, args, result)
     verify_failed = bool(verify_report and "❌" in verify_report)
     result_lower = result.lower()
@@ -2266,22 +2800,138 @@ async def _handle_tool_execution(tc: dict, current_msgs: list, session_id: str,
     tool_content = result
     if verify_report:
         tool_content = f"{result}\n{verify_report}"
+        if verify_failed:
+            tool_content += (
+                "\n\n⚠️ **验证失败！你必须立即修复以上 ❌ 项。**\n"
+                "不要跳过，不要宣布完成，不要做其他事情。\n"
+                "修复后重新执行相同工具，直到所有检查项变为 ✅。"
+            )
     elif reflection_note:
         tool_content = f"{result}\n\n[Self-Reflection: {reflection_note}]"
 
     current_msgs.append({"role": "tool", "tool_call_id": call_id, "content": tool_content})
     return verify_failed, events
 
+
+# ── Native tool call format parser (for models like Gemma that use
+#    <|tool_call|>call:name{args}<tool_call|> instead of OpenAI JSON) ──
+
+_NATIVE_TOOL_RE = re.compile(
+    # Gemma native format: <|tool_call|>call:name{args}<tool_call|>
+    # Tokenizer may strip pipe chars, so be flexible about them
+    r"<\s*\|?\s*tool_call\s*\|?\s*>call:(\w+)\{(.*?)\}<\s*\|?\s*tool_call\s*\|?\s*>",
+    re.DOTALL | re.IGNORECASE,
+)
+
+# Filter native control token wrappers from displayed content.
+# The tool execution itself is shown via tool_start/tool_end events,
+# so we just need to suppress raw <|tool_call|> / <|channel> / <channel|> markers.
+_NATIVE_CONTROL_RE = re.compile(
+    r"<\s*\|?\s*(?:tool_call|channel)\s*\|?\s*>",
+    re.IGNORECASE,
+)
+
+def _parse_native_tool_calls(text: str) -> list[dict]:
+    """Parse Gemma-style native tool calls from streamed text.
+    Returns OpenAI-format tool_calls list.
+
+    Handles formats like:
+      <|tool_call|>call:list_dir{path:<|\"|>.<|\"|>}<tool_call|>
+    """
+    tool_calls = []
+    for idx, m in enumerate(_NATIVE_TOOL_RE.finditer(text)):
+        name = m.group(1)
+        args_str = m.group(2).strip()
+        # Gemma escapes quotes as <|"|> — restore them
+        args_str = args_str.replace("<|\"|>", '"')
+        # Convert Gemma's {key:value} or {key:"value"} to JSON {"key": "value"}
+        args_str = _gemma_args_to_json(args_str)
+        try:
+            args = json.loads(args_str)
+        except json.JSONDecodeError:
+            args = _salvage_tool_args(args_str)
+        tool_calls.append({
+            "id": f"native_{name}_{idx}",
+            "type": "function",
+            "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
+        })
+    return tool_calls
+
+
+def _gemma_args_to_json(raw: str) -> str:
+    """Convert Gemma's {key:value} or {key:\"value\"} format to valid JSON.
+    Handles flat key-value pairs only (Gemma tool args are never deeply nested)."""
+    raw = raw.strip()
+    if not raw.startswith("{"):
+        raw = "{" + raw
+    if not raw.endswith("}"):
+        raw = raw + "}"
+    # Quote unquoted keys: key: → "key":
+    raw = re.sub(r'(?<!")(\b\w+\b)\s*:', r'"\1":', raw)
+    # Quote unquoted string values: : value → : "value"
+    # Only quote bare words, not already-quoted strings, not numbers, not objects/arrays
+    raw = re.sub(
+        r':\s*(?!["{\[\-\d])([a-zA-Z_./~][a-zA-Z0-9_./~*@+\-]*)',
+        r': "\1"',
+        raw,
+    )
+    return raw
+
+
+def _salvage_tool_args(args_str: str) -> dict:
+    """Last-resort parse of broken tool call arguments."""
+    result: dict[str, object] = {}
+    for part in args_str.split(","):
+        part = part.strip().strip('"').strip("'")
+        if ":" in part:
+            key, _, val = part.partition(":")
+            key = key.strip().strip('"').strip("'")
+            val = val.strip().strip('"').strip("'")
+            if key:
+                result[key] = val
+    return result or {"raw": args_str}
+
+
+def _strip_native_tool_calls(text: str) -> str:
+    """Remove native tool call blocks from text, keeping only the real content."""
+    return _NATIVE_TOOL_RE.sub("", text).strip()
+
+
 async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: dict, session_id: str = "", agent_id: str = "latiao"):
     """Agent loop: call LLM with tools. If tool_calls → execute → loop. If text → yield & done."""
     current_msgs = [dict(m) for m in messages]
+    # Two-level compression: keep head + tail, prune middle (MUSE-Autoskill style)
+    if len(current_msgs) > 30:
+        system_msgs = [m for m in current_msgs if m.get("role") == "system"]
+        other_msgs = [m for m in current_msgs if m.get("role") != "system"]
+        # Level 1: Prune old tool results beyond the last 5
+        tool_count = 0
+        for m in reversed(other_msgs):
+            if m.get("role") == "tool":
+                tool_count += 1
+                if tool_count > 5:
+                    m["content"] = "[已裁剪旧工具输出]"
+        # Level 2: Keep first 3 non-system messages + last 15 (head+tail, discard middle)
+        if len(other_msgs) > 25:
+            head = other_msgs[:3]
+            tail = other_msgs[-15:]
+            current_msgs = system_msgs + head + [
+                {"role": "system", "content": "[中间对话已压缩。继续当前任务。]"}
+            ] + tail
+        else:
+            current_msgs = system_msgs + other_msgs[-20:]
     if not session_id:
         session_id = str(uuid.uuid4())
+    
+    # Detect user language for localized system messages
+    last_user_text = _extract_last_user_text(current_msgs)
+    lang = _detect_user_language(last_user_text) if last_user_text else "zh"
+    
     max_retries = 3
     retry_count = 0
     last_verify_failed = False
     stagnation = 0             # consecutive unproductive iterations
-    max_stagnation = 3          # exit after this many dead-end rounds
+    max_stagnation = 5          # exit after this many dead-end rounds (was 3, bumped for Gemma)
     recent_tool_calls: set[str] = set()  # signature = "tool_name:arg_hash"
     iteration = 0
 
@@ -2295,9 +2945,14 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                 system_idx = i + 1
             else:
                 break
+        learn_label = _get_localized_text(lang, {
+            "zh": "以下是 AI 从过去交互中学习的知识，请在回复时参考：",
+            "en": "Here's what AI learned from past interactions — reference when responding:",
+            "ja": "以下はAIが過去の対話から学んだ知識です。回答時に参考にしてください：",
+        })
         current_msgs.insert(system_idx, {
             "role": "system",
-            "content": f"以下是 AI 从过去交互中学习的知识，请在回复时参考：\n\n{learning_context}",
+            "content": f"{learn_label}\n\n{learning_context}",
         })
 
     # ── Self-Learning: Heuristic extraction ──
@@ -2307,6 +2962,13 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
     # ── Dynamic Tool Filtering + Agent restrictions ──
     agent_tools = _get_agent_tools(agent_id, TOOLS)
     active_tools = _filter_tools(last_user_text, agent_tools) if last_user_text else agent_tools
+    # Cap tools at 5 to prevent overflowing model context with large definitions
+    if len(active_tools) > 5:
+        # Keep most important: read/write/list + the first 2 matching intent tools
+        essential = {"read_file", "write_file", "list_dir"}
+        priority = [t for t in active_tools if t.get("function", {}).get("name") in essential]
+        others = [t for t in active_tools if t.get("function", {}).get("name") not in essential]
+        active_tools = priority + others[:max(0, 5 - len(priority))]
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(120)) as client:
         while iteration < 50:  # hard cap at 50, dynamic exit via stagnation
@@ -2349,11 +3011,21 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                             delta = event.get("choices", [{}])[0].get("delta", {})
 
                             content = delta.get("content", "")
+                            reasoning = delta.get("reasoning", "")
                             if content:
                                 streamed_text += content
-                                yield {"content": content}
+                                # Filter native control tokens so the UI doesn't show
+                                # raw <|tool_call|> / <|channel> / <channel|> markers
+                                clean = _NATIVE_CONTROL_RE.sub("", content)
+                                if clean:
+                                    yield {"content": clean}
                                 if len(streamed_text) < 5:
                                     _track_progress(session_id, "generating", "text_start")
+                            elif reasoning:
+                                # Reasoning model (Qwen3.6, DeepSeek-R1, etc.) — stream thinking as content
+                                # so the UI doesn't appear frozen during the thinking phase
+                                streamed_text += reasoning
+                                yield {"content": reasoning}
 
                             for tc_delta in delta.get("tool_calls", []):
                                 idx = tc_delta.get("index", 0)
@@ -2378,7 +3050,22 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
 
             if tool_call_bufs:
                 tool_calls = [tool_call_bufs[i] for i in sorted(tool_call_bufs.keys())]
+            elif streamed_text and _NATIVE_TOOL_RE.search(streamed_text):
+                # Native tool call format from models like Gemma —
+                # parse <|tool_call|>call:name{args}<tool_call|> → OpenAI tool_calls
+                tool_calls = _parse_native_tool_calls(streamed_text)
+                if tool_calls:
+                    streamed_text = _strip_native_tool_calls(streamed_text)
+                else:
+                    tool_calls = []
+            else:
+                tool_calls = []
+
+            if tool_calls:
+                with open("/tmp/latiao-loop.log", "a") as lf:
+                    lf.write(f"Iteration {iteration}: found {len(tool_calls)} tool(s): {[tc.get('function',{}).get('name') for tc in tool_calls]}\n")
                 _track_progress(session_id, "tool_calling", f"{len(tool_calls)} tool(s)")
+                logger.info(f"[LOCAL-AGENT] Iteration {iteration}: {len(tool_calls)} tool(s) called, msgs_in_context={len(current_msgs)}")
 
                 current_msgs.append({
                     "role": "assistant",
@@ -2395,6 +3082,7 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                         any_new = True
                     verify_failed, events = await _handle_tool_execution(
                         tc, current_msgs, session_id, agent_id)
+                    logger.info(f"[LOCAL-AGENT] Iteration {iteration}: tool={tc.get('function',{}).get('name','')} executed, result_len={len(current_msgs[-1].get('content','')) if current_msgs else 0}")
                     for evt in events:
                         yield evt
                     if verify_failed:
@@ -2409,6 +3097,15 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                 continue
 
             # Text response — already streamed word-by-word
+            if not streamed_text.strip() and iteration < 3:
+                logger.warning(f"[AGENT] Iteration {iteration}: empty response from cloud model, retrying")
+                nudge_text = _get_localized_text(lang, {
+                    "zh": "⚠️ 你上一轮的回复是空的。请直接回复用户，或者使用工具完成任务。",
+                    "en": "⚠️ Your last response was empty. Please respond to the user directly, or use a tool.",
+                    "ja": "⚠️ 前回の応答が空でした。ユーザーに直接返信するか、ツールを使用してください。",
+                })
+                current_msgs.append({"role": "system", "content": nudge_text})
+                continue
             _track_progress(session_id, "completed", f"text_response ({len(streamed_text)} chars)")
             return
 
@@ -2417,38 +3114,491 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
         yield {"content": f"\n\n⚠️ 已达到硬上限 (50 轮)。本会话共执行了 {tool_count} 次工具调用。如需继续，请发送新消息。"}
 
 
-def _build_chat_messages(body: dict, messages: list) -> list:
-    """Assemble the full message array with identity, env, skills, agent, and image injections."""
+# ═══════════════════════════════════════════════════════
+#  Local Agent Loop — Prompt-based tool calling
+#  For local models that don't support OpenAI function calling.
+#  Injects tools as formatted text in a system message, and
+#  parses the model's textual tool invocation commands.
+# ═══════════════════════════════════════════════════════
+
+# Regex to parse prompt-based tool calls from local model output.
+# Supports formats:
+#   ```tool read_file\n{"path": "/home/file.txt"}\n```  (primary, taught in prompt)
+#   [TOOL:read_file path="src/main.py"]
+#   <tool>read_file{"path": "/home/file.txt"}</tool>
+#   FUNC:read_file path=/home/file.txt
+#   web_search "query string" / search "query string"  (natural language fallback)
+_PROMPT_TOOL_FENCE_RE = re.compile(
+    r'```tool\s+(\w+)\s*\n(.*?)\n```',
+    re.DOTALL | re.IGNORECASE,
+)
+
+_PROMPT_TOOL_RE = re.compile(
+    r'(?:\[TOOL:|<tool>|FUNC:)(\w+)\s*(?:\{(.*?)\}|"(.*?)"|(.*?))(?:\]|</tool>|$)',
+    re.DOTALL | re.IGNORECASE,
+)
+
+# Natural language fallback: matches "web_search \"query\"" or "search \"query\"" etc.
+_NL_TOOL_RE = re.compile(
+    r'\b(web_search|tavily_search|search|read_file|write_file|list_dir|run_cmd|open_app|open_folder|search_files)\s*[\(\[""]\s*([^\")\]\.]+)\s*[\)\]""]',
+    re.IGNORECASE,
+)
+
+# Bash/shell code block fallback: ```bash\nls -la /path\n``` → run_cmd
+_BASH_BLOCK_RE = re.compile(
+    r'```(?:bash|sh|shell|zsh)\s*\n(.*?)\n```',
+    re.DOTALL | re.IGNORECASE,
+)
+
+# Common commands in bash blocks
+_LS_CMD_RE = re.compile(r'^\s*ls\s+(?:-\w+\s+)*["\']?([/\~]\S+|\.\S*)\s*$', re.IGNORECASE)
+_CAT_CMD_RE = re.compile(r'^\s*cat\s+["\']?([/\~]\S+)\s*$', re.IGNORECASE)
+_FIND_CMD_RE = re.compile(r'^\s*find\s+["\']?([/\~]\S+)\s+(.*)', re.IGNORECASE)
+
+
+def _parse_prompt_tool_calls(text: str) -> tuple[str, list[dict]]:
+    """Parse tool calls from text generated by a local model (prompt-based).
+    Returns (cleaned_text, tool_calls_in_openai_format)."""
+    tool_calls = []
+    used_ranges = []  # track char ranges to strip from text
+
+    # For Qwen models that embed <think>...</think> blocks inside content output:
+    # strip think blocks before parsing — reasoning should not contain tool invocations.
+    search_text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    if not search_text:
+        search_text = text  # fallback if everything was think
+
+    # Priority 1: Fenced format ```tool name\n{json}\n```
+    for idx, m in enumerate(_PROMPT_TOOL_FENCE_RE.finditer(text)):
+        name = m.group(1)
+        args_str = m.group(2).strip()
+        try:
+            args = json.loads(args_str)
+        except json.JSONDecodeError:
+            args = _salvage_tool_args(args_str)
+        tool_calls.append({
+            "id": f"local_fence_{name}_{idx}",
+            "type": "function",
+            "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
+        })
+        used_ranges.append((m.start(), m.end()))
+
+    # Priority 2: Inline format [TOOL:name key=value ...] or <tool>name{json}</tool> or FUNC:name key=value
+    if not tool_calls:
+        for idx, m in enumerate(_PROMPT_TOOL_RE.finditer(text)):
+            name = m.group(1)
+            json_str = m.group(2)
+            quoted = m.group(3)
+            rest = m.group(4)
+            if json_str:
+                try:
+                    args = json.loads("{" + json_str + "}")
+                except json.JSONDecodeError:
+                    args = _salvage_tool_args(json_str)
+            elif quoted:
+                args = {"query": quoted} if name in ("web_search", "tavily_search", "search") else {"path": quoted}
+            elif rest:
+                args = _parse_kv_args(rest.strip())
+            else:
+                args = {}
+            if not args:
+                continue
+            tool_calls.append({
+                "id": f"local_inline_{name}_{idx}",
+                "type": "function",
+                "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
+            })
+            used_ranges.append((m.start(), m.end()))
+
+    # Priority 3: Natural language fallback — "web_search \"query\"" etc.
+    if not tool_calls:
+        for idx, m in enumerate(_NL_TOOL_RE.finditer(text)):
+            name = m.group(1).lower()
+            # Normalize tool name
+            if name == "search":
+                name = "web_search"
+            raw_query = m.group(2).strip()
+            if not raw_query:
+                continue
+            # Build args based on tool type
+            if name in ("web_search", "tavily_search"):
+                args = {"query": raw_query}
+            elif name in ("read_file", "write_file", "open_app", "open_folder"):
+                args = {"path": raw_query}
+            elif name == "list_dir":
+                args = {"path": raw_query}
+            elif name == "run_cmd":
+                args = {"command": raw_query}
+            elif name == "search_files":
+                args = {"pattern": raw_query}
+            else:
+                args = {"query": raw_query}
+            tool_calls.append({
+                "id": f"local_nl_{name}_{idx}",
+                "type": "function",
+                "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
+            })
+            used_ranges.append((m.start(), m.end()))
+
+    # Priority 4: Bash/shell code block fallback — models often output ```bash
+    # instead of the taught ```tool format; parse ls/cat/find into our tools
+    if not tool_calls:
+        for idx, m in enumerate(_BASH_BLOCK_RE.finditer(text)):
+            cmd_text = m.group(1).strip()
+            if not cmd_text:
+                continue
+            tool_name = ""
+            args = {}
+            ls_match = _LS_CMD_RE.match(cmd_text)
+            cat_match = _CAT_CMD_RE.match(cmd_text)
+            find_match = _FIND_CMD_RE.match(cmd_text)
+            if ls_match:
+                tool_name = "list_dir"
+                args = {"path": ls_match.group(1) or "."}
+            elif cat_match:
+                tool_name = "read_file"
+                args = {"path": cat_match.group(1)}
+            elif find_match:
+                tool_name = "search_files"
+                args = {"path": find_match.group(1), "pattern": find_match.group(2).strip()}
+            else:
+                tool_name = "run_cmd"
+                args = {"command": cmd_text}
+            if tool_name:
+                tool_calls.append({
+                    "id": f"local_bash_{tool_name}_{idx}",
+                    "type": "function",
+                    "function": {"name": tool_name, "arguments": json.dumps(args, ensure_ascii=False)},
+                })
+                used_ranges.append((m.start(), m.end()))
+
+    # Clean text by removing parsed tool call regions
+    clean = text
+    if used_ranges:
+        # Remove from end to start to preserve offsets
+        for start, end in sorted(used_ranges, reverse=True):
+            clean = clean[:start] + clean[end:]
+        clean = clean.strip()
+
+    return clean, tool_calls
+
+
+def _parse_kv_args(raw: str) -> dict:
+    """Parse key=value or key=\"value\" pairs from a raw string."""
+    result = {}
+    # Match: key="value" or key=value
+    for m in re.finditer(r'(\w+)\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|(\S+))', raw):
+        key = m.group(1)
+        val = m.group(2) or m.group(3) or m.group(4)
+        result[key] = val
+    return result
+
+
+def _build_local_tools_prompt(active_tools: list[dict]) -> str:
+    """Build a concise tool prompt for local models with strong few-shot examples."""
+    lines = ["# 可用工具\n"]
+    lines.append("你可以使用以下工具来完成任务。不需要工具时直接回复用户。\n")
+    for t in active_tools:
+        fn = t.get("function", {})
+        name = fn.get("name", "")
+        desc = fn.get("description", "")
+        params = fn.get("parameters", {}).get("properties", {})
+        param_hints = ""
+        if params:
+            required = fn.get("parameters", {}).get("required", [])
+            parts = []
+            for pk, pv in params.items():
+                req = "*" if pk in required else ""
+                ptype = pv.get("type", "string")
+                if ptype == "string":
+                    ptype = "str"
+                elif ptype == "integer":
+                    ptype = "int"
+                elif ptype == "boolean":
+                    ptype = "bool"
+                parts.append(f'{pk}{req}: {ptype}')
+            param_hints = "(" + ", ".join(parts) + ")"
+        lines.append(f"- {name}{param_hints}: {desc}")
+
+    lines.append("\n# 调用格式\n")
+    lines.append("调用工具时，必须严格使用以下格式：\n")
+    lines.append("```tool 工具名")
+    lines.append('{"参数名": "参数值"}')
+    lines.append("```")
+    lines.append("")
+    lines.append("# 示例\n")
+    lines.append("用户：帮我看看当前目录有什么文件")
+    lines.append("助手：```tool list_dir")
+    lines.append('{"path": "."}')
+    lines.append("```")
+    lines.append("")
+    lines.append("用户：搜索今天A股行情")
+    lines.append("助手：```tool tavily_search")
+    lines.append('{"query": "今天A股大盘走势 上证指数"}')
+    lines.append("```")
+    lines.append("")
+    lines.append("用户：读取 main.py 的内容")
+    lines.append("助手：```tool read_file")
+    lines.append('{"path": "main.py"}')
+    lines.append("```")
+    lines.append("")
+    lines.append("重要规则：")
+    lines.append("1. 每次只调用一个工具")
+    lines.append("2. 必须用 ```tool 代码块格式，不要用其他格式")
+    lines.append("3. 参数必须是合法 JSON")
+    lines.append("4. 等待工具结果后再决定下一步")
+    lines.append("5. 不要在 ```tool 块外面写工具调用")
+    lines.append("")
+    lines.append("⚠️ 强制要求：当用户的问题需要搜索、读取文件、执行命令时，你必须使用工具。")
+    lines.append("不可以用文字描述来代替工具调用。直接写出 ```tool 代码块。")
+    lines.append("")
+    return "\n".join(lines)
+
+
+async def _local_agent_loop_stream(messages: list, model: str, api_url: str, headers: dict,
+                                    session_id: str = "", agent_id: str = "latiao"):
+    """Local model agent loop: inject tools as prompt, parse tool calls from text."""
+    current_msgs = [dict(m) for m in messages]
+    # Truncate long history to prevent context overflow.
+    # Keeps system messages + last 20 user/assistant pairs.
+    # Also estimates token count to warn before overflow.
+    if len(current_msgs) > 30:
+        system_msgs = [m for m in current_msgs if m.get("role") == "system"]
+        other_msgs = [m for m in current_msgs if m.get("role") != "system"]
+        # Level 1: Prune old tool results: keep last 5, truncate older ones
+        tool_count = 0
+        for m in reversed(other_msgs):
+            if m.get("role") == "tool" or (isinstance(m.get("content"), str) and m["content"].startswith("[工具结果]")):
+                tool_count += 1
+                if tool_count > 5:
+                    m["content"] = "[已裁剪旧工具输出]"
+        # Level 2: Keep head (first 3) + tail (last 15), discard middle (MUSE-Autoskill style)
+        if len(other_msgs) > 25:
+            head = other_msgs[:3]
+            tail = other_msgs[-15:]
+            current_msgs = system_msgs + head + [
+                {"role": "system", "content": "[中间对话已压缩。继续当前任务。]"}
+            ] + tail
+        else:
+            current_msgs = system_msgs + other_msgs[-20:]
+    # Rough token estimate: ~2 chars per token for Chinese
+    total_chars = sum(len(str(m.get("content", ""))) for m in current_msgs)
+    if total_chars > 60000:
+        # Context Anxiety prevention: save progress and suggest restart (Harness pattern)
+        logger.warning(f"[LOCAL-AGENT] Context near limit: ~{total_chars} chars (~{total_chars//2} tokens). Saving progress.")
+        # Write PROGRESS.md with current state
+        try:
+            last_user = _extract_last_user_text(current_msgs)
+            _record_progress(f"⚠️ 自动存档（上下文 {{total_chars//2}} tokens）\n最后用户消息: {last_user[:200] if last_user else '(无)'}")
+        except Exception:
+            pass
+        yield {"content": f"\n\n💡 **上下文接近上限**（~{total_chars//2} tokens）。建议：\n1. 当前进度已自动保存到 PROGRESS.md\n2. 开一个新会话，Agent 会从断点继续\n3. 或继续在本会话中完成（质量可能下降）"}
+    elif total_chars > 80000:
+        logger.warning(f"[LOCAL-AGENT] Context may overflow: ~{total_chars} chars (~{total_chars//2} tokens)")
+    if not session_id:
+        session_id = str(uuid.uuid4())
+
+    max_iterations = 15
+    iteration = 0
+    recent_tool_calls: set[str] = set()
+    stagnation = 0
+    max_stagnation = 5
+
+    # Build tool prompt
+    last_user_text = _extract_last_user_text(current_msgs)
+    agent_tools = _get_agent_tools(agent_id, TOOLS)
+    active_tools = _filter_tools(last_user_text, agent_tools) if last_user_text else agent_tools
+    if len(active_tools) > 8:
+        essential = {"read_file", "write_file", "list_dir"}
+        priority = [t for t in active_tools if t.get("function", {}).get("name") in essential]
+        others = [t for t in active_tools if t.get("function", {}).get("name") not in essential]
+        active_tools = priority + others[:max(0, 8 - len(priority))]
+    tools_prompt = _build_local_tools_prompt(active_tools)
+
+    # Inject tools into the first user message context
+    for i, m in enumerate(current_msgs):
+        if m.get("role") == "user":
+            # Insert tools prompt as a system message right before the last user message
+            break
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(120)) as client:
+        while iteration < max_iterations:
+            iteration += 1
+            with open("/tmp/latiao-loop.log", "a") as lf:
+                lf.write(f"Iteration {iteration}: current_msgs={len(current_msgs)}, roles={[m.get('role') for m in current_msgs[-5:]]}\n")
+
+            # Build messages for this iteration: merge tools + current context
+            loop_msgs = list(current_msgs)
+            # Convert role:"tool" → role:"user" (llama-cpp Qwen chat format only supports
+            # system/user/assistant roles; "tool" role causes empty responses)
+            loop_msgs = [
+                {"role": "user", "content": f"[工具结果] {m['content']}"}
+                if m.get("role") == "tool" else dict(m)
+                for m in loop_msgs
+            ]
+            # Inject tool prompt: full on first iteration, short on later ones.
+            # Long prompts cause Qwen's <think> to overflow max_tokens on follow-up rounds.
+            if iteration == 1:
+                current_prompt = tools_prompt
+            else:
+                # Build lightweight tool reminder that still lists available tools by name
+                tool_names = [t.get("function", {}).get("name", "") for t in active_tools if t.get("function", {}).get("name")]
+                names_str = ", ".join(tool_names) if tool_names else "无"
+                current_prompt = (
+                    f"你可以继续使用工具。可用工具: {names_str}。\n"
+                    "格式：```tool 工具名\n{\"参数\":\"值\"}\n```\n"
+                    "不需要工具则直接回复用户。"
+                )
+            for i, m in enumerate(loop_msgs):
+                if m.get("role") == "system":
+                    m["content"] = current_prompt + "\n\n" + m["content"]
+                    break
+            else:
+                loop_msgs.insert(0, {"role": "system", "content": current_prompt})
+
+            body = {
+                "model": model, "messages": loop_msgs,
+                "max_tokens": 8192, "stream": True,
+            }
+
+            streamed_text = ""
+            logger.info(f"[LOCAL-AGENT] Iteration {iteration}: calling LLM, msgs={len(loop_msgs)}, first_user_content_len={len(loop_msgs[-1].get('content','')) if loop_msgs else 0}")
+            async with client.stream("POST", api_url, json=body, headers=headers) as r:
+                async for line in r.aiter_lines():
+                    if line and line.startswith("data: "):
+                        data_str = line[6:]
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            event = json.loads(data_str)
+                            delta = event.get("choices", [{}])[0].get("delta", {})
+                            content = delta.get("content", "")
+                            reasoning = delta.get("reasoning", "")
+                            if content:
+                                streamed_text += content
+                                yield {"content": content}
+                            elif reasoning:
+                                streamed_text += reasoning
+                                yield {"content": reasoning}
+                        except (json.JSONDecodeError, KeyError, TypeError):
+                            pass
+                        except Exception:
+                            logger.error("Local agent SSE parse error", exc_info=True)
+                            raise
+
+            # Check for tool calls in the streamed text
+            clean_text, tool_calls = _parse_prompt_tool_calls(streamed_text)
+
+            if tool_calls:
+                _track_progress(session_id, "tool_calling", f"{len(tool_calls)} tool(s)")
+
+                # Add assistant message (cleaned text)
+                current_msgs.append({
+                    "role": "assistant",
+                    "content": clean_text or "正在调用工具...",
+                })
+
+                any_new = False
+                for tc in tool_calls:
+                    sig = f"{tc.get('function',{}).get('name','')}:{hash(str(tc.get('function',{}).get('arguments','')))} "
+                    if sig not in recent_tool_calls:
+                        recent_tool_calls.add(sig)
+                        any_new = True
+                    verify_failed, events = await _handle_tool_execution(
+                        tc, current_msgs, session_id, agent_id)
+                    for evt in events:
+                        yield evt
+
+                if any_new:
+                    stagnation = 0
+                else:
+                    stagnation += 1
+                    if stagnation >= max_stagnation:
+                        yield {"content": f"\n\n⚠️ 连续 {stagnation} 轮无新进展，Agent 停止。如需继续请发新消息。"}
+                        return
+                continue
+
+            # No tool calls — pure text response done
+            if not streamed_text.strip() and iteration < 3:
+                # Empty response from local model — retry with a nudge
+                logger.warning(f"[LOCAL-AGENT] Iteration {iteration}: empty response, retrying")
+                nudge_text = _get_localized_text(_detect_user_language(_extract_last_user_text(current_msgs)), {
+                    "zh": "⚠️ 你上一轮的回复是空的。请直接回复用户，或者使用工具完成任务。如果需要调用工具，使用 ```tool 格式。",
+                    "en": "⚠️ Your last response was empty. Please respond to the user directly, or use a tool. To call a tool, use the ```tool format.",
+                    "ja": "⚠️ 前回の応答が空でした。ユーザーに直接返信するか、ツールを使用してください。ツールを使用するには ```tool 形式を使ってください。",
+                })
+                current_msgs.append({"role": "system", "content": nudge_text})
+                continue
+            _track_progress(session_id, "completed", f"text_response ({len(streamed_text)} chars)")
+            logger.info(f"[LOCAL-AGENT] Iteration {iteration}: no tools, returning text ({len(streamed_text)} chars)")
+            return
+
+        tool_count = sum(1 for m in current_msgs if m.get("role") == "tool")
+        yield {"content": f"\n\n⚠️ 已达到硬上限 ({max_iterations} 轮)。本会话共执行了 {tool_count} 次工具调用。如需继续，请发送新消息。"}
+
+
+def _build_chat_messages(body: dict, messages: list, matched_skill: str|None = None) -> list:
+    """Assemble the full message array with identity, env, skills, agent, and image injections.
+    All system prompts are merged into ONE message to work around a llama-cpp bug
+    where multiple system messages cause empty responses."""
     last_user_text = _extract_last_user_text(messages)
     intent_result = _process_identity_intents(last_user_text)
 
-    identity_msgs = _read_identity()
-    if intent_result:
-        identity_msgs.append({
-            "role": "system",
-            "content": (
-                f"⚠️ 你的身份刚刚被用户更新了：{intent_result}。"
-                f"从现在开始，你必须以更新后的身份回复用户。"
-                f"忽略对话历史中你以前用过的任何名字、风格或自称，全部以更新后的为准。"
-            )
-        })
-    if identity_msgs:
-        messages = identity_msgs + messages
+    system_parts = []
 
+    # Agent identity
+    agent_id = body.get("agent", "latiao")
+    agent_cfg = _get_agent_config(agent_id)
+    system_parts.append(agent_cfg["identity"])
+
+    # Identity file
+    identity_msgs = _read_identity()
+    for im in identity_msgs:
+        system_parts.append(im["content"])
+    if intent_result:
+        system_parts.append(
+            f"⚠️ 你的身份刚刚被用户更新了：{intent_result}。"
+            f"从现在开始，你必须以更新后的身份回复用户。"
+        )
+
+    # Environment info
     home = str(Path.home())
     cwd = os.getcwd()
-    messages = [{"role": "system", "content": (
-        f"Runtime environment:\n"
-        f"- User home directory: {home}\n"
-        f"- Current working directory: {cwd}\n"
-        f"- OS: macOS (Darwin)\n"
-        f"- Shell: zsh"
-    )}] + messages
+    now = datetime.now().strftime("%Y-%m-%d (%A) %H:%M:%S")
+    
+    # Detect user language for system prompt localization
+    user_lang = _detect_user_language(last_user_text)
+    
+    env_labels = _get_localized_text(user_lang, {
+        "zh": {"rt": "运行环境", "time": "当前时间", "home": "用户目录", "cwd": "工作目录", "os": "操作系统", "sh": "终端"},
+        "en": {"rt": "Runtime Environment", "time": "Current time", "home": "Home", "cwd": "Working dir", "os": "OS", "sh": "Shell"},
+        "ja": {"rt": "実行環境", "time": "現在時刻", "home": "ホーム", "cwd": "作業ディレクトリ", "os": "OS", "sh": "シェル"},
+    })
+    system_parts.append(
+        f"{env_labels['rt']}:\n"
+        f"- {env_labels['time']}: {now}\n"
+        f"- {env_labels['home']}: {home}\n"
+        f"- {env_labels['cwd']}: {cwd}\n"
+        f"- {env_labels['os']}: {platform.system()} ({platform.release()})\n"
+        f"- {env_labels['sh']}: {os.environ.get('SHELL', os.environ.get('COMSPEC', 'unknown'))}"
+    )
 
+    # Matched skill
+    if matched_skill and matched_skill in SKILL_INDEX:
+        skill = SKILL_INDEX[matched_skill]
+        skill_intro = _get_localized_text(user_lang, {
+            "zh": {"use": f"你现在可以使用以下技能：{skill['name']}", "desc": f"技能说明：{skill['description']}", "level": f"技能安全等级：{skill.get('security_level', 'safe')}", "rules": f"技能使用规则：\n{skill['content']}", "follow": "请根据技能规则来回答用户的问题。"},
+            "en": {"use": f"You can now use this skill: {skill['name']}", "desc": f"Description: {skill['description']}", "level": f"Security level: {skill.get('security_level', 'safe')}", "rules": f"Rules:\n{skill['content']}", "follow": "Follow the skill rules when responding."},
+            "ja": {"use": f"次のスキルを使用できます：{skill['name']}", "desc": f"説明：{skill['description']}", "level": f"セキュリティレベル：{skill.get('security_level', 'safe')}", "rules": f"ルール：\n{skill['content']}", "follow": "スキルルールに従って回答してください。"},
+        })
+        system_parts.append(f"{skill_intro['use']}\n{skill_intro['desc']}\n{skill_intro['level']}\n{skill_intro['rules']}\n{skill_intro['follow']}")
+
+    # Skill prompt
     skill_prompt = _build_skill_prompt()
     if skill_prompt:
-        messages = [{"role": "system", "content": skill_prompt}] + messages
+        system_parts.append(skill_prompt)
 
+    # Goal mode / progressive delivery
     goal_mode = body.get("goal_mode", False)
     progressive = body.get("progressive_delivery", True)
     extra_prompts = []
@@ -2457,11 +3607,21 @@ def _build_chat_messages(body: dict, messages: list) -> list:
     if progressive:
         extra_prompts.append(PROGRESSIVE_DELIVERY_PROMPT)
     if extra_prompts:
-        messages = [{"role": "system", "content": "\n".join(extra_prompts)}] + messages
+        system_parts.append("\n".join(extra_prompts))
 
-    agent_id = body.get("agent", "latiao")
-    agent_cfg = _get_agent_config(agent_id)
-    messages = [{"role": "system", "content": agent_cfg["identity"]}] + messages
+    # Cross-session memory: inject recent learnings from past conversations
+    recent = _get_recent_learnings(5)
+    if recent:
+        memory_label = _get_localized_text(user_lang, {
+            "zh": "以下是 AI 从过去交互中学到的知识：",
+            "en": "Here's what AI learned from past interactions:",
+            "ja": "以下はAIが過去の対話から学んだ知識です：",
+        })
+        system_parts.append(memory_label + "\n" + "\n".join(recent))
+
+    # Merge all system parts into one message
+    merged_system = "\n\n".join(system_parts)
+    messages = [{"role": "system", "content": merged_system}] + messages
 
     image_base64 = body.get("image_base64")
     image_mime = body.get("image_mime", "image/png")
@@ -2471,68 +3631,341 @@ def _build_chat_messages(body: dict, messages: list) -> list:
     return messages
 
 
-def _resolve_api_target(cloud_config: dict | None) -> tuple[str, str, dict]:
-    """Resolve API URL, protocol, and headers from cloud config or local fallback."""
-    if cloud_config and cloud_config.get("key") and cloud_config.get("endpoint"):
+def _resolve_api_target(cloud_config: dict | None) -> tuple[str, str, dict, bool]:
+    """Resolve API URL, protocol, headers, and whether it's a local LLM (no cloud config).
+    Cloud models are detected by having an endpoint (key is optional for local proxies)."""
+    if cloud_config and cloud_config.get("endpoint"):
         protocol = cloud_config.get("protocol", "openai")
-        if protocol == "openai":
-            api_url = cloud_config["endpoint"].rstrip("/") + "/chat/completions"
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {cloud_config['key']}",
-            }
-        else:
-            api_url = None
-            headers = None
+        api_url = cloud_config["endpoint"].rstrip("/") + "/chat/completions"
+        headers = {"Content-Type": "application/json"}
+        key = cloud_config.get("key", "")
+        if key and protocol != "local":
+            headers["Authorization"] = f"Bearer {key}"
+        # If the endpoint points to a local server, treat as cloud (native function calling)
+        return protocol, api_url, headers, False
     else:
         protocol = "openai"
         local_api = local_llm.get_api_url()
         if local_api:
             api_url = local_api + "/chat/completions"
         else:
-            api_url = LM_STUDIO_URL
+            api_url = ""  # No local LLM running — will be caught as connection error
         headers = {"Content-Type": "application/json"}
-    return protocol, api_url, headers
+        return protocol, api_url, headers, True
+
+
+# ── Task Intent Detection + Model Auto-Routing ──
+
+_CODE_INTENT_PATTERNS = [
+    r'(?:代码|编程|写|修复|改|review|检查|debug|优化|重构|实现|开发)',
+    r'(?:code|fix|write|implement|refactor|debug|review|optimize)',
+    r'(?:bug|error|报错|异常|crash)',
+    r'(?:function|函数|class|类|module|模块|API|接口)',
+    r'(?:read_file|write_file|list_dir|run_cmd)',
+]
+
+
+def _detect_user_language(text: str) -> str:
+    """Detect the language of user input: 'zh', 'en', or 'ja'."""
+    if not text:
+        return "zh"
+    # Count characters in each language range
+    zh = len(re.findall(r'[\u4e00-\u9fff\u3400-\u4dbf]', text))
+    ja_kana = len(re.findall(r'[\u3040-\u309f\u30a0-\u30ff]', text))
+    en = len(re.findall(r'[a-zA-Z]', text))
+    if ja_kana > zh and ja_kana > en:
+        return "ja"
+    if en > zh + ja_kana:
+        return "en"
+    return "zh"
+
+
+def _get_localized_text(lang: str, texts: dict[str, str | dict]) -> str | dict:
+    """Get localized text for a given language, falling back to zh."""
+    return texts.get(lang) or texts.get("zh", "")
+
+def _detect_task_intent(text: str) -> str:
+    """Detect whether the user intent is 'code', 'chat', or 'research'.
+    Used for automatic model routing."""
+    text_lower = text.lower()
+    for pattern in _CODE_INTENT_PATTERNS:
+        if re.search(pattern, text_lower):
+            return "code"
+    # Research indicators
+    if re.search(r'(?:搜索|查|找|论文|研究|分析|最新|news|search|research)', text_lower):
+        return "research"
+    return "chat"
+
+
+def _has_cloud_models() -> bool:
+    """Check if any cloud model is configured."""
+    try:
+        config_file = CONFIG_FILE
+        if config_file.exists():
+            cfg = json.loads(config_file.read_text(encoding="utf-8"))
+            models = cfg.get("cloud_models", [])
+            return any(m.get("endpoint") for m in models)
+    except Exception:
+        pass
+    return False
+
+
+def _get_best_cloud_config() -> dict | None:
+    """Get the best available cloud model config for code tasks."""
+    try:
+        # First try: config.json cloud_models
+        config_file = CONFIG_FILE
+        if config_file.exists():
+            cfg = json.loads(config_file.read_text(encoding="utf-8"))
+            models = cfg.get("cloud_models", [])
+            # Prefer models with "mini" or "gpt" in name for code tasks
+            for m in models:
+                if m.get("endpoint"):
+                    return {
+                        "endpoint": m["endpoint"],
+                        "key": m.get("key", ""),
+                        "model": m.get("name", ""),
+                        "protocol": m.get("protocol", "openai"),
+                    }
+            # Fallback: first model with endpoint
+            for m in models:
+                if m.get("endpoint"):
+                    return {
+                        "endpoint": m["endpoint"],
+                        "key": m.get("key", ""),
+                        "model": m.get("name", ""),
+                        "protocol": m.get("protocol", "openai"),
+                    }
+    except Exception:
+        pass
+    return None
 
 
 @app.post("/v1/chat/completions")
 async def chat_completion(request: Request):
-    """Main chat endpoint. Routes to agent loop (OpenAI-compatible) or simple streaming."""
+    """Main chat endpoint. Routes to agent loop (OpenAI-compatible) or simple streaming.
+    Auto-routes to best model based on task type when no specific model is selected."""
     body = await request.json()
     messages = body.get("messages", [])
+    last_user_text = _extract_last_user_text(messages)
+    
+    # Async match skill (no event loop conflict)
+    matched_skill = await _match_skill(last_user_text)
 
     # Assemble full message context (identity, env, skills, agent, image)
-    messages = _build_chat_messages(body, messages)
+    messages = _build_chat_messages(body, messages, matched_skill)
     model = body.get("model") or SUBAGENT_MODEL
+    
+    # ── Auto-route: if no explicit model selected, pick based on task intent ──
+    cloud_config = body.get("cloud_config")
+    user_selected_model = body.get("model")  # User explicitly chose a model?
+    if not user_selected_model and not cloud_config and last_user_text:
+        intent = _detect_task_intent(last_user_text)
+        if intent == "code" and _has_cloud_models():
+            logger.info("Auto-route: code task → using cloud model")
+            # Try to use an available cloud model for code tasks
+            cloud_config = _get_best_cloud_config()
+            if cloud_config:
+                model = cloud_config.get("model", model)
+        elif intent == "chat" and local_llm.get_api_url():
+            logger.info("Auto-route: chat task → using local model (free)")
+            # Keep local model for casual chat
+            pass
+    
     logger.info("Chat request: model=%s, msg_count=%d, stream=%s", model, len(messages), body.get("stream", False))
 
     skip_tools = body.get("skip_tools", False)
-    model = body.get("model") or SUBAGENT_MODEL
     agent_id = body.get("agent", "latiao")
     cloud_config = body.get("cloud_config")
+    _last_cloud_config.set(cloud_config)
     use_stream = body.get("stream", False)
 
     # Resolve API target
-    protocol, api_url, headers = _resolve_api_target(cloud_config)
+    protocol, api_url, headers, is_local = _resolve_api_target(cloud_config)
 
     # Agent loop: LLM autonomously decides when to call tools
-    if not skip_tools and protocol == "openai" and use_stream:
-        session_id = body.get("session_id", "")
-        async def agent_loop_wrapper():
-            try:
-                async for event in _agent_loop_stream(messages, model, api_url, headers, session_id, agent_id):
-                    yield f"data: {json.dumps(event)}\n\n"
-                yield "data: [DONE]\n\n"
-            except httpx.ConnectError:
-                yield f"data: {json.dumps({'error': '无法连接模型服务。请检查 LM Studio 或本地 LLM 是否已启动。'})}\n\n"
-                yield "data: [DONE]\n\n"
-        return StreamingResponse(agent_loop_wrapper(), media_type="text/event-stream",
+    if not skip_tools and protocol == "openai":
+        session_id = body.get("session_id", str(uuid.uuid4()))
+        if use_stream:
+            async def agent_loop_wrapper():
+                try:
+                    if is_local:
+                        # 本地模型：用 prompt-based tool calling（不依赖 OpenAI function calling API）
+                        async for event in _local_agent_loop_stream(messages, model, api_url, headers, session_id, agent_id):
+                            yield f"data: {json.dumps(event)}\n\n"
+                    else:
+                        # 云端模型：原生 OpenAI function calling
+                        async for event in _agent_loop_stream(messages, model, api_url, headers, session_id, agent_id):
+                            yield f"data: {json.dumps(event)}\n\n"
+                    yield "data: [DONE]\n\n"
+                except (httpx.ConnectError, httpx.RemoteProtocolError):
+                    yield f"data: {json.dumps({'error': '无法连接模型服务。请检查后端是否已启动。'})}\n\n"
+                    yield "data: [DONE]\n\n"
+                except httpx.HTTPStatusError as e:
+                    yield f"data: {json.dumps({'error': f'模型服务返回错误 HTTP {e.response.status_code}'})}\n\n"
+                    yield "data: [DONE]\n\n"
+                except httpx.TimeoutException:
+                    yield f"data: {json.dumps({'error': '模型服务响应超时，请检查网络或模型是否过大。'})}\n\n"
+                    yield "data: [DONE]\n\n"
+                except Exception:
+                    logger.error("Agent loop unexpected error", exc_info=True)
+                    yield f"data: {json.dumps({'error': 'Agent 循环内部错误，请查看日志。'})}\n\n"
+                    yield "data: [DONE]\n\n"
+            return StreamingResponse(agent_loop_wrapper(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache"})
+
+    # Non-streaming agent loop (for Tauri HTTP plugin compatibility)
+    if not skip_tools and protocol == "openai":
+        # Run agent loop synchronously — collect all content + tool results
+        current_msgs = [dict(m) for m in messages]
+        # Truncate to prevent context overflow (8K token limit)
+        if len(current_msgs) > 30:
+            # Keep system messages + last 20 exchanges
+            system_msgs = [m for m in current_msgs if m.get("role") == "system"]
+            other_msgs = [m for m in current_msgs if m.get("role") != "system"]
+            current_msgs = system_msgs + other_msgs[-20:]
+        agent_tools_ns = _get_agent_tools(agent_id, TOOLS)
+        active_tools_ns = _filter_tools(last_user_text, agent_tools_ns) if last_user_text else agent_tools_ns
+        use_prompt_tools = is_local  # Local models use prompt-based tool calling
+        # Cap tools: 5 for native function calling, 8 for prompt-based (less overhead)
+        tool_cap = 8 if use_prompt_tools else 5
+        if len(active_tools_ns) > tool_cap:
+            essential = {"read_file", "write_file", "list_dir"}
+            priority_ns = [t for t in active_tools_ns if t.get("function", {}).get("name") in essential]
+            others_ns = [t for t in active_tools_ns if t.get("function", {}).get("name") not in essential]
+            active_tools = priority_ns + others_ns[:max(0, tool_cap - len(priority_ns))]
+        else:
+            active_tools = active_tools_ns
+        full_content = ""
+        tool_count = 0
+        local_tools_prompt = _build_local_tools_prompt(active_tools) if use_prompt_tools else ""
+
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(120)) as client:
+                for _ in range(30):  # max iterations, non-streaming
+                    loop_msgs = list(current_msgs)
+                    # Convert role:"tool" → role:"user" for Qwen chat format compatibility
+                    loop_msgs = [
+                        {"role": "user", "content": f"[工具结果] {m['content']}"}
+                        if m.get("role") == "tool" else dict(m)
+                        for m in loop_msgs
+                    ]
+                    if use_prompt_tools:
+                        # Inject tool prompt as system message before the last user message
+                        last_sys_idx = -1
+                        for i, m in enumerate(loop_msgs):
+                            if m.get("role") == "system":
+                                last_sys_idx = i
+                        tool_msg = {"role": "system", "content": local_tools_prompt}
+                        if last_sys_idx >= 0:
+                            loop_msgs.insert(last_sys_idx + 1, tool_msg)
+                        else:
+                            loop_msgs.insert(0, tool_msg)
+
+                    if use_prompt_tools:
+                        resp = await client.post(api_url, json={
+                            "model": model, "messages": loop_msgs,
+                            "max_tokens": 8192, "stream": False,
+                        }, headers=headers)
+                    else:
+                        resp = await client.post(api_url, json={
+                            "model": model, "messages": current_msgs,
+                            "tools": active_tools, "tool_choice": "auto",
+                            "max_tokens": 8192, "stream": False,
+                        }, headers=headers)
+                    resp_data = resp.json()
+                    choices = resp_data.get("choices", [])
+                    if not choices:
+                        break
+                    msg = choices[0].get("message", {})
+                    content = msg.get("content", "") or ""
+                    reasoning = msg.get("reasoning", "") or ""
+                    tc_data = msg.get("tool_calls", [])
+
+                    # Native tool call detection for Gemma
+                    if not tc_data and content and _NATIVE_TOOL_RE.search(content):
+                        native_tcs = _parse_native_tool_calls(content)
+                        if native_tcs:
+                            content = _strip_native_tool_calls(content)
+                            tc_data = native_tcs
+
+                    # Prompt-based tool call detection for local models
+                    if not tc_data and content and use_prompt_tools:
+                        clean_text, prompt_tcs = _parse_prompt_tool_calls(content)
+                        if prompt_tcs:
+                            content = clean_text
+                            tc_data = prompt_tcs
+
+                    if tc_data:
+                        tool_count += 1
+                        current_msgs.append({
+                            "role": "assistant",
+                            "content": content or None,
+                            "tool_calls": tc_data,
+                        })
+                        for tc in tc_data:
+                            call_id = tc.get("id", str(uuid.uuid4()))
+                            tool_name = tc.get("function", {}).get("name", "")
+                            tool_args_str = tc.get("function", {}).get("arguments", "{}")
+                            try:
+                                tool_args = json.loads(tool_args_str) if isinstance(tool_args_str, str) else tool_args_str
+                            except json.JSONDecodeError:
+                                tool_args = {}
+                            # Respect permissions — non-streaming can't ask for user confirmation
+                            perm = _resolve_permission(tool_name, tool_args)
+                            if perm == "confirm":
+                                result = f"⛔ 操作需要用户确认: {tool_name}。请在流式模式下重试。"
+                            elif perm == "danger":
+                                result = f"⛔ 高危操作已阻止: {tool_name}。请联系管理员。"
+                            else:
+                                logger.info("Tool executing (non-streaming): %s %s", tool_name, str(tool_args)[:100])
+                                result = await execute_tool(tool_name, tool_args)
+                                # Self-evolution: record + background-refine learning
+                                _record_tool_call_db(session_id, tool_name, tool_args, result)
+                                asyncio.create_task(_refine_learnings(tool_name, tool_args, result, session_id))
+                            if len(result) > 5000:
+                                result = result[:5000] + "\n...(截断)"
+                            current_msgs.append({
+                                "role": "tool",
+                                "tool_call_id": call_id,
+                                "content": result,
+                            })
+                        continue  # Loop again with tool results
+
+                    # Text response
+                    if content:
+                        full_content += content
+                    elif reasoning:
+                        full_content += reasoning
+                    break  # Done
+        except Exception as e:
+            logger.error("Non-streaming agent loop error: %s", e)
+            return JSONResponse({"error": f"Agent 循环错误: {e}"}, status_code=500)
+
+        if not full_content:
+            # Model may return empty when context is too long or only thinking tokens
+            logger.warning("Non-streaming agent loop: model returned empty content, tool_count=%d", tool_count)
+            full_content = "（模型未生成文本回复。可能是上下文过长。请开启新会话或缩短对话历史。）"
+        return {
+            "id": "chatcmpl-sidecar",
+            "object": "chat.completion",
+            "created": int(datetime.now().timestamp()),
+            "model": model,
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": full_content},
+                         "finish_reason": "stop"}],
+            "usage": {"total_tokens": 0},
+        }
 
     # Simple streaming fallback (skip_tools=True or non-OpenAI protocol or sync mode)
     if use_stream:
         async def stream():
-            lm_body = {"model": model, "messages": messages, "stream": True, "max_tokens": 4096}
+            # Truncate long history to prevent context overflow
+            msgs_for_model = messages
+            if len(msgs_for_model) > 30:
+                system_msgs = [m for m in msgs_for_model if m.get("role") == "system"]
+                other_msgs = [m for m in msgs_for_model if m.get("role") != "system"]
+                msgs_for_model = system_msgs + other_msgs[-20:]
+            lm_body = {"model": model, "messages": msgs_for_model, "stream": True, "max_tokens": 4096}
             try:
                 async with httpx.AsyncClient(timeout=httpx.Timeout(120)) as c:
                     async with c.stream("POST", api_url, json=lm_body, headers=headers) as r:
@@ -2546,6 +3979,9 @@ async def chat_completion(request: Request):
                                     event = json.loads(data_str)
                                     delta = event.get("choices", [{}])[0].get("delta", {})
                                     text = delta.get("content", "")
+                                    reasoning = delta.get("reasoning", "")
+                                    if reasoning:
+                                        yield f"data: {json.dumps({'content': reasoning})}\n\n"
                                     if text:
                                         yield f"data: {json.dumps({'content': text})}\n\n"
                                 except (json.JSONDecodeError, KeyError, IndexError):
@@ -2553,27 +3989,50 @@ async def chat_completion(request: Request):
                                 except Exception:
                                     logger.warning("Unexpected error in SSE stream fallback", exc_info=True)
                                     raise
-            except httpx.ConnectError:
+            except (httpx.ConnectError, httpx.RemoteProtocolError):
                 yield f"data: {json.dumps({'error': '无法连接模型服务。请检查 LM Studio 或本地 LLM 是否已启动。'})}\n\n"
                 yield "data: [DONE]\n\n"
         return StreamingResponse(stream(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache"})
 
     # Sync fallback (rarely used)
+    resp_data = {}
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(120)) as c:
             resp = await c.post(api_url, json={
                 "model": model, "messages": messages, "max_tokens": 4096,
             }, headers=headers)
             resp_data = resp.json()
-
-        ai_content = resp_data["choices"][0]["message"].get("content", "")
-        ai_reasoning = resp_data["choices"][0]["message"].get("reasoning_content", "")
-    except httpx.ConnectError:
+    except (httpx.ConnectError, httpx.RemoteProtocolError):
         return JSONResponse(
             {"error": "无法连接模型服务。请检查 LM Studio 或本地 LLM 是否已启动。"},
             status_code=503,
         )
+    except Exception:
+        logger.error("Sync chat fallback failed", exc_info=True)
+        return JSONResponse(
+            {"error": "模型请求失败，请查看日志。"},
+            status_code=500,
+        )
+
+    # Handle malformed responses (model may return only reasoning, no choices)
+    choices = resp_data.get("choices", [])
+    if choices:
+        ai_content = choices[0].get("message", {}).get("content", "") or ""
+        ai_reasoning = choices[0].get("message", {}).get("reasoning_content", "") or ""
+        # Also check top-level reasoning field (used by some MLX models)
+        if not ai_reasoning:
+            ai_reasoning = resp_data.get("reasoning", "") or ""
+    else:
+        # Model returned no choices — might be an error or all-reasoning response
+        ai_content = ""
+        ai_reasoning = resp_data.get("reasoning", "") or ""
+        if not ai_content and not ai_reasoning:
+            # Check for error field
+            err = resp_data.get("error", "")
+            if isinstance(err, str) and err:
+                return JSONResponse({"error": f"模型返回错误: {err[:300]}"}, status_code=502)
+            return JSONResponse({"error": "模型返回了空的响应。"}, status_code=502)
 
     if not ai_content and ai_reasoning:
         ai_content = "(思考过程太长，以下是部分推理内容)\n\n" + ai_reasoning[-500:]
@@ -2601,7 +4060,7 @@ async def upload_file(file: UploadFile = File(...)):
             }
         file_type = file.content_type or ""
         is_image = file_type.startswith("image/")
-        is_pdf = file_type == "application/pdf" or file.filename.lower().endswith(".pdf")
+        is_pdf = file_type == "application/pdf" or (file.filename or "").lower().endswith(".pdf")
 
         if is_image:
             base64_content = base64.b64encode(content).decode("utf-8")
@@ -3044,7 +4503,7 @@ async def forget_learning(request: Request):
     topic = body.get("topic", "")
     try:
         conn = _get_db()
-        with _db_write_lock:
+        async with _async_db_lock:
             if lid:
                 conn.execute("DELETE FROM learnings WHERE id = ?", (lid,))
             elif topic:
@@ -3172,27 +4631,46 @@ async def delete_skill(key: str):
 
 @app.get("/v1/settings/tavily-key")
 async def get_tavily_key():
-    """Get Tavily API key status (masked, never returns full key)."""
+    """Get Tavily API key status (masked, never returns full key). Reads from keychain first, then config.json."""
+    key = ""
+    # Try macOS Keychain first
     try:
-        if CONFIG_FILE.exists():
-            cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-            key = cfg.get("tavily_api_key", "")
-            if key:
-                masked = key[:7] + "••••" + key[-4:] if len(key) > 11 else "••••"
-                return {"status": "ok", "has_key": True, "masked": masked}
+        result = subprocess.run(
+            ["security", "find-generic-password", "-s", "com.latiao.desktop", "-a", "tavily_api_key", "-w"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            key = result.stdout.strip()
     except Exception:
         pass
+    # Fallback to config.json
+    if not key:
+        try:
+            if CONFIG_FILE.exists():
+                cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+                key = cfg.get("tavily_api_key", "")
+        except Exception:
+            pass
+    if key:
+        masked = key[:7] + "••••" + key[-4:] if len(key) > 11 else "••••"
+        return {"status": "ok", "has_key": True, "masked": masked}
     return {"status": "ok", "has_key": False, "masked": None}
 
 
 @app.post("/v1/settings/tavily-key")
 async def set_tavily_key(request: Request):
-    """Save Tavily API key to config file."""
+    """Save Tavily API key to macOS Keychain (primary) + config.json (fallback)."""
     body = await request.json()
     key = body.get("key", "").strip()
     if not key:
         return {"status": "error", "message": "API key is required"}
     try:
+        # Store in macOS Keychain
+        subprocess.run(
+            ["security", "add-generic-password", "-s", "com.latiao.desktop", "-a", "tavily_api_key", "-w", key, "-U"],
+            capture_output=True, timeout=10,
+        )
+        # Also update config.json for backward compatibility
         cfg = {}
         if CONFIG_FILE.exists():
             cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
@@ -3207,7 +4685,14 @@ async def set_tavily_key(request: Request):
 
 @app.delete("/v1/settings/tavily-key")
 async def delete_tavily_key():
-    """Remove Tavily API key from config."""
+    """Remove Tavily API key from keychain and config."""
+    try:
+        subprocess.run(
+            ["security", "delete-generic-password", "-s", "com.latiao.desktop", "-a", "tavily_api_key"],
+            capture_output=True, timeout=5,
+        )
+    except Exception:
+        pass
     try:
         if CONFIG_FILE.exists():
             cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
@@ -3316,27 +4801,49 @@ def _save_cron(jobs: list[dict]):
 
 
 _cron_jobs: list[dict] = []
+_cron_lock = threading.Lock()  # protects concurrent read/write to _cron_jobs
 _cron_last_run: dict[str, str] = {}  # job_id → last run timestamp
 
 
+def _cron_field_matches(field: str, value: int, dow_value: int = -1) -> bool:
+    """Check if a single cron field matches the current value. Supports *, */N, N, N,M,O."""
+    if field == "*":
+        return True
+    # Handle comma-separated: "9,17"
+    if "," in field:
+        return any(_cron_field_matches(f.strip(), value, dow_value) for f in field.split(","))
+    # Handle step: "*/15"
+    if field.startswith("*/"):
+        interval = int(field[2:])
+        return value % interval == 0
+    # Handle range: "9-17"
+    if "-" in field:
+        lo, hi = field.split("-", 1)
+        return int(lo) <= value <= int(hi)
+    # Single value
+    if field.isdigit():
+        return value == int(field)
+    return False
+
+
 def _cron_matches(cron_expr: str, now: datetime) -> bool:
-    """Simple cron expression matcher. Supports: */N, H, D patterns."""
+    """Standard 5-field cron expression matcher. Minute Hour DayOfMonth Month DayOfWeek."""
     try:
         parts = cron_expr.strip().split()
         if len(parts) != 5:
             return False
         minute, hour, dom, month, dow = parts
-        # */N every N minutes
-        if minute.startswith("*/") and hour == "*":
-            interval = int(minute[2:])
-            return now.minute % interval == 0
-        # 0 H * * * → daily at hour H
-        if minute == "0" and hour.isdigit() and dom == "*" and month == "*" and dow == "*":
-            return now.hour == int(hour) and now.minute == 0
-        # 0 H * * D → weekly on day D at hour H
-        if minute == "0" and hour.isdigit() and dom == "*" and month == "*" and dow.isdigit():
-            return now.hour == int(hour) and now.minute == 0 and str(now.weekday()) == dow
-        return False
+        if not _cron_field_matches(minute, now.minute):
+            return False
+        if not _cron_field_matches(hour, now.hour):
+            return False
+        if not _cron_field_matches(dom, now.day):
+            return False
+        if not _cron_field_matches(month, now.month):
+            return False
+        # Day-of-week: cron uses 0-7 (0=Sunday, 7=Sunday), Python uses 0=Monday
+        py_wday = (now.weekday() + 1) % 7  # Convert to cron DOW (0=Sun)
+        return _cron_field_matches(dow, py_wday, now.weekday())
     except Exception:
         return False
 
@@ -3345,17 +4852,18 @@ def _tick_cron():
     """Check all enabled cron jobs, return list of due jobs."""
     now = datetime.now()
     due = []
-    for job in _cron_jobs:
-        if not job.get("enabled", True):
-            continue
-        job_id = job["id"]
-        last = _cron_last_run.get(job_id, "")
-        now_str = now.strftime("%Y-%m-%d %H:%M")
-        if last == now_str:
-            continue  # Already ran this minute
-        if _cron_matches(job["schedule"], now):
-            _cron_last_run[job_id] = now_str
-            due.append(job)
+    with _cron_lock:
+        for job in _cron_jobs:
+            if not job.get("enabled", True):
+                continue
+            job_id = job["id"]
+            last = _cron_last_run.get(job_id, "")
+            now_str = now.strftime("%Y-%m-%d %H:%M")
+            if last == now_str:
+                continue  # Already ran this minute
+            if _cron_matches(job["schedule"], now):
+                _cron_last_run[job_id] = now_str
+                due.append(job)
     return due
 
 
@@ -3364,7 +4872,9 @@ def _tick_cron():
 @app.get("/v1/cron")
 async def get_cron_jobs():
     """List all cron jobs."""
-    return {"status": "ok", "jobs": _cron_jobs}
+    with _cron_lock:
+        jobs = list(_cron_jobs)
+    return {"status": "ok", "jobs": jobs}
 
 
 @app.post("/v1/cron")
@@ -3380,8 +4890,9 @@ async def create_cron_job(request: Request):
         "enabled": body.get("enabled", True),
         "created_at": datetime.now().isoformat(),
     }
-    _cron_jobs.append(job)
-    _save_cron(_cron_jobs)
+    with _cron_lock:
+        _cron_jobs.append(job)
+        _save_cron(_cron_jobs)
     return {"status": "ok", "job": job}
 
 
@@ -3390,18 +4901,19 @@ async def update_cron_job(job_id: str, request: Request):
     """Update a cron job."""
     global _cron_jobs
     body = await request.json()
-    for job in _cron_jobs:
-        if job["id"] == job_id:
-            if "schedule" in body:
-                job["schedule"] = body["schedule"]
-            if "task" in body:
-                job["task"] = body["task"]
-            if "enabled" in body:
-                job["enabled"] = body["enabled"]
-            if "action" in body:
-                job["action"] = body["action"]
-            _save_cron(_cron_jobs)
-            return {"status": "ok", "job": job}
+    with _cron_lock:
+        for job in _cron_jobs:
+            if job["id"] == job_id:
+                if "schedule" in body:
+                    job["schedule"] = body["schedule"]
+                if "task" in body:
+                    job["task"] = body["task"]
+                if "enabled" in body:
+                    job["enabled"] = body["enabled"]
+                if "action" in body:
+                    job["action"] = body["action"]
+                _save_cron(_cron_jobs)
+                return {"status": "ok", "job": job}
     return {"status": "error", "message": "Job not found"}
 
 
@@ -3409,8 +4921,9 @@ async def update_cron_job(job_id: str, request: Request):
 async def delete_cron_job(job_id: str):
     """Delete a cron job."""
     global _cron_jobs
-    _cron_jobs = [j for j in _cron_jobs if j["id"] != job_id]
-    _save_cron(_cron_jobs)
+    with _cron_lock:
+        _cron_jobs = [j for j in _cron_jobs if j["id"] != job_id]
+        _save_cron(_cron_jobs)
     return {"status": "ok"}
 
 
@@ -3418,11 +4931,12 @@ async def delete_cron_job(job_id: str):
 async def toggle_cron_job(job_id: str):
     """Toggle a cron job enabled/disabled."""
     global _cron_jobs
-    for job in _cron_jobs:
-        if job["id"] == job_id:
-            job["enabled"] = not job.get("enabled", True)
-            _save_cron(_cron_jobs)
-            return {"status": "ok", "job": job}
+    with _cron_lock:
+        for job in _cron_jobs:
+            if job["id"] == job_id:
+                job["enabled"] = not job.get("enabled", True)
+                _save_cron(_cron_jobs)
+                return {"status": "ok", "job": job}
     return {"status": "error", "message": "Job not found"}
 
 
@@ -3430,7 +4944,9 @@ async def toggle_cron_job(job_id: str):
 async def get_due_jobs():
     """Check and return currently due cron jobs."""
     due = _tick_cron()
-    return {"status": "ok", "due": due, "total_jobs": len(_cron_jobs)}
+    with _cron_lock:
+        total = len(_cron_jobs)
+    return {"status": "ok", "due": due, "total_jobs": total}
 
 
 # ── Local LLM Engine endpoints ──
@@ -3448,9 +4964,9 @@ async def local_llm_detect():
 
 
 @app.get("/v1/local-llm/search")
-async def local_llm_search(q: str = Query(..., min_length=1), library: str = Query(default=""), limit: int = Query(default=10, le=20)):
-    """Search HuggingFace for models."""
-    results = local_llm.search_huggingface(q, limit, library)
+async def local_llm_search(q: str = Query(default=""), library: str = Query(default=""), limit: int = Query(default=20, le=30)):
+    """Search HuggingFace for models. Empty q returns trending models."""
+    results = local_llm.search_huggingface(q, limit, library) if q else local_llm.search_huggingface("gguf", limit, library)
     return {"status": "ok", "results": results, "query": q}
 
 
@@ -3526,10 +5042,36 @@ async def local_llm_models():
     return {"status": "ok", "models": local_llm.list_local_models()}
 
 
+@app.get("/v1/local-llm/model-detail")
+async def local_llm_model_detail(model_id: str = Query(..., min_length=1)):
+    """Fetch HuggingFace model detail: metadata, files, README."""
+    return local_llm.get_model_detail(model_id)
+
+
 @app.get("/v1/local-llm/recommended")
 async def local_llm_recommended():
     """List recommended models with download status."""
     return {"status": "ok", "models": local_llm.get_recommended_models(), "backend": local_llm.get_backend()}
+
+
+@app.get("/v1/local-llm/estimate-context")
+async def local_llm_estimate_context(model_path: str = Query(default="")):
+    """Estimate max context based on available memory and model size."""
+    return local_llm.estimate_max_context(model_path)
+
+
+@app.post("/v1/local-llm/context-limit")
+async def local_llm_set_context(request: Request):
+    """Set context limit (applies to next model start)."""
+    body = await request.json()
+    limit = body.get("limit", 8192)
+    return local_llm.set_context_limit(int(limit))
+
+
+@app.get("/v1/local-llm/context-limit")
+async def local_llm_get_context():
+    """Get current context limit."""
+    return {"status": "ok", "context_limit": local_llm._engine.model_token_limit}
 
 
 @app.post("/v1/local-llm/start")
@@ -3550,6 +5092,15 @@ async def local_llm_stop():
     return local_llm.stop_model()
 
 
+@app.post("/v1/local-llm/delete-model")
+async def local_llm_delete_model(request: Request):
+    """Delete a local model file from ~/Models/ or download cache."""
+    body = await request.json()
+    model_id = body.get("model_id", "")
+    if not model_id:
+        return {"status": "error", "message": "model_id required"}
+    return local_llm.delete_model_file(model_id)
+
 # ── Seed default cron jobs ──
 
 def _seed_default_cron():
@@ -3566,45 +5117,115 @@ def _seed_default_cron():
 
 
 async def _execute_cron_job(job: dict):
-    """Execute a due cron job by calling the LLM with the task as prompt."""
+    """Execute a due cron job: run the task through the agent loop with tools enabled."""
     task = job.get("task", "")
     action = job.get("action", "notify")
     logger.info("Cron job triggered: %s — %s", task, action)
 
-    # Build messages: identity + skills + cron prompt
-    messages = _read_identity()
-    skills_content = _build_skills_content()
-    if skills_content:
-        messages.append({"role": "system", "content": skills_content})
-    messages.append({
-        "role": "system",
-        "content": (
-            "你是一个定时任务助手。用户设定了一个定时任务，请根据任务描述执行。\n"
-            "当前时间: " + datetime.now().strftime("%Y-%m-%d %H:%M:%S") + "\n"
-            "注意: 不要使用任何工具。只需输出分析结果和建议。输出用中文。"
-        ),
-    })
+    # Build messages with identity, env, and tools enabled
+    home = str(Path.home())
+    cwd = os.getcwd()
+    now = datetime.now().strftime("%Y-%m-%d (%A) %H:%M:%S")
+    agent_cfg = _get_agent_config("latiao")
+
+    messages = [{"role": "system", "content": (
+        f"{agent_cfg['identity']}\n\n"
+        f"Runtime environment:\n"
+        f"- Current time: {now}\n"
+        f"- User home directory: {home}\n"
+        f"- Current working directory: {cwd}\n"
+        f"- OS: macOS (Darwin)\n"
+        f"- Shell: zsh\n\n"
+        f"你正在执行一个定时任务。使用可用的工具来完成这个任务。"
+        f"执行完毕后输出总结。"
+    )}]
     messages.append({"role": "user", "content": f"定时任务: {task}"})
 
-    # Get API target (use local LLM or cloud config from env, no-op if none)
-    protocol, api_url, headers = _resolve_api_target(None)
+    # Use non-streaming agent loop to execute the task
+    protocol, api_url, headers, _ = _resolve_api_target(None)
+    if not api_url:
+        logger.warning("Cron job: no API target available")
+        return
     model = os.environ.get("LATIAO_SUBAGENT_MODEL", SUBAGENT_MODEL)
+    agent_tools = _get_agent_tools("latiao", TOOLS)
+    active_tools = _filter_tools(task, agent_tools)
+    if len(active_tools) > 5:
+        essential = {"read_file", "write_file", "list_dir"}
+        priority = [t for t in active_tools if t.get("function", {}).get("name") in essential]
+        others = [t for t in active_tools if t.get("function", {}).get("name") not in essential]
+        active_tools = priority + others[:max(0, 5 - len(priority))]
 
+    current_msgs = [dict(m) for m in messages]
+    full_content = ""
+    tool_count = 0
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(120)) as c:
-            resp = await c.post(api_url, json={
-                "model": model, "messages": messages, "max_tokens": 1024,
-            }, headers=headers)
-            resp_data = resp.json()
-            ai_content = resp_data["choices"][0]["message"].get("content", "")
-    except (httpx.ConnectError, KeyError, Exception) as e:
-        ai_content = f"[AI 调用失败: {e}]"
+        async with httpx.AsyncClient(timeout=httpx.Timeout(120)) as client:
+            for _ in range(10):  # max 10 iterations for cron
+                resp = await client.post(api_url, json={
+                    "model": model, "messages": current_msgs,
+                    "tools": active_tools, "tool_choice": "auto",
+                    "max_tokens": 2048, "stream": False,
+                }, headers=headers)
+                resp_data = resp.json()
+                choices = resp_data.get("choices", [])
+                if not choices:
+                    break
+                msg = choices[0].get("message", {})
+                content = msg.get("content", "") or ""
+                tc_data = msg.get("tool_calls", [])
+
+                if not tc_data and content and _NATIVE_TOOL_RE.search(content):
+                    native_tcs = _parse_native_tool_calls(content)
+                    if native_tcs:
+                        content = _strip_native_tool_calls(content)
+                        tc_data = native_tcs
+
+                if tc_data:
+                    tool_count += 1
+                    current_msgs.append({"role": "assistant", "content": content or None, "tool_calls": tc_data})
+                    for tc in tc_data:
+                        tool_name = tc.get("function", {}).get("name", "")
+                        tool_args_str = tc.get("function", {}).get("arguments", "{}")
+                        try:
+                            tool_args = json.loads(tool_args_str) if isinstance(tool_args_str, str) else tool_args_str
+                        except json.JSONDecodeError:
+                            tool_args = {}
+                        perm = _resolve_permission(tool_name, tool_args)
+                        if perm in ("confirm", "danger"):
+                            result = f"⛔ Cron 任务不支持需要确认的操作: {tool_name}"
+                        else:
+                            result = await execute_tool(tool_name, tool_args)
+                        if len(result) > 3000:
+                            result = result[:3000] + "\n...(截断)"
+                        current_msgs.append({"role": "tool", "tool_call_id": tc.get("id", "cron"), "content": result})
+                    continue
+
+                if content:
+                    full_content += content
+                elif full_content:
+                    # Already have content from earlier iterations, stop
+                    break
+                else:
+                    # Empty response from model — retry once
+                    logger.warning("Cron job: empty response, retrying")
+                    current_msgs.append({
+                        "role": "system",
+                        "content": "⚠️ 你上一轮的回复是空的。请直接回复总结或使用工具完成任务。",
+                    })
+                    if len(current_msgs) > 15:
+                        # Prevent infinite loop — give up after too many messages
+                        full_content = "(Cron 任务未生成有效回复)"
+                        break
+                    continue
+        ai_content = full_content or "(无输出)"
+    except Exception as e:
+        ai_content = f"[Cron 任务执行失败: {e}]"
         logger.warning("Cron LLM call failed: %s", e)
 
     # Record to memory DB with AI result
     try:
         conn = _get_db()
-        with _db_write_lock:
+        async with _async_db_lock:
             conn.execute(
                 "INSERT INTO memory (session_id, type, topic, content, meta) VALUES (?, ?, ?, ?, ?)",
                 ("cron", "cron_job", task,

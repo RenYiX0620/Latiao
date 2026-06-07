@@ -26,6 +26,8 @@ IS_MACOS = platform.system() == "Darwin"
 
 def execute(args: dict) -> str:
     path = args["path"]
+    if ".." in path.split("/"):
+        return "⛔ Blocked: path traversal not allowed"
     if IS_MACOS:
         subprocess.Popen(["open", path])
         return f"✅ 已在 Finder 中打开：{path}"

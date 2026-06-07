@@ -1,4 +1,4 @@
-import React, { Component } from 'react'
+import { Component, StrictMode, type ReactNode } from 'react'
 import ReactDOM from 'react-dom/client'
 import App from './App'
 import { I18nProvider } from './i18n'
@@ -36,15 +36,15 @@ window.addEventListener('unhandledrejection', (e) => {
   showErrorOverlay(`Unhandled Promise Rejection: ${e.reason}`, e.reason?.stack)
 })
 
-class ErrorBoundary extends Component<{ children: React.ReactNode }, { error: Error | null }> {
-  constructor(props: { children: React.ReactNode }) {
+class ErrorBoundary extends Component<{ children: ReactNode }, { error: Error | null }> {
+  constructor(props: { children: ReactNode }) {
     super(props)
     this.state = { error: null }
   }
   static getDerivedStateFromError(error: Error) {
     return { error }
   }
-  componentDidCatch(error: Error, _info: React.ErrorInfo) {
+  componentDidCatch(error: Error) {
     showErrorOverlay(error.message, error.stack)
   }
   render() {
@@ -56,11 +56,11 @@ class ErrorBoundary extends Component<{ children: React.ReactNode }, { error: Er
 }
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
-  <React.StrictMode>
+  <StrictMode>
     <ErrorBoundary>
       <I18nProvider>
         <App />
       </I18nProvider>
     </ErrorBoundary>
-  </React.StrictMode>,
+  </StrictMode>,
 )

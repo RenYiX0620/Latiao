@@ -25,6 +25,8 @@ DEFINITION = {
 def execute(args: dict) -> str:
     directory = args["directory"]
     pattern = args["pattern"]
+    if ".." in directory.split("/"):
+        return "⛔ Blocked: path traversal not allowed"
     try:
         search_path = os.path.join(os.path.expanduser(directory), pattern)
         matches = glob_mod.glob(search_path, recursive=True)

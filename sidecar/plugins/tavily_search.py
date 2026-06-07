@@ -1,4 +1,5 @@
 """Search the web using Tavily Search API."""
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -52,7 +53,7 @@ def _get_api_key() -> str | None:
     return None
 
 
-def execute(args: dict) -> str:
+async def execute(args: dict) -> str:
     api_key = _get_api_key()
     if not api_key:
         return (
@@ -66,43 +67,44 @@ def execute(args: dict) -> str:
     max_results = min(args.get("max_results", 5), 10)
 
     try:
-        resp = httpx.post(
-            "https://api.tavily.com/search",
-            json={
-                "api_key": api_key,
-                "query": query,
-                "search_depth": search_depth,
-                "max_results": max_results,
-            },
-            timeout=30,
-        )
-        resp.raise_for_status()
-        data = resp.json()
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30)) as client:
+            resp = await client.post(
+                os.environ.get("TAVILY_API_URL", "https://api.tavily.com/search"),
+                json={
+                    "api_key": api_key,
+                    "query": query,
+                    "search_depth": search_depth,
+                    "max_results": max_results,
+                },
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
 
-        results = data.get("results", [])
-        answer = data.get("answer", "")
+            results = data.get("results", [])
+            answer = data.get("answer", "")
 
-        if not results and not answer:
-            return f"🔍 Tavily 搜索: {query}\n\n未找到相关结果。"
+            if not results and not answer:
+                return f"🔍 Tavily 搜索: {query}\n\n未找到相关结果。"
 
-        lines = [f"🔍 Tavily 搜索: {query}\n"]
+            lines = [f"🔍 Tavily 搜索: {query}\n"]
 
-        if answer:
-            lines.append(f"📝 {answer}\n")
+            if answer:
+                lines.append(f"📝 {answer}\n")
 
-        if results:
-            lines.append(f"📎 共 {len(results)} 条结果:\n")
-            for i, r in enumerate(results, 1):
-                title = r.get("title", "No title")
-                url = r.get("url", "")
-                content = r.get("content", "")
-                if len(content) > 300:
-                    content = content[:300] + "..."
-                lines.append(f"{i}. **{title}**")
-                lines.append(f"   {url}")
-                lines.append(f"   {content}\n")
+            if results:
+                lines.append(f"📎 共 {len(results)} 条结果:\n")
+                for i, r in enumerate(results, 1):
+                    title = r.get("title", "No title")
+                    url = r.get("url", "")
+                    content = r.get("content", "")
+                    if len(content) > 300:
+                        content = content[:300] + "..."
+                    lines.append(f"{i}. **{title}**")
+                    lines.append(f"   {url}")
+                    lines.append(f"   {content}\n")
 
-        return "\n".join(lines)
+            return "\n".join(lines)
 
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 401:

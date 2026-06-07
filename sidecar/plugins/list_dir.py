@@ -22,6 +22,9 @@ DEFINITION = {
 
 def execute(args: dict) -> str:
     path = args["path"]
+    # Block path traversal — only allow absolute paths without '..' segments
+    if ".." in path.split("/"):
+        return "⛔ Blocked: path traversal not allowed"
     try:
         entries = os.listdir(path)
         lines = [f"  {'📁' if os.path.isdir(os.path.join(path, e)) else '📄'} {e}"

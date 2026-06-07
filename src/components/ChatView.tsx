@@ -1,4 +1,4 @@
-import { memo, lazy, Suspense } from "react";
+import { memo, lazy, Suspense, useRef, useCallback, useEffect } from "react";
 import type { Message, PendingFile } from "../types";
 import { useTranslation } from "../i18n";
 import ToolCallBubble from "./ToolCallBubble";
@@ -41,6 +41,8 @@ interface ChatViewProps {
   startRecording: () => void;
   confirmTool: (callId: string, approved: boolean) => void;
   chatEndRef: React.RefObject<HTMLDivElement | null>;
+  handleDrop?: (e: React.DragEvent) => void;
+  onPasteImage?: (file: File) => void;
 }
 
 export default memo(function ChatView({
@@ -48,12 +50,41 @@ export default memo(function ChatView({
   prompt, setPrompt, planMode, setPlanMode,
   fileInputRef, mediaRecorderRef, isRecording,
   sendMessage, handleFileSelect, startRecording, confirmTool,
-  chatEndRef,
+  chatEndRef, handleDrop, onPasteImage,
 }: ChatViewProps) {
   const { t } = useTranslation();
+  const editableRef = useRef<HTMLDivElement>(null);
+  const promptRef = useRef(prompt);
+  useEffect(() => { promptRef.current = prompt; }, [prompt]);
+
+  const handleEditableInput = useCallback(() => {
+    const el = editableRef.current;
+    if (!el) return;
+    setPrompt(el.textContent || "");
+  }, [setPrompt]);
+
+  const handleSend = useCallback(() => {
+    sendMessage();
+    // Clear the editable div after send (state handled by sendMessage's setPrompt(""))
+    setTimeout(() => {
+      if (editableRef.current && promptRef.current === "") {
+        editableRef.current.textContent = "";
+      }
+    }, 0);
+  }, [sendMessage]);
+
+  const handleEditableKeyDown = useCallback((e: React.KeyboardEvent) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      handleSend();
+    }
+  }, [handleSend]);
+
   return (
     <>
-      <div className="chat-area">
+      <div className="chat-area"
+        onDrop={handleDrop}
+        onDragOver={e => e.preventDefault()}>
         {messages.length === 0 ? (
           <div className="chat-empty">
             <div className="chat-empty-icon">💬</div>
@@ -66,14 +97,14 @@ export default memo(function ChatView({
             if (msg.type === "tool_call" || msg.role === "tool") {
               return (
                 <div key={i} className="msg">
-                  <div className="msg-role">助手</div>
+                  <div className="msg-role">{t("chat.role_assistant")}</div>
                   <ToolCallBubble msg={msg} onConfirm={confirmTool} />
                 </div>
               );
             }
             return (
               <div key={i} className={`msg${msg.role === "user" ? " user" : ""}`}>
-                <div className="msg-role">{msg.role === "user" ? "你" : "助手"}</div>
+                <div className="msg-role">{msg.role === "user" ? t("chat.role_you") : t("chat.role_assistant")}</div>
                 {msg.role === "user" && msg.imagePreview ? (
                   <div>
                     {msg.imagePreview && <img src={msg.imagePreview} alt={msg.filename || "image"} style={{ maxWidth: 260, borderRadius: 8, marginBottom: 8 }} />}
@@ -96,7 +127,7 @@ export default memo(function ChatView({
                           },
                         }}
                       >
-                        {msg.content}
+                        {(msg.content || "").replace(/```tool\s+\w+\s*\n\{[^}]*\}\n```/g, "").replace(/^```\s*\n?/gm, "").trim()}
                       </ReactMarkdown>
                     ) : (msg.content)}
                   </div>
@@ -127,10 +158,29 @@ export default memo(function ChatView({
           </div>
         )}
         <div className="input-row">
-          <input className="chat-input" placeholder={t("chat.placeholder")}
-            value={prompt} onChange={(e) => setPrompt(e.target.value)}
-            onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); } }}
-            disabled={isProcessing} />
+          <div
+            ref={editableRef}
+            className={`chat-input${prompt ? "" : " is-empty"}`}
+            contentEditable={!isProcessing}
+            onInput={handleEditableInput}
+            onKeyDown={handleEditableKeyDown}
+            onPaste={async (e) => {
+              if (!onPasteImage) return;
+              const items = e.clipboardData?.items;
+              if (!items) return;
+              for (const item of Array.from(items)) {
+                if (item.type.startsWith("image/")) {
+                  e.preventDefault();
+                  const file = item.getAsFile();
+                  if (file) onPasteImage(file);
+                  return;
+                }
+              }
+            }}
+            data-placeholder={t("chat.placeholder")}
+            role="textbox"
+            aria-multiline="true"
+          />
           <input type="file" ref={fileInputRef} style={{ display: "none" }} onChange={handleFileSelect} />
           <button className="btn-icon" onClick={() => fileInputRef.current?.click()} title={t("chat.attach")}>📎</button>
           <button className="btn-icon" onClick={isRecording ? () => mediaRecorderRef.current?.stop() : startRecording}
@@ -140,7 +190,7 @@ export default memo(function ChatView({
             onClick={() => setPlanMode(!planMode)} title={t("chat.plan_mode")}>
             📋 计划
           </button>
-          <button className="btn-send" onClick={sendMessage} disabled={isProcessing}>{t("chat.send")}</button>
+          <button className="btn-send" onClick={handleSend} disabled={isProcessing}>{t("chat.send")}</button>
         </div>
       </div>
     </>

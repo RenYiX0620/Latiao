@@ -26,7 +26,6 @@ mlx==0.31.2
 mlx-lm==0.31.3
 mlx-metal==0.31.2
 numpy==2.4.6
-onnxruntime==1.26.0
 packaging==26.2
 protobuf==7.35.0
 psutil==7.2.2
@@ -39,13 +38,11 @@ PyYAML==6.0.3
 regex==2026.5.9
 rich==15.0.0
 safetensors==0.7.0
-sentencepiece==0.2.1
 setuptools==82.0.1
 shellingham==1.5.4
 starlette==1.2.0
 tokenizers==0.22.2
 tqdm==4.67.3
-transformers==5.9.0
 typer==0.25.1
 typing-inspection==0.4.2
 typing_extensions==4.15.0

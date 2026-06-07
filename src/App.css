@@ -325,14 +325,24 @@ body {
 /* ── Input Area ── */
 .input-area { padding: 12px 24px 18px; background: linear-gradient(0deg, var(--bg-root) 0%, transparent 100%); flex-shrink: 0; }
 .input-row {
-  display: flex; align-items: center; gap: 8px; padding: 10px 18px;
+  display: flex; align-items: flex-end; gap: 8px; padding: 8px 14px;
   background: var(--bg-input); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
   border-radius: var(--radius-xl); border: 1px solid var(--border-default); transition: all 0.2s ease;
 }
 .input-row:focus-within { border-color: var(--border-accent); box-shadow: 0 0 0 3px rgba(56,189,248,0.06); }
 .chat-input {
-  flex: 1; background: transparent; border: none; color: var(--text-primary);
-  font-size: 13px; outline: none; padding: 5px 0; font-family: var(--font-sans); resize: none;
+  flex: 1; background: 0 0; border: 0; color: var(--text-primary);
+  font-size: 13px; outline: 0; padding: 6px 0; font-family: var(--font-sans);
+  line-height: 1.5; max-height: 150px; overflow-y: auto;
+  white-space: pre-wrap; word-break: break-word;
+  -webkit-user-modify: read-write-plaintext-only;
+}
+.chat-input:focus { outline: 0; }
+/* Placeholder */
+.chat-input.is-empty::before {
+  content: attr(data-placeholder);
+  color: var(--text-disabled);
+  pointer-events: none;
 }
 .chat-input::placeholder { color: var(--text-disabled); }
 
@@ -547,6 +557,14 @@ body {
 /* ── Animations ── */
 @keyframes fadeInMsg { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+@keyframes slideInRight { from { transform: translateX(30px); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+@keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+/* Custom scrollbar for model detail panel */
+.custom-scrollbar::-webkit-scrollbar { width: 5px; }
+.custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
+.custom-scrollbar::-webkit-scrollbar-thumb { background: #d1d5db; border-radius: 10px; }
+.custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #9ca3af; }
 
 /* ── Mobile ── */
 @media (max-width: 768px) {

@@ -1,4 +1,4 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, useCallback } from "react";
 import { useTranslation } from "../i18n";
 
 interface LogEntry {
@@ -59,7 +59,7 @@ export default function LogsView({ logs }: LogsViewProps) {
       {/* Log panel */}
       <div
         className="log-panel"
-        ref={autoScroll ? (el) => { if (el) el.scrollTop = el.scrollHeight; } : undefined}
+        ref={useCallback((el: HTMLDivElement | null) => { if (autoScroll && el) el.scrollTop = el.scrollHeight; }, [autoScroll])}
         style={{ display: "block", maxHeight: "calc(100vh - 220px)", overflowY: "auto" }}
       >
         {filtered.length === 0 ? (

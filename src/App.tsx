@@ -1,8 +1,10 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import { fetch } from "@tauri-apps/plugin-http";
+import { invoke } from "@tauri-apps/api/core";
 import type { Message, PendingFile, SessionInfo, IdentityFile, ViewId, CloudModel, DownloadState, HFModelResult, LLMStatus } from "./types";
-import { encrypt, decrypt } from "./utils/crypto";
+// API keys stored in OS keychain via Rust commands (store_secret/get_secret/delete_secret)
 import { useSessions } from "./hooks/useSessions";
+import { sidecarFetch, waitForSidecar } from "./utils/api";
 import { useTranslation } from "./i18n";
 import { useCronJobs } from "./hooks/useCronJobs";
 import { useSkills } from "./hooks/useSkills";
@@ -19,13 +21,6 @@ import "./App.css";
 
 /* ═══════════ Constants ═══════════ */
 
-const newSession = (): SessionInfo => ({
-  id: `session_${Math.random().toString(36).substring(7)}`,
-  name: "session.default",
-  messages: [],
-  selectedModel: "",
-});
-
 const PLAN_MODE_PROMPT =
   "【Structured Workflow — 阶段门控】\n" +
   "你必须按以下阶段顺序执行，不得跳步。\n\n" +
@@ -39,8 +34,6 @@ const PLAN_MODE_PROMPT =
   "关键规则：阶段1和阶段2完成之前，不得调用任何 confirm 级别工具（write_file、run_cmd、open_app、open_folder）。";
 
 const SIDECAR = "http://127.0.0.1:8000";
-const ENC_KEY = "latiao_cloud_models_enc";
-const OLD_KEY = "local_ai_os_cloud_models";
 
 const AGENT_NAME_KEYS: Record<string, string> = {
   latiao: "agent.latiao", "code-reviewer": "agent.code_reviewer",
@@ -64,7 +57,13 @@ function buildApiMessages(session: SessionInfo, extraUser?: Message, planMode?: 
   const msgs: Record<string, unknown>[] = [];
   if (planMode) msgs.push({ role: "system", content: PLAN_MODE_PROMPT });
   const allMsgs = extraUser ? [...session.messages, extraUser] : session.messages;
-  for (const msg of allMsgs) {
+  // Truncate long history: keep system messages + last 30 user/assistant pairs
+  // Prevents context overflow for local models that struggle with long histories
+  const MAX_CONTEXT_MSGS = 30;
+  const recentMsgs = allMsgs.length > MAX_CONTEXT_MSGS
+    ? allMsgs.slice(-MAX_CONTEXT_MSGS)
+    : allMsgs;
+  for (const msg of recentMsgs) {
     if (msg.role === "tool" || msg.type === "tool_call") continue;
     if (msg.role === "user" && msg.imageBase64) {
       msgs.push({
@@ -87,7 +86,7 @@ function App() {
   /* ── Session State ── */
   const {
     sessions, setSessions, currentIdx, setCurrentIdx,
-    session, messages, setSelectedModel, setMessages,
+    session, messages, setSelectedModel, setMessages, newSession,
   } = useSessions();
   const { t } = useTranslation();
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
@@ -107,23 +106,13 @@ function App() {
   const [cloudModels, setCloudModels] = useState<CloudModel[]>([]);
   const [cloudModelsLoaded, setCloudModelsLoaded] = useState(false);
 
-  // Load encrypted cloud models on first mount (migrate from old plaintext if needed)
+  // Load cloud models from OS keychain
   useEffect(() => {
     (async () => {
       try {
-        const enc = localStorage.getItem(ENC_KEY);
-        if (enc) {
-          setCloudModels(JSON.parse(await decrypt(enc)));
-          setCloudModelsLoaded(true);
-          return;
-        }
-        // Migration: read old plaintext key, encrypt, delete old key
-        const old = localStorage.getItem(OLD_KEY);
-        if (old) {
-          const models = JSON.parse(old);
-          setCloudModels(models);
-          localStorage.setItem(ENC_KEY, await encrypt(old));
-          localStorage.removeItem(OLD_KEY);
+        const fromKeychain = await invoke("get_secret", { key: "cloud_models" }).catch(() => null) as string | null;
+        if (fromKeychain) {
+          setCloudModels(JSON.parse(fromKeychain));
         }
       } catch { /* ignore */ }
       setCloudModelsLoaded(true);
@@ -134,6 +123,7 @@ function App() {
 
 
   const [sidecarStatus, setSidecarStatus] = useState<"checking" | "online" | "offline">("checking");
+  const [restartingSidecar, setRestartingSidecar] = useState(false);
   const [testingModel, setTestingModel] = useState<string | null>(null);
   const [testResult, setTestResult] = useState("");
   const [theme, setTheme] = useState<"light" | "dark">(() => {
@@ -221,15 +211,15 @@ function App() {
     return () => clearTimeout(timer);
   }, [messages]);
   useEffect(() => { localStorage.setItem("local_ai_os_plan_mode", JSON.stringify(planMode)); }, [planMode]);
-  // Persist cloud models encrypted
+  // Persist cloud models to OS keychain (debounced to avoid writes on every keystroke)
   useEffect(() => {
     if (!cloudModelsLoaded) return;
-    (async () => {
+    const timer = setTimeout(async () => {
       try {
-        localStorage.setItem(ENC_KEY, await encrypt(JSON.stringify(cloudModels)));
-        localStorage.removeItem(OLD_KEY);
+        await invoke("store_secret", { key: "cloud_models", value: JSON.stringify(cloudModels) });
       } catch { /* ignore */ }
-    })();
+    }, 1000);
+    return () => clearTimeout(timer);
   }, [cloudModels, cloudModelsLoaded]);
 
   const fetchIdentityFiles = async () => {
@@ -247,15 +237,68 @@ function App() {
   };
   useEffect(() => { fetchIdentityFiles(); }, []);
 
-  // Fetch tools from sidecar
+  const [fetchDiag, setFetchDiag] = useState("🔍 正在获取...");
+
+
+  // Fetch tools from sidecar (via Rust IPC proxy) with health check + retry
   const fetchTools = async () => {
-    try {
-      const resp = await fetch(SIDECAR + "/v1/tools");
-      const data = await resp.json();
-      if (data.status === "ok") setTools(data.tools || []);
-    } catch (e) { console.error(e) }
+    setFetchDiag("🔍 检查 Sidecar 状态...");
+    const healthy = await waitForSidecar();
+    if (!healthy) {
+      setFetchDiag("❌ Sidecar 无响应，请确认 http://127.0.0.1:8000 已启动");
+      return;
+    }
+
+    const maxRetries = 5;
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      try {
+        if (attempt > 0) {
+          setFetchDiag(`⏳ 重试获取工具列表... (${attempt}/${maxRetries})`);
+          await new Promise(r => setTimeout(r, 2000));
+        } else {
+          setFetchDiag("⏳ 正在获取工具列表...");
+        }
+        const data = await sidecarFetch("/v1/tools");
+        setFetchDiag(`✅ /v1/tools → status=${data.status}`);
+        if (data.status === "ok") {
+          setTools(data.tools || []);
+          setFetchDiag(d => `${d}, tools=${data.tools?.length || 0}`);
+        }
+        return; // success
+      } catch (e: any) {
+        if (attempt === maxRetries - 1) {
+          setFetchDiag(`❌ 错误: ${e?.message || String(e)} (已重试${maxRetries}次)`);
+        }
+      }
+    }
   };
   useEffect(() => { fetchTools(); }, []);
+
+  // Restart sidecar
+  const handleRestartSidecar = async () => {
+    setRestartingSidecar(true);
+    setSidecarStatus("checking");
+    try {
+      await invoke("restart_sidecar");
+      // Wait for sidecar to come back online (up to 15s)
+      for (let i = 0; i < 15; i++) {
+        await new Promise(r => setTimeout(r, 1000));
+        try {
+          const resp = await fetch(SIDECAR + "/health", { signal: AbortSignal.timeout(2000) });
+          if (resp.ok) {
+            setSidecarStatus("online");
+            showToast("Sidecar 已重启");
+            return;
+          }
+        } catch { /* still starting */ }
+      }
+      showToast("Sidecar 重启后无响应，请检查");
+    } catch (e: any) {
+      showToast(`重启失败: ${e?.message || String(e)}`);
+    } finally {
+      setRestartingSidecar(false);
+    }
+  };
 
   // Unified heartbeat: sidecar status + downloads + learnings
   useEffect(() => {
@@ -297,6 +340,30 @@ function App() {
   const [searching, setSearching] = useState(false);
   const [downloadProgress, setDownloadProgress] = useState<Record<string, DownloadState>>({});
   const [fixing, setFixing] = useState("");
+  const [contextLimit, setContextLimit] = useState(8192);
+  const [contextEstimate, setContextEstimate] = useState<{max_context: number; recommended_context: number; ram_available_gb: number; memory_for_context_gb: number} | null>(null);
+
+  // Fetch context estimate
+  const fetchContextEstimate = async (modelPath?: string) => {
+    try {
+      const params = modelPath ? `?model_path=${encodeURIComponent(modelPath)}` : "";
+      const resp = await fetch(SIDECAR + "/v1/local-llm/estimate-context" + params);
+      const data = await resp.json();
+      if (data.max_context) setContextEstimate(data);
+      if (data.current_context) setContextLimit(data.current_context);
+    } catch { /* ignore */ }
+  };
+  useEffect(() => { fetchContextEstimate(); }, []);
+
+  // Set context limit
+  const updateContextLimit = async (limit: number) => {
+    setContextLimit(limit);
+    try {
+      await fetch(SIDECAR + "/v1/local-llm/context-limit", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ limit }),
+      });
+    } catch { /* ignore */ }
+  };
 
   // Fetch setup check on mount
   const fetchSetup = () => {
@@ -319,12 +386,32 @@ function App() {
     setFixing("");
   };
 
-  const searchHF = useCallback(async (query?: string) => {
+  // ── Download progress polling (like LM Studio) ──
+  useEffect(() => {
+    const poll = async () => {
+      try {
+        const resp = await fetch(SIDECAR + "/v1/local-llm/downloads");
+        const data = await resp.json();
+        if (data.status === "ok" && Array.isArray(data.downloads)) {
+          const progress: Record<string, DownloadState> = {};
+          for (const dl of data.downloads) {
+            progress[dl.model_id] = dl;
+          }
+          setDownloadProgress(progress);
+        }
+      } catch { /* ignore poll errors */ }
+    };
+    poll();
+    const interval = setInterval(poll, 2000);
+    return () => clearInterval(interval);
+  }, []);
+
+  const searchHF = useCallback(async (query?: string, library?: string) => {
     const q = query ?? hfSearch;
-    if (!q.trim()) { setHfResults([]); return; }
     setSearching(true);
     try {
-      const resp = await fetch(`${SIDECAR}/v1/local-llm/search?q=${encodeURIComponent(q)}&limit=20`);
+      const libParam = library ? `&library=${encodeURIComponent(library)}` : "";
+      const resp = await fetch(`${SIDECAR}/v1/local-llm/search?q=${encodeURIComponent(q)}&limit=30${libParam}`);
       const data = await resp.json();
       if (data.status === "ok") setHfResults(data.results);
     } catch (e) { console.error(e) }
@@ -339,11 +426,27 @@ function App() {
   }, [hfSearch, searchHF]);
 
   const downloadModel = async (modelId: string) => {
+    showToast(t("toast.dl_start", { name: modelId.split("/").pop() || modelId }));
     try {
-      await fetch(SIDECAR + "/v1/local-llm/download", {
+      const resp = await fetch(SIDECAR + "/v1/local-llm/download", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ model_id: modelId }),
       });
+      const data = await resp.json();
+      if (data.status === "ok") {
+        // Immediately fetch downloads to show UI feedback
+        const dlResp = await fetch(SIDECAR + "/v1/local-llm/downloads");
+        const dlData = await dlResp.json();
+        if (dlData.status === "ok" && Array.isArray(dlData.downloads)) {
+          const progress: Record<string, DownloadState> = {};
+          for (const dl of dlData.downloads) {
+            if (dl.model_id) progress[dl.model_id] = dl;
+          }
+          setDownloadProgress(prev => ({ ...prev, ...progress }));
+        }
+      } else {
+        showToast(t("toast.dl_fail") + ": " + (data.message || ""));
+      }
     } catch (e) { console.error(e); showToast(t("toast.dl_fail")); }
   };
 
@@ -437,8 +540,7 @@ function App() {
         method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
       });
     } catch (e) {
-      // eslint-disable-next-line preserve-caught-error
-      throw new Error(`无法连接 Sidecar。请确保 Python 后端已启动：cd sidecar && python main.py\n\n原始错误: ${e}`);
+      throw new Error(`无法连接 Sidecar\n原始错误: ${e}`);
     }
     if (!response.ok || !response.body) throw new Error(`HTTP ${response.status}`);
 
@@ -484,22 +586,16 @@ function App() {
                   return msgs;
                 });
               } else if (parsed.event === "tool_end") {
-                // Safely convert result to string, truncate if huge
                 const rawResult = String(parsed.result ?? "");
-                const MAX_TOOL_RESULT = 10000;
-                const toolResult = rawResult.length > MAX_TOOL_RESULT
-                  ? rawResult.slice(0, MAX_TOOL_RESULT) + `\n\n...(截断，共 ${rawResult.length} 字符)`
+                const toolResult = rawResult.length > 10000
+                  ? rawResult.slice(0, 10000) + `\n\n...(截断)`
                   : rawResult;
-                const isError = rawResult.startsWith("Error") || rawResult.startsWith("⛔") || rawResult.startsWith("错误");
+                const isError = rawResult.startsWith("Error") || rawResult.startsWith("⛔");
                 setMessages((prev) => {
                   const msgs = [...prev];
                   const idx = msgs.findIndex((m) => m.callId === parsed.call_id && (m.toolStatus === "running" || m.toolStatus === "confirming"));
                   if (idx !== -1) {
-                    msgs[idx] = {
-                      ...msgs[idx], toolResult,
-                      toolStatus: isError ? "error" : "done",
-                      content: toolResult,
-                    };
+                    msgs[idx] = { ...msgs[idx], toolResult, toolStatus: isError ? "error" : "done", content: toolResult };
                   }
                   return msgs;
                 });
@@ -512,10 +608,7 @@ function App() {
                   return msgs;
                 });
               }
-            } catch (evtErr) {
-              // Don't let a single bad event crash the entire stream
-              full += `\n\n⚠️ SSE 事件处理异常: ${evtErr}`;
-            }
+            } catch { /* skip malformed event */ }
           } catch (e) { if (e instanceof SyntaxError) continue; throw e; }
         }
       }
@@ -584,9 +677,11 @@ function App() {
   /* ── File Upload ── */
   // Resize image to max 1024px longest side (reduces token cost)
   const resizeImage = (file: File): Promise<{ base64: string; mime: string; preview: string }> => {
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
       const img = new Image();
+      const objectUrl = URL.createObjectURL(file);
       img.onload = () => {
+        URL.revokeObjectURL(objectUrl);
         const MAX = 1024;
         let { width, height } = img;
         if (width > MAX || height > MAX) {
@@ -602,16 +697,34 @@ function App() {
         const dataUrl = canvas.toDataURL(mime, 0.85);
         resolve({ base64: dataUrl.split(",")[1], mime, preview: dataUrl });
       };
-      img.src = URL.createObjectURL(file);
+      img.onerror = () => {
+        URL.revokeObjectURL(objectUrl);
+        reject(new Error("Failed to load image"));
+      };
+      img.src = objectUrl;
     });
   };
+
+  const processImageFile = async (file: File, name?: string) => {
+    if (file.type.startsWith("image/")) {
+      const { base64, mime, preview } = await resizeImage(file);
+      setPendingFile({ name: name || file.name, preview, type: "image", content: preview, base64, mimeType: mime });
+    }
+  };
+
+  const handleDrop = useCallback(async (e: React.DragEvent) => {
+    e.preventDefault();
+    const file = e.dataTransfer?.files?.[0];
+    if (file?.type.startsWith("image/")) {
+      await processImageFile(file);
+    }
+  }, []);
 
   const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
     if (file.type.startsWith("image/")) {
-      const { base64, mime, preview } = await resizeImage(file);
-      setPendingFile({ name: file.name, preview, type: "image", content: preview, base64, mimeType: mime });
+      await processImageFile(file);
     } else {
       const reader = new FileReader();
       reader.onload = () => {
@@ -720,7 +833,7 @@ function App() {
             <button key={s.id} className={`session-item${i === currentIdx ? " active" : ""}`} onClick={() => switchSession(i)}>
               <span className="session-info">
                 <div className="session-name">{s.name.startsWith("session.") ? t(s.name) : s.name}</div>
-                <div className="session-preview">{s.messages.length > 0 ? s.messages[s.messages.length - 1].content.slice(0, 30) + "..." : t("session.default")}</div>
+                <div className="session-preview">{s.messages.length > 0 ? (s.messages[s.messages.length - 1].content || "").slice(0, 30) + "..." : t("session.default")}</div>
               </span>
               <span className="session-delete-btn" style={i === currentIdx ? { opacity: 1 } : undefined}
                 onClick={(e) => { e.stopPropagation(); deleteSession(i); }}>×</span>
@@ -786,7 +899,8 @@ function App() {
             isRecording={isRecording}
             sendMessage={sendMessage} handleFileSelect={handleFileSelect}
             startRecording={startRecording} confirmTool={confirmTool}
-            chatEndRef={chatEndRef}
+            chatEndRef={chatEndRef} handleDrop={handleDrop}
+            onPasteImage={(file) => processImageFile(file, `截图 ${new Date().toLocaleTimeString()}`)}
           />
         </div>
 
@@ -819,6 +933,8 @@ function App() {
             startLocalLLM={startLocalLLM} stopLocalLLM={stopLocalLLM}
             fixing={fixing} runFix={runFix}
             showToast={showToast}
+            contextLimit={contextLimit} setContextLimit={updateContextLimit}
+            contextEstimate={contextEstimate} fetchContextEstimate={fetchContextEstimate}
           />
         </div>
 
@@ -828,6 +944,7 @@ function App() {
             <div><div className="page-title">{t("page.tools")}</div><div className="page-desc">{t("page.tools_desc", { count: tools.length })}</div></div>
           </div>
           <div className="page-body">
+            {tools.length === 0 && <div style={{padding:20,color:'var(--warning)',fontFamily:'monospace',whiteSpace:'pre-wrap'}}>{fetchDiag}</div>}
             <ToolsView tools={tools} setTools={setTools} showToast={showToast} />
           </div>
         </div>
@@ -881,6 +998,8 @@ function App() {
           <SettingsView
             theme={theme} setTheme={setTheme}
             sidecarStatus={sidecarStatus}
+            restartingSidecar={restartingSidecar}
+            onRestartSidecar={handleRestartSidecar}
             gatewayLogsOpen={gatewayLogsOpen} setGatewayLogsOpen={setGatewayLogsOpen}
             gatewayLogs={gatewayLogs}
             selectedModel={session.selectedModel}

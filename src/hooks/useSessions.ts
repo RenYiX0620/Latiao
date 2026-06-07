@@ -41,7 +41,7 @@ export function useSessions() {
         let name = s.name;
         if (s.name === "session.default" && newMsgs.length > 0) {
           const firstUser = newMsgs.find((m: Message) => m.role === "user");
-          if (firstUser) name = firstUser.content.slice(0, 20).replace(/\n/g, " ") + (firstUser.content.length > 20 ? "…" : "");
+          if (firstUser?.content) name = firstUser.content.slice(0, 20).replace(/\n/g, " ") + (firstUser.content.length > 20 ? "…" : "");
         }
         return { ...s, messages: newMsgs, name };
       })

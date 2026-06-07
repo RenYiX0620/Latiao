@@ -4,6 +4,8 @@ interface SettingsViewProps {
   theme: "light" | "dark";
   setTheme: (t: "light" | "dark") => void;
   sidecarStatus: string;
+  restartingSidecar: boolean;
+  onRestartSidecar: () => void;
   gatewayLogsOpen: boolean;
   setGatewayLogsOpen: (v: boolean) => void;
   gatewayLogs: { time: string; level: string; message: string }[];
@@ -30,7 +32,8 @@ function toggleOnChange(setter: (v: boolean) => void, storageKey: string) {
 
 export default function SettingsView({
   theme, setTheme,
-  sidecarStatus, gatewayLogsOpen, setGatewayLogsOpen, gatewayLogs,
+  sidecarStatus, restartingSidecar, onRestartSidecar,
+  gatewayLogsOpen, setGatewayLogsOpen, gatewayLogs,
   selectedModel, cloudModels, setActiveView,
   autoLaunch, setAutoLaunch, autoStartGateway, setAutoStartGateway,
   anonymousData, setAnonymousData, autoCheckUpdate, setAutoCheckUpdate,
@@ -86,7 +89,11 @@ export default function SettingsView({
           </div>
           <div className="settings-row">
             <div><div className="settings-row-label">{t("settings.restart")}</div><div className="settings-row-desc">{t("settings.restart_desc")}</div></div>
-            <button className="btn btn-sm btn-ghost" disabled title={t("settings.wip")}>{t("settings.restart_dev")}</button>
+            <button className="btn btn-sm btn-ghost"
+              onClick={onRestartSidecar}
+              disabled={restartingSidecar}>
+              {restartingSidecar ? "⏳" : "🔄"} {restartingSidecar ? "重启中..." : t("settings.restart")}
+            </button>
           </div>
           <div className="settings-row">
             <div><div className="settings-row-label">{t("settings.logs")}</div><div className="settings-row-desc">{t("settings.logs_desc")}</div></div>
@@ -134,7 +141,7 @@ export default function SettingsView({
           <div className="settings-group-header">{t("settings.updates")}</div>
           <div className="settings-row">
             <div><div className="settings-row-label">{t("settings.version")}</div><div className="settings-row-desc">{t("settings.version_desc")}</div></div>
-            <button className="btn btn-sm btn-ghost" disabled title={t("settings.wip")}>{t("settings.check_update")}</button>
+            <span style={{ fontFamily: "var(--font-mono)", fontSize: 12, color: "var(--text-muted)" }}>v0.1.0</span>
           </div>
           <div className="settings-row">
             <div><div className="settings-row-label">{t("settings.auto_update")}</div><div className="settings-row-desc">{t("settings.auto_update_desc")}</div></div>

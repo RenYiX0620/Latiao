@@ -58,7 +58,7 @@ _OBFUSCATION_PATTERNS = [
 
 # Commands that are always allowed (whitelist override for common dev tools)
 _ALWAYS_ALLOWED = re.compile(
-    r"^(ls|pwd|cd|echo|cat|head|tail|wc|file|which|whoami|uname|date|env|printenv)$"
+    r"^(ls|pwd|echo|cat|head|tail|wc|file|which|whoami|uname|date|env|printenv)$"
 )
 
 

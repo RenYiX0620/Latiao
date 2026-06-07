@@ -10,3 +10,8 @@ __pycache__/
 .DS_Store
 .env
 .env.local
+# OpenClaw skills folder (not part of Latiao)
+skills/
+# IDE
+.codegraph/
+.mcp.json
