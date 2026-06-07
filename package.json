@@ -14,7 +14,7 @@
     "lint:py": "cd sidecar && ruff check .",
     "lint:fix": "eslint src/ --fix",
     "lint:py:fix": "cd sidecar && ruff check --fix .",
-    "deploy": "find sidecar -name '__pycache__' -type d ! -path '*/venv/*' -exec rm -rf {} + 2>/dev/null; find sidecar -name '*.pyc' ! -path '*/venv/*' -delete 2>/dev/null; tauri build; cp -R src-tauri/target/release/bundle/macos/Latiao.app ./Latiao.app/; cp sidecar/main.py ./Latiao.app/Contents/Resources/sidecar/main.py; cp sidecar/local_llm.py ./Latiao.app/Contents/Resources/sidecar/local_llm.py; echo 'Deployed to ./Latiao.app'"
+    "deploy": "find sidecar -name '__pycache__' -type d ! -path '*/venv/*' -exec rm -rf {} + 2>/dev/null; find sidecar -name '*.pyc' ! -path '*/venv/*' -delete 2>/dev/null; tauri build; rm -rf /Users/langzuxiang/Desktop/Latiao.app; cp -R src-tauri/target/release/bundle/macos/Latiao.app /Users/langzuxiang/Desktop/Latiao.app/; cp sidecar/main.py /Users/langzuxiang/Desktop/Latiao.app/Contents/Resources/sidecar/main.py; cp sidecar/local_llm.py /Users/langzuxiang/Desktop/Latiao.app/Contents/Resources/sidecar/local_llm.py; echo 'Deployed to Desktop'"
   },
   "keywords": [],
   "author": "",

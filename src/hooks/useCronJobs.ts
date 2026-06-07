@@ -1,7 +1,9 @@
 import { useState, useEffect, useCallback } from "react";
 import { sidecarFetch } from "../utils/api";
+import { useTranslation } from "../i18n";
 
 export function useCronJobs(showToast: (msg: string) => void) {
+  const { t } = useTranslation();
   const [cronJobs, setCronJobs] = useState<{id: string; schedule: string; task: string; enabled: boolean; action: string}[]>([]);
   const [newCron, setNewCron] = useState({ schedule: "0 9 * * *", task: "", action: "notify" });
 
@@ -15,16 +17,16 @@ export function useCronJobs(showToast: (msg: string) => void) {
   }, []);
 
   const addCronJob = useCallback(async () => {
-    if (!newCron.task.trim()) { showToast("请输入任务描述"); return; }
+    if (!newCron.task.trim()) { showToast(t("cron.fill_task")); return; }
     try {
       const data = await sidecarFetch("/v1/cron", "POST", newCron);
       if (data.status === "ok") {
         setCronJobs(prev => [...prev, data.job]);
         setNewCron({ schedule: "0 9 * * *", task: "", action: "notify" });
-        showToast("定时任务已创建");
+        showToast(t("cron.created"));
       }
-    } catch (e) { console.error(e); showToast("创建失败"); }
-  }, [newCron, showToast]);
+    } catch (e) { console.error(e); showToast(t("cron.create_fail")); }
+  }, [newCron, showToast, t]);
 
   const toggleCronJob = useCallback(async (jobId: string) => {
     try {
@@ -37,9 +39,9 @@ export function useCronJobs(showToast: (msg: string) => void) {
     try {
       await sidecarFetch(`/v1/cron/${jobId}`, "DELETE");
       setCronJobs(prev => prev.filter(j => j.id !== jobId));
-      showToast("任务已删除");
+      showToast(t("cron.deleted"));
     } catch (e) { console.error(e); }
-  }, [showToast]);
+  }, [showToast, t]);
 
   return { cronJobs, newCron, setNewCron, addCronJob, toggleCronJob, deleteCronJob };
 }

@@ -975,7 +975,7 @@ function App() {
             <div><div className="page-title">{t("page.cron")}</div><div className="page-desc">{t("page.cron_desc", { count: cronJobs.filter(j => j.enabled).length })}</div></div>
           </div>
           <div className="page-body">
-            <CronView cronJobs={cronJobs} newCron={newCron} setNewCron={setNewCron}
+            <CronView key={lang} cronJobs={cronJobs} newCron={newCron} setNewCron={setNewCron}
               toggleCronJob={toggleCronJob} deleteCronJob={deleteCronJob} addCronJob={addCronJob} />
           </div>
         </div>
@@ -997,7 +997,7 @@ function App() {
             <button className="btn btn-md btn-primary" style={{ marginLeft: "auto" }} onClick={() => showToast(t("agent.created_simple"))}>{t("agent.new_btn")}</button>
           </div>
           <div className="page-body">
-            <AgentView activeAgent={activeAgent} setActiveAgent={setActiveAgent} showToast={showToast} />
+            <AgentView key={lang} activeAgent={activeAgent} setActiveAgent={setActiveAgent} showToast={showToast} />
           </div>
         </div>
         <div className={`view-panel${activeView === "settings" ? " active" : ""}`} id="view-settings">

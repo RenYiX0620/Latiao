@@ -1,7 +1,9 @@
 import { useState, useEffect, useCallback } from "react";
 import { sidecarFetch, sidecarFetchWithRetry } from "../utils/api";
+import { useTranslation } from "../i18n";
 
 export function useSkills(showToast: (msg: string) => void) {
+  const { t } = useTranslation();
   const [skills, setSkills] = useState<{name: string; file: string; key: string; enabled: boolean}[]>([]);
   const [newSkill, setNewSkill] = useState({ name: "", content: "" });
   const [tavilyKey, setTavilyKey] = useState({ hasKey: false, masked: null as string | null, loading: false });
@@ -25,19 +27,19 @@ export function useSkills(showToast: (msg: string) => void) {
   }, []);
 
   const saveTavilyKey = useCallback(async (key: string) => {
-    if (!key.trim()) { showToast("请输入 API Key"); return; }
+    if (!key.trim()) { showToast(t("skills.tavily_fill_key")); return; }
     setTavilyKey(prev => ({ ...prev, loading: true }));
     try {
       const data = await sidecarFetch("/v1/settings/tavily-key", "POST", { key });
       if (data.status === "ok") {
         setTavilyKey({ hasKey: true, masked: data.masked, loading: false });
-        showToast("Tavily API Key 已保存");
+        showToast(t("skills.tavily_saved"));
       } else {
         setTavilyKey(prev => ({ ...prev, loading: false }));
-        showToast(data.message || "保存失败");
+        showToast(data.message || t("skills.save_fail"));
       }
-    } catch (e) { console.error("Failed to save Tavily key:", e); setTavilyKey(prev => ({ ...prev, loading: false })); showToast("保存失败"); }
-  }, [showToast]);
+    } catch (e) { console.error("Failed to save Tavily key:", e); setTavilyKey(prev => ({ ...prev, loading: false })); showToast(t("skills.save_fail")); }
+  }, [showToast, t]);
 
   const deleteTavilyKey = useCallback(async () => {
     setTavilyKey(prev => ({ ...prev, loading: true }));
@@ -45,17 +47,17 @@ export function useSkills(showToast: (msg: string) => void) {
       const data = await sidecarFetch("/v1/settings/tavily-key", "DELETE");
       if (data.status === "ok") {
         setTavilyKey({ hasKey: false, masked: null, loading: false });
-        showToast("Tavily API Key 已删除");
+        showToast(t("skills.tavily_deleted"));
       } else {
         setTavilyKey(prev => ({ ...prev, loading: false }));
-        showToast(data.message || "删除失败");
+        showToast(data.message || t("skills.delete_fail"));
       }
     } catch (e) {
       console.error("Failed to delete Tavily key:", e);
       setTavilyKey(prev => ({ ...prev, loading: false }));
-      showToast("删除失败");
+      showToast(t("skills.delete_fail"));
     }
-  }, [showToast]);
+  }, [showToast, t]);
 
   const toggleSkill = useCallback(async (key: string) => {
     try {
@@ -68,21 +70,21 @@ export function useSkills(showToast: (msg: string) => void) {
     try {
       await sidecarFetch(`/v1/skills/${key}`, "DELETE");
       setSkills(prev => prev.filter(s => s.key !== key));
-      showToast("技能已删除");
+      showToast(t("skills.deleted"));
     } catch (e) { console.error("Failed to delete skill:", e); }
-  }, [showToast]);
+  }, [showToast, t]);
 
   const addSkill = useCallback(async () => {
-    if (!newSkill.name.trim() || !newSkill.content.trim()) { showToast("请填写技能名称和内容"); return; }
+    if (!newSkill.name.trim() || !newSkill.content.trim()) { showToast(t("skills.fill")); return; }
     try {
       const data = await sidecarFetch("/v1/skills", "POST", { name: newSkill.name, content: newSkill.content });
       if (data.status === "ok") {
         setSkills(prev => [...prev, data.skill]);
         setNewSkill({ name: "", content: "" });
-        showToast("技能已创建");
+        showToast(t("skills.created"));
       }
-    } catch (e) { console.error("Failed to create skill:", e); showToast("创建失败"); }
-  }, [newSkill, showToast]);
+    } catch (e) { console.error("Failed to create skill:", e); showToast(t("skills.create_fail")); }
+  }, [newSkill, showToast, t]);
 
   return { skills, newSkill, setNewSkill, toggleSkill, deleteSkill, addSkill, tavilyKey, saveTavilyKey, deleteTavilyKey };
 }

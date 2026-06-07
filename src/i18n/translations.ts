@@ -213,6 +213,12 @@ const T: Record<string, Record<Lang, string>> = {
   "skills.tavily_delete": { zh: "删除", en: "Delete", ja: "削除", ru: "Удалить" },
   "skills.tavily_save": { zh: "保存", en: "Save", ja: "保存", ru: "Сохранить" },
   "skills.tavily_cancel": { zh: "取消", en: "Cancel", ja: "取消", ru: "Отмена" },
+  "skills.tavily_fill_key": { zh: "请输入 API Key", en: "Please enter API Key", ja: "APIキーを入力", ru: "Введите API ключ" },
+  "skills.tavily_saved": { zh: "Tavily API Key 已保存", en: "Tavily API Key saved", ja: "Tavily APIキー保存済", ru: "Tavily ключ сохранен" },
+  "skills.tavily_deleted": { zh: "Tavily API Key 已删除", en: "Tavily API Key deleted", ja: "Tavily APIキー削除済", ru: "Tavily ключ удален" },
+  "skills.save_fail": { zh: "保存失败", en: "Save failed", ja: "保存失敗", ru: "Ошибка сохранения" },
+  "skills.delete_fail": { zh: "删除失败", en: "Delete failed", ja: "削除失敗", ru: "Ошибка удаления" },
+  "skills.create_fail": { zh: "创建失败", en: "Create failed", ja: "作成失敗", ru: "Ошибка создания" },
   // ── CronView ──
   "cron.running": { zh: "运行中", en: "Running", ja: "実行中", ru: "Работает" },
   "cron.paused": { zh: "已暂停", en: "Paused", ja: "一時停止", ru: "Пауза" },
