@@ -52,7 +52,7 @@ class LocalLLMEngine:
             self.mlx_available = True
             if IS_APPLE_SILICON:
                 self.backend = "mlx"
-        except ImportError:
+        except (ImportError, RuntimeError):
             pass
 
         try:
@@ -60,7 +60,7 @@ class LocalLLMEngine:
             self.llama_cpp_available = True
             if not self.mlx_available:
                 self.backend = "llama-cpp"
-        except ImportError:
+        except (ImportError, RuntimeError):
             pass
 
         if not self.mlx_available and not self.llama_cpp_available:
@@ -881,7 +881,7 @@ def detect_system() -> dict:
         mem = psutil.virtual_memory()
         info["ram_total_gb"] = round(mem.total / (1024**3), 1)
         info["ram_available_gb"] = round(mem.available / (1024**3), 1)
-    except ImportError:
+    except (ImportError, RuntimeError):
         info["ram_total_gb"] = "unknown (pip install psutil)"
 
     # GPU detection
@@ -904,7 +904,7 @@ def detect_system() -> dict:
                 gpu_info["type"] = "cuda"
                 gpu_info["name"] = torch.cuda.get_device_name(0)
                 gpu_info["vram_gb"] = round(torch.cuda.get_device_properties(0).total_memory / (1024**3), 1)
-        except ImportError:
+        except (ImportError, RuntimeError):
             pass
     else:
         try:
@@ -913,7 +913,7 @@ def detect_system() -> dict:
                 gpu_info["type"] = "cuda"
                 gpu_info["name"] = torch.cuda.get_device_name(0)
                 gpu_info["vram_gb"] = round(torch.cuda.get_device_properties(0).total_memory / (1024**3), 1)
-        except ImportError:
+        except (ImportError, RuntimeError):
             pass
 
     info["gpu"] = gpu_info
@@ -968,7 +968,7 @@ def check_setup() -> dict:
             ok.append({"item": f"内存 {ram:.0f}GB", "status": "ok"})
         else:
             issues.append({"item": f"内存 {ram:.0f}GB (建议 ≥16GB)", "status": "warning", "fix": "小模型 (≤3B) 仍可运行"})
-    except ImportError:
+    except (ImportError, RuntimeError):
         pass
 
     try:
@@ -1099,13 +1099,13 @@ def run_fix(fix_type: str, fix_pkg: str = "") -> dict:
                     try:
                         import mlx_lm  # noqa: F401
                         _engine.mlx_available = True
-                    except ImportError:
+                    except (ImportError, RuntimeError):
                         pass
                 elif fix_pkg == "llama-cpp-python":
                     try:
                         import llama_cpp  # noqa: F401
                         _engine.llama_cpp_available = True
-                    except ImportError:
+                    except (ImportError, RuntimeError):
                         pass
                 return {"status": "ok", "output": proc_result.stdout[-500:]}
             return {"status": "error", "output": proc_result.stderr[-500:]}
@@ -1152,7 +1152,7 @@ def estimate_max_context(model_path: str = "") -> dict:
         mem = psutil.virtual_memory()
         avail_gb = mem.available / (1024**3)
         total_gb = mem.total / (1024**3)
-    except ImportError:
+    except (ImportError, RuntimeError):
         if IS_MAC:
             try:
                 # macOS fallback using sysctl

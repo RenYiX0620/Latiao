@@ -44,6 +44,10 @@ import local_llm
 
 logger = logging.getLogger("latiao-sidecar")
 
+# ── MX_APIKEY: set via env var MX_APIKEY ──
+if not os.environ.get("MX_APIKEY"):
+    logger.info("MX_APIKEY not set — 妙想金融技能将不可用")
+
 # In-memory ring buffer for recent log entries (accessible via /v1/logs)
 _log_buffer: deque = deque(maxlen=500)
 
@@ -1370,6 +1374,7 @@ async def _auto_verify(tool_name: str, args: dict, result: str) -> str:
     """Run programmatic verification after a tool executes.
     Returns a verification report to inject into the LLM context, or '' if nothing to verify."""
     checks = []
+    path = ''
 
     if tool_name == "write_file":
         path = args.get("path") or args.get("file") or ""
@@ -2690,7 +2695,7 @@ async def _await_tool_confirmation(call_id: str, tool_name: str, args: dict) -> 
     async with _pending_lock:
         _pending_confirmations[call_id] = {"event": event, "approved": False}
     try:
-        await asyncio.wait_for(event.wait(), timeout=30)
+        await asyncio.wait_for(event.wait(), timeout=120)
         async with _pending_lock:
             approved = _pending_confirmations.get(call_id, {}).get("approved", False)
     except asyncio.TimeoutError:
@@ -2933,7 +2938,8 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
     retry_count = 0
     last_verify_failed = False
     stagnation = 0             # consecutive unproductive iterations
-    max_stagnation = 5          # exit after this many dead-end rounds (was 3, bumped for Gemma)
+    has_called_tool = False
+    max_stagnation = 10          # exit after this many dead-end rounds
     recent_tool_calls: set[str] = set()  # signature = "tool_name:arg_hash"
     iteration = 0
 
@@ -3074,6 +3080,7 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                     "content": streamed_text or None,
                     "tool_calls": tool_calls,
                 })
+                has_called_tool = True
 
                 # Stagnation check: reset if new tool calls, else count toward limit
                 any_new = False
@@ -3099,6 +3106,30 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                 continue
 
             # Text response — already streamed word-by-word
+            # Check if there are pending tasks: model returned text after tool result
+            has_recent_tool_result = any(
+                m.get("role") == "tool" or (isinstance(m.get("content"), str) and m["content"].startswith("[工具结果]"))
+                for m in current_msgs[-3:]
+            )
+            if has_recent_tool_result and iteration < 8 and streamed_text.strip():
+                current_msgs.append({
+                    "role": "system",
+                    "content": (
+                        "⚠️ 你刚才收到了工具的执行结果，但只回复了文字而没有继续调用工具。\n"
+                        "请检查：用户的任务是否真的完全完成了？\n"
+                        "如果还没完成，请继续调用工具。如果确实完成了，请回复最终结果。"
+                    ),
+                })
+                continue
+            if not has_called_tool and iteration <= 3 and streamed_text.strip():
+                # Model hasn't called any tools yet - nudging to use tools instead of planning
+                current_msgs.append({
+                    "role": "system",
+                    "content": (
+                        "不要写执行计划，直接行动。需要用什么工具就立即调用。"
+                    ),
+                })
+                continue
             if not streamed_text.strip() and iteration < 3:
                 logger.warning(f"[AGENT] Iteration {iteration}: empty response from cloud model, retrying")
                 nudge_text = _get_localized_text(lang, {
@@ -3364,25 +3395,25 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
     # Truncate long history to prevent context overflow.
     # Keeps system messages + last 20 user/assistant pairs.
     # Also estimates token count to warn before overflow.
-    if len(current_msgs) > 30:
+    if len(current_msgs) > 50:
         system_msgs = [m for m in current_msgs if m.get("role") == "system"]
         other_msgs = [m for m in current_msgs if m.get("role") != "system"]
-        # Level 1: Prune old tool results: keep last 5, truncate older ones
+        # Level 1: Prune old tool results: keep last 10, truncate older ones
         tool_count = 0
         for m in reversed(other_msgs):
             if m.get("role") == "tool" or (isinstance(m.get("content"), str) and m["content"].startswith("[工具结果]")):
                 tool_count += 1
-                if tool_count > 5:
+                if tool_count > 10:
                     m["content"] = "[已裁剪旧工具输出]"
-        # Level 2: Keep head (first 3) + tail (last 15), discard middle (MUSE-Autoskill style)
-        if len(other_msgs) > 25:
-            head = other_msgs[:3]
-            tail = other_msgs[-15:]
+        # Level 2: Keep head (first 5) + tail (last 25), discard middle (MUSE-Autoskill style)
+        if len(other_msgs) > 40:
+            head = other_msgs[:5]
+            tail = other_msgs[-25:]
             current_msgs = system_msgs + head + [
                 {"role": "system", "content": "[中间对话已压缩。继续当前任务。]"}
             ] + tail
         else:
-            current_msgs = system_msgs + other_msgs[-20:]
+            current_msgs = system_msgs + other_msgs[-30:]
     # Rough token estimate: ~2 chars per token for Chinese
     total_chars = sum(len(str(m.get("content", ""))) for m in current_msgs)
     if total_chars > 60000:
@@ -3400,12 +3431,13 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
     if not session_id:
         session_id = str(uuid.uuid4())
 
-    max_iterations = 15
+    max_iterations = 30
     iteration = 0
     recent_tool_calls: set[str] = set()
     stagnation = 0
-    max_stagnation = 5
-
+    max_stagnation = 10
+    text_only_streak = 0
+    has_called_tool = False
     # Build tool prompt
     last_user_text = _extract_last_user_text(current_msgs)
     agent_tools = _get_agent_tools(agent_id, TOOLS)
@@ -3416,6 +3448,22 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
         others = [t for t in active_tools if t.get("function", {}).get("name") not in essential]
         active_tools = priority + others[:max(0, 8 - len(priority))]
     tools_prompt = _build_local_tools_prompt(active_tools)
+
+    # Detect continuation: if session has tool results but no final answer,
+    # inject a strong continuation nudge in the first system message
+    tool_result_count = sum(1 for m in current_msgs if m.get("role") == "tool" or (isinstance(m.get("content"), str) and m["content"].startswith("[工具结果]")))
+    has_final_answer = any(
+        m.get("role") == "assistant" and isinstance(m.get("content"), str) and len(m["content"]) > 100
+        for m in current_msgs[-5:]
+    ) if len(current_msgs) > 5 else False
+    is_continuation = tool_result_count >= 2 and not has_final_answer
+    if is_continuation:
+        tools_prompt += (
+            "\n\n⚠️⚠️⚠️ 你现在处于任务执行中途！\n"
+            f"会话中已有 {tool_result_count} 条工具执行结果，但任务尚未完成。\n"
+            "你必须继续使用工具完成用户的原始请求，不能只回复文字说'好的'或'正在处理'。\n"
+            "直接调用工具，不要废话。"
+        )
 
     # Inject tools into the first user message context
     for i, m in enumerate(current_msgs):
@@ -3447,9 +3495,9 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                 tool_names = [t.get("function", {}).get("name", "") for t in active_tools if t.get("function", {}).get("name")]
                 names_str = ", ".join(tool_names) if tool_names else "无"
                 current_prompt = (
-                    f"你可以继续使用工具。可用工具: {names_str}。\n"
+                    f"⚠️ 任务尚未完成，你必须继续！可用工具: {names_str}。\n"
                     "格式：```tool 工具名\n{\"参数\":\"值\"}\n```\n"
-                    "不需要工具则直接回复用户。"
+                    "如果当前任务的所有步骤都已完成，才可以直接回复用户。否则必须继续使用工具。"
                 )
             for i, m in enumerate(loop_msgs):
                 if m.get("role") == "system":
@@ -3490,6 +3538,13 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
 
             # Check for tool calls in the streamed text
             clean_text, tool_calls = _parse_prompt_tool_calls(streamed_text)
+            # Also check for native tool call format (Gemma 4 <|tool_call|>)
+            if not tool_calls and _NATIVE_TOOL_RE.search(streamed_text):
+                native_tcs = _parse_native_tool_calls(streamed_text)
+                if native_tcs:
+                    streamed_text = _strip_native_tool_calls(streamed_text)
+                    tool_calls = native_tcs
+
 
             if tool_calls:
                 _track_progress(session_id, "tool_calling", f"{len(tool_calls)} tool(s)")
@@ -3499,6 +3554,7 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                     "role": "assistant",
                     "content": clean_text or "正在调用工具...",
                 })
+                has_called_tool = True
 
                 any_new = False
                 for tc in tool_calls:
@@ -3513,7 +3569,7 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
 
                 if any_new:
                     stagnation = 0
-                else:
+                    text_only_streak = 0
                     stagnation += 1
                     if stagnation >= max_stagnation:
                         yield {"content": f"\n\n⚠️ 连续 {stagnation} 轮无新进展，Agent 停止。如需继续请发新消息。"}
@@ -3521,7 +3577,39 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                 continue
 
             # No tool calls — pure text response done
-            if not streamed_text.strip() and iteration < 3:
+            # Check if there are pending tasks: if the last message is a tool result
+            # and model didn't call another tool, it might have prematurely stopped
+            has_recent_tool_result = any(
+                m.get("role") == "tool" or (isinstance(m.get("content"), str) and m["content"].startswith("[工具结果]"))
+                for m in current_msgs[-3:]
+            )
+            if has_recent_tool_result and text_only_streak < max_stagnation and streamed_text.strip():
+                # Model returned text after a tool result but didn't call another tool.
+                # It might think the task is done when it's not. Force one more check.
+                logger.info(f"[LOCAL-AGENT] Iteration {iteration}: model returned text after tool result, pushing for continuation")
+                current_msgs.append({
+                    "role": "system",
+                    "content": (
+                        "⚠️ 你刚才收到了工具的执行结果，但只回复了文字而没有继续调用工具。\n"
+                        "请检查：用户的任务是否真的完全完成了？\n"
+                        "如果还没完成，请继续调用工具。如果确实完成了，请回复最终结果。\n"
+                        "调用工具格式：```tool 工具名\n{\"参数\":\"值\"}\n```"
+                    ),
+                })
+                text_only_streak += 1
+                continue
+            if not has_called_tool and iteration <= 3 and streamed_text.strip():
+                # Model hasn't called any tools yet and is outputting text (planning instead of doing)
+                logger.info(f"[LOCAL-AGENT] Iteration {iteration}: model planning instead of calling tools, nudging")
+                current_msgs.append({
+                    "role": "system",
+                    "content": (
+                        "不要写执行计划，直接行动。需要用什么工具就立即调用。"
+                    ),
+                })
+                text_only_streak += 1
+                continue
+            if not streamed_text.strip() and text_only_streak < max_stagnation:
                 # Empty response from local model — retry with a nudge
                 logger.warning(f"[LOCAL-AGENT] Iteration {iteration}: empty response, retrying")
                 nudge_text = _get_localized_text(_detect_user_language(_extract_last_user_text(current_msgs)), {
@@ -3629,9 +3717,14 @@ def _build_chat_messages(body: dict, messages: list, matched_skill: str|None = N
         })
         system_parts.append(lang_override)
 
-    # Merge all system parts into one message
-    merged_system = "\n\n".join(system_parts)
-    messages = [{"role": "system", "content": merged_system}] + messages
+    # Merge all system parts into ONE message (frontend may also send system messages
+    # for language / plan mode). Multiple system messages trigger a llama-cpp bug
+    # where the model returns empty content → no tool calls → agent stalls.
+    frontend_systems = [m["content"] for m in messages if m.get("role") == "system"]
+    non_system_msgs = [m for m in messages if m.get("role") != "system"]
+    all_system_parts = system_parts + frontend_systems
+    merged_system = "\n\n".join(all_system_parts)
+    messages = [{"role": "system", "content": merged_system}] + non_system_msgs
 
     image_base64 = body.get("image_base64")
     image_mime = body.get("image_mime", "image/png")
@@ -3861,16 +3954,16 @@ async def chat_completion(request: Request):
                         for m in loop_msgs
                     ]
                     if use_prompt_tools:
-                        # Inject tool prompt as system message before the last user message
+                        # Inject tool prompt into the LAST system message (append, don't create new)
+                        # Creating a second system message triggers a llama-cpp bug → empty response
                         last_sys_idx = -1
                         for i, m in enumerate(loop_msgs):
                             if m.get("role") == "system":
                                 last_sys_idx = i
-                        tool_msg = {"role": "system", "content": local_tools_prompt}
                         if last_sys_idx >= 0:
-                            loop_msgs.insert(last_sys_idx + 1, tool_msg)
+                            loop_msgs[last_sys_idx]["content"] += "\n\n" + local_tools_prompt
                         else:
-                            loop_msgs.insert(0, tool_msg)
+                            loop_msgs.insert(0, {"role": "system", "content": local_tools_prompt})
 
                     if use_prompt_tools:
                         resp = await client.post(api_url, json={
