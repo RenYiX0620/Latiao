@@ -44,12 +44,7 @@ jobs:
           BUNDLE="src-tauri/target/release/bundle"
           DMG_FILE=$(ls "$BUNDLE"/dmg/*.dmg 2>/dev/null | head -1)
           if [ -z "$DMG_FILE" ]; then echo "No DMG"; exit 0; fi
-          echo "$TAURI_SIGNING_PRIVATE_KEY" > /tmp/tauri.key
-          npx @tauri-apps/cli signer sign \
-            --private-key-path /tmp/tauri.key \
-            --password "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" \
-            "$DMG_FILE"
-          rm -f /tmp/tauri.key
+          npx @tauri-apps/cli signer sign             --password "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD"             "$DMG_FILE"
           ls -la "$DMG_FILE.sig" && echo "Signature generated"
 
       - name: Generate manifest
