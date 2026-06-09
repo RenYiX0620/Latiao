@@ -370,6 +370,14 @@ body {
 .btn-send:hover { filter: brightness(1.15); transform: translateY(-1px); box-shadow: 0 4px 16px rgba(56,189,248,0.3); }
 .btn-send:active { transform: translateY(0); }
 .btn-send:disabled { opacity: 0.5; cursor: not-allowed; filter: none; transform: none; box-shadow: none; }
+.btn-stop {
+  padding: 7px 18px; border-radius: var(--radius-md); border: none;
+  background: linear-gradient(135deg, var(--danger), #dc2626); color: #fff;
+  font-size: 12.5px; font-weight: 550; font-family: var(--font-sans); cursor: pointer;
+  transition: all 0.15s ease; flex-shrink: 0;
+}
+.btn-stop:hover { filter: brightness(1.15); transform: translateY(-1px); box-shadow: 0 4px 16px rgba(239,68,68,0.3); }
+.btn-stop:active { transform: translateY(0); }
 
 /* ── Tool Call ── */
 .tool-call {

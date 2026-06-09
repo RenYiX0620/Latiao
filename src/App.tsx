@@ -110,6 +110,7 @@ function App() {
 
   const [prompt, setPrompt] = useState("");
   const [isProcessing, setIsProcessing] = useState(false);
+  const abortControllerRef = useRef<AbortController | null>(null);
   const [pendingFile, setPendingFile] = useState<PendingFile | null>(null);
   const [isRecording, setIsRecording] = useState(false);
   const [cloudModels, setCloudModels] = useState<CloudModel[]>([]);
@@ -536,6 +537,7 @@ function App() {
   const streamChat = async (
     messages: Record<string, unknown>[],
     opts?: { model?: string; agent?: string; cloudConfig?: Record<string, unknown>; skipTools?: boolean },
+    signal?: AbortSignal,
   ): Promise<string> => {
     const body: Record<string, unknown> = { messages, stream: true };
     if (opts?.model) body.model = opts.model;
@@ -546,7 +548,7 @@ function App() {
     let response: Response;
     try {
       response = await fetch(SIDECAR + "/v1/chat/completions", {
-        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal,
       });
     } catch (e) {
       throw new Error(`无法连接 Sidecar\n原始错误: ${e}`);
@@ -638,6 +640,16 @@ function App() {
     } catch (e) { console.error(e) }
   }, [showToast, setMessages, t]);
 
+  const stopGeneration = useCallback(() => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+    setIsProcessing(false);
+    setPendingFile(null);
+    setAgentPhase("");
+  }, []);
+
   /* ── Send Message ── */
   const sendMessage = async () => {
     const text = prompt;
@@ -668,7 +680,9 @@ function App() {
       if (session.selectedModel) opts.model = session.selectedModel;
       if (cloudCfg) opts.cloudConfig = { key: cloudCfg.key, endpoint: cloudCfg.endpoint, protocol: cloudCfg.protocol || "openai" };
 
-      await streamChat(apiMessages, opts);
+      const controller = new AbortController();
+      abortControllerRef.current = controller;
+      await streamChat(apiMessages, opts, controller.signal);
     } catch (e) {
       setMessages((prev) => {
         const msgs = [...prev];
@@ -677,6 +691,7 @@ function App() {
         return msgs;
       });
     } finally {
+      abortControllerRef.current = null;
       setIsProcessing(false);
       setPendingFile(null);
       setAgentPhase("");
@@ -906,7 +921,7 @@ function App() {
             planMode={planMode} setPlanMode={setPlanMode}
             fileInputRef={fileInputRef} mediaRecorderRef={mediaRecorderRef}
             isRecording={isRecording}
-            sendMessage={sendMessage} handleFileSelect={handleFileSelect}
+            sendMessage={sendMessage} onStop={stopGeneration} handleFileSelect={handleFileSelect}
             startRecording={startRecording} confirmTool={confirmTool}
             chatEndRef={chatEndRef} handleDrop={handleDrop}
             onPasteImage={(file) => processImageFile(file, `截图 ${new Date().toLocaleTimeString()}`)}

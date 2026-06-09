@@ -1,51 +1,58 @@
 {
-  "$schema": "https://schema.tauri.app/config/2.0.0",
-  "productName": "Latiao",
-  "version": "0.1.0",
-  "identifier": "com.latiao.desktop",
-  "build": {
-    "beforeDevCommand": "npm run dev",
-    "beforeBuildCommand": "npm run build",
-    "devUrl": "http://localhost:1420",
-    "frontendDist": "../dist"
-  },
-  "app": {
-    "windows": [
-      {
-        "fullscreen": false,
-        "resizable": true,
-        "title": "辣条 Latiao",
-        "width": 1200,
-        "height": 800,
-        "useHttpsScheme": false
-      }
-    ],
-    "security": {
-      "csp": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self' http://127.0.0.1:8000 https://huggingface.co https://api.deepseek.com https://api.openai.com https://api.anthropic.com https://generativelanguage.googleapis.com; img-src 'self' data: blob:; media-src 'self' data: blob:; font-src 'self' data:; worker-src 'self' blob:"
-    }
-  },
-  "bundle": {
-    "active": true,
-    "targets": "all",
-    "resources": {
-      "../sidecar": "sidecar"
+    "$schema": "https://schema.tauri.app/config/2.0.0",
+    "productName": "Latiao",
+    "version": "0.1.0",
+    "identifier": "com.latiao.desktop",
+    "build": {
+        "beforeDevCommand": "npm run dev",
+        "beforeBuildCommand": "npm run build",
+        "devUrl": "http://localhost:1420",
+        "frontendDist": "../dist"
     },
-
-    "icon": [
-      "icons/32x32.png",
-      "icons/128x128.png",
-      "icons/128x128@2x.png",
-      "icons/icon.icns",
-      "icons/icon.ico"
-    ]
-  },
-  "plugins": {
-    "shell": {
-      "allow": [
-        {
-          "name": "sidecar/*"
+    "app": {
+        "windows": [
+            {
+                "fullscreen": false,
+                "resizable": true,
+                "title": "\u8fa3\u6761 Latiao",
+                "width": 1200,
+                "height": 800,
+                "useHttpsScheme": false
+            }
+        ],
+        "security": {
+            "csp": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self' http://127.0.0.1:8000 https://huggingface.co https://api.deepseek.com https://api.openai.com https://api.anthropic.com https://generativelanguage.googleapis.com; img-src 'self' data: blob:; media-src 'self' data: blob:; font-src 'self' data:; worker-src 'self' blob: https://github.com"
         }
-      ]
+    },
+    "bundle": {
+        "active": true,
+        "targets": "all",
+        "resources": {
+            "../sidecar": "sidecar"
+        },
+        "icon": [
+            "icons/32x32.png",
+            "icons/128x128.png",
+            "icons/128x128@2x.png",
+            "icons/icon.icns",
+            "icons/icon.ico"
+        ]
+    },
+    "plugins": {
+        "shell": {
+            "allow": [
+                {
+                    "name": "sidecar/*"
+                }
+            ]
+        },
+        "updater": {
+            "active": true,
+            "endpoints": [
+                "https://github.com/RenYiX0620/Latiao/releases/latest/download/latest.json"
+            ],
+            "dialog": true,
+            "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEFBRTI4MTkyMjI1NzI1NTYKUldSV0pWY2lrb0hpcXAvbW9sRVFNQzVaZkU5eFBBRkh3dHZwdzcyUUczRU9HMTFzN0t2RWhCZWYK"
+        }
     }
-  }
 }

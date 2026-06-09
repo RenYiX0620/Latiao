@@ -18,3 +18,5 @@ skills/
 .codegraph/
 .mcp.json
 sidecar/main.py.deploy
+tauri-key
+tauri-key.pub

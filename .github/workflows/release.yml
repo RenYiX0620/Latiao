@@ -1,0 +1,85 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  release:
+    name: Build & Release
+    runs-on: macos-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: "npm"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Rust dependencies
+        run: |
+          npm install
+
+      - name: Build the app
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+        run: |
+          cd sidecar
+          python3 -m venv venv
+          source venv/bin/activate
+          pip install -r requirements.txt
+          cd ..
+          npm run tauri build
+
+      - name: Generate update manifest
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          DMG="src-tauri/target/release/bundle/dmg/Latiao_${VERSION}_aarch64.dmg"
+          SIG="${DMG}.sig"
+
+          if [ -f "$DMG" ] && [ -f "$SIG" ]; then
+            SIGNATURE=$(cat "$SIG")
+            cat > src-tauri/target/release/bundle/dmg/latest.json << EOF
+      {
+        "version": "${VERSION}",
+        "notes": "Latiao v${VERSION}",
+        "pub_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+        "platforms": {
+          "darwin-aarch64": {
+            "url": "https://github.com/RenYiX0620/Latiao/releases/download/${GITHUB_REF_NAME}/Latiao_${VERSION}_aarch64.dmg",
+            "signature": "${SIGNATURE}"
+          }
+        }
+      }
+      EOF
+            echo "latest.json generated"
+          else
+            echo "ERROR: DMG or SIG not found"
+            ls -la src-tauri/target/release/bundle/dmg/ || true
+            exit 1
+          fi
+
+      - name: Upload Release Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            src-tauri/target/release/bundle/dmg/*.dmg
+            src-tauri/target/release/bundle/dmg/*.sig
+            src-tauri/target/release/bundle/dmg/latest.json
+          draft: false
+          generate_release_notes: true

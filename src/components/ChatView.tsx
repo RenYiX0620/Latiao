@@ -36,6 +36,7 @@ interface ChatViewProps {
   fileInputRef: React.RefObject<HTMLInputElement | null>;
   mediaRecorderRef: React.MutableRefObject<MediaRecorder | null>;
   isRecording: boolean;
+  onStop: () => void;
   sendMessage: () => void;
   handleFileSelect: (e: React.ChangeEvent<HTMLInputElement>) => void;
   startRecording: () => void;
@@ -49,7 +50,7 @@ export default memo(function ChatView({
   messages, isProcessing, pendingFile, setPendingFile,
   prompt, setPrompt, planMode, setPlanMode,
   fileInputRef, mediaRecorderRef, isRecording,
-  sendMessage, handleFileSelect, startRecording, confirmTool,
+  sendMessage, onStop, handleFileSelect, startRecording, confirmTool,
   chatEndRef, handleDrop, onPasteImage,
 }: ChatViewProps) {
   const { t } = useTranslation();
@@ -190,7 +191,11 @@ export default memo(function ChatView({
             onClick={() => setPlanMode(!planMode)} title={t("chat.plan_mode")}>
             📋 {t("chat.plan_mode_btn")}
           </button>
-          <button className="btn-send" onClick={handleSend} disabled={isProcessing}>{t("chat.send")}</button>
+          {isProcessing ? (
+            <button className="btn-stop" onClick={onStop}>⏹ {t("chat.stop")}</button>
+          ) : (
+            <button className="btn-send" onClick={handleSend}>{t("chat.send")}</button>
+          )}
         </div>
       </div>
     </>

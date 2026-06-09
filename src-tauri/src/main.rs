@@ -248,6 +248,7 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(SidecarProcess(Mutex::new(sidecar)))
         .invoke_handler(tauri::generate_handler![sidecar_proxy, restart_sidecar, store_secret, get_secret, delete_secret, open_model_dir])
         .run(tauri::generate_context!())
