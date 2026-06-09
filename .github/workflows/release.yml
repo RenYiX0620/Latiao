@@ -7,7 +7,7 @@ on:
 
 jobs:
   release:
-    name: Build & Release
+    name: "Build and Release"
     runs-on: macos-latest
     permissions:
       contents: write
@@ -25,14 +25,13 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.14"
+          python-version: "3.13"
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install Rust dependencies
-        run: |
-          npm install
+      - name: Install npm dependencies
+        run: npm install
 
       - name: Build the app
         env:
@@ -51,22 +50,11 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           DMG="src-tauri/target/release/bundle/dmg/Latiao_${VERSION}_aarch64.dmg"
           SIG="${DMG}.sig"
-
           if [ -f "$DMG" ] && [ -f "$SIG" ]; then
             SIGNATURE=$(cat "$SIG")
-            cat > src-tauri/target/release/bundle/dmg/latest.json << EOF
-      {
-        "version": "${VERSION}",
-        "notes": "Latiao v${VERSION}",
-        "pub_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-        "platforms": {
-          "darwin-aarch64": {
-            "url": "https://github.com/RenYiX0620/Latiao/releases/download/${GITHUB_REF_NAME}/Latiao_${VERSION}_aarch64.dmg",
-            "signature": "${SIGNATURE}"
-          }
-        }
-      }
-      EOF
+            printf '{"version":"%s","notes":"Latiao v%s","pub_date":"%s","platforms":{"darwin-aarch64":{"url":"https://github.com/RenYiX0620/Latiao/releases/download/%s/Latiao_%s_aarch64.dmg","signature":"%s"}}}\n' \
+              "$VERSION" "$VERSION" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$GITHUB_REF_NAME" "$VERSION" "$SIGNATURE" \
+              > src-tauri/target/release/bundle/dmg/latest.json
             echo "latest.json generated"
           else
             echo "ERROR: DMG or SIG not found"
@@ -75,7 +63,7 @@ jobs:
           fi
 
       - name: Upload Release Assets
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v1
         with:
           files: |
             src-tauri/target/release/bundle/dmg/*.dmg
