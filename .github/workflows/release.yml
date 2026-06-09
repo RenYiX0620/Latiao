@@ -36,17 +36,33 @@ jobs:
           cd ..
           npm run tauri build
 
-      - name: Generate manifest and upload
+      - name: Sign DMG
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+        run: |
+          BUNDLE="src-tauri/target/release/bundle"
+          DMG_FILE=$(ls "$BUNDLE"/dmg/*.dmg 2>/dev/null | head -1)
+          if [ -z "$DMG_FILE" ]; then echo "No DMG"; exit 0; fi
+          echo "$TAURI_SIGNING_PRIVATE_KEY" > /tmp/tauri.key
+          npx @tauri-apps/cli signer sign \
+            --file "$DMG_FILE" \
+            --private-key-path /tmp/tauri.key \
+            --password "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD"
+          rm -f /tmp/tauri.key
+          ls -la "$DMG_FILE.sig" && echo "Signature generated"
+
+      - name: Generate manifest
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           BUNDLE="src-tauri/target/release/bundle"
           DMG_FILE=$(ls "$BUNDLE"/dmg/*.dmg 2>/dev/null | head -1)
           SIG_FILE=$(find "$BUNDLE" -name "*.sig" 2>/dev/null | head -1)
           echo "=== Build artifacts ==="
-          ls -la "$BUNDLE"/dmg/ 2>/dev/null || true
+          find "$BUNDLE" -type f | sort
           if [ -z "$DMG_FILE" ]; then echo "ERROR: no DMG"; exit 1; fi
           SIG=$(cat "$SIG_FILE" 2>/dev/null || echo "")
-          echo "{\"version\":\"$VERSION\",\"notes\":\"Latiao v$VERSION\",\"pub_date\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"platforms\":{\"darwin-aarch64\":{\"url\":\"https://github.com/RenYiX0620/Latiao/releases/download/$GITHUB_REF_NAME/Latiao_${VERSION}_aarch64.dmg\",\"signature\":\"$SIG\"}}}" > "$BUNDLE/dmg/latest.json"
+          echo '{"version":"'$VERSION'","notes":"Latiao v'$VERSION'","pub_date":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'","platforms":{"darwin-aarch64":{"url":"https://github.com/RenYiX0620/Latiao/releases/download/'$GITHUB_REF_NAME'/Latiao_'$VERSION'_aarch64.dmg","signature":"'$SIG'"}}}' > "$BUNDLE/dmg/latest.json"
           echo "Manifest: $(cat "$BUNDLE/dmg/latest.json")"
 
       - uses: softprops/action-gh-release@v2
