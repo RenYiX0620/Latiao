@@ -46,9 +46,9 @@ jobs:
           if [ -z "$DMG_FILE" ]; then echo "No DMG"; exit 0; fi
           echo "$TAURI_SIGNING_PRIVATE_KEY" > /tmp/tauri.key
           npx @tauri-apps/cli signer sign \
-            --file "$DMG_FILE" \
             --private-key-path /tmp/tauri.key \
-            --password "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD"
+            --password "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" \
+            "$DMG_FILE"
           rm -f /tmp/tauri.key
           ls -la "$DMG_FILE.sig" && echo "Signature generated"
 
