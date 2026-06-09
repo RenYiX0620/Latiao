@@ -20,3 +20,6 @@ skills/
 sidecar/main.py.deploy
 tauri-key
 tauri-key.pub
+tauri-key
+tauri-key.pub
+outputs/
