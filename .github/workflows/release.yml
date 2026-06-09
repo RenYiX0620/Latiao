@@ -45,29 +45,55 @@ jobs:
           cd ..
           npm run tauri build
 
+      - name: Verify build artifacts
+        run: |
+          echo "=== Bundle directory ==="
+          ls -la src-tauri/target/release/bundle/ || true
+          echo "=== DMG ==="
+          ls -la src-tauri/target/release/bundle/dmg/ || true
+          echo "=== macOS (tar.gz) ==="
+          ls -la src-tauri/target/release/bundle/macos/ || true
+          echo "=== Any .sig files ==="
+          find src-tauri/target/release/bundle/ -name "*.sig" 2>/dev/null || echo "No .sig files found"
+
       - name: Generate update manifest
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           DMG="src-tauri/target/release/bundle/dmg/Latiao_${VERSION}_aarch64.dmg"
           SIG="${DMG}.sig"
-          if [ -f "$DMG" ] && [ -f "$SIG" ]; then
-            SIGNATURE=$(cat "$SIG")
-            printf '{"version":"%s","notes":"Latiao v%s","pub_date":"%s","platforms":{"darwin-aarch64":{"url":"https://github.com/RenYiX0620/Latiao/releases/download/%s/Latiao_%s_aarch64.dmg","signature":"%s"}}}\n' \
-              "$VERSION" "$VERSION" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$GITHUB_REF_NAME" "$VERSION" "$SIGNATURE" \
-              > src-tauri/target/release/bundle/dmg/latest.json
+
+          # Also try app.tar.gz for updater
+          TARBALL=$(ls src-tauri/target/release/bundle/macos/Latiao_${VERSION}_aarch64*.tar.* 2>/dev/null | head -1)
+          TARBALL_SIG="${TARBALL}.sig" 2>/dev/null || true
+
+          # Check for .sig files from various sources
+          SIG_FILE=$(find src-tauri/target/release/bundle/ -name "*.sig" 2>/dev/null | head -1)
+
+          if [ -f "$DMG" ]; then
+            if [ -n "$SIG_FILE" ]; then
+              SIGNATURE=$(cat "$SIG_FILE")
+            else
+              SIGNATURE=""
+              echo "WARNING: No signature file found, update will not be verified"
+            fi
+            printf '{"version":"%s","notes":"Latiao v%s","pub_date":"%s","platforms":{"darwin-aarch64":{"url":"https://github.com/RenYiX0620/Latiao/releases/download/%s/Latiao_%s_aarch64.dmg","signature":"%s"}}}
+'               "$VERSION" "$VERSION" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$GITHUB_REF_NAME" "$VERSION" "$SIGNATURE"               > src-tauri/target/release/bundle/dmg/latest.json
             echo "latest.json generated"
           else
-            echo "ERROR: DMG or SIG not found"
+            echo "ERROR: DMG not found (looking for: $DMG)"
             ls -la src-tauri/target/release/bundle/dmg/ || true
+            ls -la src-tauri/target/release/bundle/macos/ 2>/dev/null || true
             exit 1
           fi
 
       - name: Upload Release Assets
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           files: |
             src-tauri/target/release/bundle/dmg/*.dmg
             src-tauri/target/release/bundle/dmg/*.sig
             src-tauri/target/release/bundle/dmg/latest.json
+            src-tauri/target/release/bundle/macos/*.tar.*
+            src-tauri/target/release/bundle/macos/*.sig
           draft: false
           generate_release_notes: true
