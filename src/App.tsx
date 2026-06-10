@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import { fetch } from "@tauri-apps/plugin-http";
 import { invoke } from "@tauri-apps/api/core";
-import type { Message, PendingFile, SessionInfo, IdentityFile, ViewId, CloudModel, DownloadState, HFModelResult, LLMStatus } from "./types";
+import type { Message, PendingFile, SessionInfo, ViewId, CloudModel, DownloadState, HFModelResult, LLMStatus } from "./types";
 // API keys stored in OS keychain via Rust commands (store_secret/get_secret/delete_secret)
 import { useSessions } from "./hooks/useSessions";
 import { sidecarFetch, waitForSidecar } from "./utils/api";
@@ -106,7 +106,6 @@ function App() {
     try { const saved = localStorage.getItem("local_ai_os_plan_mode"); return saved ? JSON.parse(saved) : false; }
     catch (e) { console.error(e); return false; }
   });
-  const [identityFiles, setIdentityFiles] = useState<IdentityFile[]>([]);
 
   const [prompt, setPrompt] = useState("");
   const [isProcessing, setIsProcessing] = useState(false);
@@ -232,20 +231,6 @@ function App() {
     return () => clearTimeout(timer);
   }, [cloudModels, cloudModelsLoaded]);
 
-  const fetchIdentityFiles = async () => {
-    try {
-      const resp = await fetch(SIDECAR + "/v1/identity");
-      const data = await resp.json();
-      if (data.status === "ok") setIdentityFiles(data.files);
-    } catch { /* sidecar not running */ }
-  };
-  const openIdentityFile = async (filename: string) => {
-    try {
-      await fetch(`${SIDECAR}/v1/identity/open/${filename}`, { method: "POST" });
-      setTimeout(fetchIdentityFiles, 500);
-    } catch (e) { console.error(e) }
-  };
-  useEffect(() => { fetchIdentityFiles(); }, []);
 
   const [fetchDiag, setFetchDiag] = useState("🔍 正在获取...");
 
@@ -901,16 +886,6 @@ function App() {
           )}
         </div>
 
-        <div className="identity-bar">
-          <span className="identity-label">{t("sidebar.identity")}</span>
-          {identityFiles.map((f) => (
-            <span key={f.name} className={`identity-chip ${f.exists ? "active" : "inactive"}`}
-              onClick={() => openIdentityFile(f.name)}>
-              <span className="chip-dot">●</span> {f.name}
-            </span>
-          ))}
-          <span className="flex-spacer"></span>
-        </div>
 
         {/* ═══ Chat View ═══ */}
         <div className={`view-panel${activeView === "chat" ? " active" : ""}`} id="view-chat">

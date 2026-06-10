@@ -105,6 +105,14 @@ export default function AgentView({ activeAgent, setActiveAgent, showToast }: Ag
     } catch (e) { console.error("Agent operation failed:", e); showToast(t("agent.conn_fail")); }
   };
 
+  const handleOpenFile = async (id: string, section?: string) => {
+    try {
+      const url = "/v1/identity/open/" + id + (section ? "?section=" + section : "");
+      const data = await sidecarFetch(url, "POST");
+      if (data.status !== "ok") showToast(data.message || "打开失败");
+    } catch { showToast(t("agent.conn_fail")); }
+  };
+
   const handleDelete = async (id: string) => {
     try {
       const data = await sidecarFetch("/v1/agents/" + id, "DELETE");
@@ -159,7 +167,7 @@ export default function AgentView({ activeAgent, setActiveAgent, showToast }: Ag
       )}
 
       {agents.map((a) => (
-        <div key={a.id} className={`agent-row${activeAgent === a.id ? " current" : ""}`}>
+        <div key={a.id} className={`agent-row${activeAgent === a.id ? " current" : ""}`} onClick={() => handleOpenFile(a.id)} style={{cursor:"pointer"}}>
           <span style={{ fontSize: 24, flexShrink: 0 }}>{a.custom ? "🧩" : "✨"}</span>
           <div style={{ flex: 1, minWidth: 0 }}>
             <div style={{ fontSize: 13, fontWeight: 600, display: "flex", alignItems: "center", gap: 8 }}>
@@ -169,7 +177,7 @@ export default function AgentView({ activeAgent, setActiveAgent, showToast }: Ag
             <div style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 2 }}>{a.display.includes("_display") ? t(a.display) : a.display}</div>
             <div style={{ display: "flex", gap: 4, marginTop: 6 }}>
               {(BUILTIN_IDENTITY[a.id] || ["CUSTOM"]).map((label, j) => label ? (
-                <span key={j} className="identity-chip active">
+                <span key={j} className="identity-chip active" onClick={(e) => { e.stopPropagation(); handleOpenFile(a.id, label); }}>
                   <span className="chip-dot">●</span> {label}
                 </span>
               ) : null)}

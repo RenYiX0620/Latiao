@@ -228,12 +228,29 @@ IS_MACOS = platform.system() == "Darwin"
 AGENTS_DIR = Path(__file__).parent / "agents"
 
 def _load_agent_identity(agent_id: str, fallback: str) -> str:
-    """Load agent identity from agents/{agent_id}.txt, falling back to hardcoded string."""
-    agent_file = AGENTS_DIR / f"{agent_id}.txt"
+    """Load agent identity from agents/{agent_id}.txt or merge from section files."""
+    agents_dir = Path(__file__).resolve().parent / "agents"
+    
+    # Try loading from section files first (latiao_IDENTITY.txt + latiao_SOUL.txt + ...)
+    sections = ["IDENTITY", "SOUL", "AGENTS", "USER"]
+    parts = []
+    for section in sections:
+        sf = agents_dir / f"{agent_id}_{section}.txt"
+        if sf.exists():
+            txt = sf.read_text().strip()
+            header = f"# {agent_id} - {section}"
+            if txt and txt != header and txt != f"{header}\n\n（此部分内容待补充）":
+                parts.append(f"## {section}\n{txt}")
+    
+    if parts:
+        return "\n\n".join(parts)
+    
+    # Fall back to combined identity file
+    agent_file = agents_dir / f"{agent_id}.txt"
     if agent_file.exists():
         try:
-            return agent_file.read_text(encoding="utf-8").strip()
-        except (OSError, UnicodeDecodeError) as e:
+            return agent_file.read_text()
+        except Exception as e:
             logger.warning("Failed to load agent identity from %s: %s", agent_file, e)
     return fallback
 
@@ -2971,9 +2988,9 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
     agent_tools = _get_agent_tools(agent_id, TOOLS)
     active_tools = _filter_tools(last_user_text, agent_tools) if last_user_text else agent_tools
     # Cap tools at 5 to prevent overflowing model context with large definitions
-    if len(active_tools) > 5:
+    if len(active_tools) > 7:
         # Keep most important: read/write/list + the first 2 matching intent tools
-        essential = {"read_file", "write_file", "list_dir"}
+        essential = {"read_file", "write_file", "list_dir", "tavily_search"}
         priority = [t for t in active_tools if t.get("function", {}).get("name") in essential]
         others = [t for t in active_tools if t.get("function", {}).get("name") not in essential]
         active_tools = priority + others[:max(0, 5 - len(priority))]
@@ -3443,7 +3460,7 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
     agent_tools = _get_agent_tools(agent_id, TOOLS)
     active_tools = _filter_tools(last_user_text, agent_tools) if last_user_text else agent_tools
     if len(active_tools) > 8:
-        essential = {"read_file", "write_file", "list_dir"}
+        essential = {"read_file", "write_file", "list_dir", "tavily_search"}
         priority = [t for t in active_tools if t.get("function", {}).get("name") in essential]
         others = [t for t in active_tools if t.get("function", {}).get("name") not in essential]
         active_tools = priority + others[:max(0, 8 - len(priority))]
@@ -3933,7 +3950,7 @@ async def chat_completion(request: Request):
         # Cap tools: 5 for native function calling, 8 for prompt-based (less overhead)
         tool_cap = 8 if use_prompt_tools else 5
         if len(active_tools_ns) > tool_cap:
-            essential = {"read_file", "write_file", "list_dir"}
+            essential = {"read_file", "write_file", "list_dir", "tavily_search"}
             priority_ns = [t for t in active_tools_ns if t.get("function", {}).get("name") in essential]
             others_ns = [t for t in active_tools_ns if t.get("function", {}).get("name") not in essential]
             active_tools = priority_ns + others_ns[:max(0, tool_cap - len(priority_ns))]
@@ -4329,29 +4346,6 @@ async def get_identity():
         except Exception:
             files.append({"name": filename, "exists": False, "content": ""})
     return {"status": "ok", "files": files}
-
-
-@app.post("/v1/identity/open/{filename}")
-async def open_identity_file(filename: str):
-    """Open an identity file in the system's default editor."""
-    if filename not in IDENTITY_FILES:
-        return {"status": "error", "message": f"Unknown identity file: {filename}"}
-
-    filepath = PROGRESS_DIR / filename
-    try:
-        PROGRESS_DIR.mkdir(parents=True, exist_ok=True)
-        if not filepath.exists():
-            # Create the file first if it doesn't exist
-            _create_default_identity()
-        if platform.system() == "Darwin":
-            subprocess.Popen(["open", str(filepath)])
-        elif platform.system() == "Windows":
-            os.startfile(str(filepath))
-        else:
-            subprocess.Popen(["xdg-open", str(filepath)])
-        return {"status": "ok", "message": f"Opened {filename}"}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
 
 
 # ── Agent management endpoints ──
@@ -5252,8 +5246,8 @@ async def _execute_cron_job(job: dict):
     model = os.environ.get("LATIAO_SUBAGENT_MODEL", SUBAGENT_MODEL)
     agent_tools = _get_agent_tools("latiao", TOOLS)
     active_tools = _filter_tools(task, agent_tools)
-    if len(active_tools) > 5:
-        essential = {"read_file", "write_file", "list_dir"}
+    if len(active_tools) > 7:
+        essential = {"read_file", "write_file", "list_dir", "tavily_search"}
         priority = [t for t in active_tools if t.get("function", {}).get("name") in essential]
         others = [t for t in active_tools if t.get("function", {}).get("name") not in essential]
         active_tools = priority + others[:max(0, 5 - len(priority))]
@@ -5353,6 +5347,26 @@ async def _cron_loop():
         except Exception:
             logger.warning("Cron loop error", exc_info=True)
 
+
+
+@app.post("/v1/identity/open/{agent_id}")
+async def api_open_identity(agent_id: str, section: str = ""):
+    """Open the agent identity file (or section file) with the system default editor."""
+    agents_dir = Path(__file__).resolve().parent / "agents"
+    if section:
+        agent_file = agents_dir / f"{agent_id}_{section}.txt"
+        if not agent_file.exists():
+            agent_file.write_text(f"# {agent_id} - {section}\n\n（此部分内容待补充）\n")
+    else:
+        agent_file = agents_dir / f"{agent_id}.txt"
+    if not agent_file.exists():
+        return {"status": "error", "message": f"Not found: {agent_id}" + (f"_{section}" if section else "")}
+    try:
+        import subprocess
+        subprocess.Popen(["open", str(agent_file)])
+        return {"status": "ok"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 if __name__ == "__main__":
     import uvicorn
