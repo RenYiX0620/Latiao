@@ -55,9 +55,11 @@ def _auto_cache_type(model_path: str) -> tuple[int, int]:
     ggml_type: F16=1, Q4_0=2, Q8_0=8"""
     bits = _detect_model_bits(model_path)
     if bits <= 4:
-        return (2, 2)    # Q4 model → Q4_0 KV
+        return (2, 2)    # Q4 model → Q4_0 KV (max memory savings)
+    elif bits <= 8:
+        return (8, 8)    # Q5-Q8 model → Q8_0 KV (balanced)
     else:
-        return (8, 8)    # Q5+ model → Q8_0 KV
+        return (8, 8)    # F16+ model → Q8_0 KV
 
 IS_MAC = platform.system() == "Darwin"
 IS_WINDOWS = platform.system() == "Windows"
@@ -666,7 +668,6 @@ class LocalLLMEngine:
             # Q4 model → Q4_0 KV; Q5+ model → Q8_0 KV
             kv_k, kv_v = _auto_cache_type(model_path)
             cmd += ["--type_k", str(kv_k), "--type_v", str(kv_v)]
-            # Flash attention — reduce attention memory overhead
             cmd += ["--flash_attn", "1"]
             # Enable function calling via chat format for models that support it
             chat_fmt = self._guess_chat_format(model_path)

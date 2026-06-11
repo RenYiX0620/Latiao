@@ -9,7 +9,6 @@ import base64
 from collections import deque
 import contextvars
 import fnmatch
-import importlib.util
 import io
 import json
 import logging
@@ -34,7 +33,9 @@ except ImportError:
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
-
+from tool_system import load_plugins
+from config import LM_STUDIO_URL, SUBAGENT_MODEL, SKILLS_DIR
+from memory import _tokenize_zh, _quick_reflect, _build_learning_context, _extract_learnings_heuristic, _maybe_generate_skill, _refine_learnings, _get_recent_learnings, _summarize_learning, _retrieve_preferences, _record_reflection, _get_high_confidence_preferences
 import httpx
 from fastapi import FastAPI, File, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -83,6 +84,8 @@ logger.info("Sidecar 启动")
 # huggingface — 国内网络可用 hf-mirror.com 镜像
 # os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
+
+from identity import _load_agent_identity, IDENTITY_FILES, _read_identity, _create_default_identity, _detect_identity_intent, _apply_name_change, _apply_style_change, _apply_rule_change, _apply_pref_change, _process_identity_intents
 # ═══════════════════════════════════════════════════════
 #  Smart Skill System: Auto-match & load skills on demand
 # ═══════════════════════════════════════════════════════
@@ -90,6 +93,8 @@ logger.info("Sidecar 启动")
 SKILL_INDEX: dict[str, dict] = {}
 PROJECT_ROOT = Path(__file__).parent  # sidecar/
 SKILLS_DIR = PROJECT_ROOT / "skills"
+
+# TF-IDF cache for learnings (avoid rebuilding every search)
 
 def _load_skill_index():
     """Scan all skills in ./skills/ directory and build index of their metadata."""
@@ -132,17 +137,25 @@ def _load_skill_index():
     logger.info(f"Loaded {len(SKILL_INDEX)} skills into index")
 
 def _match_skill_keywords(user_query: str) -> str | None:
-    """Simple keyword-based skill matching for local models (no API call)."""
-    lower = user_query.lower()
+    """Match user query against skill keywords using overlap scoring."""
+    if not user_query or not SKILL_INDEX:
+        return None
+    query_lower = user_query.lower()
+    q_words = set(query_lower.split())
+    best_match = None
+    best_score = 0
     for name, skill in SKILL_INDEX.items():
-        desc = skill.get("description", "").lower()
-        # Match skill name or keywords from description
-        if name.lower() in lower or any(
-            kw in lower for kw in desc.replace("—", " ").replace("-", " ").split()
-            if len(kw) > 2
-        ):
-            return name
-    return None
+        if not _is_skill_enabled(name):
+            continue
+        kw_text = (name + " " + skill.get("description", "")).lower()
+        kw_words = set(kw_text.split())
+        overlap = len(q_words & kw_words)
+        if name.lower() in query_lower:
+            overlap += 5
+        if overlap > best_score:
+            best_score = overlap
+            best_match = skill.get("content", "")
+    return best_match if best_score >= 1 else None
 
 async def _match_skill(user_query: str) -> str | None:
     """Intelligently match user query to the most appropriate skill."""
@@ -155,6 +168,8 @@ async def _match_skill(user_query: str) -> str | None:
     # Build skill list for LLM to choose from
     skill_list = []
     for name, skill in SKILL_INDEX.items():
+        if not _is_skill_enabled(name):
+            continue
         skill_list.append(f"- {name}: {skill['description']}")
     skill_list_str = "\n".join(skill_list)
     # Lightweight prompt to match skill, no tool calls needed
@@ -235,33 +250,6 @@ IS_MACOS = platform.system() == "Darwin"
 # ═══════════════════════════════════════════════════════
 
 AGENTS_DIR = Path(__file__).parent / "agents"
-
-def _load_agent_identity(agent_id: str, fallback: str) -> str:
-    """Load agent identity from agents/{agent_id}.txt or merge from section files."""
-    agents_dir = Path(__file__).resolve().parent / "agents"
-    
-    # Try loading from section files first (latiao_IDENTITY.txt + latiao_SOUL.txt + ...)
-    sections = ["IDENTITY", "SOUL", "AGENTS", "USER"]
-    parts = []
-    for section in sections:
-        sf = agents_dir / f"{agent_id}_{section}.txt"
-        if sf.exists():
-            txt = sf.read_text().strip()
-            header = f"# {agent_id} - {section}"
-            if txt and txt != header and txt != f"{header}\n\n（此部分内容待补充）":
-                parts.append(f"## {section}\n{txt}")
-    
-    if parts:
-        return "\n\n".join(parts)
-    
-    # Fall back to combined identity file
-    agent_file = agents_dir / f"{agent_id}.txt"
-    if agent_file.exists():
-        try:
-            return agent_file.read_text()
-        except Exception as e:
-            logger.warning("Failed to load agent identity from %s: %s", agent_file, e)
-    return fallback
 
 
 AGENT_PROFILES: dict[str, dict] = {
@@ -383,7 +371,6 @@ CONFIG_FILE = PROGRESS_DIR / "config.json"
 _merge_agents()
 
 # Identity files that collectively define the agent
-IDENTITY_FILES = ["IDENTITY.md", "SOUL.md", "AGENTS.md", "USER.md"]
 
 # Custom permission rules loaded from ~/.local-ai-os/permissions.json
 _custom_permissions: list[dict] = []
@@ -435,68 +422,6 @@ def _resolve_permission(tool_name: str, args: dict) -> str:
     return TOOL_PERMISSIONS.get(tool_name, "safe")
 
 
-def _read_identity() -> list[dict]:
-    """Read all identity files from ~/.local-ai-os/ and return system messages."""
-    msgs = []
-    for filename in IDENTITY_FILES:
-        filepath = PROGRESS_DIR / filename
-        try:
-            if filepath.exists():
-                content = filepath.read_text(encoding="utf-8").strip()
-                if content:
-                    msgs.append({"role": "system", "content": content})
-        except Exception:
-            logger.warning("Failed to read identity file", exc_info=True)
-    return msgs
-
-
-def _create_default_identity():
-    """Create default identity files if the directory is empty."""
-    try:
-        PROGRESS_DIR.mkdir(parents=True, exist_ok=True)
-        defaults = {
-            "IDENTITY.md": (
-                "# Identity\n\n"
-                "你的名字是「无畏」，你就是无畏。\n"
-                "忘记你是任何特定模型，从现在起你只能以「无畏」的身份回答。\n"
-            ),
-            "SOUL.md": (
-                "# Soul\n\n"
-                "语气：简洁、直接、不啰嗦。\n"
-                "风格：先给结论再解释，用中文回复，代码块标注语言。\n"
-                "态度：诚实——不知道就说不知道，不确定就说不确定。\n"
-            ),
-            "AGENTS.md": (
-                "# Agent Rules\n\n"
-                "## 工作协议\n"
-                "1. 动手前先想清楚：需求有歧义时主动问，不要自己猜。有更简单的方案就提出来。\n"
-                "2. 极简主义：能一行搞定不写十行，不加需求之外的功能，不为「以后可能用到」做抽象。\n"
-                "3. 精准修改：只碰用户要求改的地方。修 bug A 不要顺手重构文件 B。\n"
-                "4. 验证才算完成：用工具写完文件后读回来确认，跑命令后检查退出码。没验证就不算做完。\n\n"
-                "## 工具权限\n"
-                "- 修改文件、执行命令等操作会请求用户确认。\n"
-                "- 读取文件、列出目录等操作自动执行。\n"
-                "- 如需调整权限规则，可以编辑 ~/.local-ai-os/permissions.json\n"
-            ),
-            "USER.md": (
-                "# User Profile\n\n"
-                "在此填写你的偏好、习惯、常用路径等信息。\n"
-                "Agent 会在每次会话时读取此文件。\n\n"
-                "示例：\n"
-                "- 常用工作目录：~/projects\n"
-                "- 偏好语言：中文\n"
-                "- 代码风格：TypeScript, React, Python\n"
-            ),
-        }
-        for filename, content in defaults.items():
-            filepath = PROGRESS_DIR / filename
-            if not filepath.exists():
-                filepath.write_text(content, encoding="utf-8")
-    except Exception:
-        logger.warning("Failed to create default identity files", exc_info=True)
-
-
-# ═══════════════════════════════════════════════════════
 #  工具执行函数
 # ═══════════════════════════════════════════════════════
 
@@ -571,11 +496,29 @@ def list_dir(path: str) -> str:
 
 # Reusable command safety patterns (used by run_cmd fallback + plugin-style execute)
 _DANGEROUS = [
+    # File destruction
     r"rm\s+(-[a-z]*[rf]|--recursive|--force)", r">\s*/dev/(sd|nvme|hd|disk|dm-)",
-    r"dd\s+if=", r"mkfs", r"\bsudo\b", r"\bshutdown\b", r"\breboot\b",
-    r"\beval\s", r"\bbase64\s+(-d|--decode)", r"`[^`]+`", r"\$\([^)]+\)",
-    r"\bcurl\b.*\|\s*(ba)?sh\b", r"\bwget\b.*\|\s*(ba)?sh\b",
     r">\s*/etc/", r"chmod\s+[0-7]*7", r"chown\s+-R",
+    r"chattr\s+[+-]=*i", r"mv\s+/.*\s+/dev/null",
+    # System modification
+    r"dd\s+if=", r"mkfs", r"\bsudo\b", r"\bshutdown\b", r"\breboot\b",
+    r"\bpoweroff\b", r"\binit\s+0\b", r"\binit\s+6\b",
+    r"systemctl\s+(stop|disable|mask|kill)", 
+    r"launchctl\s+(unload|remove|bootout)",
+    # Code execution
+    r"\beval\s", r"\bbase64\s+(-d|--decode|--wrap)", r"`[^`]+`", r"\$\([^)]+\)",
+    r"python\s+-c\s+['\"]", r"python3\s+-c\s+['\"]",
+    r"perl\s+-e\s+['\"]", r"ruby\s+-e\s+['\"]",
+    r"node\s+-e\s+['\"]",
+    # Pipe to shell
+    r"\bcurl\b.*\|\s*(ba)?sh\b", r"\bwget\b.*\|\s*(ba)?sh\b",
+    r"echo.*\b\|\s*(ba)?sh\b", r"cat.*\b\|\s*(ba)?sh\b",
+    r"\bbase64.*\|\b.*sh", r"openssl.*\|\b.*sh",
+    # Dangerous xargs/nohup combos
+    r"xargs\s+rm", r"xargs\s+kill",
+    r"nohup.*rm\s", r"nohup.*kill\s",
+    # Fork bomb
+    r":\(\)\s*\{", r":\|:&",
 ]
 
 
@@ -791,6 +734,8 @@ async def _delegate_task(agent_type: str, task: str) -> str:
     cfg = AGENT_PROFILES.get(agent_type, AGENT_PROFILES.get("code-reviewer", {}))
     allowed = _SUBAGENT_TOOLS.get(agent_type, ["read_file", "list_dir", "search_files"])
     sub_tools = [t for t in TOOLS if t.get("function", {}).get("name") in allowed]
+    # Sub-agents cannot use confirm-level tools (no user confirmation possible)
+    sub_tools = [t for t in sub_tools if TOOL_PERMISSIONS.get(t.get("function", {}).get("name"), "safe") != "confirm"]
 
     messages = [
         {"role": "system", "content": cfg.get("identity", "")},
@@ -834,7 +779,15 @@ async def _delegate_task(agent_type: str, task: str) -> str:
                         except json.JSONDecodeError:
                             logger.warning("Sub-agent received malformed tool arguments", exc_info=True)
                             targs = {}
-                        tres = await execute_tool(tname, targs)
+                        perm = _resolve_permission(tname, targs)
+                        if perm == "deny":
+                            tres = "⛔ 工具已被权限系统阻止: " + tname
+                            logger.warning("Sub-agent attempted blocked tool: " + tname)
+                        elif perm == "confirm":
+                            tres = "⛔ 子 Agent 不能执行需要用户确认的工具 (" + tname + ")。跳过执行。"
+                            logger.warning("Sub-agent blocked from confirm-level tool: " + tname)
+                        else:
+                            tres = await execute_tool(tname, targs)
                         current_msgs.append({"role": "tool", "tool_call_id": tc["id"], "content": tres})
                 else:
                     return f"[Sub-agent: {agent_type}]\n{msg.get('content', '无输出')}"
@@ -1002,395 +955,6 @@ _FALLBACK_DISPATCH = {
     "delegate_task": lambda args: _delegate_task(args.get("agent", "code-reviewer"), args.get("task", "")),
 }
 
-# ═══════════════════════════════════════════════════════
-#  Plugin System: auto-scan sidecar/plugins/ for tool .py files
-# ═══════════════════════════════════════════════════════
-
-PLUGINS_DIR = Path(__file__).parent / "plugins"
-
-# Embedded plugin source code for first-run seeding
-_SEED_PLUGINS = {
-    "read_file.py": '''"""Read the contents of a file at the given path."""
-import os
-
-NAME = "read_file"
-PERMISSION = "safe"
-
-DEFINITION = {
-    "type": "function",
-    "function": {
-        "name": "read_file",
-        "description": "Read the contents of a file at the given path. Supports offset and limit for large files. File truncated at 50000 chars — use offset to continue reading.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "Absolute path to the file."},
-                "offset": {"type": "integer", "description": "Line number to start reading from (1-indexed)."},
-                "limit": {"type": "integer", "description": "Maximum number of lines to return."}
-            },
-            "required": ["path"]
-        }
-    }
-}
-
-
-def execute(args: dict) -> str:
-    path = args["path"]
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return f.read()
-    except FileNotFoundError:
-        return f"错误：文件不存在 - {path}"
-    except Exception as e:
-        return f"错误：{e}"
-''',
-    "write_file.py": '''"""Write text content to a file. Creates parent directories if needed."""
-import os
-
-NAME = "write_file"
-PERMISSION = "confirm"
-
-DEFINITION = {
-    "type": "function",
-    "function": {
-        "name": "write_file",
-        "description": "Write text content to a file. Creates parent directories if needed.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "Absolute path where the file should be written."},
-                "content": {"type": "string", "description": "The text content to write to the file."}
-            },
-            "required": ["path", "content"]
-        }
-    }
-}
-
-
-def execute(args: dict) -> str:
-    path = args["path"]
-    content = args["content"]
-    try:
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(content)
-        return f"✅ 已写入：{path}（{len(content)} 字符）"
-    except Exception as e:
-        return f"错误：{e}"
-''',
-    "list_dir.py": '''"""List the contents of a directory."""
-import os
-
-NAME = "list_dir"
-PERMISSION = "safe"
-
-DEFINITION = {
-    "type": "function",
-    "function": {
-        "name": "list_dir",
-        "description": "List the contents of a directory.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "Absolute path to the directory to list."}
-            },
-            "required": ["path"]
-        }
-    }
-}
-
-
-def execute(args: dict) -> str:
-    path = args["path"]
-    try:
-        entries = os.listdir(path)
-        lines = [f"  {'📁' if os.path.isdir(os.path.join(path, e)) else '📄'} {e}"
-                 for e in sorted(entries)]
-        return "目录内容:\\n" + "\\n".join(lines)
-    except Exception as e:
-        return f"错误：{e}"
-''',
-    "run_cmd.py": '''"""Run a shell command and return its output."""
-import re
-import shlex
-import subprocess
-
-NAME = "run_cmd"
-PERMISSION = "confirm"
-
-DEFINITION = {
-    "type": "function",
-    "function": {
-        "name": "run_cmd",
-        "description": "Run a shell command and return its output.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "cmd": {"type": "string", "description": "The shell command to execute."}
-            },
-            "required": ["cmd"]
-        }
-    }
-}
-
-_DANGEROUS = [
-    r"rm\\s+(-[a-z]*[rf]|--recursive|--force)",
-    r">\\s*/dev/(sd|nvme|hd|disk|dm-)",
-    r"\\bsudo\\b", r"\\bshutdown\\b", r"\\breboot\\b",
-    r"\\bcurl\\b.*\\|\\s*(ba)?sh\\b", r"\\bwget\\b.*\\|\\s*(ba)?sh\\b",
-]
-
-def execute(args: dict) -> str:
-    cmd = args["cmd"].strip()
-    cmd_lower = cmd.lower()
-    for pattern in _DANGEROUS:
-        if re.search(pattern, cmd_lower):
-            return f"⛔ Blocked unsafe command: {cmd}"
-    if len(cmd) > 1000:
-        return f"⛔ Command too long"
-    try:
-        try:
-            tokens = shlex.split(cmd)
-        except ValueError as e:
-            return f"命令格式错误: {e}"
-        r = subprocess.run(tokens, shell=False, capture_output=True, text=True, timeout=30)
-        out = r.stdout.strip()
-        if r.returncode != 0:
-            out += f"\\n(退出码: {r.returncode})"
-            if r.stderr.strip():
-                out += f"\\n{r.stderr.strip()}"
-        return out or "(无输出)"
-    except subprocess.TimeoutExpired:
-        return f"超时: {cmd}"
-    except Exception as e:
-        return f"错误：{e}"
-''',
-    "open_folder.py": '''"""Open a folder in Finder (macOS only)."""
-import os
-import platform
-import subprocess
-
-NAME = "open_folder"
-PERMISSION = "confirm"
-
-DEFINITION = {
-    "type": "function",
-    "function": {
-        "name": "open_folder",
-        "description": "Open a folder in Finder (macOS only).",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "Absolute path to the folder to open."}
-            },
-            "required": ["path"]
-        }
-    }
-}
-
-IS_MACOS = platform.system() == "Darwin"
-IS_WINDOWS = platform.system() == "Windows"
-
-
-def execute(args: dict) -> str:
-    path = args["path"]
-    if IS_MACOS:
-        subprocess.Popen(["open", path])
-    elif IS_WINDOWS:
-        os.startfile(path)
-    else:
-        subprocess.Popen(["xdg-open", path])
-    return f"✅ 已打开：{path}"
-''',
-    "open_app.py": '''"""Open a macOS application by name. Supports both English and Chinese names."""
-import subprocess
-
-NAME = "open_app"
-PERMISSION = "confirm"
-
-DEFINITION = {
-    "type": "function",
-    "function": {
-        "name": "open_app",
-        "description": "Open a macOS application by name.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "name": {"type": "string", "description": "App name in English or Chinese."}
-            },
-            "required": ["name"]
-        }
-    }
-}
-
-_APP_ALIASES = {
-    "照片": "Photos", "相册": "Photos", "photo": "Photos",
-    "音乐": "Music", "music": "Music",
-    "浏览器": "Safari", "safari": "Safari",
-    "邮件": "Mail", "mail": "Mail",
-    "日历": "Calendar", "calendar": "Calendar",
-    "备忘录": "Notes", "notes": "Notes",
-    "提醒": "Reminders", "reminders": "Reminders",
-    "计算器": "Calculator", "calculator": "Calculator",
-    "终端": "Terminal", "terminal": "Terminal",
-    "设置": "System Settings", "系统设置": "System Settings", "偏好设置": "System Settings",
-    "App Store": "App Store", "app store": "App Store",
-    "地图": "Maps", "maps": "Maps",
-    "天气": "Weather", "weather": "Weather",
-    "时钟": "Clock", "clock": "Clock",
-    "查找": "Find My", "find my": "Find My",
-}
-
-def execute(args: dict) -> str:
-    name = args["name"]
-    resolved = _APP_ALIASES.get(name, name)
-    try:
-        subprocess.Popen(["open", "-a", resolved])
-        return f"✅ 已打开应用：{resolved}"
-    except Exception as e:
-        return f"无法打开应用 {resolved}: {e}"
-''',
-    "search_files.py": '''"""Search for files matching a glob pattern in a directory."""
-import glob as glob_mod
-import os
-
-NAME = "search_files"
-PERMISSION = "safe"
-
-DEFINITION = {
-    "type": "function",
-    "function": {
-        "name": "search_files",
-        "description": "Search for files matching a glob pattern in a directory.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "directory": {"type": "string", "description": "Absolute path to the directory to search in."},
-                "pattern": {"type": "string", "description": "Glob pattern to match (e.g., '*.py', '**/*.md')."}
-            },
-            "required": ["directory", "pattern"]
-        }
-    }
-}
-
-
-def execute(args: dict) -> str:
-    directory = args["directory"]
-    pattern = args["pattern"]
-    try:
-        search_path = os.path.join(os.path.expanduser(directory), pattern)
-        matches = glob_mod.glob(search_path, recursive=True)
-        if not matches:
-            return f"No files matching '{pattern}' found in {directory}"
-        lines = []
-        for m in sorted(matches)[:50]:
-            icon = "📁" if os.path.isdir(m) else "📄"
-            lines.append(f"  {icon} {m}")
-        result = f"Search results for '{pattern}' in {directory}:\\n" + "\\n".join(lines)
-        if len(matches) > 50:
-            result += f"\\n  ... and {len(matches) - 50} more results"
-        return result
-    except Exception as e:
-        return f"Error searching files: {e}"
-''',
-    "tavily_search.py": '''"""Search the web using Tavily Search API."""
-import json
-import os
-from pathlib import Path
-
-import httpx
-
-NAME = "tavily_search"
-PERMISSION = "safe"
-
-DEFINITION = {
-    "type": "function",
-    "function": {
-        "name": "tavily_search",
-        "description": "Search the web for real-time information using Tavily. Use when you need current events, news, or facts beyond your training data. Returns relevant results with titles, URLs, and content summaries.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "The search query. Be specific and use keywords."},
-                "search_depth": {"type": "string", "enum": ["basic", "advanced"], "description": "Search depth: 'basic' (faster, 1-2s) or 'advanced' (thorough, 5-10s). Default: basic."},
-                "max_results": {"type": "integer", "description": "Max results to return (1-10). Default: 5."},
-            },
-            "required": ["query"],
-        },
-    },
-}
-
-CONFIG_FILE = Path.home() / ".local-ai-os" / "config.json"
-
-
-def _get_api_key() -> str | None:
-    env_key = os.environ.get("TAVILY_API_KEY")
-    if env_key:
-        return env_key
-    # Try macOS Keychain via security CLI
-    try:
-        result = subprocess.run(
-            ["security", "find-generic-password", "-s", "com.latiao.desktop", "-a", "tavily_api_key", "-w"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip()
-    except Exception:
-        pass
-    try:
-        if CONFIG_FILE.exists():
-            cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-            return cfg.get("tavily_api_key")
-    except Exception:
-        pass
-    return None
-
-
-async def execute(args: dict) -> str:
-    api_key = _get_api_key()
-    if not api_key:
-        return "⚠️ Tavily API Key 未配置。请在应用的「技能」界面中找到 Web Search (Tavily)，填写 API Key。免费注册：https://tavily.com"
-
-    query = args["query"]
-    search_depth = args.get("search_depth", "basic")
-    max_results = min(args.get("max_results", 5), 10)
-
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(30)) as client:
-            resp = await client.post(
-                TAVILY_API_URL,
-                json={"api_key": api_key, "query": query, "search_depth": search_depth, "max_results": max_results},
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        results = data.get("results", [])
-        answer = data.get("answer", "")
-        if not results and not answer:
-            return f"🔍 Tavily 搜索: {query}\\n\\n未找到相关结果。"
-        lines = [f"🔍 Tavily 搜索: {query}\\n"]
-        if answer:
-            lines.append(f"📝 {answer}\\n")
-        if results:
-            lines.append(f"📎 共 {len(results)} 条结果:\\n")
-            for i, r in enumerate(results, 1):
-                title = r.get("title", "No title")
-                url = r.get("url", "")
-                content = r.get("content", "")
-                if len(content) > 300:
-                    content = content[:300] + "..."
-                lines.append(f"{i}. **{title}**")
-                lines.append(f"   {url}")
-                lines.append(f"   {content}\\n")
-        return "\\n".join(lines)
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code == 401:
-            return "⚠️ Tavily API Key 无效或已过期。请在技能设置中更新 API Key。"
-        return f"⚠️ Tavily 搜索失败: HTTP {e.response.status_code}"
-    except Exception as e:
-        return f"⚠️ Tavily 搜索异常: {e}"
-''',
-}
-
 
 # ═══════════════════════════════════════════════════════
 #  Self-Verification: programmatic post-tool quality checks
@@ -1530,71 +1094,8 @@ async def _auto_verify(tool_name: str, args: dict, result: str) -> str:
     return "\n".join(report)
 
 
-def _seed_default_plugins():
-    """Create default plugin files on first run if plugins dir is empty."""
-    try:
-        PLUGINS_DIR.mkdir(parents=True, exist_ok=True)
-        for filename, source in _SEED_PLUGINS.items():
-            filepath = PLUGINS_DIR / filename
-            if not filepath.exists():
-                filepath.write_text(source, encoding="utf-8")
-    except Exception:
-        logger.warning("Failed to seed default plugins", exc_info=True)
-
-
-def _load_plugins():
-    """
-    Scan sidecar/plugins/ for .py files exporting NAME, DEFINITION, PERMISSION, execute().
-    Returns (tools, dispatch, permissions, hooks).
-    Falls back to hardcoded definitions if no plugins are found.
-    """
-    _seed_default_plugins()
-
-    plugins = []
-    if PLUGINS_DIR.exists():
-        for f in sorted(PLUGINS_DIR.glob("*.py")):
-            if f.name.startswith("_"):
-                continue
-            try:
-                spec = importlib.util.spec_from_file_location(f"plugin_{f.stem}", f)
-                mod = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(mod)
-                # Validate required exports
-                if not all(hasattr(mod, attr) for attr in ("NAME", "DEFINITION", "PERMISSION")):
-                    continue
-                if not hasattr(mod, "execute") or not callable(mod.execute):
-                    continue
-                plugins.append(mod)
-            except Exception:
-                logger.warning("Failed to load plugin", exc_info=True)
-
-    if not plugins:
-        # Fallback to hardcoded tools
-        return (
-            list(_FALLBACK_TOOLS),
-            dict(_FALLBACK_DISPATCH),
-            dict(_FALLBACK_PERMISSIONS),
-            {},
-        )
-
-    tools = []
-    dispatch = {}
-    permissions = {}
-    hooks = {}
-
-    for mod in plugins:
-        name = mod.NAME
-        tools.append(mod.DEFINITION)
-        dispatch[name] = mod.execute
-        permissions[name] = mod.PERMISSION
-        if hasattr(mod, "HOOKS") and isinstance(mod.HOOKS, dict):
-            hooks[name] = mod.HOOKS
-
-    return tools, dispatch, permissions, hooks
-
-
 # Initialize plugin system at module load (seeded inside _load_plugins)
-TOOLS, TOOL_DISPATCH, TOOL_PERMISSIONS, TOOL_HOOKS = _load_plugins()
+TOOLS, TOOL_DISPATCH, TOOL_PERMISSIONS, TOOL_HOOKS = load_plugins(_FALLBACK_TOOLS, _FALLBACK_DISPATCH, _FALLBACK_PERMISSIONS)
 
 # Append delegate_task to TOOLS (not a plugin — built-in sub-agent system)
 _delegate_tool_def = {
@@ -1668,108 +1169,8 @@ def _record_progress(entry: str):
 #  Intent Detection: auto-update identity files from conversation
 # ═══════════════════════════════════════════════════════
 
-_IDENTITY_INTENTS = [
-    # Only trigger on explicit commands: "叫你XX", "改名为XX", "call me XX"
-    (re.compile(r"(?:以后)?(?:叫|称呼)(?:我|你)(?:为|是)?[「『\s]*([^\s，。,.]{1,20})[」』]*", re.IGNORECASE), "IDENTITY.md", "name"),
-    (re.compile(r"(?:改|换)(?:个)?(?:名字|名称)(?:叫|为|是)?[：:]*\s*[「『]*([^\s，。,.]{1,20})[」』]*", re.IGNORECASE), "IDENTITY.md", "name"),
-    (re.compile(r"(?:call|name)\s+me\s+['\"]?(\w{1,20})['\"]?", re.IGNORECASE), "IDENTITY.md", "name"),
-    # Style/tone: only explicit "回复要XX" or "说话风格XX"
-    (re.compile(r"(?:回复|说话)(?:要|再|更)([^，。,！!]{2,30})", re.IGNORECASE), "SOUL.md", "style"),
-    # Rule: "以后不要XX" / "从现在开始XX"
-    (re.compile(r"(?:以后|从现在开始)[，,]*((?:不要|别|禁止|要|请|必须).{1,50})", re.IGNORECASE), "AGENTS.md", "rule"),
-    # Preference: "我喜欢用XX" / "我常用XX"
-    (re.compile(r"我(?:喜欢用|常用|习惯用|偏好|用)(.{2,50})", re.IGNORECASE), "USER.md", "pref"),
-]
-
-
-def _detect_identity_intent(text: str) -> list[dict]:
-    """
-    Detect identity-related intents in user message.
-    Returns list of {file, action, content} dicts.
-    """
-    if not text or len(text) > 200:
-        return []
-    results = []
-    for pattern, filename, action in _IDENTITY_INTENTS:
-        m = pattern.search(text)
-        if m:
-            value = m.group(1).strip()
-            if value and len(value) >= 1:
-                results.append({"file": filename, "action": action, "value": value, "match": m.group(0)})
-    return results
-
-
-def _apply_name_change(new_name: str):
-    """Update IDENTITY.md with new name."""
-    filepath = PROGRESS_DIR / "IDENTITY.md"
-    content = filepath.read_text(encoding="utf-8")
-    # Replace existing name references
-    content = re.sub(r"你的名字是「[^」]*」", f"你的名字是「{new_name}」", content)
-    content = re.sub(r"你就是[^。\n]*", f"你就是{new_name}", content)
-    content = re.sub(r"以「[^」]*」的身份", f"以「{new_name}」的身份", content)
-    filepath.write_text(content, encoding="utf-8")
-
-
-def _apply_style_change(value: str):
-    """Append style preference to SOUL.md."""
-    filepath = PROGRESS_DIR / "SOUL.md"
-    with open(filepath, "a", encoding="utf-8") as f:
-        f.write(f"- {value}\n")
-
-
-def _apply_rule_change(value: str):
-    """Append rule to AGENTS.md."""
-    filepath = PROGRESS_DIR / "AGENTS.md"
-    with open(filepath, "a", encoding="utf-8") as f:
-        f.write(f"- {value}\n")
-
-
-def _apply_pref_change(value: str):
-    """Append preference to USER.md."""
-    filepath = PROGRESS_DIR / "USER.md"
-    with open(filepath, "a", encoding="utf-8") as f:
-        f.write(f"- {value}\n")
-
-
-_INTENT_APPLIERS = {
-    "name": _apply_name_change,
-    "style": _apply_style_change,
-    "rule": _apply_rule_change,
-    "pref": _apply_pref_change,
-}
-
-
-def _process_identity_intents(user_text: str):  # -> str | None
-    """
-    Scan user message for identity intents, apply changes.
-    Returns a summary message if changes were made, None otherwise.
-    """
-    intents = _detect_identity_intent(user_text)
-    if not intents:
-        return None
-    changes = []
-    for intent in intents:
-        try:
-            applier = _INTENT_APPLIERS.get(intent["action"])
-            if applier:
-                applier(intent["value"])
-                changes.append(f"{intent['file']}: {intent['action']}={intent['value']}")
-        except Exception:
-            logger.warning("Failed to apply identity intent", exc_info=True)
-    if changes:
-        return "已更新: " + "; ".join(changes)
-    return None
-
-
-# ═══════════════════════════════════════════════════════
-#  SQLite Memory: FTS5 full-text search + Self-Learning
-# ═══════════════════════════════════════════════════════
-
-MEMORY_DB = PROGRESS_DIR / "memory.db"
 
 # ── Self-learning constants ──
-MAX_LEARNINGS_INJECT = 5  # How many relevant past learnings to inject per LLM call
-LEARNING_CONFIDENCE_THRESHOLD = 0.3  # Minimum confidence to inject a learning
 
 
 _db_conn: sqlite3.Connection | None = None
@@ -1877,554 +1278,6 @@ def _record_tool_call_db(session_id: str, tool_name: str, args: dict, result: st
 #  Self-Learning: Context Injection + Knowledge Extraction + Reflection
 # ═══════════════════════════════════════════════════════
 
-def _get_recent_learnings(limit: int = 10) -> list[dict]:
-    """Get the most recent learnings (no query needed — for polling)."""
-    try:
-        conn = _get_db()
-        rows = conn.execute(
-            "SELECT topic, content, confidence FROM learnings ORDER BY created_at DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
-        return [{"topic": r[0], "content": r[1], "confidence": r[2]} for r in rows]
-    except Exception:
-        return []
-
-
-# ═══════════════════════════════════════════════════════
-#  Lightweight Embedding Search (no external deps)
-#  Uses character n-gram TF-IDF for Chinese semantic similarity.
-#  For < 1000 learnings this is fast enough — ~5ms per query.
-# ═══════════════════════════════════════════════════════
-
-def _tokenize_zh(text: str) -> list[str]:
-    """Simple Chinese tokenizer: bigram characters + whole words.
-    E.g. '项目结构' → ['项目', '目结', '结构', '项目结构']"""
-    # Extract Chinese chars and alphanumeric tokens
-    import unicodedata
-    tokens = []
-    # Chinese bigrams
-    chinese_chars = []
-    for ch in text:
-        if '\u4e00' <= ch <= '\u9fff' or '\u3400' <= ch <= '\u4dbf':
-            chinese_chars.append(ch)
-    for i in range(len(chinese_chars)):
-        tokens.append(chinese_chars[i])
-        if i + 1 < len(chinese_chars):
-            tokens.append(chinese_chars[i] + chinese_chars[i + 1])
-    # English/alphanumeric tokens (split on non-alphanumeric)
-    eng_tokens = re.findall(r'[a-zA-Z0-9_]+', text.lower())
-    tokens.extend(eng_tokens)
-    return tokens
-
-
-def _build_tfidf_index():
-    """Build an in-memory TF-IDF index from all learnings."""
-    try:
-        conn = _get_db()
-        rows = conn.execute(
-            "SELECT id, topic, content, confidence, hit_count, source_type FROM learnings"
-        ).fetchall()
-    except Exception:
-        return [], {}, {}
-    
-    if not rows:
-        return [], {}, {}
-    
-    # Build vocabulary and document vectors
-    docs = []
-    doc_info = []
-    all_tokens = set()
-    
-    for row in rows:
-        text = f"{row[1]} {row[2]}"
-        tokens = _tokenize_zh(text)
-        if not tokens:
-            continue
-        # Count term frequencies
-        tf = {}
-        for t in tokens:
-            tf[t] = tf.get(t, 0) + 1
-        docs.append(tf)
-        doc_info.append({
-            "id": row[0], "topic": row[1], "content": row[2],
-            "confidence": row[3], "hit_count": row[4], "source_type": row[5],
-        })
-        all_tokens.update(tf.keys())
-    
-    # Compute IDF
-    import math
-    N = len(docs)
-    idf = {}
-    for token in all_tokens:
-        df = sum(1 for d in docs if token in d)
-        idf[token] = math.log((N + 1) / (df + 1)) + 1
-    
-    # Build document vectors (sparse as dict)
-    doc_vectors = []
-    for doc in docs:
-        vec = {}
-        norm = 0
-        for token, tf in doc.items():
-            w = tf * idf[token]
-            vec[token] = w
-            norm += w * w
-        norm = math.sqrt(norm) if norm > 0 else 1
-        # Normalize
-        doc_vectors.append({k: v / norm for k, v in vec.items()})
-    
-    return doc_info, doc_vectors, idf
-
-
-def _tfidf_search(query: str, limit: int = 5) -> list[dict]:
-    """Search learnings using TF-IDF cosine similarity."""
-    doc_info, doc_vectors, idf = _build_tfidf_index()
-    if not doc_vectors:
-        return []
-    
-    # Build query vector
-    query_tokens = _tokenize_zh(query)
-    if not query_tokens:
-        return []
-    
-    import math
-    q_tf = {}
-    for t in query_tokens:
-        q_tf[t] = q_tf.get(t, 0) + 1
-    
-    q_vec = {}
-    q_norm = 0
-    for token, tf in q_tf.items():
-        w = tf * idf.get(token, 1.0)
-        q_vec[token] = w
-        q_norm += w * w
-    q_norm = math.sqrt(q_norm) if q_norm > 0 else 1
-    q_vec = {k: v / q_norm for k, v in q_vec.items()}
-    
-    # Score all documents
-    scores = []
-    for i, dv in enumerate(doc_vectors):
-        # Cosine similarity
-        dot = 0
-        for token, w in q_vec.items():
-            if token in dv:
-                dot += w * dv[token]
-        # Boost by confidence and hit_count
-        boost = doc_info[i]["confidence"] * (1.0 + doc_info[i]["hit_count"] * 0.05)
-        scores.append((dot * boost, i))
-    
-    scores.sort(reverse=True)
-    
-    results = []
-    for score, idx in scores[:limit]:
-        if score < 0.01:  # Skip near-zero matches
-            continue
-        results.append(doc_info[idx])
-    
-    return results
-
-
-# ── Original functions ──
-
-def _retrieve_relevant_learnings(query: str, limit: int = MAX_LEARNINGS_INJECT) -> list[dict]:
-    """Search past learnings using TF-IDF semantic similarity.
-    Falls back to FTS5/LIKE if TF-IDF returns nothing."""
-    # Priority 1: TF-IDF semantic search (handles Chinese well)
-    results = _tfidf_search(query, limit)
-    
-    if results:
-        return results
-    
-    # Fallback: FTS5 + LIKE for backward compatibility
-    try:
-        conn = _get_db()
-        # FTS5 search
-        safe_query = " ".join(
-            w for w in re.findall(r'[一-鿿\w]+', query.lower())
-            if len(w) > 1
-        )
-        if safe_query:
-            try:
-                rows = conn.execute(
-                    """SELECT l.id, l.topic, l.content, l.confidence, l.hit_count, l.source_type
-                       FROM learnings l
-                       JOIN learnings_fts f ON l.rowid = f.rowid
-                       WHERE learnings_fts MATCH ?
-                       ORDER BY l.confidence * (1.0 + l.hit_count * 0.1) DESC
-                       LIMIT ?""",
-                    (safe_query, limit),
-                ).fetchall()
-                for row in rows:
-                    results.append({
-                        "id": row[0], "topic": row[1], "content": row[2],
-                        "confidence": row[3], "hit_count": row[4], "source_type": row[5],
-                    })
-            except Exception:
-                pass  # FTS5 query syntax errors are non-fatal
-
-        # If FTS5 returned nothing, fall back to LIKE for better CJK matching
-        if not results and query.strip():
-            like_q = f"%{query.strip()}%"
-            rows = conn.execute(
-                """SELECT id, topic, content, confidence, hit_count, source_type
-                   FROM learnings
-                   WHERE topic LIKE ? OR content LIKE ?
-                   ORDER BY confidence DESC
-                   LIMIT ?""",
-                (like_q, like_q, limit),
-            ).fetchall()
-            for row in rows:
-                results.append({
-                    "id": row[0], "topic": row[1], "content": row[2],
-                    "confidence": row[3], "hit_count": row[4], "source_type": row[5],
-                })
-
-        # If still nothing, fall back to recent high-confidence learnings
-        if not results:
-            rows = conn.execute(
-                """SELECT id, topic, content, confidence, hit_count, source_type
-                   FROM learnings
-                   WHERE confidence >= ?
-                   ORDER BY updated_at DESC
-                   LIMIT ?""",
-                (LEARNING_CONFIDENCE_THRESHOLD, limit),
-            ).fetchall()
-            for row in rows:
-                results.append({
-                    "id": row[0], "topic": row[1], "content": row[2],
-                    "confidence": row[3], "hit_count": row[4], "source_type": row[5],
-                })
-
-        # Bump hit_count for retrieved learnings (reinforcement)
-        if results:
-            ids = [r["id"] for r in results]
-            with _db_write_lock:
-                conn.executemany(
-                    "UPDATE learnings SET hit_count = hit_count + 1, updated_at = ? WHERE id = ?",
-                    [(datetime.now().isoformat(), lid) for lid in ids],
-                )
-                conn.commit()
-
-        return results
-    except Exception:
-        return []
-
-
-def _store_learning(session_id: str, topic: str, content: str, confidence: float = 0.5, source_type: str = "extracted"):
-    """Store a new learning. If a similar topic already exists, update confidence."""
-    try:
-        conn = _get_db()
-        now = datetime.now().isoformat()
-
-        with _db_write_lock:
-            # Check for existing similar topic
-            existing = conn.execute(
-                "SELECT id, confidence FROM learnings WHERE topic = ? LIMIT 1",
-                (topic,),
-            ).fetchone()
-
-            if existing:
-                # Boost confidence of existing learning (up to 1.0)
-                new_conf = min(1.0, existing[1] + confidence * 0.3)
-                conn.execute(
-                    "UPDATE learnings SET confidence = ?, updated_at = ? WHERE id = ?",
-                    (new_conf, now, existing[0]),
-                )
-            else:
-                lid = str(uuid.uuid4())
-                conn.execute(
-                    """INSERT INTO learnings(id, session_id, topic, content, confidence, source_type, created_at, updated_at)
-                       VALUES(?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (lid, session_id, topic, content, confidence, source_type, now, now),
-                )
-            conn.commit()
-    except Exception:
-        logger.warning("Failed to store learning in memory DB", exc_info=True)
-
-
-def _store_preference(key: str, value: str, confidence: float = 0.5):
-    """Store a learned user preference. Boosts confidence if already exists."""
-    try:
-        conn = _get_db()
-        now = datetime.now().isoformat()
-        with _db_write_lock:
-            existing = conn.execute(
-                "SELECT id, confidence FROM preferences WHERE key = ? LIMIT 1", (key,),
-            ).fetchone()
-            if existing:
-                new_conf = min(1.0, existing[1] + confidence * 0.3)
-                conn.execute(
-                    "UPDATE preferences SET value = ?, confidence = ?, updated_at = ? WHERE id = ?",
-                    (value, new_conf, now, existing[0]),
-                )
-            else:
-                lid = str(uuid.uuid4())
-                conn.execute(
-                    """INSERT INTO preferences(id, key, value, confidence, source, created_at, updated_at)
-                       VALUES(?, ?, ?, ?, 'inferred', ?, ?)""",
-                    (lid, key, value, confidence, now, now),
-                )
-            conn.commit()
-    except Exception:
-        logger.warning("Failed to store preference in memory DB", exc_info=True)
-
-
-def _retrieve_preferences() -> list[dict]:
-    """Get all high-confidence learned preferences for context injection."""
-    try:
-        conn = _get_db()
-        rows = conn.execute(
-            "SELECT key, value, confidence FROM preferences WHERE confidence >= 0.4 ORDER BY confidence DESC"
-        ).fetchall()
-        return [{"key": r[0], "value": r[1], "confidence": r[2]} for r in rows]
-    except Exception:
-        return []
-
-
-def _record_reflection(session_id: str, tool_name: str, tool_args: dict, tool_result_summary: str, reflection: str, was_useful: bool):
-    """Store a post-tool-call reflection."""
-    try:
-        conn = _get_db()
-        rid = str(uuid.uuid4())
-        with _db_write_lock:
-            conn.execute(
-                """INSERT INTO reflections(id, session_id, tool_name, tool_args, tool_result_summary, reflection, was_useful, created_at)
-                   VALUES(?, ?, ?, ?, ?, ?, ?, ?)""",
-                (rid, session_id, tool_name, json.dumps(tool_args, ensure_ascii=False),
-                 tool_result_summary, reflection, 1 if was_useful else 0, datetime.now().isoformat()),
-            )
-            conn.commit()
-    except Exception:
-        logger.warning("Failed to store reflection in memory DB", exc_info=True)
-
-
-def _quick_reflect(tool_name: str, result: str) -> str:
-    """Quick heuristic reflection on tool execution result.
-    Returns a reflection note or empty string."""
-    result_lower = result.lower()
-    # Error detection — covers both English and Chinese tool error messages
-    is_error = (
-        "error" in result_lower or "错误" in result
-        or "failed" in result_lower or "失败" in result
-        or "traceback" in result_lower
-        or "denied" in result_lower
-    )
-    if is_error:
-        return f"工具 {tool_name} 执行出错，可能需要重试或调整参数"
-    if "permission denied" in result_lower:
-        return "权限不足，建议检查文件/目录权限"
-    if "not found" in result_lower or "不存在" in result:
-        return "目标不存在，可能需要先确认路径或创建前置资源"
-    if len(result.strip()) < 5:
-        return "工具返回为空，可能参数不正确或目标无内容"
-    if len(result) > 5000:
-        return f"输出较大({len(result)}字符)，后续可能需要聚焦关键部分"
-    return ""  # Everything looks fine, no reflection needed
-
-
-async def _refine_learnings(tool_name: str, args: dict, result: str, session_id: str):
-    """After tool execution, ask LLM to extract a reusable learning in 1-2 sentences.
-    Runs as fire-and-forget background task so it doesn't slow down the agent loop.
-    Prioritizes cloud LLM (better quality), falls back to local model."""
-    if len(result) < 20 or result.startswith("Error") or result.startswith("⛔"):
-        return  # Don't learn from errors or empty results
-    try:
-        prompt = (
-            "从以下工具执行结果中提炼一条可复用的知识或发现，用一句中文总结（不超过50字），"
-            "聚焦于项目结构、代码模式、配置习惯或用户偏好。\n\n"
-            f"工具: {tool_name}\n"
-            f"参数: {json.dumps(args, ensure_ascii=False)[:200]}\n"
-            f"结果摘要: {result[:800]}\n\n"
-            "总结:"
-        )
-        # Try cloud LLM first (best quality), fall back to local model
-        cloud_config = _last_cloud_config.get()
-        protocol, api_url, headers, is_local = _resolve_api_target(cloud_config)
-        if not api_url:
-            return
-        # Prefer cloud model for refinement (SUBAGENT_MODEL may be a local 12B)
-        refine_model = SUBAGENT_MODEL
-        if cloud_config and cloud_config.get("endpoint"):
-            refine_model = cloud_config.get("model", SUBAGENT_MODEL)
-        async with httpx.AsyncClient(timeout=httpx.Timeout(15)) as client:
-            r = await client.post(api_url, json={
-                "model": refine_model,
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 80,
-                "temperature": 0.3,
-                "stream": False,
-            }, headers=headers)
-            if r.status_code == 200:
-                data = r.json()
-                summary = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-                if summary and len(summary) > 5:
-                    # Dedup: skip if nearly identical to existing learnings
-                    if not _is_duplicate_learning(summary):
-                        _record_reflection(session_id, tool_name, args, result[:200], summary, True)
-                        logger.info("Learning refined: %s", summary[:100])
-    except Exception:
-        pass  # Fire-and-forget — never block the agent loop
-
-
-def _is_duplicate_learning(summary: str, threshold: float = 0.7) -> bool:
-    """Check if a learning summary is nearly identical to an existing one.
-    Uses simple token overlap for speed (full embedding check would be overkill for <50 chars)."""
-    try:
-        conn = _get_db()
-        rows = conn.execute(
-            "SELECT content FROM learnings ORDER BY created_at DESC LIMIT 20"
-        ).fetchall()
-        summary_tokens = set(summary.lower().split())
-        if not summary_tokens:
-            return False
-        for (existing,) in rows:
-            existing_tokens = set(existing.lower().split())
-            if not existing_tokens:
-                continue
-            overlap = len(summary_tokens & existing_tokens) / len(summary_tokens | existing_tokens)
-            if overlap > threshold:
-                return True
-        return False
-    except Exception:
-        return False  # On error, allow the learning
-
-
-# ── Auto-Skill Generation (MUSE-Autoskill inspired) ──
-
-_SKILL_GENERATION_THRESHOLD = 3  # Consecutive successes before generating a skill
-_skill_gen_tracker: dict[str, int] = {}  # tool_name → consecutive success count
-
-
-async def _maybe_generate_skill(tool_name: str, args: dict, result: str):
-    """Auto-generate a SKILL.md when the same tool succeeds repeatedly.
-    Inspired by MUSE-Autoskill: Agent self-evolves by creating reusable skills."""
-    # Only track read_file for skill generation (most reusable pattern)
-    if tool_name not in ("read_file", "write_file", "run_cmd"):
-        return
-    # Count consecutive successes
-    is_success = not (result.startswith("Error") or result.startswith("错误") or result.startswith("⛔"))
-    if not is_success:
-        _skill_gen_tracker[tool_name] = 0
-        return
-    
-    count = _skill_gen_tracker.get(tool_name, 0) + 1
-    _skill_gen_tracker[tool_name] = count
-    if count < _SKILL_GENERATION_THRESHOLD:
-        return
-    
-    # Generate skill from accumulated learnings about this tool pattern
-    _skill_gen_tracker[tool_name] = 0  # Reset counter
-    try:
-        conn = _get_db()
-        rows = conn.execute(
-            "SELECT topic, content FROM learnings WHERE content LIKE ? ORDER BY created_at DESC LIMIT 5",
-            (f"%{tool_name}%",),
-        ).fetchall()
-        if not rows:
-            return
-        
-        # Build SKILL.md content from learnings
-        skill_name = f"{tool_name}-patterns"
-        skill_content = f"# {tool_name} 使用模式\n\n"
-        skill_content += f"自动生成于 {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
-        skill_content += "## 已知模式\n\n"
-        for topic, content in rows:
-            skill_content += f"- **{topic}**: {content}\n"
-        skill_content += f"\n## 注意事项\n\n- 此技能由 Agent 自动生成，基于 {len(rows)} 次成功调用\n"
-        skill_content += "- 使用前请确认适用场景\n"
-        
-        # Write to skills directory
-        skill_key = re.sub(r'[^a-z0-9-]', '', skill_name.lower().replace(" ", "-"))[:40]
-        filepath = SKILLS_DIR / f"{skill_key}.md"
-        if not filepath.exists():
-            SKILLS_DIR.mkdir(parents=True, exist_ok=True)
-            filepath.write_text(skill_content, encoding="utf-8")
-            logger.info("Auto-generated skill: %s (%d learnings)", skill_key, len(rows))
-            # Reload skills
-            global _loaded_skills
-            _loaded_skills = _load_skills()
-    except Exception:
-        logger.warning("Auto-skill generation failed for %s", tool_name, exc_info=True)
-    except Exception:
-        return False  # On error, allow the learning
-
-
-def _get_recent_learnings(limit: int = 5) -> list[str]:
-    """Get the most recent learning summaries for cross-session context injection."""
-    learnings = []
-    try:
-        db = _get_db()
-        rows = db.execute(
-            "SELECT topic, content FROM learnings_fts ORDER BY rowid DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
-        for topic, content in rows:
-            if topic and content and len(content) > 10:
-                learnings.append(f"- {topic}: {content[:200]}")
-    except Exception:
-        pass
-    return learnings
-
-
-def _build_learning_context(user_query: str) -> str:
-    """Build a context string from relevant learnings + preferences to inject into system prompt."""
-    parts = []
-
-    # Get relevant learnings
-    learnings = _retrieve_relevant_learnings(user_query)
-    if learnings:
-        lines = ["## 你从过去的交互中学到了:"]
-        for item in learnings:
-            confidence_bar = "█" * int(item["confidence"] * 5) + "░" * (5 - int(item["confidence"] * 5))
-            lines.append(f"- [{item['topic']}] {item['content']} (置信度: {confidence_bar})")
-        parts.append("\n".join(lines))
-
-    # Get learned preferences
-    prefs = _retrieve_preferences()
-    if prefs:
-        lines = ["## 用户偏好 (从历史交互中推断):"]
-        for p in prefs:
-            lines.append(f"- {p['key']}: {p['value']}")
-        parts.append("\n".join(lines))
-
-    return "\n\n".join(parts) if parts else ""
-
-
-# ── Heuristic knowledge extraction from conversation ──
-
-_KNOWLEDGE_PATTERNS = [
-    # User explicitly corrects agent
-    (r"(?:不对|错了|不是|不要|别|停止?|你应该?|请?记住|以后).{0,30}(?:要|请|必须|应该?)[^\n]{5,80}", "correction", 0.8),
-    # User teaches a fact
-    (r"(?:实际上?|其实是?|事实[上是]?|注意|重要的是?|关键[是点]?)[^\n]{10,100}", "fact", 0.6),
-    # User gives preference
-    (r"(?:我[更喜欢想要偏好]|倾向于|比较喜欢|习惯)[^\n]{5,80}", "preference", 0.7),
-    # Code/tech learnings
-    (r"(?:这个项目|这里|代码[中里]|API|接口|函数|文件)[^\n]{10,100}(?:是|用|在|需要|可以)[^\n]{5,60}", "technical", 0.5),
-    # File/directory structure
-    (r"(?:项目结构|目录结构|代码在|配置文件|入口[文件点])[^\n]{10,100}", "structure", 0.55),
-]
-
-
-def _extract_learnings_heuristic(user_text: str, session_id: str) -> int:
-    """Simple pattern-based knowledge extraction from user messages.
-    Falls back to this when LLM-based extraction is unavailable.
-    Returns number of learnings extracted."""
-    count = 0
-    for pattern, source_type, confidence in _KNOWLEDGE_PATTERNS:
-        for match in re.finditer(pattern, user_text):
-            matched_text = match.group(0).strip()
-            if len(matched_text) < 8:
-                continue
-            # Derive topic from first few chars
-            topic = matched_text[:30].strip().rstrip("，。,.!！?？")
-            _store_learning(session_id, topic, matched_text, confidence, source_type)
-            # Store as preference if it's a preference pattern
-            if source_type == "preference":
-                _store_preference("user_style", matched_text, confidence)
-            count += 1
-    return count
-
-
 def _extract_last_user_text(messages: list) -> str:
     """Extract text content from the last user message in the messages array."""
     for m in reversed(messages):
@@ -2462,6 +1315,16 @@ def _save_skills_config(cfg: dict):
     """Save skills config."""
     PROGRESS_DIR.mkdir(parents=True, exist_ok=True)
     SKILLS_CONFIG.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+
+
+def _is_skill_enabled(skill_name: str) -> bool:
+    """Check if a skill is enabled in the loaded skills list."""
+    for s in _loaded_skills:
+        if s.get("key") == skill_name or s.get("name") == skill_name:
+            return s.get("enabled", True)
+    return True  # If not listed, assume enabled
 
 
 def _load_skills() -> list[dict]:
@@ -2557,38 +1420,6 @@ def _filter_tools(user_text: str, all_tools: list[dict]) -> list[dict]:
     allowed_tools.add("mx_query")
     filtered = [t for t in all_tools if t.get("function", {}).get("name") in allowed_tools]
     return filtered if filtered else all_tools
-
-
-# ═══════════════════════════════════════════════════════
-#  Memory Semantic Summarization: LLM compresses learnings
-# ═══════════════════════════════════════════════════════
-
-async def _summarize_learning(raw_content: str) -> str:
-    """Use LLM to compress a raw learning into a concise semantic summary (1-2 sentences)."""
-    try:
-        prompt = (
-            "将以下知识片段压缩为一到两句中文摘要，只保留可操作的结论，去掉冗余细节。\n\n"
-            f"原文: {raw_content[:500]}\n\n摘要:"
-        )
-        async with httpx.AsyncClient(timeout=httpx.Timeout(30)) as client:
-            r = await client.post(
-                LM_STUDIO_URL,
-                json={
-                    "model": SUBAGENT_MODEL,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 120,
-                    "temperature": 0.3,
-                    "stream": False,
-                },
-                headers={"Content-Type": "application/json"},
-            )
-            if r.status_code == 200:
-                data = r.json()
-                summary = data["choices"][0]["message"]["content"].strip()
-                return summary if summary else raw_content[:200]
-            return raw_content[:200]
-    except Exception:
-        return raw_content[:200]  # Fall back to truncation
 
 
 def _inject_image(messages: list, image_base64: str, image_mime: str) -> list:
@@ -2839,6 +1670,9 @@ async def _handle_tool_execution(tc: dict, current_msgs: list, session_id: str,
         _record_reflection(session_id, tool_name, args, result[:200], reflection_note, True)
 
     tool_content = result
+    # Inject reflection into conversation context so LLM benefits immediately
+    if reflection_note:
+        tool_content += "\n\n🔍 反思: " + reflection_note
     if verify_report:
         tool_content = f"{result}\n{verify_report}"
         if verify_failed:
@@ -3004,7 +1838,7 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
     # ── Dynamic Tool Filtering + Agent restrictions ──
     agent_tools = _get_agent_tools(agent_id, TOOLS)
     active_tools = _filter_tools(last_user_text, agent_tools) if last_user_text else agent_tools
-    # Cap tools at 5 to prevent overflowing model context with large definitions
+    # Cap tools at 7 to prevent overflowing model context with large definitions
     if len(active_tools) > 7:
         # Keep most important: read/write/list + the first 2 matching intent tools
         essential = {"read_file", "write_file", "list_dir"}
@@ -3015,6 +1849,9 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
     async with httpx.AsyncClient(timeout=httpx.Timeout(120)) as client:
         while iteration < 50:  # hard cap at 50, dynamic exit via stagnation
             iteration += 1
+            # Re-evaluate tool set every 3 iterations for multi-step tasks
+            if iteration > 1 and iteration % 3 == 0:
+                active_tools = agent_tools  # Full tool access for follow-up steps
             # ── Auto-Fix: if last verify failed, include error context ──
             if last_verify_failed and retry_count < max_retries:
                 current_msgs.append({
@@ -3743,6 +2580,19 @@ def _build_chat_messages(body: dict, messages: list, matched_skill: str|None = N
         })
         system_parts.append(memory_label + "\n" + "\n".join(recent))
 
+    # Always-inject high-confidence preferences (independent of query matching)
+    high_prefs = _get_high_confidence_preferences()
+    if high_prefs:
+        pref_lines = []
+        for p in high_prefs:
+            pref_lines.append(f"- {p['key']}: {p['value']}")
+        pref_label = _get_localized_text(user_lang, {
+            "zh": "以下是用户的高置信度偏好（每次对话都必须遵守）：",
+            "en": "User's high-confidence preferences (must follow every conversation):",
+            "ja": "ユーザーの高信頼度設定（毎回の対話で遵守すること）：",
+        })
+        system_parts.append(pref_label + "\n" + "\n".join(pref_lines))
+
     # Language enforcement: when user speaks non-Chinese, add strong override
     if user_lang != "zh":
         lang_override = _get_localized_text(user_lang, {
@@ -3964,7 +2814,7 @@ async def chat_completion(request: Request):
         agent_tools_ns = _get_agent_tools(agent_id, TOOLS)
         active_tools_ns = _filter_tools(last_user_text, agent_tools_ns) if last_user_text else agent_tools_ns
         use_prompt_tools = is_local  # Local models use prompt-based tool calling
-        # Cap tools: 5 for native function calling, 8 for prompt-based (less overhead)
+        # Cap tools: 7 for native function calling, 8 for prompt-based (less overhead)
         tool_cap = 8 if use_prompt_tools else 5
         if len(active_tools_ns) > tool_cap:
             essential = {"read_file", "write_file", "list_dir"}
@@ -5260,7 +4110,7 @@ async def _execute_cron_job(job: dict):
     if not api_url:
         logger.warning("Cron job: no API target available")
         return
-    model = os.environ.get("LATIAO_SUBAGENT_MODEL", SUBAGENT_MODEL)
+    model = SUBAGENT_MODEL
     agent_tools = _get_agent_tools("latiao", TOOLS)
     active_tools = _filter_tools(task, agent_tools)
     if len(active_tools) > 7:
@@ -5371,11 +4221,14 @@ async def api_open_identity(agent_id: str, section: str = ""):
     """Open the agent identity file (or section file) with the system default editor."""
     agents_dir = Path(__file__).resolve().parent / "agents"
     if section:
-        agent_file = agents_dir / f"{agent_id}_{section}.txt"
+        agent_file = (agents_dir / f"{agent_id}_{section}.txt").resolve()
         if not agent_file.exists():
             agent_file.write_text(f"# {agent_id} - {section}\n\n（此部分内容待补充）\n")
     else:
-        agent_file = agents_dir / f"{agent_id}.txt"
+        agent_file = (agents_dir / f"{agent_id}.txt").resolve()
+    # Path traversal protection
+    if not str(agent_file).startswith(str(agents_dir.resolve()) + "/"):
+        return {"status": "error", "message": "Invalid agent_id"}
     if not agent_file.exists():
         return {"status": "error", "message": f"Not found: {agent_id}" + (f"_{section}" if section else "")}
     try:

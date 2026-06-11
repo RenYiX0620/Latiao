@@ -292,7 +292,7 @@ body {
 .msg-bubble {
   display: inline-block; padding: 8px 14px; border-radius: var(--radius-lg);
   max-width: 68%; white-space: pre-line; word-break: break-word;
-  font-size: 13px; line-height: 1.5; text-align: left;
+  font-size: 13px; line-height: 1.35; text-align: left;
 }
 .msg-bubble.user {
   background: linear-gradient(135deg, rgba(56,189,248,0.2), rgba(99,102,241,0.12));
@@ -302,7 +302,7 @@ body {
   background: var(--bg-card); border: 1px solid var(--border-default);
   color: var(--text-primary);
 }
-.msg-bubble h1, .msg-bubble h2, .msg-bubble h3 { font-size: 15px; font-weight: 600; margin: 8px 0 4px; }
+.msg-bubble h1, .msg-bubble h2, .msg-bubble h3 { font-size: 15px; font-weight: 600; margin: 4px 0 2px; }
 .msg-bubble code {
   font-family: var(--font-mono); font-size: 11.5px;
   background: rgba(0,0,0,0.3); padding: 2px 5px; border-radius: 3px;
@@ -312,7 +312,7 @@ body {
   margin: 4px 0; overflow-x: auto; border: 1px solid var(--border-default);
 }
 .msg-bubble pre code { background: none; padding: 0; }
-.msg-bubble p { margin: 2px 0; }
+.msg-bubble p { margin: 0; }
 .msg-bubble ul, .msg-bubble ol { padding-left: 18px; margin: 2px 0; }
 .msg-bubble li { margin: 1px 0; }
 
@@ -333,7 +333,7 @@ body {
 .chat-input {
   flex: 1; background: 0 0; border: 0; color: var(--text-primary);
   font-size: 13px; outline: 0; padding: 6px 0; font-family: var(--font-sans);
-  line-height: 1.5; max-height: 150px; overflow-y: auto;
+  line-height: 1.35; max-height: 150px; overflow-y: auto;
   white-space: pre-wrap; word-break: break-word;
   -webkit-user-modify: read-write-plaintext-only;
 }
@@ -403,7 +403,7 @@ body {
 }
 .tool-call-result pre { margin: 0; font-size: 10px; font-family: var(--font-mono); white-space: pre-wrap; word-break: break-all; color: var(--text-secondary); }
 .tool-call-result h2 { font-size: 12px; margin: 6px 0 4px; color: var(--text-primary); }
-.tool-call-result p { margin: 2px 0; font-size: 10.5px; }
+.tool-call-result p { margin: 0; font-size: 10.5px; }
 .tool-call-result ul { margin: 2px 0; padding-left: 14px; }
 .tool-call-result li { font-size: 10.5px; margin: 1px 0; color: var(--text-secondary); }
 .tool-call-result strong { color: var(--text-primary); }
@@ -452,7 +452,7 @@ body {
 .card .btn-sm, .card .btn-md { margin-top: auto !important; }
 .card:hover { background: var(--bg-card-hover); border-color: var(--border-accent); }
 .card-title { font-size: 13px; font-weight: 600; margin-bottom: 4px; display: flex; align-items: center; gap: 8px; }
-.card-desc { font-size: 11px; color: var(--text-muted); line-height: 1.5; }
+.card-desc { font-size: 11px; color: var(--text-muted); line-height: 1.35; }
 .card-meta { display: flex; gap: 12px; margin-top: 8px; font-size: 10px; color: var(--text-muted); }
 
 /* ── Badge ── */
