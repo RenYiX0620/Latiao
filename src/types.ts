@@ -32,6 +32,7 @@ export interface SessionInfo {
   name: string;
   messages: Message[];
   selectedModel: string;
+  lastActive?: number;
 }
 
 export interface IdentityFile {

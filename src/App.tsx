@@ -99,6 +99,7 @@ function App() {
   } = useSessions();
   const { t, lang } = useTranslation();
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+const [timeFilter, setTimeFilter] = useState("all");
   const [activeView, setActiveView] = useState<ViewId>("chat");
   const [modelTab, setModelTab] = useState<"cloud" | "local">("cloud");
 
@@ -838,16 +839,39 @@ function App() {
               setActiveView("chat");
             }} title={t("sidebar.new")}>+</button>
           </div>
-          {!sidebarCollapsed && sessions.map((s, i) => (
-            <button key={s.id} className={`session-item${i === currentIdx ? " active" : ""}`} onClick={() => switchSession(i)}>
+          {!sidebarCollapsed && (() => {
+              const today = new Date(); today.setHours(0,0,0,0);
+              const weekStart = new Date(today); weekStart.setDate(today.getDate() - today.getDay());
+              const monthStart = new Date(today.getFullYear(), today.getMonth(), 1);
+              const t1 = today.getTime(), w1 = weekStart.getTime(), m1 = monthStart.getTime();
+              const filtered = sessions.filter(s => {
+                const la = s.lastActive || 0;
+                if (timeFilter === "today") return la >= t1;
+                if (timeFilter === "week") return la >= w1;
+                if (timeFilter === "month") return la >= m1;
+                if (timeFilter === "older") return la < m1;
+                return true;
+              });
+              return (<>
+                <div className="time-filter" style={{display:"flex",gap:4,padding:"4px 0",flexWrap:"wrap"}}>
+                  {["all","today","week","month","older"].map(f => (
+                    <button key={f} className={`btn btn-sm ${timeFilter===f?"btn-primary":"btn-ghost"}`}
+                      style={{fontSize:10,padding:"2px 6px"}}
+                      onClick={() => setTimeFilter(f)}>{t("sidebar.filter_"+f)}</button>
+                  ))}
+                </div>
+                {filtered.map((s) => {const idx = sessions.indexOf(s); return (
+          
+            <button key={s.id} className={`session-item${idx === currentIdx ? " active" : ""}`} onClick={() => switchSession(idx)}>
               <span className="session-info">
                 <div className="session-name">{s.name.startsWith("session.") ? t(s.name) : s.name}</div>
                 <div className="session-preview">{s.messages.length > 0 ? (s.messages[s.messages.length - 1].content || "").slice(0, 30) + "..." : t("session.default")}</div>
               </span>
-              <span className="session-delete-btn" style={i === currentIdx ? { opacity: 1 } : undefined}
-                onClick={(e) => { e.stopPropagation(); deleteSession(i); }}>×</span>
+              <span className="session-delete-btn" style={idx === currentIdx ? { opacity: 1 } : undefined}
+                onClick={(e) => { e.stopPropagation(); deleteSession(idx); }}>×</span>
             </button>
-          ))}
+          );})}
+          </>)})()}
           
           <div className="nav-section-label">{t("sidebar.nav")}</div>
           {NAV_ITEMS.map((item) => (

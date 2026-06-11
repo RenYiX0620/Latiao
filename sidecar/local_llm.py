@@ -31,6 +31,34 @@ logger = logging.getLogger("latiao-sidecar")
 MODELS_DIR = Path(os.environ.get("LATIAO_MODELS_DIR", Path.home() / "Models"))
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
+# ── Model quant → KV cache quant mapping ──
+# KV cache precision should never exceed model weight precision.
+# Q2/Q3/Q4 model → Q4_0 KV; Q5+ model → Q8_0 KV
+
+def _detect_model_bits(model_path: str) -> int:
+    """Detect model quantization bits from filename. Returns 4, 5, 6, 8, or 16."""
+    import re
+    name = Path(model_path).name.upper().replace(".GGUF", "")
+    # Match common quantization markers: Q4_K_M, Q5_0, IQ3_XXS, Q8_0, etc.
+    m = re.search(r'(?:^|[._-])(?:Q|IQ)(\d)', name)
+    if m:
+        return int(m.group(1))
+    m = re.search(r'(?:^|[._-])(F16|FP16|F32|FP32)', name)
+    if m:
+        return 16
+    # Default: assume 4-bit (most common download)
+    return 4
+
+def _auto_cache_type(model_path: str) -> tuple[int, int]:
+    """Return (type_k, type_v) as ggml_type ints based on model quantization level.
+    KV cache precision should never exceed model precision.
+    ggml_type: F16=1, Q4_0=2, Q8_0=8"""
+    bits = _detect_model_bits(model_path)
+    if bits <= 4:
+        return (2, 2)    # Q4 model → Q4_0 KV
+    else:
+        return (8, 8)    # Q5+ model → Q8_0 KV
+
 IS_MAC = platform.system() == "Darwin"
 IS_WINDOWS = platform.system() == "Windows"
 IS_APPLE_SILICON = IS_MAC and (platform.processor() == "arm" or "Apple" in platform.processor())
@@ -634,6 +662,12 @@ class LocalLLMEngine:
                 "--n_ctx", str(self.model_token_limit),
                 "--n_gpu_layers", str(self.n_gpu_layers),
             ]
+            # ── Auto-select KV cache quant based on model quant ──
+            # Q4 model → Q4_0 KV; Q5+ model → Q8_0 KV
+            kv_k, kv_v = _auto_cache_type(model_path)
+            cmd += ["--type_k", str(kv_k), "--type_v", str(kv_v)]
+            # Flash attention — reduce attention memory overhead
+            cmd += ["--flash_attn", "1"]
             # Enable function calling via chat format for models that support it
             chat_fmt = self._guess_chat_format(model_path)
             if chat_fmt:

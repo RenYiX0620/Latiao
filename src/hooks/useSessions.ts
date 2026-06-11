@@ -6,13 +6,14 @@ const newSession = (): SessionInfo => ({
   name: "session.default",
   messages: [],
   selectedModel: "",
+  lastActive: Date.now(),
 });
 
 export function useSessions() {
   const [sessions, setSessions] = useState<SessionInfo[]>(() => {
     try {
       const saved = localStorage.getItem("local_ai_os_sessions");
-      if (saved) { const parsed = JSON.parse(saved); if (Array.isArray(parsed) && parsed.length > 0) return parsed; }
+      if (saved) { const parsed = JSON.parse(saved); if (Array.isArray(parsed) && parsed.length > 0) return parsed.map((s: any) => ({ ...s, lastActive: s.lastActive || Date.now() })); }
     } catch { /* ignore */ }
     return [newSession()];
   });
@@ -43,7 +44,7 @@ export function useSessions() {
           const firstUser = newMsgs.find((m: Message) => m.role === "user");
           if (firstUser?.content) name = firstUser.content.slice(0, 20).replace(/\n/g, " ") + (firstUser.content.length > 20 ? "…" : "");
         }
-        return { ...s, messages: newMsgs, name };
+        return { ...s, messages: newMsgs, name, lastActive: Date.now() };
       })
     );
   };

@@ -44,6 +44,15 @@ import local_llm
 
 logger = logging.getLogger("latiao-sidecar")
 
+# Load .env file manually
+env_path = Path(__file__).parent / ".env"
+if env_path.exists():
+    for _line in env_path.read_text().splitlines():
+        _line = _line.strip()
+        if _line and not _line.startswith("#") and "=" in _line:
+            _k, _v = _line.split("=", 1)
+            os.environ[_k.strip()] = _v.strip().strip("'\"")
+
 # ── MX_APIKEY: set via env var MX_APIKEY ──
 if not os.environ.get("MX_APIKEY"):
     logger.info("MX_APIKEY not set — 妙想金融技能将不可用")
@@ -2509,6 +2518,8 @@ TOOL_CATEGORIES = {
     "file_write": ["write_file"],
     "command": ["run_cmd"],
     "app": ["open_app", "open_folder"],
+    "web": ["tavily_search", "web_search"],
+    "financial": ["mx_query"],
 }
 
 INTENT_PATTERNS = [
@@ -2520,6 +2531,10 @@ INTENT_PATTERNS = [
      ["file_read", "command"]),
     (re.compile(r"打开|启动|open|launch|start|应用|app|程序|finder", re.IGNORECASE),
      ["file_read", "app"]),
+    (re.compile(r"大盘|A股|港股|股票|个股|股价|行情|涨停|跌停|板块|上证|深证|创业板|科创板|沪深|指数|基金|财报|财务|营收|净利润|上市公司|分红|PE|PB|ROE|股息|龙头|K线|成交量|换手率|资金流向|北向资金|龙虎榜|券商研报", re.IGNORECASE),
+     ["file_read", "financial"]),
+    (re.compile(r"上网|联网|搜索网络|搜一下|最新的|最新消息|新闻|热搜|汇率|天气|search|web|online|latest|news|weather|trending", re.IGNORECASE),
+     ["file_read", "web"]),
 ]
 
 
@@ -2538,6 +2553,8 @@ def _filter_tools(user_text: str, all_tools: list[dict]) -> list[dict]:
         allowed_tools.update(TOOL_CATEGORIES.get(cat, []))
     # Always include read_file as fallback
     allowed_tools.add("read_file")
+    allowed_tools.add("tavily_search")
+    allowed_tools.add("mx_query")
     filtered = [t for t in all_tools if t.get("function", {}).get("name") in allowed_tools]
     return filtered if filtered else all_tools
 
@@ -2990,7 +3007,7 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
     # Cap tools at 5 to prevent overflowing model context with large definitions
     if len(active_tools) > 7:
         # Keep most important: read/write/list + the first 2 matching intent tools
-        essential = {"read_file", "write_file", "list_dir", "tavily_search"}
+        essential = {"read_file", "write_file", "list_dir"}
         priority = [t for t in active_tools if t.get("function", {}).get("name") in essential]
         others = [t for t in active_tools if t.get("function", {}).get("name") not in essential]
         active_tools = priority + others[:max(0, 5 - len(priority))]
@@ -3460,7 +3477,7 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
     agent_tools = _get_agent_tools(agent_id, TOOLS)
     active_tools = _filter_tools(last_user_text, agent_tools) if last_user_text else agent_tools
     if len(active_tools) > 8:
-        essential = {"read_file", "write_file", "list_dir", "tavily_search"}
+        essential = {"read_file", "write_file", "list_dir"}
         priority = [t for t in active_tools if t.get("function", {}).get("name") in essential]
         others = [t for t in active_tools if t.get("function", {}).get("name") not in essential]
         active_tools = priority + others[:max(0, 8 - len(priority))]
@@ -3950,7 +3967,7 @@ async def chat_completion(request: Request):
         # Cap tools: 5 for native function calling, 8 for prompt-based (less overhead)
         tool_cap = 8 if use_prompt_tools else 5
         if len(active_tools_ns) > tool_cap:
-            essential = {"read_file", "write_file", "list_dir", "tavily_search"}
+            essential = {"read_file", "write_file", "list_dir"}
             priority_ns = [t for t in active_tools_ns if t.get("function", {}).get("name") in essential]
             others_ns = [t for t in active_tools_ns if t.get("function", {}).get("name") not in essential]
             active_tools = priority_ns + others_ns[:max(0, tool_cap - len(priority_ns))]
@@ -5247,7 +5264,7 @@ async def _execute_cron_job(job: dict):
     agent_tools = _get_agent_tools("latiao", TOOLS)
     active_tools = _filter_tools(task, agent_tools)
     if len(active_tools) > 7:
-        essential = {"read_file", "write_file", "list_dir", "tavily_search"}
+        essential = {"read_file", "write_file", "list_dir"}
         priority = [t for t in active_tools if t.get("function", {}).get("name") in essential]
         others = [t for t in active_tools if t.get("function", {}).get("name") not in essential]
         active_tools = priority + others[:max(0, 5 - len(priority))]

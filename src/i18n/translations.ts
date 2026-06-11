@@ -20,7 +20,12 @@ const T: Record<string, Record<Lang, string>> = {
   "sidebar.online": { zh: "Sidecar 已连接", en: "Sidecar Connected", ja: "接続済み", ru: "Подключен" },
   "sidebar.offline": { zh: "Sidecar 未连接", en: "Sidecar Offline", ja: "未接続", ru: "Отключен" },
   "sidebar.identity": { zh: "身份文件:", en: "Identity:", ja: "アイデンティティ:", ru: "Идентичность:" },
-  "sidebar.processing": { zh: "处理中...", en: "Processing...", ja: "処理中...", ru: "Обработка..." },
+  "sidebar.processing": { zh: "处理中...", en: "Processing...", ja: "処理中...", ru: "Обработка..." },  "sidebar.filter_all": { zh: "全部", en: "All", ja: "すべて", ru: "Все" },
+  "sidebar.filter_today": { zh: "今天", en: "Today", ja: "今日", ru: "Сегодня" },
+  "sidebar.filter_week": { zh: "本周", en: "This Week", ja: "今週", ru: "Неделя" },
+  "sidebar.filter_month": { zh: "本月", en: "This Month", ja: "今月", ru: "Месяц" },
+  "sidebar.filter_older": { zh: "更早", en: "Older", ja: "以前", ru: "Ранее" },
+
   // ── ChatView ──
   "chat.role_you": { zh: "你", en: "You", ja: "あなた", ru: "Вы" },
   "chat.role_assistant": { zh: "助手", en: "Assistant", ja: "アシスタント", ru: "Ассистент" },
