@@ -13,6 +13,8 @@ from typing import Any
 
 import httpx
 from config import LM_STUDIO_URL, SUBAGENT_MODEL, SKILLS_DIR
+from db import _get_db
+from db import _get_db
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +26,6 @@ _skill_gen_tracker: dict[str, int] = {}
 
 
 # Database lock (separate from main.py's lock since we write to different tables)
-_db_write_lock = threading.Lock()
 
 # TF-IDF cache (moved from main.py with learning functions)
 _TFIDF_CACHE = None
