@@ -86,7 +86,7 @@ logger.info("Sidecar 启动")
 # os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
 
-from identity import _load_agent_identity, IDENTITY_FILES, _read_identity, _create_default_identity, _detect_identity_intent, _apply_name_change, _apply_style_change, _apply_rule_change, _apply_pref_change, _process_identity_intents
+from identity import _load_agent_identity, IDENTITY_FILES, _create_default_identity, _detect_identity_intent, _apply_name_change, _apply_style_change, _apply_rule_change, _apply_pref_change, _process_identity_intents
 # ═══════════════════════════════════════════════════════
 #  Smart Skill System: Auto-match & load skills on demand
 # ═══════════════════════════════════════════════════════
@@ -758,8 +758,11 @@ async def _delegate_task(agent_type: str, task: str) -> str:
                     "messages": current_msgs,
                     "tools": sub_tools,
                     "tool_choice": "auto",
-                    "max_tokens": 2048,
+                    "max_tokens": 1024,
                     "stream": False,
+                    "temperature": 0.5,
+                    "frequency_penalty": 0.6,
+                "stop": ["<|im_end|>", "<|endoftext|>"],
                 }
                 r = await client.post(api_url, json=body, headers=sub_headers)
                 if r.status_code != 200:
@@ -1165,6 +1168,26 @@ def _record_progress(entry: str):
     except Exception:
         logger.warning("Failed to record progress", exc_info=True)
 
+
+
+
+
+
+def _deduplicate_response(text: str) -> str:
+    """Remove repeated identity introductions. Keeps only the first complete one."""
+    if not text:
+        return text
+    # Pattern: text starts with "我是辣条...", then finds "我是辣条" again
+    import re
+    for prefix in ["我是辣条", "我是 LaTiao", "我是LaTiao"]:
+        pattern = re.escape(prefix)
+        m = re.search(f'^({pattern}.*?){pattern}', text, re.DOTALL)
+        if m:
+            return m.group(1).strip()
+        m = re.search(f'^(你好[，！、\\s]*{pattern}.*?)(?:你好[，！、\\s]*)?{pattern}', text, re.DOTALL)
+        if m:
+            return m.group(1).strip()
+    return text
 
 
 def _record_tool_call_db(session_id: str, tool_name: str, args: dict, result: str):
@@ -1782,6 +1805,9 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                 "model": model, "messages": current_msgs,
                 "tools": active_tools, "tool_choice": "auto",
                 "max_tokens": 4096, "stream": True,
+                "temperature": 0.5,
+                "frequency_penalty": 0.6,
+                "stop": ["<|im_end|>", "<|endoftext|>"],
             }
 
             streamed_text = ""
@@ -1801,6 +1827,9 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                             reasoning = delta.get("reasoning", "")
                             if content:
                                 streamed_text += content
+                                # Anti-repetition: skip tokens once the first complete intro is detected
+                                if len(_deduplicate_response(streamed_text)) < len(streamed_text):
+                                    continue
                                 # Filter native control tokens so the UI doesn't show
                                 # raw <|tool_call|> / <|channel> / <channel|> markers
                                 clean = _NATIVE_CONTROL_RE.sub("", content)
@@ -1812,6 +1841,8 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                                 # Reasoning model (Qwen3.6, DeepSeek-R1, etc.) — stream thinking as content
                                 # so the UI doesn't appear frozen during the thinking phase
                                 streamed_text += reasoning
+                                if len(_deduplicate_response(streamed_text)) < len(streamed_text):
+                                    continue
                                 yield {"content": reasoning}
 
                             for tc_delta in delta.get("tool_calls", []):
@@ -1856,7 +1887,7 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
 
                 current_msgs.append({
                     "role": "assistant",
-                    "content": streamed_text or None,
+                    "content": _deduplicate_response(streamed_text) if streamed_text else None,
                     "tool_calls": tool_calls,
                 })
                 has_called_tool = True
@@ -1901,7 +1932,17 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                 })
                 continue
             if not has_called_tool and iteration <= 3 and streamed_text.strip():
-                # Model hasn't called any tools yet - nudging to use tools instead of planning
+                # Model gave a text response without calling tools.
+                # Record the response so the model knows it already replied.
+                current_msgs.append({"role": "assistant", "content": streamed_text.strip()})
+                # If this is clearly a direct answer to a simple question, stop nudging.
+                user_q = last_user_text.strip().rstrip("?？") if last_user_text else ""
+                is_question = "?" in user_q or "？" in user_q or "吗" in user_q or "什么" in user_q or "谁" in user_q or "哪" in user_q
+                has_task_kw = any(kw in user_q for kw in ["运行", "执行", "做", "帮我", "写", "创建", "查", "搜", "找", "分析", "修复", "构建", "部署", "安装", "配置", "run", "build", "fix", "create", "search", "analyze", "deploy"])
+                if (len(user_q) < 20 or is_question) and not has_task_kw:
+                    _track_progress(session_id, "completed", f"text_response ({len(streamed_text)} chars)")
+                    return
+                # For task-like requests, nudge to use tools
                 current_msgs.append({
                     "role": "system",
                     "content": (
@@ -2287,7 +2328,10 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
 
             body = {
                 "model": model, "messages": loop_msgs,
-                "max_tokens": 8192, "stream": True,
+                "max_tokens": 4096, "stream": True,
+                "temperature": 0.5,
+                "frequency_penalty": 0.6,
+                "stop": ["<|im_end|>", "<|endoftext|>"],
             }
 
             streamed_text = ""
@@ -2305,9 +2349,14 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                             reasoning = delta.get("reasoning", "")
                             if content:
                                 streamed_text += content
+                                # Anti-repetition: skip tokens after the first complete intro
+                                if len(_deduplicate_response(streamed_text)) < len(streamed_text):
+                                    continue
                                 yield {"content": content}
                             elif reasoning:
                                 streamed_text += reasoning
+                                if len(_deduplicate_response(streamed_text)) < len(streamed_text):
+                                    continue
                                 yield {"content": reasoning}
                         except (json.JSONDecodeError, KeyError, TypeError):
                             pass
@@ -2378,7 +2427,17 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                 text_only_streak += 1
                 continue
             if not has_called_tool and iteration <= 3 and streamed_text.strip():
-                # Model hasn't called any tools yet and is outputting text (planning instead of doing)
+                # Model gave a text response without calling tools.
+                # Record the response so the model knows it already replied.
+                current_msgs.append({"role": "assistant", "content": streamed_text.strip()})
+                # If this is clearly a direct answer to a simple question, stop nudging.
+                user_q = _extract_last_user_text(current_msgs).strip().rstrip("?？") if current_msgs else ""
+                is_question = "?" in user_q or "？" in user_q or "吗" in user_q or "什么" in user_q or "谁" in user_q or "哪" in user_q
+                has_task_kw = any(kw in user_q for kw in ["运行", "执行", "做", "帮我", "写", "创建", "查", "搜", "找", "分析", "修复", "构建", "部署", "安装", "配置", "run", "build", "fix", "create", "search", "analyze", "deploy"])
+                if (len(user_q) < 20 or is_question) and not has_task_kw:
+                    _track_progress(session_id, "completed", f"text_response ({len(streamed_text)} chars)")
+                    return
+                # For task-like requests, nudge to use tools
                 logger.info(f"[LOCAL-AGENT] Iteration {iteration}: model planning instead of calling tools, nudging")
                 current_msgs.append({
                     "role": "system",
@@ -2420,10 +2479,6 @@ def _build_chat_messages(body: dict, messages: list, matched_skill: str|None = N
     agent_cfg = _get_agent_config(agent_id)
     system_parts.append(agent_cfg["identity"])
 
-    # Identity file
-    identity_msgs = _read_identity()
-    for im in identity_msgs:
-        system_parts.append(im["content"])
     if intent_result:
         system_parts.append(
             f"⚠️ 你的身份刚刚被用户更新了：{intent_result}。"
@@ -2760,13 +2815,19 @@ async def chat_completion(request: Request):
                     if use_prompt_tools:
                         resp = await client.post(api_url, json={
                             "model": model, "messages": loop_msgs,
-                            "max_tokens": 8192, "stream": False,
+                            "max_tokens": 2048, "stream": False,
+                            "temperature": 0.5,
+                            "frequency_penalty": 0.6,
+                "stop": ["<|im_end|>", "<|endoftext|>"],
                         }, headers=headers)
                     else:
                         resp = await client.post(api_url, json={
                             "model": model, "messages": current_msgs,
                             "tools": active_tools, "tool_choice": "auto",
-                            "max_tokens": 8192, "stream": False,
+                            "max_tokens": 2048, "stream": False,
+                            "temperature": 0.5,
+                            "frequency_penalty": 0.6,
+                "stop": ["<|im_end|>", "<|endoftext|>"],
                         }, headers=headers)
                     resp_data = resp.json()
                     choices = resp_data.get("choices", [])
@@ -2860,7 +2921,7 @@ async def chat_completion(request: Request):
                 system_msgs = [m for m in msgs_for_model if m.get("role") == "system"]
                 other_msgs = [m for m in msgs_for_model if m.get("role") != "system"]
                 msgs_for_model = system_msgs + other_msgs[-20:]
-            lm_body = {"model": model, "messages": msgs_for_model, "stream": True, "max_tokens": 4096}
+            lm_body = {"model": model, "messages": msgs_for_model, "stream": True, "max_tokens": 2048, "temperature": 0.5, "frequency_penalty": 0.6, "stop": ["<|im_end|>", "<|endoftext|>"]}
             try:
                 async with httpx.AsyncClient(timeout=httpx.Timeout(120)) as c:
                     async with c.stream("POST", api_url, json=lm_body, headers=headers) as r:
@@ -2895,7 +2956,10 @@ async def chat_completion(request: Request):
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(120)) as c:
             resp = await c.post(api_url, json={
-                "model": model, "messages": messages, "max_tokens": 4096,
+                "model": model, "messages": messages, "max_tokens": 1024,
+                "temperature": 0.5,
+                "frequency_penalty": 0.6,
+                "stop": ["<|im_end|>", "<|endoftext|>"],
             }, headers=headers)
             resp_data = resp.json()
     except (httpx.ConnectError, httpx.RemoteProtocolError):
@@ -2937,7 +3001,7 @@ async def chat_completion(request: Request):
         "object": "chat.completion",
         "created": int(datetime.now().timestamp()),
         "model": model,
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": ai_content, "reasoning": ai_reasoning},
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": _deduplicate_response(ai_content) if ai_content else None, "reasoning": ai_reasoning},
                      "finish_reason": "stop"}],
         "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
     }
@@ -4036,6 +4100,9 @@ async def _execute_cron_job(job: dict):
                     "model": model, "messages": current_msgs,
                     "tools": active_tools, "tool_choice": "auto",
                     "max_tokens": 2048, "stream": False,
+                    "temperature": 0.5,
+                    "frequency_penalty": 0.6,
+                "stop": ["<|im_end|>", "<|endoftext|>"],
                 }, headers=headers)
                 resp_data = resp.json()
                 choices = resp_data.get("choices", [])
@@ -4053,7 +4120,7 @@ async def _execute_cron_job(job: dict):
 
                 if tc_data:
                     tool_count += 1
-                    current_msgs.append({"role": "assistant", "content": content or None, "tool_calls": tc_data})
+                    current_msgs.append({"role": "assistant", "content": _deduplicate_response(content) if content else None, "tool_calls": tc_data})
                     for tc in tc_data:
                         tool_name = tc.get("function", {}).get("name", "")
                         tool_args_str = tc.get("function", {}).get("arguments", "{}")
