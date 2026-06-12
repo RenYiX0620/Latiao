@@ -1,0 +1,11 @@
+{
+  "version": "0.1.2",
+  "notes": "",
+  "pub_date": "2026-06-12T11:45:01+00:00",
+  "platforms": {
+    "darwin-aarch64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUUUgvenloMFFPY201a3hDYWl2UnBZOC8rbjhUbG1WTG04dmlDSWgzQ3pRamMwVHRNUGJKK0hLQlljQjQycko1enpTN0g0Vk5EOUJVZUpYWnNyR1ZwcU4wRXV5bGQ4Y0E4PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgxMjY0NzAxCWZpbGU6TGF0aWFvXzAuMS4yX2FhcmNoNjQuYXBwLnRhci5negpJWnZKSFVEWUdSTU5OSER4cW05ZnNpQm1mRUh4Mmc3b2tNV2lEbldUM3RYRHY5RTZPVDRiaHpOZVV0TFIyS3Y4MlRxc0hMR2dlSU1NUGM0RDlKU1pDQT09Cg==",
+      "url": "https://github.com/RenYiX0620/Latiao/releases/download/v0.1.2/Latiao_0.1.2_aarch64.app.tar.gz"
+    }
+  }
+}
