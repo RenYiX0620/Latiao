@@ -4,6 +4,7 @@ dist/
 Latiao.app/
 src-tauri/target/
 sidecar/venv/
+sidecar/python/
 sidecar/__pycache__/
 sidecar/plugins/__pycache__/
 __pycache__/

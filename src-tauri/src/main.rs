@@ -95,19 +95,47 @@ fn delete_secret(key: String) -> Result<(), String> {
 
 /// Cross-platform stubs: non-macOS platforms use in-memory storage for now.
 /// TODO: Windows Credential Manager + Linux Secret Service integration.
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+#[tauri::command]
+fn store_secret(key: String, value: String) -> Result<(), String> {
+    use std::process::Stdio;
+    let status = Command::new("cmdkey")
+        .args(["/add", &format!("latiao:{}", key), "/user", "latiao", "/pass", &value])
+        .stdout(Stdio::null()).stderr(Stdio::null())
+        .status().map_err(|e| format!("cmdkey failed: {}", e))?;
+    if status.success() { Ok(()) } else { Err("cmdkey exited non-zero".into()) }
+}
+
+#[cfg(target_os = "windows")]
+#[tauri::command]
+fn get_secret(_key: String) -> Result<String, String> {
+    Err("Not found".into())
+}
+
+#[cfg(target_os = "windows")]
+#[tauri::command]
+fn delete_secret(key: String) -> Result<(), String> {
+    use std::process::Stdio;
+    Command::new("cmdkey")
+        .args(["/delete", &format!("latiao:{}", key)])
+        .stdout(Stdio::null()).stderr(Stdio::null())
+        .status().map_err(|e| format!("cmdkey failed: {}", e))?;
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 #[tauri::command]
 fn store_secret(_key: String, _value: String) -> Result<(), String> {
     Err("Secret storage not yet implemented on this platform".into())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 #[tauri::command]
 fn get_secret(_key: String) -> Result<String, String> {
     Err("Secret storage not yet implemented on this platform".into())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 #[tauri::command]
 fn delete_secret(_key: String) -> Result<(), String> {
     Err("Secret storage not yet implemented on this platform".into())
@@ -155,7 +183,18 @@ impl Drop for SidecarProcess {
 }
 
 fn home_dir() -> std::path::PathBuf {
-    std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()))
+    #[cfg(target_os = "windows")]
+    {
+        std::path::PathBuf::from(
+            std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\".into())
+        )
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::path::PathBuf::from(
+            std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())
+        )
+    }
 }
 
 #[tauri::command]
@@ -220,12 +259,26 @@ fn start_sidecar() -> Option<Child> {
         }
     }
 
-    // Prefer venv Python, fall back to system python3
+    #[cfg(target_os = "windows")]
+    let sidecar_exe = sidecar_dir.join("sidecar.exe");
+    #[cfg(not(target_os = "windows"))]
+    let bundled_python = sidecar_dir.join("python").join("bin").join("python3");
+    #[cfg(not(target_os = "windows"))]
     let venv_python = sidecar_dir.join("venv").join("bin").join("python3");
-    let python = if venv_python.exists() { venv_python } else { std::path::PathBuf::from("python3") };
 
-    match Command::new(python)
-        .arg("main.py")
+    #[cfg(target_os = "windows")]
+    let mut cmd = Command::new(&sidecar_exe);
+    #[cfg(not(target_os = "windows"))]
+    let mut cmd = {
+        let python = if bundled_python.exists() { bundled_python }
+                     else if venv_python.exists() { venv_python }
+                     else { std::path::PathBuf::from("python3") };
+        let mut c = Command::new(python);
+        c.arg("main.py");
+        c
+    };
+
+    match cmd
         .current_dir(&sidecar_dir)
         .env("LATIAO_CTX_LEN", "64000")
         .spawn()
