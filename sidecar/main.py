@@ -37,6 +37,7 @@ import shlex
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import uuid
 
