@@ -4,6 +4,24 @@ Stateless: frontend manages all state, sends complete messages array per request
 """
 from __future__ import annotations
 
+import sys
+if len(sys.argv) > 1 and sys.argv[1] == "--mx-query":
+    sys.argv = [sys.argv[0]] + sys.argv[2:]
+    from skills.mx_data.mx_data import MXData
+    query = " ".join(sys.argv[1:])
+    mx = MXData()
+    result = mx.query(query)
+    print(mx.format_terminal(result, *mx.parse_result(result)))
+    sys.exit(0)
+
+import os
+if sys.platform == "win32" and getattr(sys, 'frozen', False):
+    if sys.stdout is None:
+        log_dir = os.path.join(os.environ.get("TEMP", "."))
+        sys.stdout = open(os.path.join(log_dir, "latiao-sidecar.log"), "a")
+        sys.stderr = sys.stdout
+
+
 import asyncio
 import base64
 from collections import deque
@@ -36,7 +54,7 @@ from pathlib import Path
 from tool_system import load_plugins
 from config import LM_STUDIO_URL, SUBAGENT_MODEL, SKILLS_DIR, PROGRESS_DIR
 from db import _get_db, _create_table, _init_db, MEMORY_DB, _db_write_lock
-from memory import _tokenize_zh, _quick_reflect, _build_learning_context, _extract_learnings_heuristic, _maybe_generate_skill, _refine_learnings, _get_recent_learnings, _summarize_learning, _retrieve_preferences, _record_reflection, _get_high_confidence_preferences
+from memory import _tokenize_zh, _quick_reflect, _build_learning_context, _extract_learnings_heuristic, _maybe_generate_skill, _refine_learnings, _get_recent_learnings, _retrieve_relevant_learnings, _summarize_learning, _retrieve_preferences, _record_reflection, _get_high_confidence_preferences
 import httpx
 from fastapi import FastAPI, File, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -86,7 +104,7 @@ logger.info("Sidecar 启动")
 # os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
 
-from identity import _load_agent_identity, IDENTITY_FILES, _create_default_identity, _detect_identity_intent, _apply_name_change, _apply_style_change, _apply_rule_change, _apply_pref_change, _process_identity_intents
+from identity import _load_agent_identity, IDENTITY_FILES, _read_identity, _create_default_identity, _detect_identity_intent, _apply_name_change, _apply_style_change, _apply_rule_change, _apply_pref_change, _process_identity_intents
 # ═══════════════════════════════════════════════════════
 #  Smart Skill System: Auto-match & load skills on demand
 # ═══════════════════════════════════════════════════════
@@ -245,6 +263,7 @@ TAVILY_API_URL = os.environ.get("TAVILY_API_URL", "https://api.tavily.com/search
 _last_cloud_config: contextvars.ContextVar = contextvars.ContextVar("cloud_config", default=None)
 MAX_UPLOAD_SIZE = 50 * 1024 * 1024  # 50 MB
 IS_MACOS = platform.system() == "Darwin"
+IS_WINDOWS = platform.system() == "Windows"
 
 # ═══════════════════════════════════════════════════════
 #  Multi-Agent System: LaTiao orchestrator + specialists
@@ -363,7 +382,7 @@ TOOL_HOOKS: dict[str, dict] = {}
 _pending_confirmations: dict[str, dict] = {}
 _pending_lock = asyncio.Lock()
 
-PROGRESS_DIR = Path.home() / ".local-ai-os"
+# PROGRESS_DIR is imported from config
 PROGRESS_FILE = PROGRESS_DIR / "PROGRESS.md"
 PERMISSIONS_CONFIG = PROGRESS_DIR / "permissions.json"
 CRON_FILE = PROGRESS_DIR / "cron.json"
@@ -1066,16 +1085,13 @@ async def _auto_verify(tool_name: str, args: dict, result: str) -> str:
         # ── Python syntax check ──
         if path.endswith(".py"):
             try:
-                proc = await asyncio.create_subprocess_exec(
-                    sys.executable, "-m", "py_compile", str(Path(path)),
-                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-                )
-                _, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
-                if proc.returncode == 0:
+                try:
+                    with open(path, encoding="utf-8") as _f:
+                        source = _f.read()
+                    compile(source, path, "exec")
                     checks.append(("OK", "Python 语法", "编译通过"))
-                else:
-                    err_text = (stderr or b"").decode("utf-8", errors="replace")[:300]
-                    checks.append(("FAIL", "Python 语法", err_text[:150]))
+                except SyntaxError as _e:
+                    checks.append(("FAIL", "Python 语法", str(_e)[:150]))
             except FileNotFoundError:
                 pass
             except asyncio.TimeoutError:
@@ -1120,6 +1136,36 @@ _delegate_tool_def = {
 TOOLS.append(_delegate_tool_def)
 TOOL_DISPATCH["delegate_task"] = lambda args: _delegate_task(args.get("agent", "code-reviewer"), args.get("task", ""))
 TOOL_PERMISSIONS["delegate_task"] = "safe"
+
+_create_cron_def = {
+    "type": "function",
+    "function": {
+        "name": "create_cron",
+        "description": "Create a scheduled task with cron expression. Schedule is standard 5-field cron, task is Chinese description.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "schedule": {"type": "string"},
+                "task": {"type": "string"}
+            },
+            "required": ["schedule", "task"]
+        }
+    }
+}
+TOOLS.append(_create_cron_def)
+TOOL_DISPATCH["create_cron"] = lambda a: _create_cron(a.get("schedule", "0 9 * * *"), a.get("task", ""))
+TOOL_PERMISSIONS["create_cron"] = "safe"
+
+
+def _create_cron(schedule, task):
+    import uuid as _uid, json
+    from datetime import datetime
+    job = {"id": str(_uid.uuid4()), "schedule": schedule, "task": task, "name": task,
+           "action": "execute", "enabled": True, "created_at": datetime.now().isoformat(), "last_run": ""}
+    with _cron_lock:
+        _cron_jobs.append(job)
+        _save_cron(_cron_jobs)
+    return "定时任务已创建: " + task + " (" + schedule + ")"
 
 
 async def execute_tool(tool_name: str, arguments: dict) -> str:
@@ -1179,7 +1225,7 @@ def _deduplicate_response(text: str) -> str:
         return text
     # Pattern: text starts with "我是辣条...", then finds "我是辣条" again
     import re
-    for prefix in ["我是辣条", "我是 LaTiao", "我是LaTiao"]:
+    for prefix in ["我是辣条", "我是 LaTiao", "我是LaTiao", "我是Latiao", "我叫辣条", "我是拉条"]:
         pattern = re.escape(prefix)
         m = re.search(f'^({pattern}.*?){pattern}', text, re.DOTALL)
         if m:
@@ -1347,8 +1393,10 @@ def _filter_tools(user_text: str, all_tools: list[dict]) -> list[dict]:
         allowed_tools.update(TOOL_CATEGORIES.get(cat, []))
     # Always include read_file as fallback
     allowed_tools.add("read_file")
-    allowed_tools.add("tavily_search")
-    allowed_tools.add("mx_query")
+    # Only add web/financial tools when relevant (not unconditionally)
+    if "financial" not in allowed_categories and "web" not in allowed_categories:
+        allowed_tools.add("tavily_search")
+        allowed_tools.add("mx_query")
     filtered = [t for t in all_tools if t.get("function", {}).get("name") in allowed_tools]
     return filtered if filtered else all_tools
 
@@ -1880,7 +1928,7 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                 tool_calls = []
 
             if tool_calls:
-                with open("/tmp/latiao-loop.log", "a") as lf:
+                with open(os.path.join(tempfile.gettempdir(), "latiao-loop.log"), "a") as lf:
                     lf.write(f"Iteration {iteration}: found {len(tool_calls)} tool(s): {[tc.get('function',{}).get('name') for tc in tool_calls]}\n")
                 _track_progress(session_id, "tool_calling", f"{len(tool_calls)} tool(s)")
                 logger.info(f"[LOCAL-AGENT] Iteration {iteration}: {len(tool_calls)} tool(s) called, msgs_in_context={len(current_msgs)}")
@@ -1958,6 +2006,7 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                     "ja": "⚠️ 前回の応答が空でした。ユーザーに直接返信するか、ツールを使用してください。",
                 })
                 current_msgs.append({"role": "system", "content": nudge_text})
+                text_only_streak += 1
                 continue
             _track_progress(session_id, "completed", f"text_response ({len(streamed_text)} chars)")
             return
@@ -2245,17 +2294,23 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
             _record_progress(f"⚠️ 自动存档（上下文 {{total_chars//2}} tokens）\n最后用户消息: {last_user[:200] if last_user else '(无)'}")
         except Exception:
             pass
-        yield {"content": f"\n\n💡 **上下文接近上限**（~{total_chars//2} tokens）。建议：\n1. 当前进度已自动保存到 PROGRESS.md\n2. 开一个新会话，Agent 会从断点继续\n3. 或继续在本会话中完成（质量可能下降）"}
+        _ctx_lang = _detect_user_language(_extract_last_user_text(current_msgs)) if 'current_msgs' in dir() and current_msgs else "zh"
+        _ctx_msg = _get_localized_text(_ctx_lang, {
+            "zh": f"💡 **上下文接近上限**（~{total_chars//2} tokens）。建议：\n1. 当前进度已自动保存到 PROGRESS.md\n2. 开一个新会话，Agent 会从断点继续\n3. 或继续在本会话中完成（质量可能下降）",
+            "en": f"💡 **Context limit approaching** (~{total_chars//2} tokens). Suggestions:\n1. Progress auto-saved to PROGRESS.md\n2. Start a new session — Agent continues from checkpoint\n3. Or continue here (quality may degrade)",
+            "ja": f"💡 **コンテキスト上限に近づいています**（~{total_chars//2} tokens）。提案：\n1. 進捗は PROGRESS.md に自動保存済み\n2. 新しいセッションを開始 — エージェントは中断から続行\n3. このまま続行（品質が低下する可能性があります）",
+        })
+        yield {"content": "\n\n" + _ctx_msg}
     elif total_chars > 80000:
         logger.warning(f"[LOCAL-AGENT] Context may overflow: ~{total_chars} chars (~{total_chars//2} tokens)")
     if not session_id:
         session_id = str(uuid.uuid4())
 
-    max_iterations = 30
+    max_iterations = 50
     iteration = 0
     recent_tool_calls: set[str] = set()
     stagnation = 0
-    max_stagnation = 10
+    max_stagnation = 8
     text_only_streak = 0
     has_called_tool = False
     # Build tool prompt
@@ -2276,7 +2331,7 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
         m.get("role") == "assistant" and isinstance(m.get("content"), str) and len(m["content"]) > 100
         for m in current_msgs[-5:]
     ) if len(current_msgs) > 5 else False
-    is_continuation = tool_result_count >= 2 and not has_final_answer
+    is_continuation = tool_result_count >= 1 and not has_final_answer
     if is_continuation:
         tools_prompt += (
             "\n\n⚠️⚠️⚠️ 你现在处于任务执行中途！\n"
@@ -2294,7 +2349,7 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
     async with httpx.AsyncClient(timeout=httpx.Timeout(120)) as client:
         while iteration < max_iterations:
             iteration += 1
-            with open("/tmp/latiao-loop.log", "a") as lf:
+            with open(os.path.join(tempfile.gettempdir(), "latiao-loop.log"), "a") as lf:
                 lf.write(f"Iteration {iteration}: current_msgs={len(current_msgs)}, roles={[m.get('role') for m in current_msgs[-5:]]}\n")
 
             # Build messages for this iteration: merge tools + current context
@@ -2374,6 +2429,9 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                     tool_calls = native_tcs
 
 
+            # Whitelist: only execute tools in the active set
+            tool_names = {t.get("function", {}).get("name") for t in active_tools}
+            tool_calls = [tc for tc in tool_calls if tc.get("function", {}).get("name") in tool_names]
             if tool_calls:
                 _track_progress(session_id, "tool_calling", f"{len(tool_calls)} tool(s)")
 
@@ -2398,8 +2456,9 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                 if any_new:
                     stagnation = 0
                     text_only_streak = 0
+                else:
                     stagnation += 1
-                    if stagnation >= max_stagnation:
+                if stagnation >= max_stagnation:
                         yield {"content": f"\n\n⚠️ 连续 {stagnation} 轮无新进展，Agent 停止。如需继续请发新消息。"}
                         return
                 continue
@@ -2417,16 +2476,15 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                 logger.info(f"[LOCAL-AGENT] Iteration {iteration}: model returned text after tool result, pushing for continuation")
                 current_msgs.append({
                     "role": "system",
-                    "content": (
-                        "⚠️ 你刚才收到了工具的执行结果，但只回复了文字而没有继续调用工具。\n"
-                        "请检查：用户的任务是否真的完全完成了？\n"
-                        "如果还没完成，请继续调用工具。如果确实完成了，请回复最终结果。\n"
-                        "调用工具格式：```tool 工具名\n{\"参数\":\"值\"}\n```"
-                    ),
+                    "content": _get_localized_text(_detect_user_language(_extract_last_user_text(current_msgs)), {
+                        "zh": "⚠️ 你刚才收到了工具的执行结果，但只回复了文字而没有继续调用工具。\n请检查任务是否完成，未完成请继续调用工具。\n调用工具格式：```tool 工具名\n{\"参数\":\"值\"}\n```",
+                        "en": "⚠️ You received tool results but only replied with text.\nCheck if the task is complete, if not continue calling tools.\nFormat: ```tool tool_name\n{\"param\":\"value\"}\n```",
+                        "ja": "⚠️ ツール実行結果を受け取りましたが、テキストのみ返信しました。\nタスク完了を確認し、未完了の場合はツールを続けて呼び出してください。\n形式：```tool ツール名\n{\"パラメータ\":\"値\"}\n```",
+                    }),
                 })
                 text_only_streak += 1
                 continue
-            if not has_called_tool and iteration <= 3 and streamed_text.strip():
+            if not has_called_tool and text_only_streak < 3 and streamed_text.strip():
                 # Model gave a text response without calling tools.
                 # Record the response so the model knows it already replied.
                 current_msgs.append({"role": "assistant", "content": streamed_text.strip()})
@@ -2437,8 +2495,8 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                 if (len(user_q) < 20 or is_question) and not has_task_kw:
                     _track_progress(session_id, "completed", f"text_response ({len(streamed_text)} chars)")
                     return
-                # For task-like requests, nudge to use tools
-                logger.info(f"[LOCAL-AGENT] Iteration {iteration}: model planning instead of calling tools, nudging")
+                # For task-like requests, nudge to use tools — text_only_streak limits nudges
+                logger.info(f"[LOCAL-AGENT] Iteration {iteration}: model planning instead of calling tools, nudging (streak={text_only_streak})")
                 current_msgs.append({
                     "role": "system",
                     "content": (
@@ -2456,6 +2514,7 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                     "ja": "⚠️ 前回の応答が空でした。ユーザーに直接返信するか、ツールを使用してください。ツールを使用するには ```tool 形式を使ってください。",
                 })
                 current_msgs.append({"role": "system", "content": nudge_text})
+                text_only_streak += 1
                 continue
             _track_progress(session_id, "completed", f"text_response ({len(streamed_text)} chars)")
             logger.info(f"[LOCAL-AGENT] Iteration {iteration}: no tools, returning text ({len(streamed_text)} chars)")
@@ -2474,10 +2533,24 @@ def _build_chat_messages(body: dict, messages: list, matched_skill: str|None = N
 
     system_parts = []
 
-    # Agent identity
+    # Agent identity — system rules from developer (highest priority)
     agent_id = body.get("agent", "latiao")
     agent_cfg = _get_agent_config(agent_id)
-    system_parts.append(agent_cfg["identity"])
+    system_parts.append(
+        "## 系统规则 (最高优先级)\n"
+        "以下规则由开发者设定，用户偏好不可覆盖。如果系统规则与用户偏好冲突，以系统规则为准。\n\n"
+        + agent_cfg["identity"]
+    )
+
+    # User identity — personal preferences (lower priority)
+    user_identity = _read_identity()
+    if user_identity:
+        system_parts.append(
+            "## 用户偏好\n"
+            "以下偏好由用户自行设定。优先级低于系统规则，可与系统规则共存。"
+        )
+        for msg in user_identity:
+            system_parts.append(msg["content"])
 
     if intent_result:
         system_parts.append(
@@ -2533,15 +2606,19 @@ def _build_chat_messages(body: dict, messages: list, matched_skill: str|None = N
     if extra_prompts:
         system_parts.append("\n".join(extra_prompts))
 
-    # Cross-session memory: inject recent learnings from past conversations
-    recent = _get_recent_learnings(5)
-    if recent:
+    # Cross-session memory: inject learnings semantically relevant to current query
+    recent_data = _retrieve_relevant_learnings(last_user_text, limit=5) if last_user_text else []
+    if recent_data:
+        recent_data = [r for r in recent_data if r.get("confidence", 0) >= 0.3]
+    if recent_data:
         memory_label = _get_localized_text(user_lang, {
-            "zh": "以下是 AI 从过去交互中学到的知识：",
-            "en": "Here's what AI learned from past interactions:",
-            "ja": "以下はAIが過去の対話から学んだ知識です：",
+            "zh": "以下是 AI 从过去交互学到的相关知识：",
+            "en": "Relevant learnings from past interactions:",
+            "ja": "過去の対話からの関連知識：",
         })
-        system_parts.append(memory_label + "\n" + "\n".join(recent))
+        system_parts.append(memory_label + "\n" + "\n".join(
+            f"- {item['topic']}: {item['content'][:200]}" for item in recent_data
+        ))
 
     # Always-inject high-confidence preferences (independent of query matching)
     high_prefs = _get_high_confidence_preferences()
@@ -3600,18 +3677,21 @@ async def set_tavily_key(request: Request):
     if not key:
         return {"status": "error", "message": "API key is required"}
     try:
-        # Store in macOS Keychain
-        subprocess.run(
-            ["security", "add-generic-password", "-s", "com.latiao.desktop", "-a", "tavily_api_key", "-w", key, "-U"],
-            capture_output=True, timeout=10,
-        )
-        # Also update config.json for backward compatibility
+        # First write config.json (cross-platform primary storage)
         cfg = {}
         if CONFIG_FILE.exists():
             cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
         cfg["tavily_api_key"] = key
         CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
         CONFIG_FILE.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+        # Then update macOS Keychain (best-effort)
+        try:
+            subprocess.run(
+                ["security", "add-generic-password", "-s", "com.latiao.desktop", "-a", "tavily_api_key", "-w", key, "-U"],
+                capture_output=True, timeout=10,
+            )
+        except Exception:
+            pass
         masked = key[:7] + "••••" + key[-4:] if len(key) > 11 else "••••"
         return {"status": "ok", "has_key": True, "masked": masked}
     except Exception as e:
@@ -3843,6 +3923,8 @@ async def update_cron_job(job_id: str, request: Request):
                     job["schedule"] = body["schedule"]
                 if "task" in body:
                     job["task"] = body["task"]
+                if "name" in body:
+                    job["name"] = body["name"]
                 if "enabled" in body:
                     job["enabled"] = body["enabled"]
                 if "action" in body:
@@ -4064,7 +4146,7 @@ async def _execute_cron_job(job: dict):
     agent_cfg = _get_agent_config("latiao")
 
     messages = [{"role": "system", "content": (
-        f"{agent_cfg['identity']}\n\n"
+        f"## 系统规则\n{agent_cfg['identity']}\n\n"
         f"Runtime environment:\n"
         f"- Current time: {now}\n"
         f"- User home directory: {home}\n"
@@ -4213,5 +4295,7 @@ async def api_open_identity(agent_id: str, section: str = ""):
         return {"status": "error", "message": str(e)}
 
 if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.freeze_support()
     import uvicorn
     uvicorn.run(app, host="127.0.0.1", port=8000)
