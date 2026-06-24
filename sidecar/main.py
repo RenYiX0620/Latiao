@@ -1,6 +1,18 @@
 """
 Local AI OS - Python Sidecar
 Stateless: frontend manages all state, sends complete messages array per request.
+
+SECTIONS (find via search for "╔══"):
+  1.  Imports & Setup          (line ~1)
+  2.  Agent Config & Skills    (line ~345)
+  3.  Shared State & Plugins   (line ~399)
+  4.  Tool Fallbacks           (line ~474)
+  5.  Verification & Dispatch  (line ~1010)
+  6.  Parsing & Formatting     (line ~1735)
+  7.  Cloud Agent Loop         (line ~1801)
+  8.  Local Agent Loop          (line ~2072)
+  9.  Chat Building & LLM      (line ~2583)
+ 10.  FastAPI Routes            (line ~2828)
 """
 from __future__ import annotations
 
@@ -138,6 +150,11 @@ PROJECT_ROOT = Path(__file__).parent  # sidecar/
 SKILLS_DIR = PROJECT_ROOT / "skills"
 
 # TF-IDF cache for learnings (avoid rebuilding every search)
+
+# ╔══════════════════════════════════════════════════════╗
+# ║  SECTION 1: Skills & App Lifecycle                    ║
+# ║  _load_skill_index, _match_skill, lifespan            ║
+# ╚══════════════════════════════════════════════════════╝
 
 def _load_skill_index():
     """Scan all skills in ./skills/ directory and build index of their metadata."""
@@ -342,6 +359,11 @@ AGENT_PROFILES: dict[str, dict] = {
 }
 
 
+# ╔══════════════════════════════════════════════════════╗
+# ║  SECTION 2: Agent Config & Custom Agents             ║
+# ║  _get_agent_config, _load_custom_agents, _merge_agents║
+# ╚══════════════════════════════════════════════════════╝
+
 def _get_agent_config(agent_id: str) -> dict:
     """Get agent profile, falling back to latiao (orchestrator)."""
     return AGENT_PROFILES.get(agent_id, AGENT_PROFILES["latiao"])
@@ -395,6 +417,11 @@ _FALLBACK_PERMISSIONS = {
     "tavily_search": "safe",
     "web_search": "safe",
 }
+
+# ╔══════════════════════════════════════════════════════╗
+# ║  SECTION 3: Shared State & Plugin Registry           ║
+# ║  TOOLS, TOOL_DISPATCH, TOOL_PERMISSIONS, TOOL_HOOKS  ║
+# ╚══════════════════════════════════════════════════════╝
 
 # Plugin system globals — populated by _load_plugins()
 TOOL_PERMISSIONS: dict[str, str] = {}
@@ -470,6 +497,11 @@ def _resolve_permission(tool_name: str, args: dict) -> str:
 # ═══════════════════════════════════════════════════════
 
 MAX_READ_SIZE = 50000  # chars before truncation (~1500 lines)
+
+# ╔══════════════════════════════════════════════════════╗
+# ║  SECTION 4: Tool Fallbacks                           ║
+# ║  Fallback impls used when plugins/ is empty           ║
+# ╚══════════════════════════════════════════════════════╝
 
 def read_file(path: str, offset: int = 0, limit: int = 0) -> str:
     """Read file contents. Supports offset/limit for large files.
@@ -1006,6 +1038,11 @@ _FALLBACK_DISPATCH = {
 # ═══════════════════════════════════════════════════════
 #  Self-Verification: programmatic post-tool quality checks
 # ═══════════════════════════════════════════════════════
+
+# ╔══════════════════════════════════════════════════════╗
+# ║  SECTION 5: Verification & Tool Dispatch             ║
+# ║  _auto_verify, execute_tool, _handle_tool_execution  ║
+# ╚══════════════════════════════════════════════════════╝
 
 async def _auto_verify(tool_name: str, args: dict, result: str) -> str:
     """Run programmatic verification after a tool executes.
@@ -1732,6 +1769,11 @@ _NATIVE_CONTROL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ╔══════════════════════════════════════════════════════╗
+# ║  SECTION 6: Parsing & Formatting                     ║
+# ║  _parse_native_tool_calls, _parse_prompt_tool_calls  ║
+# ╚══════════════════════════════════════════════════════╝
+
 def _parse_native_tool_calls(text: str) -> list[dict]:
     """Parse Gemma-style native tool calls from streamed text.
     Returns OpenAI-format tool_calls list.
@@ -1797,6 +1839,11 @@ def _strip_native_tool_calls(text: str) -> str:
     """Remove native tool call blocks from text, keeping only the real content."""
     return _NATIVE_TOOL_RE.sub("", text).strip()
 
+
+# ╔══════════════════════════════════════════════════════╗
+# ║  SECTION 7: Cloud Agent Loop                         ║
+# ║  OpenAI-compatible function calling                   ║
+# ╚══════════════════════════════════════════════════════╝
 
 async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: dict, session_id: str = "", agent_id: str = "latiao"):
     """Agent loop: call LLM with tools. If tool_calls → execute → loop. If text → yield & done."""
@@ -2069,6 +2116,11 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
 
 
 # ═══════════════════════════════════════════════════════
+# ╔══════════════════════════════════════════════════════╗
+# ║  SECTION 8: Local Agent Loop                         ║
+# ║  Prompt-based tool calling for local models           ║
+# ╚══════════════════════════════════════════════════════╝
+
 #  Local Agent Loop — Prompt-based tool calling
 #  For local models that don't support OpenAI function calling.
 #  Injects tools as formatted text in a system message, and
@@ -2580,6 +2632,11 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
         yield {"content": f"\n\n⚠️ 已达到硬上限 ({max_iterations} 轮)。本会话共执行了 {tool_count} 次工具调用。如需继续，请发送新消息。"}
 
 
+# ╔══════════════════════════════════════════════════════╗
+# ║  SECTION 9: Chat Building & LLM Config               ║
+# ║  _build_chat_messages, _resolve_api_target, etc.     ║
+# ╚══════════════════════════════════════════════════════╝
+
 def _build_chat_messages(body: dict, messages: list, matched_skill: str|None = None) -> list:
     """Assemble the full message array with identity, env, skills, agent, and image injections.
     All system prompts are merged into ONE message to work around a llama-cpp bug
@@ -2825,6 +2882,11 @@ def _get_best_cloud_config() -> dict | None:
 
 
 @app.post("/v1/chat/completions")
+# ╔══════════════════════════════════════════════════════╗
+# ║  SECTION 10: FastAPI Routes                          ║
+# ║  /chat, /upload, /speech, /tools, /memory, /agents...║
+# ╚══════════════════════════════════════════════════════╝
+
 async def chat_completion(request: Request):
     """Main chat endpoint. Routes to agent loop (OpenAI-compatible) or simple streaming.
     Auto-routes to best model based on task type when no specific model is selected."""
