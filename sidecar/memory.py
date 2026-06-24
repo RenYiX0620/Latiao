@@ -81,12 +81,9 @@ def _quick_reflect(tool_name: str, result: str) -> str:
 # Lazy import helpers to avoid circular dependency with main.py
 
 def _get_db():
-    """Get database connection via main module (lazy import to avoid circular dep)."""
-    import main
-    if not hasattr(main, '_get_db'):
-        import importlib
-        importlib.reload(main)
-    return main._get_db()
+    """Get database connection from db module (no circular dependency)."""
+    from db import _get_db as _get_db_inner
+    return _get_db_inner()
 
 def _load_skills():
     """Load skills via main module (lazy import)."""

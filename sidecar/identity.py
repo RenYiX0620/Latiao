@@ -194,7 +194,6 @@ _INTENT_APPLIERS = {
 
 def _process_identity_intents(user_text: str):  # -> str | None
     """Process identity-related intents in user message. Updates identity files in background."""
-    import main
     """
     Scan user message for identity intents, apply changes.
     Returns a summary message if changes were made, None otherwise.

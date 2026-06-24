@@ -1462,6 +1462,16 @@ def _filter_tools(user_text: str, all_tools: list[dict]) -> list[dict]:
     return filtered if filtered else all_tools
 
 
+
+def _cap_tools(tools: list[dict], cap: int = 8) -> list[dict]:
+    """Cap tool count, keeping essential tools (read_file, write_file, list_dir) first."""
+    essential = {"read_file", "write_file", "list_dir"}
+    priority = [t for t in tools if t.get("function", {}).get("name") in essential]
+    others = [t for t in tools if t.get("function", {}).get("name") not in essential]
+    return priority + others[:max(0, cap - len(priority))]
+
+
+
 def _inject_image(messages: list, image_base64: str, image_mime: str) -> list:
     """Modify the last user message to include an image attachment."""
     msgs = [dict(m) for m in messages]
@@ -1885,40 +1895,16 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
     iteration = 0
     text_only_streak = 0   # 与 local loop 对齐，消除空响应分支 (text_only_streak += 1) 的 NameError 崩溃
 
-    # ── Self-Learning: Inject past learnings + preferences ──
-    last_user_text = _extract_last_user_text(current_msgs)
-    learning_context = _build_learning_context(last_user_text) if last_user_text else ""
-    if learning_context:
-        system_idx = 0
-        for i, m in enumerate(current_msgs):
-            if m.get("role") == "system":
-                system_idx = i + 1
-            else:
-                break
-        learn_label = _get_localized_text(lang, {
-            "zh": "以下是 AI 从过去交互中学习的知识，请在回复时参考：",
-            "en": "Here's what AI learned from past interactions — reference when responding:",
-            "ja": "以下はAIが過去の対話から学んだ知識です。回答時に参考にしてください：",
-        })
-        current_msgs.insert(system_idx, {
-            "role": "system",
-            "content": f"{learn_label}\n\n{learning_context}",
-        })
-
-    # ── Self-Learning: Heuristic extraction ──
+    # ── Self-Learning: Heuristic extraction + learning_context via _build_chat_messages ──
     if last_user_text:
         _extract_learnings_heuristic(last_user_text, session_id)
 
     # ── Dynamic Tool Filtering + Agent restrictions ──
     agent_tools = _get_agent_tools(agent_id, TOOLS)
     active_tools = _filter_tools(last_user_text, agent_tools) if last_user_text else agent_tools
-    # Cap tools at 7 to prevent overflowing model context with large definitions
-    if len(active_tools) > 7:
-        # Keep most important: read/write/list + the first 2 matching intent tools
-        essential = {"read_file", "write_file", "list_dir"}
-        priority = [t for t in active_tools if t.get("function", {}).get("name") in essential]
-        others = [t for t in active_tools if t.get("function", {}).get("name") not in essential]
-        active_tools = priority + others[:max(0, 5 - len(priority))]
+    # Cap tools to prevent overflowing model context
+    if len(active_tools) > 5:
+        active_tools = _cap_tools(active_tools, 5)
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(120)) as client:
         while iteration < 50:  # hard cap at 50, dynamic exit via stagnation
@@ -2422,10 +2408,7 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
     agent_tools = _get_agent_tools(agent_id, TOOLS)
     active_tools = _filter_tools(last_user_text, agent_tools) if last_user_text else agent_tools
     if len(active_tools) > 8:
-        essential = {"read_file", "write_file", "list_dir"}
-        priority = [t for t in active_tools if t.get("function", {}).get("name") in essential]
-        others = [t for t in active_tools if t.get("function", {}).get("name") not in essential]
-        active_tools = priority + others[:max(0, 8 - len(priority))]
+        active_tools = _cap_tools(active_tools, 8)
     tools_prompt = _build_local_tools_prompt(active_tools)
 
     # Detect continuation: if session has tool results but no final answer,
@@ -2480,7 +2463,7 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                 )
             for i, m in enumerate(loop_msgs):
                 if m.get("role") == "system":
-                    m["content"] = current_prompt + "\n\n" + m["content"]
+                    m["content"] = m["content"] + "\n\n" + current_prompt
                     break
             else:
                 loop_msgs.insert(0, {"role": "system", "content": current_prompt})
@@ -2989,10 +2972,7 @@ async def chat_completion(request: Request):
         # Cap tools: 7 for native function calling, 8 for prompt-based (less overhead)
         tool_cap = 8 if use_prompt_tools else 5
         if len(active_tools_ns) > tool_cap:
-            essential = {"read_file", "write_file", "list_dir"}
-            priority_ns = [t for t in active_tools_ns if t.get("function", {}).get("name") in essential]
-            others_ns = [t for t in active_tools_ns if t.get("function", {}).get("name") not in essential]
-            active_tools = priority_ns + others_ns[:max(0, tool_cap - len(priority_ns))]
+            active_tools = _cap_tools(active_tools_ns, tool_cap)
         else:
             active_tools = active_tools_ns
         full_content = ""
@@ -3024,7 +3004,7 @@ async def chat_completion(request: Request):
                     if use_prompt_tools:
                         resp = await client.post(api_url, json={
                             "model": model, "messages": loop_msgs,
-                            "max_tokens": 2048, "stream": False,
+                            "max_tokens": _resolve_max_tokens(model), "stream": False,
                             "temperature": 0.5,
                             "frequency_penalty": 0.6,
                 "stop": ["<|im_end|>", "<|endoftext|>"],
@@ -4298,11 +4278,8 @@ async def _execute_cron_job(job: dict):
     model = SUBAGENT_MODEL
     agent_tools = _get_agent_tools("latiao", TOOLS)
     active_tools = _filter_tools(task, agent_tools)
-    if len(active_tools) > 7:
-        essential = {"read_file", "write_file", "list_dir"}
-        priority = [t for t in active_tools if t.get("function", {}).get("name") in essential]
-        others = [t for t in active_tools if t.get("function", {}).get("name") not in essential]
-        active_tools = priority + others[:max(0, 5 - len(priority))]
+    if len(active_tools) > 5:
+        active_tools = _cap_tools(active_tools, 5)
 
     current_msgs = [dict(m) for m in messages]
     full_content = ""
