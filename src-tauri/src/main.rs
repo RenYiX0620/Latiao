@@ -3,6 +3,7 @@
 use std::process::{Child, Command};
 use std::sync::Mutex;
 use std::time::Duration;
+use tauri::Manager;
 /// Proxy HTTP request to sidecar — bypasses Tauri HTTP plugin entirely
 #[tauri::command]
 async fn sidecar_proxy(url: String, method: String, body: Option<String>) -> Result<String, String> {
@@ -303,7 +304,21 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
-        .manage(SidecarProcess(Mutex::new(sidecar)))
+.manage(SidecarProcess(Mutex::new(sidecar)))
+        .setup(|app| {
+            if let Some(window) = app.get_webview_window("main") {
+                window.on_navigation(move |url| {
+                    let is_local = matches!(url.host_str(), Some("tauri.localhost") | Some("127.0.0.1") | Some("localhost"));
+                    if !is_local && (url.scheme() == "http" || url.scheme() == "https") {
+                        let _ = std::process::Command::new("open").arg(url.as_str()).spawn();
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![sidecar_proxy, restart_sidecar, store_secret, get_secret, delete_secret, open_model_dir])
         .run(tauri::generate_context!())
         .expect("Failed to start Latiao app");
