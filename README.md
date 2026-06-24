@@ -49,7 +49,7 @@ The agent loop streams its thinking in real-time via SSE. For sensitive operatio
 
 ## 📥 Install (macOS)
 
-> ⚠️ **Apple Silicon only** (M1 / M2 / M3 / M4). Intel Mac and Windows are not yet supported.
+> ⚠️ **Apple Silicon only** (M1 / M2 / M3 / M4 / M5). Intel Mac and Windows are not yet supported.
 
 Download the latest `.dmg` from [GitHub Releases](https://github.com/RenYiX0620/Latiao/releases):
 
@@ -221,7 +221,7 @@ Agent 通过 SSE 实时流式输出思考和执行过程。对于敏感操作（
 
 ## 📥 下载安装（macOS）
 
-> ⚠️ **仅支持 Apple Silicon Mac**（M1 / M2 / M3 / M4）。Intel Mac 和 Windows 暂不支持。
+> ⚠️ **仅支持 Apple Silicon Mac**（M1 / M2 / M3 / M4 / M5）。Intel Mac 和 Windows 暂不支持。
 
 从 [GitHub Releases](https://github.com/RenYiX0620/Latiao/releases) 下载最新 `.dmg`：
 
