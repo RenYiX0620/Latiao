@@ -1,6 +1,6 @@
 import { useTranslation } from "../i18n";
 
-const SIDECAR = "http://127.0.0.1:8000";
+const SIDECAR = "http://127.0.0.1:8765";
 
 interface ToolsViewProps {
   tools: { name: string; description: string; parameters: Record<string, unknown>; permission: string; usage_count: number }[];

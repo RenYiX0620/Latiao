@@ -8,12 +8,15 @@ export function useCronJobs(showToast: (msg: string) => void) {
   const [newCron, setNewCron] = useState({ schedule: "0 9 * * *", task: "", action: "notify" });
 
   useEffect(() => {
-    (async () => {
+    const fetchJobs = async () => {
       try {
         const data = await sidecarFetch("/v1/cron");
         if (data.status === "ok") setCronJobs(data.jobs || []);
       } catch (e) { console.error(e); }
-    })();
+    };
+    fetchJobs();
+    const interval = setInterval(fetchJobs, 10000);
+    return () => clearInterval(interval);
   }, []);
 
   const addCronJob = useCallback(async () => {

@@ -3,6 +3,7 @@ import type { Message, PendingFile } from "../types";
 import { useTranslation } from "../i18n";
 import ToolCallBubble from "./ToolCallBubble";
 import ReactMarkdown from "react-markdown";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import remarkGfm from "remark-gfm";
 
 const SyntaxHighlighter = lazy(async () => {
@@ -117,6 +118,21 @@ export default memo(function ChatView({
                       <ReactMarkdown
                         remarkPlugins={[remarkGfm]}
                         components={{
+                          a({ href, children, ...props }) {
+                            return (
+                              <a
+                                href={href}
+                                onClick={(e) => {
+                                  e.preventDefault();
+                                  if (href) openUrl(href);
+                                }}
+                                style={{ color: "#2563eb", cursor: "pointer", textDecoration: "underline" }}
+                                {...props}
+                              >
+                                {children}
+                              </a>
+                            );
+                          },
                           code({ className, children, ...props }) {
                             const match = /language-(\w+)/.exec(className || "");
                             const codeStr = String(children).replace(/\n$/, "");

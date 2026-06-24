@@ -40,7 +40,7 @@ const PLAN_MODE_PROMPT =
   "- 遗留问题、未完成项、后续建议\n\n" +
   "关键规则：阶段1和阶段2完成之前，不得调用任何 confirm 级别工具（write_file、run_cmd、open_app、open_folder）。";
 
-const SIDECAR = "http://127.0.0.1:8000";
+const SIDECAR = "http://127.0.0.1:8765";
 
 const AGENT_NAME_KEYS: Record<string, string> = {
   latiao: "agent.latiao", "code-reviewer": "agent.code_reviewer",
@@ -241,7 +241,7 @@ const [timeFilter, setTimeFilter] = useState("all");
     setFetchDiag("🔍 检查 Sidecar 状态...");
     const healthy = await waitForSidecar();
     if (!healthy) {
-      setFetchDiag("❌ Sidecar 无响应，请确认 http://127.0.0.1:8000 已启动");
+      setFetchDiag("❌ Sidecar 无响应，请确认 http://127.0.0.1:8765 已启动");
       return;
     }
 

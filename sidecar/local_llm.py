@@ -571,7 +571,20 @@ class LocalLLMEngine:
 
     @staticmethod
     def _kill_port(port: int):
-        """Kill any process listening on the given port. Works on macOS and Linux."""
+        """Kill any process listening on the given port."""
+        if platform.system() == "Windows":
+            try:
+                result = subprocess.run(
+                    ["netstat", "-ano"], capture_output=True, text=True, timeout=10
+                )
+                for line in result.stdout.splitlines():
+                    if f":{port}" in line and "LISTENING" in line:
+                        pid = line.split()[-1]
+                        subprocess.run(["taskkill", "/F", "/PID", pid],
+                                       capture_output=True, timeout=10)
+            except Exception:
+                pass
+            return
         try:
             result = subprocess.run(
                 ["lsof", "-ti", f":{port}"], capture_output=True, text=True, timeout=5,
@@ -655,6 +668,11 @@ class LocalLLMEngine:
         self.server_status = "starting"
         self.status_message = f"正在加载 {self.current_model_name}..."
 
+        if platform.system() == "Windows":
+            self.server_status = "starting"
+            self.status_message = f"正在加载 {self.current_model_name}..."
+            return self._start_llama_native(model_path, port)
+
         try:
             cmd = [
                 sys.executable, "-m", "llama_cpp.server",
@@ -726,6 +744,80 @@ class LocalLLMEngine:
             self.server_status = "error"
             self.status_message = str(e)[:200]
             return self.get_status()
+
+    def _find_llama_server(self) -> Path | None:
+        """Find native llama-server.exe (bundled with Windows package)."""
+        exe = Path(__file__).parent / "llama-server.exe"
+        return exe if exe.exists() else None
+
+    def _start_llama_native(self, model_path: str, port: int) -> dict:
+        """Start llama-server.exe directly (Windows only)."""
+        exe = self._find_llama_server()
+        if not exe:
+            self.server_status = "error"
+            self.status_message = "找不到 llama-server.exe，请重装 Latiao"
+            return self.get_status()
+
+        self.server_status = "starting"
+        self.status_message = f"正在加载 {self.current_model_name}..."
+
+        cmd = [
+            str(exe),
+            "-m", model_path,
+            "--port", str(port),
+            "--host", "127.0.0.1",
+            "-c", str(self.model_token_limit),
+            "-ngl", str(self.n_gpu_layers),
+        ]
+        kv_k, kv_v = _auto_cache_type(model_path)
+        cmd += ["--cache-type-k", str(kv_k), "--cache-type-v", str(kv_v)]
+        cmd += ["-fa"]
+        chat_fmt = self._guess_chat_format(model_path)
+        if chat_fmt:
+            cmd += ["--chat-template", chat_fmt]
+
+        env = os.environ.copy()
+        env.pop("HF_ENDPOINT", None)
+        self._process = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env
+        )
+
+        stderr_lines: list[str] = []
+        def _drain():
+            if self._process and self._process.stderr:
+                try:
+                    for line in self._process.stderr:
+                        stderr_lines.append(line)
+                except Exception:
+                    pass
+        t = threading.Thread(target=_drain, daemon=True)
+        t.start()
+
+        if not self._wait_for_http(port, timeout_sec=300, process=self._process):
+            t.join(timeout=1)
+            err_lines = stderr_lines[-50:] if stderr_lines else []
+            err_summary = ""
+            for line in reversed(err_lines):
+                stripped = line.strip()
+                if stripped and ("Error" in stripped or "error" in stripped.lower()):
+                    err_summary = stripped[-150:]
+                    break
+            if not err_summary and err_lines:
+                err_summary = err_lines[-1].strip()[-150:]
+            logger.error("llama-server native: %s",
+                "exited early" if self._process.poll() is not None else "HTTP timeout")
+            self.stop_model()
+            self.server_status = "error"
+            self.status_message = f"启动失败: {err_summary}" if err_summary else "模型加载超时"
+            self.current_model_id = ""
+            self.current_model_name = ""
+            return self.get_status()
+
+        self.server_status = "running"
+        self.status_message = f"{self.current_model_name} 运行中"
+        self._active_backend = "llama-cpp-native"
+        return self.get_status()
+
 
     def _start_mlx(self, model_id: str, port: int) -> dict:
         self.current_model_id = model_id
@@ -846,6 +938,14 @@ class LocalLLMEngine:
                 self._process.wait(timeout=5)
             except Exception:
                 pass
+            if platform.system() == "Windows":
+                try:
+                    subprocess.run(
+                        ["taskkill", "/F", "/T", "/PID", str(self._process.pid)],
+                        capture_output=True, timeout=10
+                    )
+                except Exception:
+                    pass
 
     def stop_model(self) -> dict:
         if self._process:
@@ -1122,6 +1222,8 @@ def get_model_detail(model_id: str) -> dict:
         return {"status": "error", "message": "Failed to fetch model details"}
 
 def run_fix(fix_type: str, fix_pkg: str = "") -> dict:
+    if getattr(sys, "frozen", False):
+        return {"status": "error", "message": "依赖已打包在安装包中，请联系开发者更新"}
     """Execute a fix for an environment issue."""
     if fix_type == "pip" and fix_pkg:
         try:

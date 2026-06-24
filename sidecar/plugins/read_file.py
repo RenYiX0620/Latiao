@@ -1,5 +1,6 @@
-"""Read the contents of a file at the given path."""
+"""Read the contents of a file at the given path. Supports ~ expansion."""
 
+import os
 MAX_READ_SIZE = 10000  # chars before truncation
 
 NAME = "read_file"
@@ -22,7 +23,7 @@ DEFINITION = {
 
 
 def execute(args: dict) -> str:
-    path = args["path"]
+    path = os.path.expanduser(args["path"])
     # Block path traversal — only allow absolute paths without '..' segments
     if ".." in path.split("/"):
         return "⛔ Blocked: path traversal not allowed"

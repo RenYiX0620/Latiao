@@ -2,6 +2,7 @@ import { useState, useMemo, memo } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { useTranslation } from "../i18n";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import type { Message } from "../types";
 
 const MAX_PREVIEW_CHARS = 2000;
@@ -46,7 +47,28 @@ const ToolCallBubble = memo(function ToolCallBubble({ msg, onConfirm }: {
     return (
       <div className="tool-call-result">
         {isMarkdown ? (
-          <ReactMarkdown remarkPlugins={[remarkGfm]}>{displayContent}</ReactMarkdown>
+          <ReactMarkdown
+            remarkPlugins={[remarkGfm]}
+            components={{
+              a({ href, children, ...props }) {
+                return (
+                  <a
+                    href={href}
+                    onClick={(e) => {
+                      e.preventDefault();
+                      if (href) openUrl(href);
+                    }}
+                    style={{ color: "#2563eb", cursor: "pointer", textDecoration: "underline" }}
+                    {...props}
+                  >
+                    {children}
+                  </a>
+                );
+              },
+            }}
+          >
+            {displayContent}
+          </ReactMarkdown>
         ) : (
           <pre>{displayContent}</pre>
         )}

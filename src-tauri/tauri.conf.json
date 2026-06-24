@@ -21,7 +21,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self' http://127.0.0.1:8000 https://huggingface.co https://api.deepseek.com https://api.openai.com https://api.anthropic.com https://generativelanguage.googleapis.com; img-src 'self' data: blob:; media-src 'self' data: blob:; font-src 'self' data:; worker-src 'self' blob: https://github.com"
+      "csp": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self' http://127.0.0.1:8765 https://huggingface.co https://api.deepseek.com https://api.openai.com https://api.anthropic.com https://generativelanguage.googleapis.com; img-src 'self' data: blob:; media-src 'self' data: blob:; font-src 'self' data:; worker-src 'self' blob: https://github.com"
     }
   },
   "bundle": {

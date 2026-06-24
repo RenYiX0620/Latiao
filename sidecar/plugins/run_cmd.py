@@ -1,7 +1,11 @@
 """Run a shell command and return its output. ⚠️ Requires user confirmation."""
+import platform
 import re
 import shlex
 import subprocess
+
+_IS_WINDOWS = platform.system() == "Windows"
+_WIN_CMDS = r"|dir|cd|where|ver|type|find|findstr" if _IS_WINDOWS else ""
 
 NAME = "run_cmd"
 PERMISSION = "confirm"
@@ -58,7 +62,9 @@ _OBFUSCATION_PATTERNS = [
 
 # Commands that are always allowed (whitelist override for common dev tools)
 _ALWAYS_ALLOWED = re.compile(
-    r"^(ls|pwd|echo|cat|head|tail|wc|file|which|whoami|uname|date|env|printenv)$"
+    r"^(ls|pwd|echo|cat|head|tail|wc|file|which|whoami|uname|date|env|printenv"
+    + _WIN_CMDS
+    + r")$"
 )
 
 

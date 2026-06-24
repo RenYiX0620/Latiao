@@ -5,7 +5,7 @@ import { useTranslation } from "../i18n";
 import type { HFModelResult, DownloadState, SetupIssue, LLMStatus } from "../types";
 
 const ReactMarkdown = lazy(() => import("react-markdown"));
-const SIDECAR = "http://127.0.0.1:8000";
+const SIDECAR = "http://127.0.0.1:8765";
 
 function ModelDetailPanel({ modelId, detailData, detailLoading, downloadProgress, downloadModel, pauseDownload, cancelDownload, resumeDownload, startLocalLLM, deleteModelFile, fetchModelDetail, onClose }: {
   modelId: string; detailData: Record<string, unknown> | null; detailLoading: boolean;

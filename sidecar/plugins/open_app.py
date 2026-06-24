@@ -1,5 +1,8 @@
-"""Open a macOS application by name. Supports both English and Chinese names."""
+"""Open an application by name. macOS native, Windows via start."""
+import platform
 import subprocess
+
+IS_WINDOWS = platform.system() == "Windows"
 
 NAME = "open_app"
 PERMISSION = "confirm"
@@ -41,6 +44,12 @@ _APP_ALIASES = {
 def execute(args: dict) -> str:
     name = args["name"]
     resolved = _APP_ALIASES.get(name, name)
+    if IS_WINDOWS:
+        try:
+            subprocess.Popen(["cmd", "/c", "start", "", resolved])
+            return f"✅ 已打开：{resolved}"
+        except Exception as e:
+            return f"无法打开 {resolved}: {e}"
     try:
         r = subprocess.run(["open", "-a", resolved], capture_output=True, text=True, timeout=5)
         if r.returncode != 0:

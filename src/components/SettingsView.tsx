@@ -85,7 +85,7 @@ export default function SettingsView({
           </div>
           <div className="settings-row">
             <div><div className="settings-row-label">{t("settings.port")}</div><div className="settings-row-desc">{t("settings.port_desc")}</div></div>
-            <span style={{ fontFamily: "var(--font-mono)", fontSize: 12, color: "var(--text-muted)" }}>8000</span>
+            <span style={{ fontFamily: "var(--font-mono)", fontSize: 12, color: "var(--text-muted)" }}>8765</span>
           </div>
           <div className="settings-row">
             <div><div className="settings-row-label">{t("settings.restart")}</div><div className="settings-row-desc">{t("settings.restart_desc")}</div></div>

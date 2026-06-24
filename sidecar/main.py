@@ -62,6 +62,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
 import local_llm
+from logging.handlers import RotatingFileHandler
 
 logger = logging.getLogger("latiao-sidecar")
 
@@ -97,6 +98,28 @@ _deque_handler.setFormatter(logging.Formatter("%(message)s"))
 _deque_handler.setLevel(logging.INFO)
 logger.addHandler(_deque_handler)
 logger.setLevel(logging.INFO)
+# 阻止日志向 root logger 传播——否则 uvicorn/fastapi 给 root 挂的 handler 会
+# 让每条日志重复写一次（sidecar.log 里每行出现两次的根因）
+logger.propagate = False
+
+# ── File handler: 落盘到 ~/.local-ai-os/sidecar.log，带 5MB×3 轮转 ──
+# 打包成 app 后 sidecar 无终端附着，stdout/stderr 丢失；
+# 落盘后任务中断可 `tail ~/.local-ai-os/sidecar.log` 查看 iteration 走势与异常堆栈。
+try:
+    PROGRESS_DIR.mkdir(parents=True, exist_ok=True)
+    _file_handler = RotatingFileHandler(
+        PROGRESS_DIR / "sidecar.log",
+        maxBytes=5 * 1024 * 1024,  # 5 MB
+        backupCount=3,
+        encoding="utf-8",
+    )
+    _file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    ))
+    _file_handler.setLevel(logging.INFO)
+    logger.addHandler(_file_handler)
+except Exception:
+    pass  # 日志目录不可写不应阻断启动
 
 # Log key lifecycle events
 logger.info("Sidecar 启动")
@@ -250,7 +273,7 @@ app.add_middleware(
         "https://tauri.localhost",
         "tauri://localhost",
         "http://127.0.0.1:1420",
-        "http://127.0.0.1:8000",
+        "http://127.0.0.1:8765",
     ],
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE"],
@@ -1445,6 +1468,20 @@ GOAL_MODE_PROMPT = """
 用户只关心目标是否达成，不关心你用什么工具。
 """
 
+def _resolve_max_tokens(model: str) -> int:
+    """Pick max_tokens by model family.
+
+    Reasoning models (DeepSeek-R1, Qwen3-QwQ, OpenAI o-series, *-think/*-reason)
+    emit long <think> blocks that can exhaust a 4096 cap and truncate the
+    trailing tool_call JSON. Give them a larger budget so the JSON survives;
+    non-reasoning models get a smaller, cheaper budget.
+    """
+    m = (model or "").lower()
+    if any(k in m for k in ("r1", "o1", "o3", "o4", "reason", "qwq", "qwen3", "think")):
+        return 12288
+    return 6144
+
+
 # Session state tracking: session_id → {phase, round, stalled_rounds, last_action}
 _session_states: dict[str, dict] = {}
 
@@ -1591,7 +1628,16 @@ async def _handle_tool_execution(tc: dict, current_msgs: list, session_id: str,
     try:
         args = json.loads(func.get("arguments", "{}"))
     except json.JSONDecodeError:
-        args = {}
+        # 工具参数 JSON 不完整（通常是 reasoning 模型 <think> 吃满 max_tokens，
+        # trailing tool_call JSON 被截断）。绝不静默退化为空参数执行——回灌明确
+        # 错误，让模型看到"我的 JSON 断了"，从而重新发起完整调用。
+        raw_args = func.get("arguments", "")
+        result = (
+            f"⛔ 工具参数 JSON 不完整，解析失败：{raw_args[:200]}\n"
+            "通常因回复达到 max_tokens 被截断。请重新调用该工具，保证参数 JSON 完整闭合。"
+        )
+        current_msgs.append({"role": "tool", "tool_call_id": call_id, "content": result})
+        return True, [{"event": "tool_end", "call_id": call_id, "tool": tool_name, "result": result}]
 
     # ── User confirmation ──
     if _resolve_permission(tool_name, args) == "confirm":
@@ -1790,6 +1836,7 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
     max_stagnation = 10          # exit after this many dead-end rounds
     recent_tool_calls: set[str] = set()  # signature = "tool_name:arg_hash"
     iteration = 0
+    text_only_streak = 0   # 与 local loop 对齐，消除空响应分支 (text_only_streak += 1) 的 NameError 崩溃
 
     # ── Self-Learning: Inject past learnings + preferences ──
     last_user_text = _extract_last_user_text(current_msgs)
@@ -1853,7 +1900,7 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
             body = {
                 "model": model, "messages": current_msgs,
                 "tools": active_tools, "tool_choice": "auto",
-                "max_tokens": 4096, "stream": True,
+                "max_tokens": _resolve_max_tokens(model), "stream": True,
                 "temperature": 0.5,
                 "frequency_penalty": 0.6,
                 "stop": ["<|im_end|>", "<|endoftext|>"],
@@ -1943,6 +1990,7 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
 
                 # Stagnation check: reset if new tool calls, else count toward limit
                 any_new = False
+                round_failed = False
                 for tc in tool_calls:
                     sig = f"{tc.get('function',{}).get('name','')}:{hash(str(tc.get('function',{}).get('arguments','')))}"
                     if sig not in recent_tool_calls:
@@ -1954,8 +2002,10 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                     for evt in events:
                         yield evt
                     if verify_failed:
+                        round_failed = True
                         last_verify_failed = True
-                if any_new:
+                # 新的调用签名，或本轮有工具失败（模型正在尝试修复）都算实质推进，不计停滞
+                if any_new or round_failed:
                     stagnation = 0
                 else:
                     stagnation += 1
@@ -1970,7 +2020,7 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                 m.get("role") == "tool" or (isinstance(m.get("content"), str) and m["content"].startswith("[工具结果]"))
                 for m in current_msgs[-3:]
             )
-            if has_recent_tool_result and iteration < 8 and streamed_text.strip():
+            if has_recent_tool_result and text_only_streak < max_stagnation and streamed_text.strip():
                 current_msgs.append({
                     "role": "system",
                     "content": (
@@ -1979,8 +2029,9 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                         "如果还没完成，请继续调用工具。如果确实完成了，请回复最终结果。"
                     ),
                 })
+                text_only_streak += 1
                 continue
-            if not has_called_tool and iteration <= 3 and streamed_text.strip():
+            if not has_called_tool and text_only_streak < 3 and streamed_text.strip():
                 # Model gave a text response without calling tools.
                 # Record the response so the model knows it already replied.
                 current_msgs.append({"role": "assistant", "content": streamed_text.strip()})
@@ -1999,7 +2050,7 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                     ),
                 })
                 continue
-            if not streamed_text.strip() and iteration < 3:
+            if not streamed_text.strip() and text_only_streak < max_stagnation:
                 logger.warning(f"[AGENT] Iteration {iteration}: empty response from cloud model, retrying")
                 nudge_text = _get_localized_text(lang, {
                     "zh": "⚠️ 你上一轮的回复是空的。请直接回复用户，或者使用工具完成任务。",
@@ -2384,7 +2435,7 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
 
             body = {
                 "model": model, "messages": loop_msgs,
-                "max_tokens": 4096, "stream": True,
+                "max_tokens": _resolve_max_tokens(model), "stream": True,
                 "temperature": 0.5,
                 "frequency_penalty": 0.6,
                 "stop": ["<|im_end|>", "<|endoftext|>"],
@@ -2444,6 +2495,7 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                 has_called_tool = True
 
                 any_new = False
+                round_failed = False
                 for tc in tool_calls:
                     sig = f"{tc.get('function',{}).get('name','')}:{hash(str(tc.get('function',{}).get('arguments','')))} "
                     if sig not in recent_tool_calls:
@@ -2453,8 +2505,11 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                         tc, current_msgs, session_id, agent_id)
                     for evt in events:
                         yield evt
+                    if verify_failed:
+                        round_failed = True
 
-                if any_new:
+                # 新的调用签名，或本轮有工具失败（模型正在尝试修复）都算实质推进，不计停滞
+                if any_new or round_failed:
                     stagnation = 0
                     text_only_streak = 0
                 else:
@@ -2826,13 +2881,27 @@ async def chat_completion(request: Request):
                         async for event in _agent_loop_stream(messages, model, api_url, headers, session_id, agent_id):
                             yield f"data: {json.dumps(event)}\n\n"
                     yield "data: [DONE]\n\n"
-                except (httpx.ConnectError, httpx.RemoteProtocolError):
+                except (httpx.ConnectError, httpx.RemoteProtocolError) as e:
+                    logger.error(f"Agent stream 连接错误: {type(e).__name__}: {e}", exc_info=True)
                     yield f"data: {json.dumps({'error': '无法连接模型服务。请检查后端是否已启动。'})}\n\n"
                     yield "data: [DONE]\n\n"
                 except httpx.HTTPStatusError as e:
+                    # 记录 doubao/openai 等云端 API 返回的 HTTP 错误（429限流/401鉴权/500服务端）
+                    # 含响应体片段，便于诊断"任务中断"的真实原因
+                    resp_body = ""
+                    try:
+                        resp_body = e.response.text[:500] if e.response is not None else ""
+                    except Exception:
+                        pass
+                    logger.error(
+                        f"Agent stream HTTP {e.response.status_code} "
+                        f"(url={e.request.url if e.request else '?'}): {resp_body}",
+                        exc_info=True,
+                    )
                     yield f"data: {json.dumps({'error': f'模型服务返回错误 HTTP {e.response.status_code}'})}\n\n"
                     yield "data: [DONE]\n\n"
-                except httpx.TimeoutException:
+                except httpx.TimeoutException as e:
+                    logger.error(f"Agent stream 超时: {type(e).__name__}: {e}", exc_info=True)
                     yield f"data: {json.dumps({'error': '模型服务响应超时，请检查网络或模型是否过大。'})}\n\n"
                     yield "data: [DONE]\n\n"
                 except Exception:
@@ -4299,4 +4368,4 @@ if __name__ == "__main__":
     import multiprocessing
     multiprocessing.freeze_support()
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run(app, host="127.0.0.1", port=8765)

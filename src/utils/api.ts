@@ -3,7 +3,7 @@
  * All requests route through Rust IPC proxy to bypass Tauri HTTP plugin CSP restrictions.
  */
 
-const SIDECAR = "http://127.0.0.1:8000";
+const SIDECAR = "http://127.0.0.1:8765";
 
 /** Sidecar JSON response — always has a status field, plus arbitrary payload.
  *  Return type of sidecarFetch. Use type assertions for known response shapes. */

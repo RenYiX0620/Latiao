@@ -155,24 +155,33 @@ def _apply_name_change(new_name: str):
 
 
 def _apply_style_change(value: str):
-    """Append style preference to SOUL.md."""
+    """Append style preference to SOUL.md (no duplicates)."""
     filepath = PROGRESS_DIR / "SOUL.md"
+    line = f"- {value}\n"
+    if filepath.exists() and line in filepath.read_text(encoding="utf-8"):
+        return
     with open(filepath, "a", encoding="utf-8") as f:
-        f.write(f"- {value}\n")
+        f.write(line)
 
 
 def _apply_rule_change(value: str):
-    """Append rule to AGENTS.md."""
+    """Append rule to AGENTS.md (no duplicates)."""
     filepath = PROGRESS_DIR / "AGENTS.md"
+    line = f"- {value}\n"
+    if filepath.exists() and line in filepath.read_text(encoding="utf-8"):
+        return
     with open(filepath, "a", encoding="utf-8") as f:
-        f.write(f"- {value}\n")
+        f.write(line)
 
 
 def _apply_pref_change(value: str):
-    """Append preference to USER.md."""
+    """Append preference to USER.md (no duplicates)."""
     filepath = PROGRESS_DIR / "USER.md"
+    line = f"- {value}\n"
+    if filepath.exists() and line in filepath.read_text(encoding="utf-8"):
+        return
     with open(filepath, "a", encoding="utf-8") as f:
-        f.write(f"- {value}\n")
+        f.write(line)
 
 
 _INTENT_APPLIERS = {
