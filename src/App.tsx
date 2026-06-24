@@ -231,6 +231,22 @@ const [timeFilter, setTimeFilter] = useState("all");
     }, 1000);
     return () => clearTimeout(timer);
   }, [cloudModels, cloudModelsLoaded]);
+  // Intercept external links → open in system browser (via tauri-plugin-opener)
+  useEffect(() => {
+    const handler = (e: MouseEvent) => {
+      const a = (e.target as HTMLElement).closest("a");
+      if (!a || !a.href) return;
+      try {
+        const url = new URL(a.href);
+        if (url.protocol !== "http:" && url.protocol !== "https:") return;
+        if (["127.0.0.1", "localhost", "tauri.localhost"].includes(url.hostname)) return;
+        e.preventDefault();
+        invoke("plugin:opener|open_url", { url: a.href });
+      } catch {}
+    };
+    document.addEventListener("click", handler, true);
+    return () => document.removeEventListener("click", handler, true);
+  }, []);
 
 
   const [fetchDiag, setFetchDiag] = useState("🔍 正在获取...");
