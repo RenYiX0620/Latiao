@@ -859,7 +859,7 @@ async def _delegate_task(agent_type: str, task: str) -> str:
                     "stream": False,
                     "temperature": 0.5,
                     "frequency_penalty": 0.6,
-                "stop": ["<|im_end|>", "<|endoftext|>"],
+                "stop": ["<|im_end|>", "<|endoftext|>", "<end_of_turn>", "<eos>", "</s>"],
                 }
                 r = await client.post(api_url, json=body, headers=sub_headers)
                 if r.status_code != 200:
@@ -1984,7 +1984,7 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                 "max_tokens": _resolve_max_tokens(model), "stream": True,
                 "temperature": 0.5,
                 "frequency_penalty": 0.6,
-                "stop": ["<|im_end|>", "<|endoftext|>"],
+                "stop": ["<|im_end|>", "<|endoftext|>", "<end_of_turn>", "<eos>", "</s>"],
             }
 
             streamed_text = ""
@@ -2471,6 +2471,19 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
     if len(active_tools) > 8:
         active_tools = _cap_tools(active_tools, 8)
     tools_prompt = _build_local_tools_prompt(active_tools)
+    # 4B-class models often have only ~8K ctx. If the system prompt + tool list
+    # blows past it, llama.cpp silently truncates the prompt and the model
+    # responds empty — which looks like the task "stopped halfway". Keep the
+    # first-round prompt small: trim tool list before building if needed.
+    if len(tools_prompt) > 4500 and len(active_tools) > 4:
+        _core_tools = {"read_file", "write_file", "list_dir", "run_cmd", "search_files"}
+        trimmed = [t for t in active_tools if t.get("function", {}).get("name") in _core_tools]
+        if len(trimmed) < 2:
+            trimmed = active_tools[:4]
+        logger.info(f"[LOCAL-AGENT] Tools prompt too long ({len(tools_prompt)} chars), trimming to {len(trimmed)} core tools")
+        tools_prompt = _build_local_tools_prompt(trimmed) + (
+            "\n(其他工具可按需在对话中说明,需要时再调用。)"
+        )
 
     # Detect continuation: if session has tool results but no final answer,
     # inject a strong continuation nudge in the first system message
@@ -2533,7 +2546,7 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                 "max_tokens": _resolve_max_tokens(model), "stream": True,
                 "temperature": 0.5,
                 "frequency_penalty": 0.6,
-                "stop": ["<|im_end|>", "<|endoftext|>"],
+                "stop": ["<|im_end|>", "<|endoftext|>", "<end_of_turn>", "<eos>", "</s>"],
             }
 
             streamed_text = ""
@@ -2678,6 +2691,21 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                 current_msgs.append({"role": "system", "content": nudge_text})
                 text_only_streak += 1
                 continue
+            # ── Empty-response exhaustion: streak cap reached and model still
+            # produced nothing. Do NOT silently finish the task — the user would
+            # see "执行一半就停了" with no explanation.
+            if not streamed_text.strip():
+                logger.warning(f"[LOCAL-AGENT] Iteration {iteration}: {text_only_streak} consecutive empty responses, aborting with diagnostic")
+                yield {"content": (
+                    "\n\n⚠️ **本地模型连续多次无响应，任务已中止。**\n"
+                    "可能原因：\n"
+                    "1. 模型上下文不足——系统提示+工具列表超过了模型的上下文窗口，"
+                    "输入被截断后模型输出为空（4B 小模型常见）\n"
+                    "2. 该模型不支持工具调用格式，或对长指令敏感\n"
+                    "建议：换用更大的模型（7B+），或重启模型服务后重试。"
+                )}
+                _track_progress(session_id, "stalled", f"empty_response x{text_only_streak}")
+                return
             _track_progress(session_id, "completed", f"text_response ({len(streamed_text)} chars)")
             logger.info(f"[LOCAL-AGENT] Iteration {iteration}: no tools, returning text ({len(streamed_text)} chars)")
             return
@@ -3090,7 +3118,7 @@ async def chat_completion(request: Request):
                             "max_tokens": _resolve_max_tokens(model), "stream": False,
                             "temperature": 0.5,
                             "frequency_penalty": 0.6,
-                "stop": ["<|im_end|>", "<|endoftext|>"],
+                "stop": ["<|im_end|>", "<|endoftext|>", "<end_of_turn>", "<eos>", "</s>"],
                         }, headers=headers)
                     else:
                         resp = await client.post(api_url, json={
@@ -3099,7 +3127,7 @@ async def chat_completion(request: Request):
                             "max_tokens": 2048, "stream": False,
                             "temperature": 0.5,
                             "frequency_penalty": 0.6,
-                "stop": ["<|im_end|>", "<|endoftext|>"],
+                "stop": ["<|im_end|>", "<|endoftext|>", "<end_of_turn>", "<eos>", "</s>"],
                         }, headers=headers)
                     resp.raise_for_status()  # httpx 不自动抛 4xx/5xx，必须显式检查
                     resp_data = resp.json()
@@ -3237,7 +3265,7 @@ async def chat_completion(request: Request):
                 "model": model, "messages": messages, "max_tokens": 1024,
                 "temperature": 0.5,
                 "frequency_penalty": 0.6,
-                "stop": ["<|im_end|>", "<|endoftext|>"],
+                "stop": ["<|im_end|>", "<|endoftext|>", "<end_of_turn>", "<eos>", "</s>"],
             }, headers=headers)
             resp.raise_for_status()  # httpx 不自动抛 4xx/5xx，必须显式检查
             resp_data = resp.json()
@@ -4432,7 +4460,7 @@ async def _execute_cron_job(job: dict):
                     "max_tokens": 2048, "stream": False,
                     "temperature": 0.5,
                     "frequency_penalty": 0.6,
-                "stop": ["<|im_end|>", "<|endoftext|>"],
+                "stop": ["<|im_end|>", "<|endoftext|>", "<end_of_turn>", "<eos>", "</s>"],
                 }
                 if not is_local:
                     # 本地模型不支持原生 function calling，只对云端发送 tools
