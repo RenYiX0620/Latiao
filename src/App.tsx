@@ -538,6 +538,13 @@ const [timeFilter, setTimeFilter] = useState("all");
       const resp = await fetch(SIDECAR + "/v1/local-llm/stop", { method: "POST" });
       const data = await resp.json();
       setLocalLLMStatus(data);
+      // Restore the default UI after unloading: clear the model-id input and
+      // drop the local model selection in chat so the next message routes
+      // through auto-routing/cloud instead of a stopped local server.
+      if (data.status !== "running") {
+        setLocalModelId("");
+        setSelectedModel("");
+      }
       showToast(t("toast.stopped"));
     } catch (e) { console.error(e) }
   };
