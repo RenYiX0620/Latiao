@@ -682,6 +682,12 @@ const [timeFilter, setTimeFilter] = useState("all");
     return full;
     } finally {
       disarmWatchdog();
+      // Proactively release the stream: plugin-http holds the response body as a
+      // Tauri resource (rid). If we just walk away, the plugin's later teardown
+      // races with connection close and rejects "The resource id ... is invalid"
+      // as an unhandled promise rejection -> fullscreen crash overlay.
+      try { await reader.cancel("stream-done"); } catch { /* already closed */ }
+      try { reader.releaseLock(); } catch { /* noop */ }
     }
   };
 
@@ -766,7 +772,11 @@ const [timeFilter, setTimeFilter] = useState("all");
       abortControllerRef.current = controller;
       await streamChat(apiMessages, opts, controller.signal);
     } catch (e) {
-      const aborted = (e as { name?: string })?.name === "AbortError";
+      // Tauri plugin-http teardown after abort rejects with "The resource id
+      // ... is invalid" instead of a standard AbortError — treat it the same.
+      const errText = String((e as { message?: string })?.message ?? e ?? "");
+      const aborted = (e as { name?: string })?.name === "AbortError"
+        || /resource id .* is invalid/i.test(errText);
       setMessages((prev) => {
         const msgs = [...prev];
         const last = msgs[msgs.length - 1];

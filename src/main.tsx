@@ -49,6 +49,15 @@ window.addEventListener('unhandledrejection', (e) => {
     console.warn('Ignoring benign opener rejection:', e.reason)
     return
   }
+  // Tauri plugin-http registers every response body as a resource (rid). When
+  // the connection closes or the plugin cleans up after an aborted/finished
+  // stream, its internal invoke rejects with "The resource id ... is invalid".
+  // That rejection is not on our promise chain — it is a benign teardown race
+  // and must not crash the UI.
+  if (/resource id .* is invalid/i.test(reasonText)) {
+    console.warn('Ignoring benign tauri-http resource teardown:', e.reason)
+    return
+  }
   showErrorOverlay(`Unhandled Promise Rejection: ${e.reason}`, e.reason?.stack)
 })
 
