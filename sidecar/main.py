@@ -51,6 +51,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import uuid
 
 # Fix SSL certificate verification for Python 3.14 on macOS
@@ -69,7 +70,7 @@ from config import LM_STUDIO_URL, SUBAGENT_MODEL, SKILLS_DIR, PROGRESS_DIR
 from db import _get_db, _create_table, _init_db, MEMORY_DB, _db_write_lock
 from memory import _tokenize_zh, _quick_reflect, _build_learning_context, _extract_learnings_heuristic, _maybe_generate_skill, _refine_learnings, _get_recent_learnings, _retrieve_relevant_learnings, _summarize_learning, _retrieve_preferences, _record_reflection, _get_high_confidence_preferences
 import httpx
-from fastapi import FastAPI, File, Query, Request, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -305,6 +306,17 @@ _last_cloud_config: contextvars.ContextVar = contextvars.ContextVar("cloud_confi
 MAX_UPLOAD_SIZE = 50 * 1024 * 1024  # 50 MB
 IS_MACOS = platform.system() == "Darwin"
 IS_WINDOWS = platform.system() == "Windows"
+
+# Fire-and-forget 后台任务集合——保存强引用，防止任务被 GC 提前回收
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn(coro) -> asyncio.Task:
+    """创建后台任务并保存引用，完成后自动从集合移除。"""
+    t = asyncio.create_task(coro)
+    _background_tasks.add(t)
+    t.add_done_callback(_background_tasks.discard)
+    return t
 
 # ═══════════════════════════════════════════════════════
 #  Multi-Agent System: LaTiao orchestrator + specialists
@@ -603,6 +615,15 @@ def run_cmd(cmd: str) -> str:
     cmd = "\n".join(line for line in cmd.split("\n") if not line.strip().startswith("#")).strip()
     if not cmd:
         return "错误：命令为空（可能只包含注释行）"
+    # Reject unsupported shell operators — with shell=False they are passed as
+    # literal args and the command silently misbehaves (only the 1st runs).
+    m = re.search(r"(&&|\|\||\||;|\$\(|>|<)", cmd)
+    if m:
+        return (
+            f"⛔ 不支持 shell 操作符 '{m.group(1)}'：本工具以 shell=False 执行，"
+            "复合命令会静默失败。请拆成多次调用，每次只运行一条命令"
+            "（不要用 && | ; > < 等）。"
+        )
     # Safety check before execution (fallback version — plugin has fuller check)
     cmd_lower = cmd.lower().strip()
     for pattern in _DANGEROUS:
@@ -646,6 +667,7 @@ def open_folder(path: str) -> str:
             subprocess.Popen(["xdg-open", path])
         return f"✅ 已打开：{path}"
     except Exception:
+        logger.debug("open_folder failed, falling back to list_dir", exc_info=True)
         return list_dir(path)
 
 
@@ -719,7 +741,7 @@ async def tavily_search(args: dict) -> str:
             if result.returncode == 0 and result.stdout.strip():
                 api_key = result.stdout.strip()
         except Exception:
-            pass
+            logger.debug("Tavily keychain read failed", exc_info=True)
 
     if not api_key:
         try:
@@ -727,7 +749,7 @@ async def tavily_search(args: dict) -> str:
                 cfg = json.loads(config_file.read_text(encoding="utf-8"))
                 api_key = cfg.get("tavily_api_key")
         except Exception:
-            pass
+            logger.warning("Failed to read Tavily key from config.json", exc_info=True)
 
     if not api_key:
         return (
@@ -928,11 +950,11 @@ _FALLBACK_TOOLS = [
         "type": "function",
         "function": {
             "name": "run_cmd",
-            "description": "Run a shell command and return its output. ⚠️ Requires user confirmation. Dangerous commands (rm -rf, sudo, etc.) are always blocked.",
+            "description": "Run ONE single command and return its output (no shell). ⚠️ Requires user confirmation. Dangerous commands (rm -rf, sudo, etc.) are always blocked. Do NOT use shell operators (&& | ; > <) — call once per command instead.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "cmd": {"type": "string", "description": "The shell command to execute."}
+                    "cmd": {"type": "string", "description": "A single command with arguments (no shell operators like && | ; >)."}
                 },
                 "required": ["cmd"]
             }
@@ -1140,7 +1162,7 @@ async def _auto_verify(tool_name: str, args: dict, result: str) -> str:
                     except asyncio.TimeoutError:
                         checks.append(("FAIL", "ESLint", "超时"))
                     except Exception:
-                        pass
+                        logger.debug("ESLint check failed", exc_info=True)
                     break
 
         # ── Python syntax check ──
@@ -1158,7 +1180,7 @@ async def _auto_verify(tool_name: str, args: dict, result: str) -> str:
             except asyncio.TimeoutError:
                 checks.append(("FAIL", "Python 语法", "超时"))
             except Exception:
-                pass
+                logger.debug("Python syntax check failed", exc_info=True)
 
     # ── Semgrep security scan ──
     await _enhance_auto_verify(tool_name, args, result, checks)
@@ -1235,8 +1257,14 @@ async def execute_tool(tool_name: str, arguments: dict) -> str:
     if not fn:
         return f"Error: Unknown tool '{tool_name}'"
     try:
-        result = fn(arguments)
+        if asyncio.iscoroutinefunction(fn):
+            result = await fn(arguments)
+        else:
+            # 同步工具函数（如 mx_query 内含 120s subprocess）放到线程执行，
+            # 避免阻塞事件循环
+            result = await asyncio.to_thread(fn, arguments)
         if asyncio.iscoroutine(result):
+            # 兼容：同步包装（lambda 等）返回 coroutine 的情况
             result = await result
     except KeyError as e:
         return f"Error: Missing required argument {e} for tool '{tool_name}'"
@@ -1536,13 +1564,15 @@ _session_states: dict[str, dict] = {}
 def _track_progress(session_id: str, phase: str, action: str):
     """Record agent progress for stagnation detection."""
     if session_id not in _session_states:
-        _session_states[session_id] = {"phase": "init", "round": 0, "stalled_rounds": 0, "last_action": "", "history": []}
+        _session_states[session_id] = {"phase": "init", "round": 0, "stalled_rounds": 0, "last_action": "", "history": [], "ts": time.time()}
         # Cap to last 20 sessions to prevent memory leak
         if len(_session_states) > 20:
-            oldest = sorted(_session_states.keys())[:len(_session_states) - 20]
+            # 按最近访问时间淘汰最老的会话（UUID 字典序与活跃度无关）
+            oldest = sorted(_session_states, key=lambda k: _session_states[k].get("ts", 0))[:len(_session_states) - 20]
             for k in oldest:
                 del _session_states[k]
     s = _session_states[session_id]
+    s["ts"] = time.time()  # 每次访问刷新时间戳，淘汰时按 ts 最小（LRU）
     s["round"] += 1
     prev_phase = s["phase"]
     s["phase"] = phase
@@ -1592,6 +1622,7 @@ async def _semgrep_scan(filepath: str) -> str | None:
     except asyncio.TimeoutError:
         return "semgrep 扫描超时"
     except Exception:
+        logger.debug("Semgrep scan failed", exc_info=True)
         return None
 
 
@@ -1662,14 +1693,14 @@ def _check_pre_hooks(tool_name: str, args: dict) -> tuple[bool, list[dict], str]
         if veto is False:
             return True, [], f"⛔ Hook vetoed: {tool_name}"
     except Exception:
-        pass  # hook errors don't block execution
+        logger.warning(f"Pre-tool hook failed for {tool_name}", exc_info=True)  # don't block execution
     return False, [], ""
 
 
 async def _handle_tool_execution(tc: dict, current_msgs: list, session_id: str,
                                   agent_id: str) -> tuple[bool, list[dict]]:
     """Execute a single tool call within the agent loop. Returns (verify_failed, events)."""
-    call_id = tc["id"]
+    call_id = tc.get("id") or str(uuid.uuid4())
     func = tc.get("function", {})
     tool_name = func.get("name", "unknown")
     try:
@@ -1725,8 +1756,8 @@ async def _handle_tool_execution(tc: dict, current_msgs: list, session_id: str,
     _record_tool_call_db(session_id, tool_name, args, result)
 
     # Self-evolution: background-refine learning + auto-skill generation
-    asyncio.create_task(_refine_learnings(tool_name, args, result, session_id))
-    asyncio.create_task(_maybe_generate_skill(tool_name, args, result))
+    _spawn(_refine_learnings(tool_name, args, result, session_id))
+    _spawn(_maybe_generate_skill(tool_name, args, result))
 
     verify_report = await _auto_verify(tool_name, args, result)
     verify_failed = bool(verify_report and "❌" in verify_report)
@@ -1855,6 +1886,22 @@ def _strip_native_tool_calls(text: str) -> str:
 # ║  OpenAI-compatible function calling                   ║
 # ╚══════════════════════════════════════════════════════╝
 
+def _append_loop_log(line: str):
+    """追加一行到 latiao-loop.log；超过 5MB 时截断保留尾部一半，避免无界增长。"""
+    try:
+        log_path = os.path.join(tempfile.gettempdir(), "latiao-loop.log")
+        if os.path.exists(log_path) and os.path.getsize(log_path) > 5 * 1024 * 1024:
+            with open(log_path, "rb") as f:
+                f.seek(-(5 * 1024 * 1024 // 2), os.SEEK_END)
+                tail = f.read()
+            with open(log_path, "wb") as f:
+                f.write(tail)
+        with open(log_path, "a") as lf:
+            lf.write(line)
+    except Exception:
+        pass  # 调试日志写失败不影响主流程
+
+
 async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: dict, session_id: str = "", agent_id: str = "latiao"):
     """Agent loop: call LLM with tools. If tool_calls → execute → loop. If text → yield & done."""
     current_msgs = [dict(m) for m in messages]
@@ -1894,6 +1941,7 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
     recent_tool_calls: set[str] = set()  # signature = "tool_name:arg_hash"
     iteration = 0
     text_only_streak = 0   # 与 local loop 对齐，消除空响应分支 (text_only_streak += 1) 的 NameError 崩溃
+    text_output_delivered = False  # nudge 重试期间抑制已交付文本的重复流式输出
 
     # ── Self-Learning: Heuristic extraction + learning_context via _build_chat_messages ──
     if last_user_text:
@@ -1943,6 +1991,7 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
             tool_call_bufs: dict[int, dict] = {}
 
             async with client.stream("POST", api_url, json=body, headers=headers) as r:
+                r.raise_for_status()  # httpx 不自动抛 4xx/5xx，必须显式检查
                 async for line in r.aiter_lines():
                     if line and line.startswith("data: "):
                         data_str = line[6:]
@@ -1950,7 +1999,10 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                             break
                         try:
                             event = json.loads(data_str)
-                            delta = event.get("choices", [{}])[0].get("delta", {})
+                            choices = event.get("choices") or []
+                            if not choices:
+                                continue  # usage-only chunk（仅 token 统计，无 delta）
+                            delta = choices[0].get("delta", {})
 
                             content = delta.get("content", "")
                             reasoning = delta.get("reasoning", "")
@@ -1958,6 +2010,9 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                                 streamed_text += content
                                 # Anti-repetition: skip tokens once the first complete intro is detected
                                 if len(_deduplicate_response(streamed_text)) < len(streamed_text):
+                                    continue
+                                # nudge 重试期间不再向用户重复输出已交付的文本
+                                if text_output_delivered:
                                     continue
                                 # Filter native control tokens so the UI doesn't show
                                 # raw <|tool_call|> / <|channel> / <channel|> markers
@@ -1971,6 +2026,8 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                                 # so the UI doesn't appear frozen during the thinking phase
                                 streamed_text += reasoning
                                 if len(_deduplicate_response(streamed_text)) < len(streamed_text):
+                                    continue
+                                if text_output_delivered:
                                     continue
                                 yield {"content": reasoning}
 
@@ -1989,7 +2046,7 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                                         buf["function"]["name"] = tc_delta["function"]["name"]
                                     if "arguments" in tc_delta["function"]:
                                         buf["function"]["arguments"] += tc_delta["function"]["arguments"]
-                        except (json.JSONDecodeError, KeyError, TypeError):
+                        except (json.JSONDecodeError, KeyError, TypeError, IndexError):
                             pass  # Malformed SSE delta — skip this event, try next
                         except Exception:
                             logger.error("SSE tool_call parse error", exc_info=True)
@@ -2009,8 +2066,7 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                 tool_calls = []
 
             if tool_calls:
-                with open(os.path.join(tempfile.gettempdir(), "latiao-loop.log"), "a") as lf:
-                    lf.write(f"Iteration {iteration}: found {len(tool_calls)} tool(s): {[tc.get('function',{}).get('name') for tc in tool_calls]}\n")
+                _append_loop_log(f"Iteration {iteration}: found {len(tool_calls)} tool(s): {[tc.get('function',{}).get('name') for tc in tool_calls]}\n")
                 _track_progress(session_id, "tool_calling", f"{len(tool_calls)} tool(s)")
                 logger.info(f"[LOCAL-AGENT] Iteration {iteration}: {len(tool_calls)} tool(s) called, msgs_in_context={len(current_msgs)}")
 
@@ -2020,6 +2076,7 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                     "tool_calls": tool_calls,
                 })
                 has_called_tool = True
+                text_output_delivered = False  # 工具被调用=实质推进，后续文本是新的最终回复，恢复流式输出
 
                 # Stagnation check: reset if new tool calls, else count toward limit
                 any_new = False
@@ -2062,26 +2119,28 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                         "如果还没完成，请继续调用工具。如果确实完成了，请回复最终结果。"
                     ),
                 })
+                text_output_delivered = True  # 文本已交付，nudge 重试不再重复输出
                 text_only_streak += 1
                 continue
             if not has_called_tool and text_only_streak < 3 and streamed_text.strip():
                 # Model gave a text response without calling tools.
                 # Record the response so the model knows it already replied.
                 current_msgs.append({"role": "assistant", "content": streamed_text.strip()})
-                # If this is clearly a direct answer to a simple question, stop nudging.
+                # 非任务型消息（闲聊/陈述/提问/长回复）→ 文本已交付给用户，直接结束，不再 nudge 重发
                 user_q = last_user_text.strip().rstrip("?？") if last_user_text else ""
-                is_question = "?" in user_q or "？" in user_q or "吗" in user_q or "什么" in user_q or "谁" in user_q or "哪" in user_q
                 has_task_kw = any(kw in user_q for kw in ["运行", "执行", "做", "帮我", "写", "创建", "查", "搜", "找", "分析", "修复", "构建", "部署", "安装", "配置", "run", "build", "fix", "create", "search", "analyze", "deploy"])
-                if (len(user_q) < 20 or is_question) and not has_task_kw:
+                if not has_task_kw:
                     _track_progress(session_id, "completed", f"text_response ({len(streamed_text)} chars)")
                     return
-                # For task-like requests, nudge to use tools
+                # 任务型请求但模型只回文字不调工具 → nudge 促其行动（不再向用户重复流式输出）
                 current_msgs.append({
                     "role": "system",
                     "content": (
                         "不要写执行计划，直接行动。需要用什么工具就立即调用。"
                     ),
                 })
+                text_output_delivered = True
+                text_only_streak += 1
                 continue
             if not streamed_text.strip() and text_only_streak < max_stagnation:
                 logger.warning(f"[AGENT] Iteration {iteration}: empty response from cloud model, retrying")
@@ -2375,15 +2434,18 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
             current_msgs = system_msgs + other_msgs[-30:]
     # Rough token estimate: ~2 chars per token for Chinese
     total_chars = sum(len(str(m.get("content", ""))) for m in current_msgs)
+    if total_chars > 80000:
+        # 强警告：上下文随时可能溢出（必须先于 60000 判断，否则此分支不可达）
+        logger.warning(f"[LOCAL-AGENT] Context may overflow: ~{total_chars} chars (~{total_chars//2} tokens)")
     if total_chars > 60000:
         # Context Anxiety prevention: save progress and suggest restart (Harness pattern)
         logger.warning(f"[LOCAL-AGENT] Context near limit: ~{total_chars} chars (~{total_chars//2} tokens). Saving progress.")
         # Write PROGRESS.md with current state
         try:
             last_user = _extract_last_user_text(current_msgs)
-            _record_progress(f"⚠️ 自动存档（上下文 {{total_chars//2}} tokens）\n最后用户消息: {last_user[:200] if last_user else '(无)'}")
+            _record_progress(f"⚠️ 自动存档（上下文 {total_chars//2} tokens）\n最后用户消息: {last_user[:200] if last_user else '(无)'}")
         except Exception:
-            pass
+            logger.warning("Failed to save progress during context-anxiety", exc_info=True)
         _ctx_lang = _detect_user_language(_extract_last_user_text(current_msgs)) if 'current_msgs' in dir() and current_msgs else "zh"
         _ctx_msg = _get_localized_text(_ctx_lang, {
             "zh": f"💡 **上下文接近上限**（~{total_chars//2} tokens）。建议：\n1. 当前进度已自动保存到 PROGRESS.md\n2. 开一个新会话，Agent 会从断点继续\n3. 或继续在本会话中完成（质量可能下降）",
@@ -2391,8 +2453,6 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
             "ja": f"💡 **コンテキスト上限に近づいています**（~{total_chars//2} tokens）。提案：\n1. 進捗は PROGRESS.md に自動保存済み\n2. 新しいセッションを開始 — エージェントは中断から続行\n3. このまま続行（品質が低下する可能性があります）",
         })
         yield {"content": "\n\n" + _ctx_msg}
-    elif total_chars > 80000:
-        logger.warning(f"[LOCAL-AGENT] Context may overflow: ~{total_chars} chars (~{total_chars//2} tokens)")
     if not session_id:
         session_id = str(uuid.uuid4())
 
@@ -2400,9 +2460,10 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
     iteration = 0
     recent_tool_calls: set[str] = set()
     stagnation = 0
-    max_stagnation = 8
+    max_stagnation = 3  # cap empty-response/dead-end retries to avoid hammering the model server
     text_only_streak = 0
     has_called_tool = False
+    text_output_delivered = False  # nudge 重试期间抑制已交付文本的重复流式输出
     # Build tool prompt
     last_user_text = _extract_last_user_text(current_msgs)
     agent_tools = _get_agent_tools(agent_id, TOOLS)
@@ -2436,8 +2497,7 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
     async with httpx.AsyncClient(timeout=httpx.Timeout(120)) as client:
         while iteration < max_iterations:
             iteration += 1
-            with open(os.path.join(tempfile.gettempdir(), "latiao-loop.log"), "a") as lf:
-                lf.write(f"Iteration {iteration}: current_msgs={len(current_msgs)}, roles={[m.get('role') for m in current_msgs[-5:]]}\n")
+            _append_loop_log(f"Iteration {iteration}: current_msgs={len(current_msgs)}, roles={[m.get('role') for m in current_msgs[-5:]]}\n")
 
             # Build messages for this iteration: merge tools + current context
             loop_msgs = list(current_msgs)
@@ -2479,6 +2539,7 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
             streamed_text = ""
             logger.info(f"[LOCAL-AGENT] Iteration {iteration}: calling LLM, msgs={len(loop_msgs)}, first_user_content_len={len(loop_msgs[-1].get('content','')) if loop_msgs else 0}")
             async with client.stream("POST", api_url, json=body, headers=headers) as r:
+                r.raise_for_status()  # httpx 不自动抛 4xx/5xx，必须显式检查
                 async for line in r.aiter_lines():
                     if line and line.startswith("data: "):
                         data_str = line[6:]
@@ -2486,7 +2547,10 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                             break
                         try:
                             event = json.loads(data_str)
-                            delta = event.get("choices", [{}])[0].get("delta", {})
+                            choices = event.get("choices") or []
+                            if not choices:
+                                continue  # usage-only chunk（仅 token 统计，无 delta）
+                            delta = choices[0].get("delta", {})
                             content = delta.get("content", "")
                             reasoning = delta.get("reasoning", "")
                             if content:
@@ -2494,13 +2558,18 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                                 # Anti-repetition: skip tokens after the first complete intro
                                 if len(_deduplicate_response(streamed_text)) < len(streamed_text):
                                     continue
+                                # nudge 重试期间不再向用户重复输出已交付的文本
+                                if text_output_delivered:
+                                    continue
                                 yield {"content": content}
                             elif reasoning:
                                 streamed_text += reasoning
                                 if len(_deduplicate_response(streamed_text)) < len(streamed_text):
                                     continue
+                                if text_output_delivered:
+                                    continue
                                 yield {"content": reasoning}
-                        except (json.JSONDecodeError, KeyError, TypeError):
+                        except (json.JSONDecodeError, KeyError, TypeError, IndexError):
                             pass
                         except Exception:
                             logger.error("Local agent SSE parse error", exc_info=True)
@@ -2528,6 +2597,7 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                     "content": clean_text or "正在调用工具...",
                 })
                 has_called_tool = True
+                text_output_delivered = False  # 工具被调用=实质推进，后续文本是新的最终回复，恢复流式输出
 
                 any_new = False
                 round_failed = False
@@ -2573,20 +2643,20 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                         "ja": "⚠️ ツール実行結果を受け取りましたが、テキストのみ返信しました。\nタスク完了を確認し、未完了の場合はツールを続けて呼び出してください。\n形式：```tool ツール名\n{\"パラメータ\":\"値\"}\n```",
                     }),
                 })
+                text_output_delivered = True  # 文本已交付，nudge 重试不再重复输出
                 text_only_streak += 1
                 continue
             if not has_called_tool and text_only_streak < 3 and streamed_text.strip():
                 # Model gave a text response without calling tools.
                 # Record the response so the model knows it already replied.
                 current_msgs.append({"role": "assistant", "content": streamed_text.strip()})
-                # If this is clearly a direct answer to a simple question, stop nudging.
+                # 非任务型消息（闲聊/陈述/提问/长回复）→ 文本已交付给用户，直接结束，不再 nudge 重发
                 user_q = _extract_last_user_text(current_msgs).strip().rstrip("?？") if current_msgs else ""
-                is_question = "?" in user_q or "？" in user_q or "吗" in user_q or "什么" in user_q or "谁" in user_q or "哪" in user_q
                 has_task_kw = any(kw in user_q for kw in ["运行", "执行", "做", "帮我", "写", "创建", "查", "搜", "找", "分析", "修复", "构建", "部署", "安装", "配置", "run", "build", "fix", "create", "search", "analyze", "deploy"])
-                if (len(user_q) < 20 or is_question) and not has_task_kw:
+                if not has_task_kw:
                     _track_progress(session_id, "completed", f"text_response ({len(streamed_text)} chars)")
                     return
-                # For task-like requests, nudge to use tools — text_only_streak limits nudges
+                # 任务型请求但模型只回文字不调工具 → nudge 促其行动（不再向用户重复流式输出）
                 logger.info(f"[LOCAL-AGENT] Iteration {iteration}: model planning instead of calling tools, nudging (streak={text_only_streak})")
                 current_msgs.append({
                     "role": "system",
@@ -2594,6 +2664,7 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                         "不要写执行计划，直接行动。需要用什么工具就立即调用。"
                     ),
                 })
+                text_output_delivered = True
                 text_only_streak += 1
                 continue
             if not streamed_text.strip() and text_only_streak < max_stagnation:
@@ -2829,7 +2900,7 @@ def _has_cloud_models() -> bool:
             models = cfg.get("cloud_models", [])
             return any(m.get("endpoint") for m in models)
     except Exception:
-        pass
+        logger.warning("Failed to read cloud models config", exc_info=True)
     return False
 
 
@@ -2860,8 +2931,19 @@ def _get_best_cloud_config() -> dict | None:
                         "protocol": m.get("protocol", "openai"),
                     }
     except Exception:
-        pass
+        logger.warning("Failed to read best cloud config", exc_info=True)
     return None
+
+
+async def _json_body(request: Request) -> dict:
+    """解析请求 JSON body；非法 JSON 或非对象时返回 400，而不是让端点抛 500。"""
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="expected JSON object")
+    return body
 
 
 @app.post("/v1/chat/completions")
@@ -2873,7 +2955,7 @@ def _get_best_cloud_config() -> dict | None:
 async def chat_completion(request: Request):
     """Main chat endpoint. Routes to agent loop (OpenAI-compatible) or simple streaming.
     Auto-routes to best model based on task type when no specific model is selected."""
-    body = await request.json()
+    body = await _json_body(request)
     messages = body.get("messages", [])
     last_user_text = _extract_last_user_text(messages)
     
@@ -2904,7 +2986,8 @@ async def chat_completion(request: Request):
 
     skip_tools = body.get("skip_tools", False)
     agent_id = body.get("agent", "latiao")
-    cloud_config = body.get("cloud_config")
+    # 不要在这里重新读取 cloud_config：上面的自动路由可能已为代码任务
+    # 选中了云端模型，重新从 body 取值会把路由结果覆盖回 None → 又落回本地模型。
     _last_cloud_config.set(cloud_config)
     use_stream = body.get("stream", False)
 
@@ -3018,6 +3101,7 @@ async def chat_completion(request: Request):
                             "frequency_penalty": 0.6,
                 "stop": ["<|im_end|>", "<|endoftext|>"],
                         }, headers=headers)
+                    resp.raise_for_status()  # httpx 不自动抛 4xx/5xx，必须显式检查
                     resp_data = resp.json()
                     choices = resp_data.get("choices", [])
                     if not choices:
@@ -3067,7 +3151,7 @@ async def chat_completion(request: Request):
                                 result = await execute_tool(tool_name, tool_args)
                                 # Self-evolution: record + background-refine learning
                                 _record_tool_call_db(session_id, tool_name, tool_args, result)
-                                asyncio.create_task(_refine_learnings(tool_name, tool_args, result, session_id))
+                                _spawn(_refine_learnings(tool_name, tool_args, result, session_id))
                             if len(result) > 5000:
                                 result = result[:5000] + "\n...(截断)"
                             current_msgs.append({
@@ -3114,6 +3198,7 @@ async def chat_completion(request: Request):
             try:
                 async with httpx.AsyncClient(timeout=httpx.Timeout(120)) as c:
                     async with c.stream("POST", api_url, json=lm_body, headers=headers) as r:
+                        r.raise_for_status()  # httpx 不自动抛 4xx/5xx，必须显式检查
                         async for line in r.aiter_lines():
                             if line and line.startswith("data: "):
                                 data_str = line[6:]
@@ -3137,6 +3222,10 @@ async def chat_completion(request: Request):
             except (httpx.ConnectError, httpx.RemoteProtocolError):
                 yield f"data: {json.dumps({'error': '无法连接模型服务。请检查 LM Studio 或本地 LLM 是否已启动。'})}\n\n"
                 yield "data: [DONE]\n\n"
+            except httpx.HTTPStatusError as e:
+                logger.error(f"Stream fallback HTTP {e.response.status_code}", exc_info=True)
+                yield f"data: {json.dumps({'error': f'模型服务返回错误 HTTP {e.response.status_code}'})}\n\n"
+                yield "data: [DONE]\n\n"
         return StreamingResponse(stream(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache"})
 
@@ -3150,11 +3239,18 @@ async def chat_completion(request: Request):
                 "frequency_penalty": 0.6,
                 "stop": ["<|im_end|>", "<|endoftext|>"],
             }, headers=headers)
+            resp.raise_for_status()  # httpx 不自动抛 4xx/5xx，必须显式检查
             resp_data = resp.json()
     except (httpx.ConnectError, httpx.RemoteProtocolError):
         return JSONResponse(
             {"error": "无法连接模型服务。请检查 LM Studio 或本地 LLM 是否已启动。"},
             status_code=503,
+        )
+    except httpx.HTTPStatusError as e:
+        logger.error("Sync chat fallback HTTP %s: %s", e.response.status_code, e.response.text[:300])
+        return JSONResponse(
+            {"error": f"模型服务返回错误 HTTP {e.response.status_code}"},
+            status_code=502,
         )
     except Exception:
         logger.error("Sync chat fallback failed", exc_info=True)
@@ -3197,15 +3293,23 @@ async def chat_completion(request: Request):
 
 
 @app.post("/v1/upload_file")
-async def upload_file(file: UploadFile = File(...)):
+async def upload_file(request: Request, file: UploadFile = File(...)):
     """文件上传：图片转 base64，PDF 提取文本，文本直接读取"""
+    # 先检查 Content-Length，超限直接 413，避免把超大文件读进内存
+    cl = request.headers.get("content-length", "")
+    if cl.isdigit() and int(cl) > MAX_UPLOAD_SIZE:
+        return JSONResponse(
+            {"status": "error", "message": f"文件过大 (上限 {MAX_UPLOAD_SIZE / 1024 / 1024:.0f}MB)"},
+            status_code=413,
+        )
     try:
-        content = await file.read()
+        # 限量读取：最多读 MAX_UPLOAD_SIZE+1 字节，超限即拒绝
+        content = await file.read(MAX_UPLOAD_SIZE + 1)
         if len(content) > MAX_UPLOAD_SIZE:
-            return {
-                "status": "error",
-                "message": f"文件过大: {len(content) / 1024 / 1024:.1f}MB (上限 {MAX_UPLOAD_SIZE / 1024 / 1024:.0f}MB)",
-            }
+            return JSONResponse(
+                {"status": "error", "message": f"文件过大 (上限 {MAX_UPLOAD_SIZE / 1024 / 1024:.0f}MB)"},
+                status_code=413,
+            )
         file_type = file.content_type or ""
         is_image = file_type.startswith("image/")
         is_pdf = file_type == "application/pdf" or (file.filename or "").lower().endswith(".pdf")
@@ -3279,11 +3383,15 @@ async def recognize_speech(request: Request):
     import tempfile
 
     try:
-        body = await request.json()
+        body = await _json_body(request)
         audio_base64 = body.get("audio_base64", "")
 
         if not audio_base64:
             return {"status": "error", "message": "No audio data provided"}
+
+        # 解码前先按 base64 长度做大小检查（约 25MB 原始音频上限）
+        if len(audio_base64) > 25 * 1024 * 1024 * 4 // 3:
+            return {"status": "error", "message": "音频过大（上限约 25MB）"}
 
         audio_bytes = base64.b64decode(audio_base64)
 
@@ -3292,8 +3400,9 @@ async def recognize_speech(request: Request):
             wav_path = tmp.name
 
         try:
-            model = _get_whisper_model()
-            segments, info = model.transcribe(wav_path, language="zh", beam_size=5)
+            # 模型加载与推理都是 CPU 密集阻塞操作，放到线程执行避免卡住事件循环
+            model = await asyncio.to_thread(_get_whisper_model)
+            segments, info = await asyncio.to_thread(model.transcribe, wav_path, language="zh", beam_size=5)
 
             text = " ".join(s.text.strip() for s in segments)
 
@@ -3312,7 +3421,7 @@ async def recognize_speech(request: Request):
 @app.post("/v1/test_connection")
 async def test_connection(request: Request):
     """测试云端 API 连接"""
-    body = await request.json()
+    body = await _json_body(request)
     key = body.get("key", "")
     endpoint = body.get("endpoint", "")
     protocol = body.get("protocol", "openai")
@@ -3372,6 +3481,7 @@ async def get_identity():
             else:
                 files.append({"name": filename, "exists": False, "content": ""})
         except Exception:
+            logger.debug(f"Failed to read identity file {filename}", exc_info=True)
             files.append({"name": filename, "exists": False, "content": ""})
     return {"status": "ok", "files": files}
 
@@ -3396,7 +3506,7 @@ async def get_agents():
 @app.post("/v1/agents/save")
 async def save_agent(request: Request):
     """Create or update a custom agent profile."""
-    body = await request.json()
+    body = await _json_body(request)
     agent_id = body.get("id", "").strip().lower().replace(" ", "-")
     if not agent_id or agent_id in ("latiao",):  # protect built-in orchestrator
         return {"status": "error", "message": "Invalid or reserved agent id"}
@@ -3434,12 +3544,14 @@ async def get_tools():
     try:
         if MEMORY_DB.exists():
             conn = sqlite3.connect(str(MEMORY_DB), check_same_thread=False)
-            rows = conn.execute(
-                "SELECT tool_name, COUNT(*) as cnt FROM tool_calls GROUP BY tool_name"
-            ).fetchall()
-            for row in rows:
-                usage[row[0]] = row[1]
-            conn.close()
+            try:
+                rows = conn.execute(
+                    "SELECT tool_name, COUNT(*) as cnt FROM tool_calls GROUP BY tool_name"
+                ).fetchall()
+                for row in rows:
+                    usage[row[0]] = row[1]
+            finally:
+                conn.close()
     except Exception:
         logger.warning("Failed to load usage stats", exc_info=True)
 
@@ -3472,11 +3584,15 @@ async def get_permissions():
 async def set_permissions(request: Request):
     """Save custom permission rules. Accepts {rules: [...]} or {tool, permission} for single update."""
     global _custom_permissions
-    body = await request.json()
+    body = await _json_body(request)
     if "tool" in body and "permission" in body:
         # Single tool update — upsert into custom rules
         tool = body["tool"]
         perm = body["permission"]
+        if not isinstance(tool, str) or not tool:
+            raise HTTPException(status_code=400, detail="invalid tool")
+        if perm not in ("safe", "confirm", "danger"):
+            raise HTTPException(status_code=400, detail=f"invalid permission: {perm}")
         found = False
         for rule in _custom_permissions:
             if rule.get("tool") == tool and "path_pattern" not in rule:
@@ -3488,6 +3604,14 @@ async def set_permissions(request: Request):
         _save_permissions(_custom_permissions)
         return {"status": "ok", "rules": _custom_permissions}
     rules = body.get("rules", [])
+    if not isinstance(rules, list):
+        raise HTTPException(status_code=400, detail="rules must be a list")
+    # 每条规则必须含合法 tool 字段，permission 必须在白名单内
+    for rule in rules:
+        if not isinstance(rule, dict) or not isinstance(rule.get("tool"), str) or not rule.get("tool"):
+            raise HTTPException(status_code=400, detail="each rule must have a valid 'tool' field")
+        if "permission" in rule and rule["permission"] not in ("safe", "confirm", "danger"):
+            raise HTTPException(status_code=400, detail=f"invalid permission: {rule['permission']}")
     _save_permissions(rules)
     _load_permissions()
     return {"status": "ok", "rules": _custom_permissions}
@@ -3611,7 +3735,7 @@ async def search_learnings(q: str = Query(default="", min_length=0), limit: int 
 @app.post("/v1/memory/learn")
 async def learn_from_conversation(request: Request):
     """Manually trigger knowledge extraction from a conversation."""
-    body = await request.json()
+    body = await _json_body(request)
     user_text = body.get("text", "")
     session_id = body.get("session_id", str(uuid.uuid4()))
     if not user_text.strip():
@@ -3623,12 +3747,12 @@ async def learn_from_conversation(request: Request):
 @app.post("/v1/memory/forget")
 async def forget_learning(request: Request):
     """Delete a learning by id or topic. Also decrements confidence for corrections."""
-    body = await request.json()
+    body = await _json_body(request)
     lid = body.get("id", "")
     topic = body.get("topic", "")
     try:
         conn = _get_db()
-        async with _async_db_lock:
+        with _db_write_lock:  # 快速 sqlite 操作，持锁时间短，用同步锁即可
             if lid:
                 conn.execute("DELETE FROM learnings WHERE id = ?", (lid,))
             elif topic:
@@ -3688,7 +3812,7 @@ async def get_skills():
             config = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
             has_key = bool(config.get("tavily_api_key"))
     except Exception:
-        pass
+        logger.warning("Failed to check Tavily key in config", exc_info=True)
     skills.append({
         "name": "Web Search (Tavily)",
         "file": "sidecar/plugins/tavily_search.py",
@@ -3717,7 +3841,7 @@ async def toggle_skill(key: str):
 @app.post("/v1/skills")
 async def create_skill(request: Request):
     """Create a new skill .md file."""
-    body = await request.json()
+    body = await _json_body(request)
     name = body.get("name", "").strip()
     content = body.get("content", "").strip()
     if not name or not content:
@@ -3766,7 +3890,7 @@ async def get_tavily_key():
         if result.returncode == 0 and result.stdout.strip():
             key = result.stdout.strip()
     except Exception:
-        pass
+        logger.debug("Tavily keychain read failed", exc_info=True)
     # Fallback to config.json
     if not key:
         try:
@@ -3774,7 +3898,7 @@ async def get_tavily_key():
                 cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
                 key = cfg.get("tavily_api_key", "")
         except Exception:
-            pass
+            logger.warning("Failed to read Tavily key from config.json", exc_info=True)
     if key:
         masked = key[:7] + "••••" + key[-4:] if len(key) > 11 else "••••"
         return {"status": "ok", "has_key": True, "masked": masked}
@@ -3784,7 +3908,7 @@ async def get_tavily_key():
 @app.post("/v1/settings/tavily-key")
 async def set_tavily_key(request: Request):
     """Save Tavily API key to macOS Keychain (primary) + config.json (fallback)."""
-    body = await request.json()
+    body = await _json_body(request)
     key = body.get("key", "").strip()
     if not key:
         return {"status": "error", "message": "API key is required"}
@@ -3803,7 +3927,7 @@ async def set_tavily_key(request: Request):
                 capture_output=True, timeout=10,
             )
         except Exception:
-            pass
+            logger.debug("Failed to write Tavily key to keychain", exc_info=True)
         masked = key[:7] + "••••" + key[-4:] if len(key) > 11 else "••••"
         return {"status": "ok", "has_key": True, "masked": masked}
     except Exception as e:
@@ -3819,7 +3943,7 @@ async def delete_tavily_key():
             capture_output=True, timeout=5,
         )
     except Exception:
-        pass
+        logger.debug("Failed to delete Tavily key from keychain", exc_info=True)
     try:
         if CONFIG_FILE.exists():
             cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
@@ -3894,7 +4018,7 @@ async def heartbeat():
 @app.post("/v1/confirm_tool")
 async def confirm_tool(request: Request):
     """Frontend sends tool confirmation decision."""
-    body = await request.json()
+    body = await _json_body(request)
     call_id = body.get("call_id", "")
     approved = body.get("approved", False)
 
@@ -3925,6 +4049,10 @@ def _save_cron(jobs: list[dict]):
     """Save cron jobs to disk."""
     PROGRESS_DIR.mkdir(parents=True, exist_ok=True)
     CRON_FILE.write_text(json.dumps(jobs, indent=2, ensure_ascii=False), encoding="utf-8")
+    # 清理 _cron_last_run 中已删除任务的记录，避免字典无限增长
+    valid_ids = {j.get("id") for j in jobs}
+    for stale_id in [k for k in _cron_last_run if k not in valid_ids]:
+        del _cron_last_run[stale_id]
 
 
 _cron_jobs: list[dict] = []
@@ -3972,26 +4100,32 @@ def _cron_matches(cron_expr: str, now: datetime) -> bool:
         py_wday = (now.weekday() + 1) % 7  # Convert to cron DOW (0=Sun)
         return _cron_field_matches(dow, py_wday, now.weekday())
     except Exception:
+        logger.warning("Cron match check failed", exc_info=True)
         return False
 
 
-def _tick_cron():
-    """Check all enabled cron jobs, return list of due jobs."""
-    now = datetime.now()
+def _get_due_jobs(now: datetime) -> list[dict]:
+    """纯查询：返回当前到期的任务，不写任何状态（不更新 _cron_last_run）。"""
     due = []
+    now_str = now.strftime("%Y-%m-%d %H:%M")
     with _cron_lock:
         for job in _cron_jobs:
             if not job.get("enabled", True):
                 continue
             job_id = job["id"]
-            last = _cron_last_run.get(job_id, "")
-            now_str = now.strftime("%Y-%m-%d %H:%M")
-            if last == now_str:
+            if _cron_last_run.get(job_id, "") == now_str:
                 continue  # Already ran this minute
             if _cron_matches(job["schedule"], now):
-                _cron_last_run[job_id] = now_str
                 due.append(job)
     return due
+
+
+def _mark_cron_run(job_ids: list[str], now: datetime):
+    """标记任务已执行（写入 _cron_last_run）。仅对确认要执行的任务调用。"""
+    now_str = now.strftime("%Y-%m-%d %H:%M")
+    with _cron_lock:
+        for job_id in job_ids:
+            _cron_last_run[job_id] = now_str
 
 
 # ── Cron API endpoints ──
@@ -4008,7 +4142,7 @@ async def get_cron_jobs():
 async def create_cron_job(request: Request):
     """Create a new cron job."""
     global _cron_jobs
-    body = await request.json()
+    body = await _json_body(request)
     job = {
         "id": str(uuid.uuid4()),
         "schedule": body.get("schedule", "0 9 * * *"),
@@ -4027,7 +4161,7 @@ async def create_cron_job(request: Request):
 async def update_cron_job(job_id: str, request: Request):
     """Update a cron job."""
     global _cron_jobs
-    body = await request.json()
+    body = await _json_body(request)
     with _cron_lock:
         for job in _cron_jobs:
             if job["id"] == job_id:
@@ -4071,8 +4205,8 @@ async def toggle_cron_job(job_id: str):
 
 @app.get("/v1/cron/due")
 async def get_due_jobs():
-    """Check and return currently due cron jobs."""
-    due = _tick_cron()
+    """Check and return currently due cron jobs (纯查询，不标记执行状态)。"""
+    due = _get_due_jobs(datetime.now())
     with _cron_lock:
         total = len(_cron_jobs)
     return {"status": "ok", "due": due, "total_jobs": total}
@@ -4102,7 +4236,7 @@ async def local_llm_search(q: str = Query(default=""), library: str = Query(defa
 @app.post("/v1/local-llm/fix")
 async def local_llm_fix(request: Request):
     """Execute a fix for an environment issue."""
-    body = await request.json()
+    body = await _json_body(request)
     fix_type = body.get("fix_type", "")
     fix_pkg = body.get("fix_pkg", "")
     return local_llm.run_fix(fix_type, fix_pkg)
@@ -4111,7 +4245,7 @@ async def local_llm_fix(request: Request):
 @app.post("/v1/local-llm/download")
 async def local_llm_download(request: Request):
     """Download a model from HuggingFace."""
-    body = await request.json()
+    body = await _json_body(request)
     model_id = body.get("model_id", "")
     if not model_id:
         return {"status": "error", "message": "model_id required"}
@@ -4126,32 +4260,32 @@ async def local_llm_downloads():
 
 @app.post("/v1/local-llm/download/pause")
 async def local_llm_pause(request: Request):
-    body = await request.json()
+    body = await _json_body(request)
     return local_llm.pause_download(body.get("model_id", ""))
 
 
 @app.post("/v1/local-llm/download/resume")
 async def local_llm_resume(request: Request):
-    body = await request.json()
+    body = await _json_body(request)
     return local_llm.resume_download(body.get("model_id", ""))
 
 
 @app.post("/v1/local-llm/download/cancel")
 async def local_llm_cancel(request: Request):
-    body = await request.json()
+    body = await _json_body(request)
     return local_llm.cancel_download(body.get("model_id", ""))
 
 
 @app.post("/v1/local-llm/download/clear")
 async def local_llm_clear(request: Request):
-    body = await request.json()
+    body = await _json_body(request)
     return local_llm.clear_downloads(body.get("status", ""))
 
 
 @app.post("/v1/local-llm/open-path")
 async def local_llm_open_path(request: Request):
     """Open a path in Finder/Explorer."""
-    body = await request.json()
+    body = await _json_body(request)
     path = body.get("path", "")
     if not path:
         # No path specified — open the Models directory so user can browse local files
@@ -4192,9 +4326,13 @@ async def local_llm_estimate_context(model_path: str = Query(default="")):
 @app.post("/v1/local-llm/context-limit")
 async def local_llm_set_context(request: Request):
     """Set context limit (applies to next model start)."""
-    body = await request.json()
+    body = await _json_body(request)
     limit = body.get("limit", 8192)
-    return local_llm.set_context_limit(int(limit))
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = 8192  # 非法值回退默认，避免 500
+    return local_llm.set_context_limit(limit)
 
 
 @app.get("/v1/local-llm/context-limit")
@@ -4206,7 +4344,7 @@ async def local_llm_get_context():
 @app.post("/v1/local-llm/start")
 async def local_llm_start(request: Request):
     """Start a local model."""
-    body = await request.json()
+    body = await _json_body(request)
     model_id = body.get("model_id", "")
     port = body.get("port", 1235)
     if not model_id:
@@ -4224,7 +4362,7 @@ async def local_llm_stop():
 @app.post("/v1/local-llm/delete-model")
 async def local_llm_delete_model(request: Request):
     """Delete a local model file from ~/Models/ or download cache."""
-    body = await request.json()
+    body = await _json_body(request)
     model_id = body.get("model_id", "")
     if not model_id:
         return {"status": "error", "message": "model_id required"}
@@ -4271,11 +4409,13 @@ async def _execute_cron_job(job: dict):
     messages.append({"role": "user", "content": f"定时任务: {task}"})
 
     # Use non-streaming agent loop to execute the task
-    protocol, api_url, headers, _ = _resolve_api_target(None)
+    # 优先使用云端模型（支持原生 function calling）；仅在无云端时退回本地模型
+    cloud = _get_best_cloud_config()
+    protocol, api_url, headers, is_local = _resolve_api_target(cloud)
     if not api_url:
-        logger.warning("Cron job: no API target available")
+        logger.warning("Cron job skipped: no API target（云端未配置且本地模型未运行）: %s", task[:50])
         return
-    model = SUBAGENT_MODEL
+    model = (cloud or {}).get("model") or SUBAGENT_MODEL
     agent_tools = _get_agent_tools("latiao", TOOLS)
     active_tools = _filter_tools(task, agent_tools)
     if len(active_tools) > 5:
@@ -4287,14 +4427,19 @@ async def _execute_cron_job(job: dict):
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(120)) as client:
             for _ in range(10):  # max 10 iterations for cron
-                resp = await client.post(api_url, json={
+                req_body = {
                     "model": model, "messages": current_msgs,
-                    "tools": active_tools, "tool_choice": "auto",
                     "max_tokens": 2048, "stream": False,
                     "temperature": 0.5,
                     "frequency_penalty": 0.6,
                 "stop": ["<|im_end|>", "<|endoftext|>"],
-                }, headers=headers)
+                }
+                if not is_local:
+                    # 本地模型不支持原生 function calling，只对云端发送 tools
+                    req_body["tools"] = active_tools
+                    req_body["tool_choice"] = "auto"
+                resp = await client.post(api_url, json=req_body, headers=headers)
+                resp.raise_for_status()  # httpx 不自动抛 4xx/5xx，必须显式检查
                 resp_data = resp.json()
                 choices = resp_data.get("choices", [])
                 if not choices:
@@ -4308,6 +4453,10 @@ async def _execute_cron_job(job: dict):
                     if native_tcs:
                         content = _strip_native_tool_calls(content)
                         tc_data = native_tcs
+
+                if is_local:
+                    # 本地模型：纯文本问答——不发送 tools，也不回灌 role:"tool" 消息
+                    tc_data = []
 
                 if tc_data:
                     tool_count += 1
@@ -4341,8 +4490,9 @@ async def _execute_cron_job(job: dict):
                         "role": "system",
                         "content": "⚠️ 你上一轮的回复是空的。请直接回复总结或使用工具完成任务。",
                     })
-                    if len(current_msgs) > 15:
+                    if len(current_msgs) > 8:
                         # Prevent infinite loop — give up after too many messages
+                        # (10 轮硬上限制下 >15 永远不可达，收到 8 条即放弃)
                         full_content = "(Cron 任务未生成有效回复)"
                         break
                     continue
@@ -4354,11 +4504,11 @@ async def _execute_cron_job(job: dict):
     # Record to memory DB with AI result
     try:
         conn = _get_db()
-        async with _async_db_lock:
+        with _db_write_lock:  # 快速 sqlite 操作，持锁时间短，用同步锁即可
             conn.execute(
                 "INSERT INTO memory (session_id, type, topic, content, meta) VALUES (?, ?, ?, ?, ?)",
                 ("cron", "cron_job", task,
-                 f"Cron: {task}\\n执行时间: {datetime.now().isoformat()}\\n\\nAI 分析结果:\\n{ai_content}",
+                 f"Cron: {task}\n执行时间: {datetime.now().isoformat()}\n\nAI 分析结果:\n{ai_content}",
                  json.dumps({"action": action, "schedule": job.get("schedule"), "ai_result": ai_content[:200]})),
             )
             conn.commit()
@@ -4368,14 +4518,26 @@ async def _execute_cron_job(job: dict):
     logger.info("Cron job completed: %s", task[:50])
 
 
+async def _run_cron_job_guarded(job: dict):
+    """带超时与异常保护的 cron 任务执行包装（后台任务异常不外抛）。"""
+    try:
+        await asyncio.wait_for(_execute_cron_job(job), timeout=600)
+    except Exception:
+        logger.warning("Cron job failed/timed out: %s", job.get("task", "")[:50], exc_info=True)
+
+
 async def _cron_loop():
     """Background task: tick cron every 60 seconds."""
     while True:
         try:
             await asyncio.sleep(60)
-            due = _tick_cron()
-            for job in due:
-                await _execute_cron_job(job)
+            now = datetime.now()
+            due = _get_due_jobs(now)
+            if due:
+                # 仅对确认执行的任务标记 last_run；并发执行避免单任务阻塞调度 tick
+                _mark_cron_run([j["id"] for j in due], now)
+                for job in due:
+                    _spawn(_run_cron_job_guarded(job))
         except Exception:
             logger.warning("Cron loop error", exc_info=True)
 
@@ -4387,13 +4549,13 @@ async def api_open_identity(agent_id: str, section: str = ""):
     agents_dir = Path(__file__).resolve().parent / "agents"
     if section:
         agent_file = (agents_dir / f"{agent_id}_{section}.txt").resolve()
-        if not agent_file.exists():
-            agent_file.write_text(f"# {agent_id} - {section}\n\n（此部分内容待补充）\n")
     else:
         agent_file = (agents_dir / f"{agent_id}.txt").resolve()
-    # Path traversal protection
+    # Path traversal protection — 必须在任何写文件操作之前校验
     if not str(agent_file).startswith(str(agents_dir.resolve()) + "/"):
         return {"status": "error", "message": "Invalid agent_id"}
+    if section and not agent_file.exists():
+        agent_file.write_text(f"# {agent_id} - {section}\n\n（此部分内容待补充）\n")
     if not agent_file.exists():
         return {"status": "error", "message": f"Not found: {agent_id}" + (f"_{section}" if section else "")}
     try:
