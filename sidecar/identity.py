@@ -112,10 +112,13 @@ def _create_default_identity():
 # ═══════════════════════════════════════════════════════
 
 _IDENTITY_INTENTS = [
-    # Only trigger on explicit commands: "叫你XX", "改名为XX", "call me XX"
-    (re.compile(r"(?:以后)?(?:叫|称呼)(?:我|你)(?:为|是)?[「『\s]*([^\s，。,.]{1,20})[」』]*", re.IGNORECASE), "IDENTITY.md", "name"),
-    (re.compile(r"(?:改|换)(?:个)?(?:名字|名称)(?:叫|为|是)?[：:]*\s*[「『]*([^\s，。,.]{1,20})[」』]*", re.IGNORECASE), "IDENTITY.md", "name"),
-    (re.compile(r"(?:call|name)\s+me\s+['\"]?(\w{1,20})['\"]?", re.IGNORECASE), "IDENTITY.md", "name"),
+    # Agent rename: "叫你XX" / "改名为XX" / "rename yourself XX" → IDENTITY.md
+    (re.compile(r"(?:以后)?(?:叫|称呼)你(?:为|是)?[「『\s]*([^\s，。,.]{1,20})[」』]*", re.IGNORECASE), "IDENTITY.md", "name"),
+    (re.compile(r"(?:改|换)(?:个)?(?:名字|名称|名(?:为|叫|是))(?:叫|为|是)?[：:]*\s*[「『]*([^\s，。,.]{1,20})[」』]*", re.IGNORECASE), "IDENTITY.md", "name"),
+    (re.compile(r"(?:rename|call)\s+(?:yourself|you)\s+(?:to\s+)?['\"]?(\w{1,20})['\"]?", re.IGNORECASE), "IDENTITY.md", "name"),
+    # User's own name: "叫我XX" / "称呼我为XX" / "call me XX" → USER.md (not an agent rename)
+    (re.compile(r"(?:以后)?(?:叫|称呼)我(?:为|是)?[「『\s]*([^\s，。,.]{1,20})[」』]*", re.IGNORECASE), "USER.md", "user_name"),
+    (re.compile(r"(?:call|name)\s+me\s+['\"]?(\w{1,20})['\"]?", re.IGNORECASE), "USER.md", "user_name"),
     # Style/tone: only explicit "回复要XX" or "说话风格XX"
     (re.compile(r"(?:回复|说话)(?:要|再|更)([^，。,！!]{2,30})", re.IGNORECASE), "SOUL.md", "style"),
     # Rule: "以后不要XX" / "从现在开始XX"
@@ -154,6 +157,26 @@ def _apply_name_change(new_name: str):
     filepath.write_text(content, encoding="utf-8")
 
 
+def _apply_user_name_change(new_name: str):
+    """Record the user's preferred name in USER.md (replaces any existing value)."""
+    filepath = PROGRESS_DIR / "USER.md"
+    line = f"- 用户称呼：{new_name}\n"
+    try:
+        if filepath.exists():
+            content = filepath.read_text(encoding="utf-8")
+            if "用户称呼：" in content:
+                content = re.sub(r"- 用户称呼：[^\n]*\n?", line, content)
+            else:
+                if not content.endswith("\n"):
+                    content += "\n"
+                content += line
+            filepath.write_text(content, encoding="utf-8")
+        else:
+            filepath.write_text(f"# User Profile\n\n{line}", encoding="utf-8")
+    except Exception:
+        logger.warning("Failed to record user name in USER.md", exc_info=True)
+
+
 def _apply_style_change(value: str):
     """Append style preference to SOUL.md (no duplicates)."""
     filepath = PROGRESS_DIR / "SOUL.md"
@@ -186,6 +209,7 @@ def _apply_pref_change(value: str):
 
 _INTENT_APPLIERS = {
     "name": _apply_name_change,
+    "user_name": _apply_user_name_change,
     "style": _apply_style_change,
     "rule": _apply_rule_change,
     "pref": _apply_pref_change,
