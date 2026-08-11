@@ -13,8 +13,7 @@ from typing import Any
 
 import httpx
 from config import LM_STUDIO_URL, SUBAGENT_MODEL, SKILLS_DIR
-from db import _get_db
-from db import _get_db
+from db import _get_db, _db_write_lock
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +57,9 @@ def _quick_reflect(tool_name: str, result: str) -> str:
     """Quick heuristic reflection on tool execution result.
     Returns a reflection note or empty string."""
     result_lower = result.lower()
+    # 具体建议分支放在通用 is_error 判断之前，否则永远不可达
+    if "permission denied" in result_lower or "权限不足" in result:
+        return "权限不足，建议检查文件/目录权限"
     # Error detection — covers both English and Chinese tool error messages
     is_error = (
         "error" in result_lower or "错误" in result
@@ -67,8 +69,6 @@ def _quick_reflect(tool_name: str, result: str) -> str:
     )
     if is_error:
         return f"工具 {tool_name} 执行出错，可能需要重试或调整参数"
-    if "permission denied" in result_lower:
-        return "权限不足，建议检查文件/目录权限"
     if "not found" in result_lower or "不存在" in result:
         return "目标不存在，可能需要先确认路径或创建前置资源"
     if len(result.strip()) < 5:
@@ -84,11 +84,6 @@ def _get_db():
     """Get database connection from db module (no circular dependency)."""
     from db import _get_db as _get_db_inner
     return _get_db_inner()
-
-def _load_skills():
-    """Load skills via main module (lazy import)."""
-    import main
-    return main._load_skills()
 
 
 # ── Tokenization (already in memory.py from previous extraction) ──
@@ -291,6 +286,12 @@ def _retrieve_relevant_learnings(query: str, limit: int = MAX_LEARNINGS_INJECT) 
                     [(datetime.now().isoformat(), lid) for lid in ids],
                 )
                 conn.commit()
+            # 同步内存索引里的 hit_count，保持 boost 与 DB 一致（避免置脏全量重建）
+            if _TFIDF_CACHE is not None:
+                id_set = set(ids)
+                for d in _TFIDF_CACHE[0]:
+                    if d["id"] in id_set:
+                        d["hit_count"] += 1
 
         return results
     except Exception:
@@ -439,7 +440,10 @@ async def _refine_learnings(tool_name: str, args: dict, result: str, session_id:
                 if summary and len(summary) > 5:
                     # Dedup: skip if nearly identical to existing learnings
                     if not _is_duplicate_learning(summary):
-                        _record_reflection(session_id, tool_name, args, result[:200], summary, True)
+                        # 写入 learnings 表（而不是 reflections 表），
+                        # _retrieve_relevant_learnings 才能检索到
+                        _store_learning(session_id, f"{tool_name}: {summary[:20]}", summary,
+                                        confidence=0.6, source_type="refined")
                         logger.info("Learning refined: %s", summary[:100])
     except Exception:
         pass  # Fire-and-forget — never block the agent loop
@@ -553,13 +557,11 @@ async def _maybe_generate_skill(tool_name: str, args: dict, result: str):
             SKILLS_DIR.mkdir(parents=True, exist_ok=True)
             filepath.write_text(skill_content, encoding="utf-8")
             logger.info("Auto-generated skill: %s (%d learnings)", skill_key, len(rows))
-            # Reload skills
-            global _loaded_skills
-            _loaded_skills = _load_skills()
+            # Reload skills（写回 main 模块的全局缓存；函数内 lazy import 避免循环依赖）
+            import main
+            main._loaded_skills = main._load_skills()
     except Exception:
         logger.warning("Auto-skill generation failed for %s", tool_name, exc_info=True)
-    except Exception:
-        return False  # On error, allow the learning
 
 
 def _get_recent_learnings(limit: int = 5) -> list[str]:

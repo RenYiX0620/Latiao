@@ -8,6 +8,7 @@ Auto-detects best backend:
 
 from __future__ import annotations
 
+import collections
 import json
 import logging
 import os
@@ -19,12 +20,18 @@ import threading
 import time
 from pathlib import Path
 
-# Module-level SSL context for Python 3.14 macOS compatibility
-# (huggingface.co connections can use unverified context; files are hash-verified)
+# Module-level TLS context for HuggingFace API + model downloads.
+# Verified via certifi's bundled CAs — sidesteps the broken system cert chain
+# on some macOS/Python combos that prompted the old unverified context. Model
+# files are still hash-verified by huggingface_hub as a second layer.
+import ssl
+import certifi
+
 try:
-    _ssl_ctx = __import__('ssl')._create_unverified_context()
+    _ssl_ctx = ssl.create_default_context(cafile=certifi.where())
 except Exception:
-    _ssl_ctx = None
+    # Never fall back to an unverified context — use the system store instead.
+    _ssl_ctx = ssl.create_default_context()
 
 logger = logging.getLogger("latiao-sidecar")
 
@@ -98,6 +105,8 @@ class LocalLLMEngine:
 
         # Runtime server state
         self._process: subprocess.Popen | None = None
+        # start/stop 主流程串行化锁（RLock：启动失败的错误路径会再调 stop_model）
+        self._proc_lock = threading.RLock()
         self._active_backend = ""  # The backend actually used to start the current model
         self.current_model_id = ""
         self.current_model_name = ""
@@ -105,10 +114,8 @@ class LocalLLMEngine:
         self.server_status = "stopped"  # stopped | starting | running | error
         self.status_message = ""
         self.has_image_support = False
-
-        # Clean up any orphan model server from previous session on startup.
-        # (atexit can be skipped by SIGKILL, so startup cleanup is the safety net.)
-        self._kill_port(self.server_port)
+        # _find_gguf 结果缓存（30s TTL），避免重复全盘 rglob 扫描
+        self._gguf_find_cache: dict[str, tuple[float, str | None]] = {}
 
         # Register exit handler as belt-and-suspenders (once per process)
         if not LocalLLMEngine._atexit_registered:
@@ -120,17 +127,30 @@ class LocalLLMEngine:
 
         # Download state
         self._download_lock = threading.Lock()
+        # 保护 _downloads dict 结构变更（插入/重建/序列化快照）
+        self._dl_lock = threading.Lock()
         self._download_state_file = MODELS_DIR / ".downloads.json"
         self._downloads: dict[str, dict] = {}
         self._download_procs: dict[str, subprocess.Popen] = {}
         self._download_threads: dict[str, threading.Thread] = {}
+        # Per-model locks serializing download workers across pause/resume.
+        self._download_locks: dict[str, threading.Lock] = {}
         self._cache_dir = Path.home() / ".cache" / "huggingface" / "hub"
         self._load_download_state()
 
-        # Auto-detect fastest HuggingFace mirror (hf-mirror.com for China)
+        # HF mirror 改为惰性探测：首次需要时才测速，避免 import/实例化时访问网络
         self._hf_endpoint = os.environ.get("HF_ENDPOINT", "")
-        if not self._hf_endpoint:
-            self._hf_endpoint = self._detect_fastest_mirror()
+        self._mirror_detected = bool(self._hf_endpoint)
+
+    def _get_hf_endpoint(self) -> str:
+        """Return HF endpoint, auto-detecting the fastest mirror on first use."""
+        if not self._mirror_detected:
+            self._mirror_detected = True
+            try:
+                self._hf_endpoint = self._detect_fastest_mirror()
+            except Exception:
+                self._hf_endpoint = "https://huggingface.co"
+        return self._hf_endpoint or "https://huggingface.co"
 
     def _detect_fastest_mirror(self) -> str:
         """Test hf-mirror.com vs huggingface.co, pick the faster one."""
@@ -144,8 +164,8 @@ class LocalLLMEngine:
                 url = f"{url_base}/api/models?search=gguf&limit=1&full=false"
                 req = urllib.request.Request(url, headers={"User-Agent": "Latiao/1.0"})
                 start = time.time()
-                resp = urllib.request.urlopen(req, timeout=5, context=_ssl_ctx)
-                resp.read(1024)
+                with urllib.request.urlopen(req, timeout=5, context=_ssl_ctx) as resp:
+                    resp.read(1024)
                 elapsed = time.time() - start
                 mirrors[url_base] = elapsed
             except Exception:
@@ -185,22 +205,44 @@ class LocalLLMEngine:
 
     def _save_download_state(self):
         try:
+            import copy
+            # 锁内做快照，避免序列化期间 dict 被其他线程改到一半
+            with self._dl_lock:
+                snapshot = copy.deepcopy(self._downloads)
             MODELS_DIR.mkdir(parents=True, exist_ok=True)
-            self._download_state_file.write_text(json.dumps(self._downloads, indent=2, ensure_ascii=False))
-        except (OSError, json.JSONDecodeError):
+            # 先写临时文件再原子替换，避免崩溃时留下写了一半的状态文件
+            tmp_file = self._download_state_file.with_suffix(".tmp")
+            tmp_file.write_text(json.dumps(snapshot, indent=2, ensure_ascii=False))
+            os.replace(tmp_file, self._download_state_file)
+        except (OSError, json.JSONDecodeError, RuntimeError):
             logger.warning("Failed to save download state", exc_info=True)
 
     # ── Download worker ──
 
     def _download_worker(self, model_id: str):
+        # Serialize workers per model: a quick pause→resume must wait for the
+        # previous worker (and its chunk threads, drained by the
+        # ThreadPoolExecutor `with`-exit) to fully exit before a new worker
+        # appends to the same .part files. Runs in the daemon thread so
+        # resume_download returns immediately; the epoch field lets stale chunk
+        # threads notice they've been superseded and stop without corrupting.
+        lock = self._download_locks.setdefault(model_id, threading.Lock())
+        with lock:
+            self._download_worker_inner(model_id)
+
+    def _download_worker_inner(self, model_id: str):
         dl_info = self._downloads.get(model_id, {})
-        dl_info["status"] = "downloading"
-        dl_info["started_at"] = time.time()
-        dl_info["downloaded_bytes"] = 0
+        my_epoch = dl_info.get("epoch", 0)
+        # 排队期间被取消：直接退出，不要覆盖 cancelled 状态重新下载
+        if dl_info.get("status") == "cancelled":
+            return
+        with self._dl_lock:
+            dl_info["status"] = "downloading"
+            dl_info["started_at"] = time.time()
+            dl_info["downloaded_bytes"] = 0
         try:
             import urllib.request
             from concurrent.futures import ThreadPoolExecutor, as_completed
-            import tempfile
 
             cache_root = str(self._cache_dir.parent)
 
@@ -209,7 +251,10 @@ class LocalLLMEngine:
                 parts = model_id.rsplit("/", 1)
                 repo_id = parts[0] if len(parts) == 2 else model_id
                 filename = parts[1] if len(parts) == 2 else model_id
-                url = f"{self._hf_endpoint}/{repo_id}/resolve/main/{filename}"
+                # 拼 URL 前校验 repo_id，拒绝畸形/带路径穿越的模型 ID
+                if not _re.fullmatch(r'[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+', repo_id):
+                    raise Exception(f"模型 ID 格式不合法: {repo_id}")
+                url = f"{self._get_hf_endpoint()}/{repo_id}/resolve/main/{filename}"
                 dest_dir = MODELS_DIR / repo_id.replace("/", "--")
                 dest_dir.mkdir(parents=True, exist_ok=True)
                 dest_path = dest_dir / filename
@@ -217,9 +262,9 @@ class LocalLLMEngine:
                 # Get file size and check if server supports Range requests
                 req = urllib.request.Request(url, method="HEAD",
                     headers={"User-Agent": "Latiao/1.0"})
-                resp = urllib.request.urlopen(req, timeout=15, context=_ssl_ctx)
-                total_size = int(resp.getheader("Content-Length", 0))
-                accepts_ranges = resp.getheader("Accept-Ranges") == "bytes"
+                with urllib.request.urlopen(req, timeout=15, context=_ssl_ctx) as resp:
+                    total_size = int(resp.getheader("Content-Length", 0))
+                    accepts_ranges = resp.getheader("Accept-Ranges") == "bytes"
                 dl_info["total_bytes"] = total_size
 
                 # Check if already fully downloaded
@@ -230,56 +275,116 @@ class LocalLLMEngine:
                     return
 
                 if accepts_ranges and total_size > 50 * 1024 * 1024:
-                    # Multi-threaded download with real-time progress tracking
-                    num_threads = min(6, max(2, total_size // (300 * 1024 * 1024)))  # 1 thread per 300MB, max 6
-                    chunk_size = total_size // num_threads
+                    # Multi-threaded chunked download with byte-granular resume.
+                    # Each chunk is appended to a stable .part file next to dest; a
+                    # paused/failed partial chunk is continued from the bytes already
+                    # on disk instead of being re-fetched from scratch. The model lock
+                    # + epoch field keep a stale worker (superseded by resume) from
+                    # racing the new worker's appends to the same .part files.
+                    chunk_plan = dl_info.get("chunk_ranges")
+                    if chunk_plan and chunk_plan[-1][1] != total_size - 1:
+                        # Remote file changed size since last attempt — discard stale parts.
+                        for p in (dl_info.get("chunk_paths") or []):
+                            try: os.unlink(p)
+                            except OSError: pass
+                        chunk_plan = None
+                    if not chunk_plan:
+                        num_threads = min(6, max(2, total_size // (300 * 1024 * 1024)))  # 1 thread per 300MB, max 6
+                        chunk_size = total_size // num_threads
+                        chunk_plan = []
+                        for i in range(num_threads):
+                            start = i * chunk_size
+                            end = start + chunk_size - 1 if i < num_threads - 1 else total_size - 1
+                            chunk_plan.append([start, end])
+                    dl_info["chunk_ranges"] = chunk_plan
+                    num_threads = len(chunk_plan)
+                    chunk_part_paths = [str(dest_path.parent / f".{dest_path.name}.chunk{i}.part") for i in range(num_threads)]
+                    dl_info["chunk_paths"] = chunk_part_paths
                     dl_info["message"] = f"多线程下载 {filename} ({total_size/(1024**3):.1f}GB, {num_threads}线程)..."
                     self._save_download_state()
 
-                    chunk_tmp_paths: list = [None] * num_threads
-                    # Use a shared array for progress tracking (bytes written per thread)
+                    # Seed progress from partial .part files (byte-granular resume).
                     progress_bytes = [0] * num_threads
-                    progress_lock = threading.Lock()
+                    for _i, _sp in enumerate(chunk_part_paths):
+                        if os.path.exists(_sp):
+                            progress_bytes[_i] = os.path.getsize(_sp)
                     progress_event = threading.Event()
                     last_update = time.time()
-                    last_total = 0
+                    last_total = sum(progress_bytes)
                     download_error = [None]
 
                     def download_chunk(idx: int) -> None:
-                        start = idx * chunk_size
-                        end = start + chunk_size - 1 if idx < num_threads - 1 else total_size - 1
-                        if start >= total_size:
-                            progress_bytes[idx] = 0
+                        start, end = chunk_plan[idx]
+                        full_size = end - start + 1
+                        stable = chunk_part_paths[idx]
+                        # Already fully fetched in a previous run — reuse it.
+                        if os.path.exists(stable) and os.path.getsize(stable) >= full_size:
+                            progress_bytes[idx] = full_size
+                            progress_event.set()
                             return
-                        headers = {"User-Agent": "Latiao/1.0", "Range": f"bytes={start}-{end}"}
+                        # Append-resume: each attempt continues from the bytes already
+                        # on disk, so a paused/failed partial chunk isn't re-fetched
+                        # from scratch. The epoch+status checks let a stale worker
+                        # (superseded by resume) stop without corrupting the file.
                         for attempt in range(3):
                             try:
+                                offset = os.path.getsize(stable) if os.path.exists(stable) else 0
+                                if offset >= full_size:
+                                    break
+                                headers = {"User-Agent": "Latiao/1.0",
+                                           "Range": f"bytes={start + offset}-{end}"}
                                 req2 = urllib.request.Request(url, headers=headers)
                                 with urllib.request.urlopen(req2, timeout=120, context=_ssl_ctx) as resp2:
-                                    tmpf = tempfile.NamedTemporaryFile(delete=False, suffix=".chunk")
-                                    chunk_tmp_paths[idx] = tmpf.name
-                                    downloaded = 0
-                                    while True:
-                                        if dl_info.get("status") in ("paused", "cancelled"):
-                                            tmpf.close()
-                                            os.unlink(tmpf.name)
-                                            chunk_tmp_paths[idx] = None
-                                            return
-                                        data = resp2.read(512 * 1024)  # 512KB chunks
-                                        if not data:
-                                            break
-                                        tmpf.write(data)
-                                        downloaded += len(data)
-                                        progress_bytes[idx] = downloaded
-                                        progress_event.set()
-                                    tmpf.close()
+                                    # If we asked for a partial range but the server
+                                    # returned the full body (HTTP 200, ignoring Range),
+                                    # appending would duplicate bytes — restart the chunk.
+                                    # 非 0 起始的 chunk 必须收到 206；收到 200 说明服务器
+                                    # 忽略了 Range、返回全量 body —— 跳过不属于自己的前导
+                                    # 字节，且只写本 chunk 的字节数。
+                                    range_ignored = resp2.getcode() != 206
+                                    if range_ignored:
+                                        offset = 0
+                                    skip = start if range_ignored else 0
+                                    with open(stable, "wb" if range_ignored else "ab") as f:
+                                        downloaded = 0
+                                        while True:
+                                            if dl_info.get("epoch", 0) != my_epoch or \
+                                               dl_info.get("status") in ("paused", "cancelled"):
+                                                return
+                                            data = resp2.read(512 * 1024)  # 512KB chunks
+                                            if not data:
+                                                break
+                                            if skip:
+                                                if skip >= len(data):
+                                                    skip -= len(data)
+                                                    continue
+                                                data = data[skip:]
+                                                skip = 0
+                                            # 只读取该 chunk 的字节数
+                                            remaining = full_size - offset - downloaded
+                                            if remaining <= 0:
+                                                break
+                                            if len(data) > remaining:
+                                                data = data[:remaining]
+                                            f.write(data)
+                                            downloaded += len(data)
+                                            progress_bytes[idx] = offset + downloaded
+                                            progress_event.set()
+                                if os.path.getsize(stable) >= full_size:
+                                    progress_bytes[idx] = full_size
+                                    progress_event.set()
                                     return
+                                # Server sent a truncated range — retry to continue.
                             except Exception as e:
                                 if attempt == 2:
                                     download_error[0] = str(e)
                                     return
-                                progress_bytes[idx] = 0
                                 time.sleep(1)
+                        if os.path.exists(stable) and os.path.getsize(stable) >= full_size:
+                            progress_bytes[idx] = full_size
+                            progress_event.set()
+                        else:
+                            download_error[0] = f"分块 {idx} 下载不完整"
 
                     with ThreadPoolExecutor(max_workers=num_threads) as executor:
                         futures = [executor.submit(download_chunk, i) for i in range(num_threads)]
@@ -287,11 +392,10 @@ class LocalLLMEngine:
                         # Real-time progress loop: poll every 0.8s
                         while any(not f.done() for f in futures):
                             if dl_info.get("status") in ("paused", "cancelled"):
-                                executor.shutdown(wait=False, cancel_futures=True)
-                                for p in chunk_tmp_paths:
-                                    if p:
-                                        try: os.unlink(p)
-                                        except: pass
+                                # Chunk threads check status in their read loop and stop;
+                                # the `with`-exit drains them. Stable .part files keep
+                                # partial progress for resume — nothing to discard.
+                                self._save_download_state()  # 暂停时把进度落盘
                                 return
                             # Wait for progress update or timeout
                             progress_event.wait(0.8)
@@ -317,22 +421,46 @@ class LocalLLMEngine:
                             try: f.result()
                             except: pass
 
-                    if download_error[0]:
-                        raise Exception(download_error[0])
+                        # A newer resume superseded this worker — leave the .part
+                        # files (with their partial progress) for the new worker.
+                        if dl_info.get("epoch", 0) != my_epoch:
+                            return
 
-                    # Merge chunks in order
-                    valid_chunks = [(i, p) for i, p in enumerate(chunk_tmp_paths) if p]
+                        # Cancelled mid-flight: clean up partial .part files too.
+                        # 先查 cancelled，避免取消状态被下面的 error 覆盖
+                        if dl_info.get("status") == "cancelled":
+                            for sp in chunk_part_paths:
+                                try: os.unlink(sp)
+                                except OSError: pass
+                            dl_info.pop("chunk_ranges", None)
+                            dl_info.pop("chunk_paths", None)
+                            return
+
+                        if download_error[0]:
+                            raise Exception(download_error[0])
+
+                        # Sanity-check chunk sizes before merging (guards against a
+                        # silent Range mismatch corrupting the output).
+                        total_chunk_bytes = sum(
+                            os.path.getsize(sp) for sp in chunk_part_paths if os.path.exists(sp))
+                        if total_chunk_bytes != total_size:
+                            raise Exception(f"分块大小不匹配: {total_chunk_bytes} != {total_size}")
+
+                        # Merge completed chunks in order
+                    valid_chunks = [(i, sp) for i, sp in enumerate(chunk_part_paths) if os.path.exists(sp)]
                     valid_chunks.sort(key=lambda x: x[0])
                     dl_info["message"] = f"合并分块 {filename}..."
                     self._save_download_state()
                     with open(dest_path, "wb") as out:
-                        for _, cp in valid_chunks:
-                            with open(cp, "rb") as inp:
+                        for _, sp in valid_chunks:
+                            with open(sp, "rb") as inp:
                                 while True:
                                     data = inp.read(8 * 1024 * 1024)
                                     if not data: break
                                     out.write(data)
-                            os.unlink(cp)
+                            os.unlink(sp)
+                    dl_info.pop("chunk_ranges", None)
+                    dl_info.pop("chunk_paths", None)
                 else:
                     # Single-threaded fallback for small files or servers without Range support
                     dl_info["message"] = f"正在下载 {filename} ({total_size/(1024**3):.1f}GB)..."
@@ -346,6 +474,7 @@ class LocalLLMEngine:
                             last_bytes = 0
                             while True:
                                 if dl_info.get("status") in ("paused", "cancelled"):
+                                    self._save_download_state()  # 暂停时把进度落盘
                                     return
                                 chunk = resp2.read(1024 * 1024)
                                 if not chunk: break
@@ -381,10 +510,14 @@ class LocalLLMEngine:
                 )
                 path = local_path
 
-            dl_info["progress"] = 100
-            dl_info.update({"status": "done", "path": path, "message": "下载完成"})
+            with self._dl_lock:
+                dl_info["progress"] = 100
+                dl_info.update({"status": "done", "path": path, "message": "下载完成"})
         except Exception as e:
-            dl_info.update({"status": "error", "message": f"下载失败: {str(e)[:300]}"})
+            with self._dl_lock:
+                # 已被取消的任务保持 cancelled，不被 error 覆盖
+                if dl_info.get("status") != "cancelled":
+                    dl_info.update({"status": "error", "message": f"下载失败: {str(e)[:300]}"})
         self._save_download_state()
 
     # ── Download API ──
@@ -405,12 +538,22 @@ class LocalLLMEngine:
                 model_files = [f for f in files if f.suffix in (".safetensors", ".gguf", ".bin", ".json")]
                 if model_files:
                     path = str(snap)
-                    self._downloads[model_id] = {"status": "done", "progress": 100, "path": path, "message": "已缓存", "model_id": model_id}
+                    with self._dl_lock:
+                        self._downloads[model_id] = {"status": "done", "progress": 100, "path": path, "message": "已缓存", "model_id": model_id}
                     self._save_download_state()
                     return {"status": "ok", "model_id": model_id, "path": path, "message": "模型已缓存"}
 
-        self._downloads[model_id] = {"status": "downloading", "progress": 0, "path": "", "message": "准备下载...",
-                                      "model_id": model_id, "speed_bps": 0, "eta_seconds": 0, "downloaded_bytes": 0}
+        with self._dl_lock:
+            # paused 重下：保留原有分块记录（merge 而非整体覆盖），避免丢 chunk、
+            # 遗留孤儿 .part 文件
+            prev = self._downloads.get(model_id) or {}
+            new_info = {"status": "downloading", "progress": 0, "path": "", "message": "准备下载...",
+                        "model_id": model_id, "speed_bps": 0, "eta_seconds": 0, "downloaded_bytes": 0}
+            if prev.get("status") == "paused":
+                for k in ("chunk_paths", "chunk_ranges", "total_bytes", "epoch"):
+                    if k in prev:
+                        new_info[k] = prev[k]
+            self._downloads[model_id] = new_info
         t = threading.Thread(target=self._download_worker, args=(model_id,), daemon=True)
         self._download_threads[model_id] = t
         t.start()
@@ -429,6 +572,10 @@ class LocalLLMEngine:
         dl_info = self._downloads.get(model_id)
         if not dl_info or dl_info["status"] != "paused":
             return {"status": "error", "message": "没有暂停的任务"}
+        # Bump the epoch so any stale chunk threads still draining from the
+        # previous worker notice they've been superseded and stop (rather than
+        # appending to .part files the new worker now owns).
+        dl_info["epoch"] = dl_info.get("epoch", 0) + 1
         dl_info["status"] = "downloading"
         dl_info["message"] = "恢复下载..."
         t = threading.Thread(target=self._download_worker, args=(model_id,), daemon=True)
@@ -440,7 +587,16 @@ class LocalLLMEngine:
         dl_info = self._downloads.get(model_id)
         if not dl_info:
             return {"status": "error", "message": "未找到下载任务"}
+        # Bump the epoch（同 resume）：排队中的 worker 拿到锁后会发现自己已被
+        # superseded，不会无视取消重新下载
+        dl_info["epoch"] = dl_info.get("epoch", 0) + 1
         dl_info["status"] = "cancelled"
+        # Discard any preserved chunk parts so cancel truly frees the space.
+        for p in (dl_info.get("chunk_paths") or []):
+            try: os.unlink(p)
+            except OSError: pass
+        dl_info.pop("chunk_ranges", None)
+        dl_info.pop("chunk_paths", None)
         dl_info["message"] = "已取消"
         self._save_download_state()
         return {"status": "ok", "download": dl_info}
@@ -449,10 +605,11 @@ class LocalLLMEngine:
         return {"status": "ok", "downloads": list(self._downloads.values())}
 
     def clear_downloads(self, status_filter: str = "") -> dict:
-        if status_filter:
-            self._downloads = {k: v for k, v in self._downloads.items() if v["status"] != status_filter}
-        else:
-            self._downloads = {k: v for k, v in self._downloads.items() if v["status"] in ("downloading", "paused")}
+        with self._dl_lock:
+            if status_filter:
+                self._downloads = {k: v for k, v in self._downloads.items() if v["status"] != status_filter}
+            else:
+                self._downloads = {k: v for k, v in self._downloads.items() if v["status"] in ("downloading", "paused")}
         self._save_download_state()
         return {"status": "ok", "downloads": list(self._downloads.values())}
 
@@ -465,11 +622,14 @@ class LocalLLMEngine:
     def open_path(self, path: str) -> dict:
         try:
             if IS_MAC:
-                subprocess.Popen(["open", path])
+                p = subprocess.Popen(["open", path])
+                # 后台回收子进程，避免僵尸进程堆积
+                threading.Thread(target=p.wait, daemon=True).start()
             elif IS_WINDOWS:
                 os.startfile(path)
             else:
-                subprocess.Popen(["xdg-open", path])
+                p = subprocess.Popen(["xdg-open", path])
+                threading.Thread(target=p.wait, daemon=True).start()
             return {"status": "ok", "message": f"已打开: {path}"}
         except Exception as e:
             return {"status": "error", "message": str(e)}
@@ -580,8 +740,9 @@ class LocalLLMEngine:
                 for line in result.stdout.splitlines():
                     if f":{port}" in line and "LISTENING" in line:
                         pid = line.split()[-1]
-                        subprocess.run(["taskkill", "/F", "/PID", pid],
-                                       capture_output=True, timeout=10)
+                        if pid.isdigit():
+                            subprocess.run(["taskkill", "/F", "/PID", pid],
+                                           capture_output=True, timeout=10)
             except Exception:
                 pass
             return
@@ -600,24 +761,80 @@ class LocalLLMEngine:
             pass
 
     def _find_gguf(self, model_id: str) -> str | None:
+        # 30 秒 TTL 缓存：start/delete 等路径会重复触发全盘 rglob 扫描
+        cached = self._gguf_find_cache.get(model_id)
+        if cached and time.time() - cached[0] < 30:
+            return cached[1]
+        result = self._find_gguf_uncached(model_id)
+        self._gguf_find_cache[model_id] = (time.time(), result)
+        return result
+
+    def _find_gguf_uncached(self, model_id: str) -> str | None:
         if model_id.endswith(".gguf") and Path(model_id).exists():
             return model_id
         # Strip .gguf suffix and repo prefix for fuzzy matching
         key = model_id.replace(".gguf", "").lower()
         # Also try just the filename part
         key_short = model_id.rsplit("/", 1)[-1].replace(".gguf", "").lower()
-        # Search MODELS_DIR first (user-placed models)
-        for f in MODELS_DIR.rglob("*.gguf"):
-            stem = f.stem.lower()
-            if key in stem or stem in key or key_short in stem:
-                return str(f)
-        # Also search download cache (~/.cache/huggingface/models/)
-        cache_models = self._cache_dir.parent / "models"
-        if cache_models.exists():
-            for f in cache_models.rglob("*.gguf"):
+
+        def _search_dir(root: Path):
+            """rglob a directory for a gguf file fuzzy-matching the key."""
+            if not root or not root.exists():
+                return None
+            for f in root.rglob("*.gguf"):
+                if not f.is_file():
+                    continue
                 stem = f.stem.lower()
                 if key in stem or stem in key or key_short in stem:
                     return str(f)
+            return None
+
+        # Search MODELS_DIR first (user-placed models, ~/Models/)
+        hit = _search_dir(MODELS_DIR)
+        if hit:
+            return hit
+        # Also search third-party model managers so files downloaded elsewhere
+        # (LM Studio, Ollama, etc.) are reusable without manual copying.
+        for extra in (
+            Path.home() / ".lmstudio" / "models",
+            Path.home() / ".ollama" / "models",
+        ):
+            hit = _search_dir(extra)
+            if hit:
+                return hit
+        # Also search download cache (~/.cache/huggingface/models/)
+        cache_models = self._cache_dir.parent / "models"
+        return _search_dir(cache_models)
+
+    def _find_gguf_for_delete(self, model_id: str) -> str | None:
+        """删除专用的精确查找：只在 ~/Models 内、stem 或文件名完全相等。
+
+        不做双向子串模糊匹配，也不搜 LM Studio/Ollama 等第三方目录，
+        避免误删不属于自己的模型文件。
+        """
+        try:
+            models_root = MODELS_DIR.resolve()
+        except OSError:
+            return None
+        if model_id.endswith(".gguf") and Path(model_id).exists():
+            # 直接路径：必须位于 ~/Models 内
+            try:
+                p = Path(model_id).resolve()
+                p.relative_to(models_root)
+            except (OSError, ValueError):
+                return None
+            return str(p)
+        key = model_id.replace(".gguf", "").lower()
+        key_short = model_id.rsplit("/", 1)[-1].replace(".gguf", "").lower()
+        filename = model_id.rsplit("/", 1)[-1].lower()
+        if not MODELS_DIR.exists():
+            return None
+        for f in MODELS_DIR.rglob("*.gguf"):
+            if not f.is_file():
+                continue
+            stem = f.stem.lower()
+            if stem == key or stem == key_short or f.name.lower() == filename:
+                return str(f)
         return None
 
     @staticmethod
@@ -693,16 +910,19 @@ class LocalLLMEngine:
                 cmd += ["--chat_format", chat_fmt]
             env = os.environ.copy()
             env.pop("HF_ENDPOINT", None)
-            self._process = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env
+            # stdout 无人读取，必须 DEVNULL，否则管道缓冲满后子进程死锁
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, env=env
             )
+            self._process = proc
 
             # Drain stderr in background thread so pipe buffer never blocks the child
-            stderr_lines: list[str] = []
+            # 用局部 proc 而不是 self._process，避免快速 stop→start 时读到新进程的 stderr
+            stderr_lines: collections.deque[str] = collections.deque(maxlen=300)
             def _drain():
-                if self._process and self._process.stderr:
+                if proc.stderr:
                     try:
-                        for line in self._process.stderr:
+                        for line in proc.stderr:
                             stderr_lines.append(line)
                     except Exception:
                         pass
@@ -710,9 +930,9 @@ class LocalLLMEngine:
             t.start()
 
             # Poll HTTP immediately — returns as soon as model is ready (no dead-wait)
-            if not self._wait_for_http(port, timeout_sec=300, process=self._process):
+            if not self._wait_for_http(port, timeout_sec=300, process=proc):
                 t.join(timeout=1)
-                err_lines = stderr_lines[-50:] if stderr_lines else []
+                err_lines = list(stderr_lines)[-50:] if stderr_lines else []
                 err_text = "".join(err_lines)
                 # Extract only the last meaningful error line (skip traceback clutter)
                 err_summary = ""
@@ -725,7 +945,7 @@ class LocalLLMEngine:
                     err_summary = err_lines[-1].strip()[-150:]
                 logger.error(
                     "llama-cpp server %s: %s",
-                    "exited early" if self._process.poll() is not None else "HTTP timeout",
+                    "exited early" if proc.poll() is not None else "HTTP timeout",
                     err_text[:500] if err_text else "no stderr",
                 )
                 self.stop_model()
@@ -778,24 +998,27 @@ class LocalLLMEngine:
 
         env = os.environ.copy()
         env.pop("HF_ENDPOINT", None)
-        self._process = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env
+        # stdout 无人读取，必须 DEVNULL，否则管道缓冲满后子进程死锁
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, env=env
         )
+        self._process = proc
 
-        stderr_lines: list[str] = []
+        # 用局部 proc 而不是 self._process，避免快速 stop→start 时读到新进程的 stderr
+        stderr_lines: collections.deque[str] = collections.deque(maxlen=300)
         def _drain():
-            if self._process and self._process.stderr:
+            if proc.stderr:
                 try:
-                    for line in self._process.stderr:
+                    for line in proc.stderr:
                         stderr_lines.append(line)
                 except Exception:
                     pass
         t = threading.Thread(target=_drain, daemon=True)
         t.start()
 
-        if not self._wait_for_http(port, timeout_sec=300, process=self._process):
+        if not self._wait_for_http(port, timeout_sec=300, process=proc):
             t.join(timeout=1)
-            err_lines = stderr_lines[-50:] if stderr_lines else []
+            err_lines = list(stderr_lines)[-50:] if stderr_lines else []
             err_summary = ""
             for line in reversed(err_lines):
                 stripped = line.strip()
@@ -805,7 +1028,7 @@ class LocalLLMEngine:
             if not err_summary and err_lines:
                 err_summary = err_lines[-1].strip()[-150:]
             logger.error("llama-server native: %s",
-                "exited early" if self._process.poll() is not None else "HTTP timeout")
+                "exited early" if proc.poll() is not None else "HTTP timeout")
             self.stop_model()
             self.server_status = "error"
             self.status_message = f"启动失败: {err_summary}" if err_summary else "模型加载超时"
@@ -834,16 +1057,19 @@ class LocalLLMEngine:
             ]
             env = os.environ.copy()
             env.pop("HF_ENDPOINT", None)
-            self._process = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env
+            # stdout 无人读取，必须 DEVNULL，否则管道缓冲满后子进程死锁
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, env=env
             )
+            self._process = proc
 
             # Drain stderr in background thread so pipe buffer never blocks the child
-            stderr_lines: list[str] = []
+            # 用局部 proc 而不是 self._process，避免快速 stop→start 时读到新进程的 stderr
+            stderr_lines: collections.deque[str] = collections.deque(maxlen=300)
             def _drain():
-                if self._process and self._process.stderr:
+                if proc.stderr:
                     try:
-                        for line in self._process.stderr:
+                        for line in proc.stderr:
                             stderr_lines.append(line)
                     except Exception:
                         pass
@@ -851,9 +1077,9 @@ class LocalLLMEngine:
             t.start()
 
             # Poll HTTP immediately — returns as soon as model is ready (no dead-wait)
-            if not self._wait_for_http(port, timeout_sec=300, process=self._process):
+            if not self._wait_for_http(port, timeout_sec=300, process=proc):
                 t.join(timeout=1)
-                err_lines = stderr_lines[-50:] if stderr_lines else []
+                err_lines = list(stderr_lines)[-50:] if stderr_lines else []
                 err_text = "".join(err_lines)
                 err_summary = ""
                 for line in reversed(err_lines):
@@ -865,7 +1091,7 @@ class LocalLLMEngine:
                     err_summary = err_lines[-1].strip()[-150:]
                 logger.error(
                     "MLX server %s: %s",
-                    "exited early" if self._process.poll() is not None else "HTTP timeout",
+                    "exited early" if proc.poll() is not None else "HTTP timeout",
                     err_text[:500] if err_text else "no stderr",
                 )
                 self.stop_model()
@@ -887,48 +1113,51 @@ class LocalLLMEngine:
             return self.get_status()
 
     def start_model(self, model_id: str, port: int = 1235) -> dict:
-        # Kill any stale process on the target port before starting
-        self._kill_port(port)
-        if self._process and self._process.poll() is None:
-            self.stop_model()
-        self.server_port = port
+        # start/stop 主流程持锁，避免并发 start/stop 竞态
+        # （RLock：内部错误路径会再调 stop_model）
+        with self._proc_lock:
+            # Kill any stale process on the target port before starting
+            self._kill_port(port)
+            if self._process and self._process.poll() is None:
+                self.stop_model()
+            self.server_port = port
 
-        if self.backend == "none":
-            return {"status": "error", "message": "无可用引擎。安装: pip install llama-cpp-python"}
+            if self.backend == "none":
+                return {"status": "error", "message": "无可用引擎。安装: pip install llama-cpp-python"}
 
-        # ── Auto-detect model format → choose best backend ──
-        use_llama = False
-        use_mlx = False
+            # ── Auto-detect model format → choose best backend ──
+            use_llama = False
+            use_mlx = False
 
-        # Layer 1: file extension
-        model_lower = model_id.lower()
-        if model_lower.endswith(".gguf"):
-            use_llama = True
-        elif model_lower.endswith(".mlx"):
-            use_mlx = True
-        # Layer 2: HuggingFace model ID heuristics
-        elif model_id.startswith("mlx-community/") or "/mlx-" in model_id:
-            use_mlx = True
-        elif any(kw in model_id.lower() for kw in ["gguf", "llama-cpp", "bartowski/"]):
-            use_llama = True
-        # Layer 3: search MODEL_DIR for matching file
-        elif self._find_gguf(model_id):
-            use_llama = True
+            # Layer 1: file extension
+            model_lower = model_id.lower()
+            if model_lower.endswith(".gguf"):
+                use_llama = True
+            elif model_lower.endswith(".mlx"):
+                use_mlx = True
+            # Layer 2: HuggingFace model ID heuristics
+            elif model_id.startswith("mlx-community/") or "/mlx-" in model_id:
+                use_mlx = True
+            elif any(kw in model_id.lower() for kw in ["gguf", "llama-cpp", "bartowski/"]):
+                use_llama = True
+            # Layer 3: search MODEL_DIR for matching file
+            elif self._find_gguf(model_id):
+                use_llama = True
 
-        if use_llama:
-            if not self.llama_cpp_available:
-                return {"status": "error", "message": "GGUF 模型需要 llama-cpp-python。安装: pip install llama-cpp-python"}
-            return self._start_llama_cpp(model_id, port)
-        if use_mlx:
-            if not self.mlx_available:
-                return {"status": "error", "message": "MLX 模型需要 mlx-lm。安装: pip install mlx-lm"}
-            return self._start_mlx(model_id, port)
+            if use_llama:
+                if not self.llama_cpp_available:
+                    return {"status": "error", "message": "GGUF 模型需要 llama-cpp-python。安装: pip install llama-cpp-python"}
+                return self._start_llama_cpp(model_id, port)
+            if use_mlx:
+                if not self.mlx_available:
+                    return {"status": "error", "message": "MLX 模型需要 mlx-lm。安装: pip install mlx-lm"}
+                return self._start_mlx(model_id, port)
 
-        # Layer 4: fall back to platform default
-        if self.backend == "mlx" and self.mlx_available:
-            return self._start_mlx(model_id, port)
-        else:
-            return self._start_llama_cpp(model_id, port)
+            # Layer 4: fall back to platform default
+            if self.backend == "mlx" and self.mlx_available:
+                return self._start_mlx(model_id, port)
+            else:
+                return self._start_llama_cpp(model_id, port)
 
     def _cleanup_child(self):
         """atexit handler — kill child model server so it doesn't become orphaned."""
@@ -948,34 +1177,48 @@ class LocalLLMEngine:
                     pass
 
     def stop_model(self) -> dict:
-        if self._process:
-            try:
-                self._process.terminate()
-                self._process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                self._process.kill()
-                self._process.wait()
-            except Exception:
-                pass
-            self._process = None
-        # Belt-and-suspenders: ensure port is actually free
-        self._kill_port(self.server_port)
-        self.server_status = "stopped"
-        self.status_message = "已停止"
-        self.current_model_id = ""
-        self.current_model_name = ""
-        self._active_backend = ""
-        self.has_image_support = False
-        return self.get_status()
+        with self._proc_lock:
+            if self._process:
+                try:
+                    self._process.terminate()
+                    self._process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    self._process.kill()
+                    self._process.wait()
+                except Exception:
+                    # 兜底：异常时也要 kill + wait，避免留下僵尸进程
+                    try:
+                        self._process.kill()
+                        self._process.wait(timeout=5)
+                    except Exception:
+                        pass
+                self._process = None
+            # Belt-and-suspenders: ensure port is actually free
+            self._kill_port(self.server_port)
+            self.server_status = "stopped"
+            self.status_message = "已停止"
+            self.current_model_id = ""
+            self.current_model_name = ""
+            self._active_backend = ""
+            self.has_image_support = False
+            return self.get_status()
 
     def delete_model_file(self, model_id: str) -> dict:
         """Delete a local model GGUF file by model_id and clear download record."""
-        path = self._find_gguf(model_id)
+        # 只允许删除 ~/Models 内的文件，且精确匹配，避免误删 LM Studio/Ollama 模型
+        path = self._find_gguf_for_delete(model_id)
         if not path:
-            return {"status": "error", "message": f"找不到模型文件: {model_id}"}
+            return {"status": "error", "message": f"找不到模型文件: {model_id}（仅可删除 ~/Models 内的模型）"}
+        # 模型正在运行时拒绝删除
+        if self._process and self._process.poll() is None:
+            cur_stem = Path(self.current_model_name).stem.lower() if self.current_model_name else ""
+            if self.current_model_id == model_id or (cur_stem and Path(path).stem.lower() == cur_stem):
+                return {"status": "error", "message": "模型正在运行中，请先停止再删除"}
         try:
             os.unlink(path)
             logger.info(f"Deleted model file: {path}")
+            # 清掉 _find_gguf 缓存，避免 30s TTL 内还命中已删除的路径
+            self._gguf_find_cache.clear()
             # Also remove download record
             with self._download_lock:
                 self._downloads.pop(model_id, None)
@@ -1133,11 +1376,11 @@ def search_huggingface(query: str, limit: int = 10, library: str = "") -> list[d
         params = {"search": query, "limit": limit, "sort": "downloads", "direction": "-1", "full": "true"}
         if library:
             params["library"] = library
-        base = _engine._hf_endpoint.rstrip("/")
+        base = _engine._get_hf_endpoint().rstrip("/")
         url = base + "/api/models?" + urllib.parse.urlencode(params)
         req = urllib.request.Request(url, headers={"User-Agent": "Latiao/1.0"})
-        resp = urllib.request.urlopen(req, timeout=15, context=_ssl_ctx)
-        data = json.loads(resp.read())
+        with urllib.request.urlopen(req, timeout=15, context=_ssl_ctx) as resp:
+            data = json.loads(resp.read())
         results = []
         for m in data:
             results.append({
@@ -1156,14 +1399,17 @@ def search_huggingface(query: str, limit: int = 10, library: str = "") -> list[d
 def get_model_detail(model_id: str) -> dict:
     """Fetch model detail from HuggingFace: metadata, file siblings, README."""
     import urllib.request
+    # 拼 URL 前校验 model_id，拒绝畸形/带路径穿越的 ID
+    if not _re.fullmatch(r'[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+', model_id):
+        return {"status": "error", "message": f"模型 ID 格式不合法: {model_id}"}
     try:
         # Fetch model info (respects HF_ENDPOINT mirror)
         # ?blobs=true resolves LFS pointers to get real file sizes
-        base = _engine._hf_endpoint.rstrip("/")
+        base = _engine._get_hf_endpoint().rstrip("/")
         url = f"{base}/api/models/{model_id}?blobs=true"
         req = urllib.request.Request(url, headers={"User-Agent": "Latiao/1.0"})
-        resp = urllib.request.urlopen(req, timeout=15, context=_ssl_ctx)
-        data = json.loads(resp.read())
+        with urllib.request.urlopen(req, timeout=15, context=_ssl_ctx) as resp:
+            data = json.loads(resp.read())
 
         # Get REAL file sizes via huggingface_hub (resolves LFS pointers)
         siblings = []
@@ -1198,8 +1444,8 @@ def get_model_detail(model_id: str) -> dict:
         try:
             readme_url = f"{base}/{model_id}/raw/main/README.md"
             readme_req = urllib.request.Request(readme_url, headers={"User-Agent": "Latiao/1.0"})
-            readme_resp = urllib.request.urlopen(readme_req, timeout=10)
-            readme_raw = readme_resp.read().decode("utf-8", errors="replace")
+            with urllib.request.urlopen(readme_req, timeout=10, context=_ssl_ctx) as readme_resp:
+                readme_raw = readme_resp.read().decode("utf-8", errors="replace")
             readme = readme_raw[:3000]  # First 3000 chars
         except Exception:
             pass
@@ -1221,11 +1467,24 @@ def get_model_detail(model_id: str) -> dict:
     except Exception:
         return {"status": "error", "message": "Failed to fetch model details"}
 
+# run_fix 允许安装的 pip 包白名单（取包名部分比较，不含 extras/版本号）
+_PIP_INSTALL_WHITELIST = {
+    "mlx", "mlx-lm", "mlx-metal", "llama-cpp-python", "huggingface_hub",
+    "hf-xet", "numpy", "tokenizers", "transformers", "sentencepiece",
+    "protobuf", "safetensors", "accelerate",
+}
+
 def run_fix(fix_type: str, fix_pkg: str = "") -> dict:
     if getattr(sys, "frozen", False):
         return {"status": "error", "message": "依赖已打包在安装包中，请联系开发者更新"}
     """Execute a fix for an environment issue."""
     if fix_type == "pip" and fix_pkg:
+        # 包名白名单 + 格式校验：防止任意 pip 安装导致 RCE
+        if not _re.fullmatch(r'[A-Za-z0-9_.\-]+(\[[A-Za-z0-9_,\-]+\])?(==[A-Za-z0-9.*]+)?', fix_pkg):
+            return {"status": "error", "message": f"包名不合法，已拒绝安装: {fix_pkg}"}
+        pkg_name = _re.split(r'[\[=]', fix_pkg, maxsplit=1)[0]
+        if pkg_name not in _PIP_INSTALL_WHITELIST:
+            return {"status": "error", "message": f"不在允许安装的包白名单内，已拒绝: {pkg_name}"}
         try:
             proc_result = subprocess.run(
                 [sys.executable, "-m", "pip", "install", fix_pkg],
@@ -1364,17 +1623,35 @@ def get_status() -> dict:
     return _engine.get_status()
 
 def list_local_models() -> list[dict]:
-    """Scan for GGUF and MLX model files locally."""
-    models = []
-    if not MODELS_DIR.exists():
-        return models
-    for f in sorted(MODELS_DIR.rglob("*")):
-        if f.is_file() and f.suffix in (".gguf", ".mlx"):
+    """Scan for GGUF and MLX model files locally.
+
+    Searches the built-in ~/Models/ dir plus third-party model managers
+    (LM Studio, Ollama) so models downloaded elsewhere are discoverable.
+    """
+    models: list[dict] = []
+    seen_paths: set[str] = set()
+
+    def _scan_dir(root: Path):
+        if not root or not root.exists():
+            return
+        for f in sorted(root.rglob("*")):
+            if not f.is_file() or f.suffix not in (".gguf", ".mlx"):
+                continue
+            if str(f) in seen_paths:
+                continue
+            seen_paths.add(str(f))
             size_gb = f.stat().st_size / (1024**3)
             models.append({
                 "id": f.stem, "name": f.stem, "path": str(f),
                 "size": f"{size_gb:.1f}GB", "format": f.suffix[1:],
             })
+
+    # 1. Built-in model dir (~/Models/)
+    _scan_dir(MODELS_DIR)
+    # 2. Third-party model managers (reuse models downloaded via LM Studio / Ollama)
+    _scan_dir(Path.home() / ".lmstudio" / "models")
+    _scan_dir(Path.home() / ".ollama" / "models")
+    # 3. HuggingFace cache
     hf = Path.home() / ".cache" / "huggingface" / "hub"
     if hf.exists():
         for dl_info in hf.glob("models--*"):

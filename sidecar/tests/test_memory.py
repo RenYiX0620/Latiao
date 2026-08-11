@@ -18,7 +18,7 @@ class TestQuickReflect(unittest.TestCase):
 
     def test_permission_denied(self):
         r = _quick_reflect("read_file", "permission denied")
-        self.assertIn("出错", r)
+        self.assertIn("权限不足", r)
 
     def test_not_found(self):
         r = _quick_reflect("search_files", "not found")

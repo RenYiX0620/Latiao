@@ -14,6 +14,7 @@ MEMORY_DB = PROGRESS_DIR / "memory.db"
 
 # Connection and lock management
 _db_conn: sqlite3.Connection | None = None
+_db_init_lock = threading.Lock()   # protects lazy connection init
 _db_write_lock = threading.Lock()  # protects sync write paths
 _async_db_lock = asyncio.Lock()    # protects async write paths
 
@@ -22,19 +23,31 @@ def _get_db() -> sqlite3.Connection:
     """Return a module-level SQLite connection (lazy-init, reused across calls)."""
     global _db_conn
     if _db_conn is None:
-        PROGRESS_DIR.mkdir(parents=True, exist_ok=True)
-        _db_conn = sqlite3.connect(str(MEMORY_DB), check_same_thread=False)
-        _db_conn.execute("PRAGMA journal_mode=WAL")
+        with _db_init_lock:
+            # double-checked locking：避免多线程并发首次调用时重复建连接
+            if _db_conn is None:
+                PROGRESS_DIR.mkdir(parents=True, exist_ok=True)
+                _db_conn = sqlite3.connect(str(MEMORY_DB), check_same_thread=False)
+                _db_conn.execute("PRAGMA journal_mode=WAL")
     return _db_conn
 
 
 
 def _create_table(conn: sqlite3.Connection, name: str, columns: str, extras: list[str] | None = None):
     """Create a table + FTS5 virtual table + triggers if they don't exist."""
-    conn.execute(f"CREATE TABLE IF NOT EXISTS {name} ({columns})")
+    try:
+        conn.execute(f"CREATE TABLE IF NOT EXISTS {name} ({columns})")
+    except Exception:
+        # 主表失败才整体放弃该表（extras 依附于主表，建了也没意义）
+        logger.error("Failed to create table %s", name, exc_info=True)
+        return
     if extras:
         for stmt in extras:
-            conn.execute(stmt)
+            try:
+                conn.execute(stmt)
+            except Exception:
+                # extras 失败不阻断其他表，但必须可见——否则 FTS 永久缺失且无人察觉
+                logger.error("Failed to create FTS/trigger for %s: %.60s", name, stmt, exc_info=True)
 
 
 
@@ -86,19 +99,25 @@ def _init_db():
                 "key, value, content='preferences', content_rowid='rowid')",
             ])
 
-        conn.execute("CREATE TABLE IF NOT EXISTS reflections ("
-            "id TEXT PRIMARY KEY, session_id TEXT NOT NULL, tool_name TEXT NOT NULL, "
-            "tool_args TEXT NOT NULL, tool_result_summary TEXT NOT NULL, "
-            "reflection TEXT NOT NULL, was_useful INTEGER DEFAULT 1, created_at TEXT NOT NULL)")
+        try:
+            conn.execute("CREATE TABLE IF NOT EXISTS reflections ("
+                "id TEXT PRIMARY KEY, session_id TEXT NOT NULL, tool_name TEXT NOT NULL, "
+                "tool_args TEXT NOT NULL, tool_result_summary TEXT NOT NULL, "
+                "reflection TEXT NOT NULL, was_useful INTEGER DEFAULT 1, created_at TEXT NOT NULL)")
+        except Exception:
+            logger.error("Failed to create table reflections", exc_info=True)
 
-        conn.execute("CREATE TABLE IF NOT EXISTS memory ("
-            "session_id TEXT NOT NULL, type TEXT NOT NULL, topic TEXT NOT NULL, "
-            "content TEXT NOT NULL, meta TEXT NOT NULL, "
-            "created_at TEXT DEFAULT (datetime('now')))")
+        try:
+            conn.execute("CREATE TABLE IF NOT EXISTS memory ("
+                "session_id TEXT NOT NULL, type TEXT NOT NULL, topic TEXT NOT NULL, "
+                "content TEXT NOT NULL, meta TEXT NOT NULL, "
+                "created_at TEXT DEFAULT (datetime('now')))")
+        except Exception:
+            logger.error("Failed to create table memory", exc_info=True)
 
         conn.commit()
     except Exception:
-        logger.warning("Failed to initialize memory DB", exc_info=True)
+        logger.error("Failed to initialize memory DB", exc_info=True)
 
 
 
