@@ -1,20 +1,37 @@
 {
   "identifier": "default",
   "description": "Default capability allowing HTTP requests to sidecar",
-  "windows": ["main"],
+  "windows": [
+    "main"
+  ],
   "permissions": [
     "core:default",
     "dialog:default",
+    "opener:default",
     {
       "identifier": "http:default",
       "allow": [
-        { "url": "http://127.0.0.1:8765/**" },
-        { "url": "http://localhost:8765/**" },
-        { "url": "https://huggingface.co/**" },
-        { "url": "https://api.deepseek.com/**" },
-        { "url": "https://api.openai.com/**" },
-        { "url": "https://api.anthropic.com/**" },
-        { "url": "https://generativelanguage.googleapis.com/**" }
+        {
+          "url": "http://127.0.0.1:8765/**"
+        },
+        {
+          "url": "http://localhost:8765/**"
+        },
+        {
+          "url": "https://huggingface.co/**"
+        },
+        {
+          "url": "https://api.deepseek.com/**"
+        },
+        {
+          "url": "https://api.openai.com/**"
+        },
+        {
+          "url": "https://api.anthropic.com/**"
+        },
+        {
+          "url": "https://generativelanguage.googleapis.com/**"
+        }
       ]
     }
   ]

@@ -3,10 +3,24 @@
 use std::process::{Child, Command};
 use std::sync::Mutex;
 use std::time::Duration;
-use tauri::Manager;
-/// Proxy HTTP request to sidecar — bypasses Tauri HTTP plugin entirely
+
+/// Proxy HTTP request to sidecar — bypasses Tauri HTTP plugin entirely.
+/// Allowlist: only http://127.0.0.1:8765 (the local sidecar). Prevents the
+/// webview from abusing this command as an open proxy / SSRF surface
+/// (incl. `@`-userinfo host spoofing and cloud-metadata endpoints).
 #[tauri::command]
 async fn sidecar_proxy(url: String, method: String, body: Option<String>) -> Result<String, String> {
+    let parsed = reqwest::Url::parse(&url)
+        .map_err(|e| format!("Invalid URL: {}", e))?;
+    let allowed = parsed.scheme() == "http"
+        && matches!(parsed.host_str(), Some("127.0.0.1") | Some("localhost"))
+        && parsed.port_or_known_default() == Some(8765);
+    if !allowed {
+        return Err(format!(
+            "Blocked: sidecar_proxy only permits http://127.0.0.1:8765, got {}",
+            url
+        ));
+    }
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
         .build()
@@ -157,11 +171,13 @@ fn restart_sidecar(state: tauri::State<'_, SidecarProcess>) -> Result<String, St
     let new_child = start_sidecar();
     if new_child.is_some() {
         println!("[Latiao] Sidecar restarted");
+        *guard = new_child;
+        Ok("ok".to_string())
     } else {
         eprintln!("[Latiao] Failed to restart sidecar");
+        *guard = None;
+        Err("Sidecar 启动失败：未找到 main.py 或可用的 Python 运行时。请尝试重启应用。".to_string())
     }
-    *guard = new_child;
-    Ok("ok".to_string())
 }
 
 /// Managed state holding the sidecar child process handle.
@@ -298,6 +314,10 @@ fn start_sidecar() -> Option<Child> {
 fn main() {
     eprintln!("[Latiao] App starting...");
     let sidecar = start_sidecar();
+    let sidecar_ok = sidecar.is_some();
+    if !sidecar_ok {
+        eprintln!("[Latiao] WARNING: sidecar failed to start — AI features will be unavailable");
+    }
 
     tauri::Builder::default()
         .plugin(tauri_plugin_http::init())
@@ -306,6 +326,18 @@ fn main() {
         .plugin(tauri_plugin_opener::init())
 .manage(SidecarProcess(Mutex::new(sidecar)))
         .invoke_handler(tauri::generate_handler![sidecar_proxy, restart_sidecar, store_secret, get_secret, delete_secret, open_model_dir])
+        .setup(move |app| {
+            if !sidecar_ok {
+                // Sidecar didn't start — tell the user instead of leaving them
+                // staring at a UI whose backend calls will all time out.
+                use tauri_plugin_dialog::DialogExt;
+                app.dialog()
+                    .message("AI 后端进程(sidecar)启动失败。\n聊天、模型和工具功能暂时不可用。\n\n请尝试重启应用；若反复出现，请重新安装。")
+                    .title("Latiao 启动警告")
+                    .blocking_show();
+            }
+            Ok(())
+        })
         .run(tauri::generate_context!())
         .expect("Failed to start Latiao app");
 }
