@@ -1,6 +1,10 @@
 """Read the contents of a file at the given path. Supports ~ expansion."""
 
 import os
+
+_BLOCKED_SUBSTRINGS = ("/.ssh", "/.aws", "/.gnupg", "/Library/Keychains", "/.kube", "/.docker")
+_BLOCKED_FILE_NAMES = (".env", "id_rsa", "id_ed25519", "id_ecdsa", "known_hosts")
+
 MAX_READ_SIZE = 10000  # chars before truncation
 
 NAME = "read_file"
@@ -22,13 +26,33 @@ DEFINITION = {
 }
 
 
+def _safe_path(path: str) -> str | None:
+    """返回规范化后的绝对路径；不合法返回 None。"""
+    if not path:
+        return None
+    expanded = os.path.expanduser(path)
+    # 必须本身就是绝对路径（realpath 会把相对路径变成绝对路径，所以先查）
+    if not os.path.isabs(expanded):
+        return None
+    # Block path traversal — 两种分隔符都查
+    if ".." in path.split("/") or ".." in path.split("\\"):
+        return None
+    # realpath 解析符号链接，防止经由 symlink 逃出校验
+    return os.path.realpath(expanded)
+
+
 def execute(args: dict) -> str:
-    path = os.path.expanduser(args["path"])
-    # Block path traversal — only allow absolute paths without '..' segments
-    if ".." in path.split("/"):
+    p = _safe_path(args["path"])
+    if p is None:
         return "⛔ Blocked: path traversal not allowed"
+    # 敏感目录（密钥/凭证）一律拒绝
+    if any(s in p for s in _BLOCKED_SUBSTRINGS):
+        return f"⛔ Blocked: 不允许访问敏感目录 - {p}"
+    # 敏感文件名一律拒绝
+    if os.path.basename(p) in _BLOCKED_FILE_NAMES:
+        return f"⛔ Blocked: 不允许读取敏感文件 - {p}"
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(p, "r", encoding="utf-8") as f:
             content = f.read(MAX_READ_SIZE + 1)
         if len(content) > MAX_READ_SIZE:
             est_lines = content.count("\n")
@@ -39,6 +63,6 @@ def execute(args: dict) -> str:
             )
         return content
     except FileNotFoundError:
-        return f"错误：文件不存在 - {path}"
+        return f"错误：文件不存在 - {p}"
     except Exception as e:
         return f"错误：{e}"

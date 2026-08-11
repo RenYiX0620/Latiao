@@ -14,11 +14,11 @@ DEFINITION = {
     "type": "function",
     "function": {
         "name": "run_cmd",
-        "description": "Run a shell command and return its output. ⚠️ Requires user confirmation. Destructive commands are always blocked.",
+        "description": "Run ONE single command and return its output (no shell). ⚠️ Requires user confirmation. Destructive commands are always blocked. Do NOT use shell operators like && | ; > < — they are not supported; call this tool once per command instead.",
         "parameters": {
             "type": "object",
             "properties": {
-                "cmd": {"type": "string", "description": "The shell command to execute."}
+                "cmd": {"type": "string", "description": "A single command with arguments, e.g. 'python3 -m pytest -v'. No shell operators (&& | ; >)."}
             },
             "required": ["cmd"]
         }
@@ -67,10 +67,36 @@ _ALWAYS_ALLOWED = re.compile(
     + r")$"
 )
 
+# Shell operators that are NOT supported because we run with shell=False.
+# If these slip through, shlex.split() passes them as literal arguments and the
+# command silently misbehaves (e.g. "cd x && pytest" only runs `cd`, exits 0,
+# prints nothing — the agent then hallucinates success). Detect and reject loudly.
+_SHELL_OPERATORS = re.compile(r"(&&|\|\||\||;|\$\(|>|<)")
+
+
+def _reject_shell_operators(cmd: str) -> str | None:
+    """Return an error string if cmd uses shell syntax we can't execute, else None."""
+    m = _SHELL_OPERATORS.search(cmd)
+    if not m:
+        return None
+    return (
+        f"⛔ 不支持 shell 操作符 '{m.group(1)}'：本工具以 shell=False 直接执行，"
+        f"无法解释 {m.group(1)}，否则只会运行第一个命令并把其余当参数（静默失败）。\n"
+        "请拆成多次调用，每次只运行一条命令，例如：\n"
+        "  ❌ cd /tmp/x && python3 -m pytest -v\n"
+        "  ✅ 第1次 run_cmd: cd /tmp/x    第2次 run_cmd: python3 -m pytest -v\n"
+        "重定向(>)和管道(|)同样不支持；需要输出时请让命令直接打印到 stdout。"
+    )
+
 
 def execute(args: dict) -> str:
     cmd = (args.get("cmd") or args.get("command", "")).strip()
     cmd_lower = cmd.lower()
+
+    # ── Reject unsupported shell syntax FIRST (before whitelist shortcut) ──
+    rejected = _reject_shell_operators(cmd)
+    if rejected:
+        return rejected
 
     # ── Whitelist check for simple safe commands ──
     base_cmd = cmd_lower.split()[0] if cmd_lower.split() else ""

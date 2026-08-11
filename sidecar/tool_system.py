@@ -1,6 +1,9 @@
 """Tool System Module — plugin loading, seeding, and dispatch."""
+import hashlib
 import importlib.util
+import json
 import logging
+import os
 from pathlib import Path
 
 logger = logging.getLogger("tool_system")
@@ -13,8 +16,14 @@ PLUGINS_DIR = Path(__file__).parent / "plugins"
 
 # Embedded plugin source code for first-run seeding
 _SEED_PLUGINS = {
-    "read_file.py": '''"""Read the contents of a file at the given path."""
+    'read_file.py': r'''"""Read the contents of a file at the given path. Supports ~ expansion."""
+
 import os
+
+_BLOCKED_SUBSTRINGS = ("/.ssh", "/.aws", "/.gnupg", "/Library/Keychains", "/.kube", "/.docker")
+_BLOCKED_FILE_NAMES = (".env", "id_rsa", "id_ed25519", "id_ecdsa", "known_hosts")
+
+MAX_READ_SIZE = 10000  # chars before truncation
 
 NAME = "read_file"
 PERMISSION = "safe"
@@ -23,13 +32,11 @@ DEFINITION = {
     "type": "function",
     "function": {
         "name": "read_file",
-        "description": "Read the contents of a file at the given path. Supports offset and limit for large files. File truncated at 50000 chars — use offset to continue reading.",
+        "description": "Read the contents of a file at the given path. Large files are truncated.",
         "parameters": {
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "Absolute path to the file."},
-                "offset": {"type": "integer", "description": "Line number to start reading from (1-indexed)."},
-                "limit": {"type": "integer", "description": "Maximum number of lines to return."}
+                "path": {"type": "string", "description": "Absolute path to the file."}
             },
             "required": ["path"]
         }
@@ -37,18 +44,53 @@ DEFINITION = {
 }
 
 
+def _safe_path(path: str) -> str | None:
+    """返回规范化后的绝对路径；不合法返回 None。"""
+    if not path:
+        return None
+    expanded = os.path.expanduser(path)
+    # 必须本身就是绝对路径（realpath 会把相对路径变成绝对路径，所以先查）
+    if not os.path.isabs(expanded):
+        return None
+    # Block path traversal — 两种分隔符都查
+    if ".." in path.split("/") or ".." in path.split("\\"):
+        return None
+    # realpath 解析符号链接，防止经由 symlink 逃出校验
+    return os.path.realpath(expanded)
+
+
 def execute(args: dict) -> str:
-    path = args["path"]
+    p = _safe_path(args["path"])
+    if p is None:
+        return "⛔ Blocked: path traversal not allowed"
+    # 敏感目录（密钥/凭证）一律拒绝
+    if any(s in p for s in _BLOCKED_SUBSTRINGS):
+        return f"⛔ Blocked: 不允许访问敏感目录 - {p}"
+    # 敏感文件名一律拒绝
+    if os.path.basename(p) in _BLOCKED_FILE_NAMES:
+        return f"⛔ Blocked: 不允许读取敏感文件 - {p}"
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            return f.read()
+        with open(p, "r", encoding="utf-8") as f:
+            content = f.read(MAX_READ_SIZE + 1)
+        if len(content) > MAX_READ_SIZE:
+            est_lines = content.count("\n")
+            return (
+                content[:MAX_READ_SIZE]
+                + f"\n\n... (文件过长，已截断。约 {est_lines}+ 行，"
+                + f"仅显示前 {MAX_READ_SIZE} 字符。如需完整内容请分段读取)"
+            )
+        return content
     except FileNotFoundError:
-        return f"错误：文件不存在 - {path}"
+        return f"错误：文件不存在 - {p}"
     except Exception as e:
         return f"错误：{e}"
 ''',
-    "write_file.py": '''"""Write text content to a file. Creates parent directories if needed."""
+    'write_file.py': r'''"""Write text content to a file. Creates parent directories if needed."""
 import os
+
+_BLOCKED_DIRS = ("/etc", "/System", "/usr", "/bin", "/sbin", "/var", "/private/etc")
+_BLOCKED_SUBSTRINGS = ("/.ssh", "/.aws", "/.gnupg", "/Library/Keychains", "/.kube", "/.docker")
+_BLOCKED_FILE_NAMES = (".env", "id_rsa", "id_ed25519", "id_ecdsa", "known_hosts")
 
 NAME = "write_file"
 PERMISSION = "confirm"
@@ -57,7 +99,7 @@ DEFINITION = {
     "type": "function",
     "function": {
         "name": "write_file",
-        "description": "Write text content to a file. Creates parent directories if needed.",
+        "description": "Write text content to a file. Creates parent directories if needed. ⚠️ Requires user confirmation before executing.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -70,18 +112,48 @@ DEFINITION = {
 }
 
 
+def _safe_path(path: str) -> str | None:
+    """返回规范化后的绝对路径；不合法返回 None。"""
+    if not path:
+        return None
+    expanded = os.path.expanduser(path)
+    # 必须本身就是绝对路径（realpath 会把相对路径变成绝对路径，所以先查）
+    if not os.path.isabs(expanded):
+        return None
+    # Block path traversal — 两种分隔符都查
+    if ".." in path.split("/") or ".." in path.split("\\"):
+        return None
+    # realpath 解析符号链接，防止经由 symlink 逃出校验
+    return os.path.realpath(expanded)
+
+
 def execute(args: dict) -> str:
-    path = args["path"]
     content = args["content"]
+    p = _safe_path(args["path"])
+    if p is None:
+        return "⛔ Blocked: path traversal not allowed"
+    # 系统目录一律拒绝写入
+    if any(p == d or p.startswith(d + os.sep) for d in _BLOCKED_DIRS):
+        return f"⛔ Blocked: 不允许写入系统目录 - {p}"
+    # 敏感目录（密钥/凭证）一律拒绝
+    if any(s in p for s in _BLOCKED_SUBSTRINGS):
+        return f"⛔ Blocked: 不允许访问敏感目录 - {p}"
+    # 敏感文件名一律拒绝
+    if os.path.basename(p) in _BLOCKED_FILE_NAMES:
+        return f"⛔ Blocked: 不允许写入敏感文件 - {p}"
+    # sidecar 的 plugins/ 目录一律拒绝（写入后下次启动会被 import 执行 = RCE）
+    sidecar_plugins = os.path.realpath(os.path.dirname(__file__))
+    if p == sidecar_plugins or p.startswith(sidecar_plugins + os.sep):
+        return f"⛔ Blocked: 不允许写入插件目录 - {p}"
     try:
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
+        os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
+        with open(p, "w", encoding="utf-8") as f:
             f.write(content)
-        return f"✅ 已写入：{path}（{len(content)} 字符）"
+        return f"✅ 已写入：{p}（{len(content)} 字符）"
     except Exception as e:
         return f"错误：{e}"
 ''',
-    "list_dir.py": '''"""List the contents of a directory."""
+    'list_dir.py': r'''"""List the contents of a directory."""
 import os
 
 NAME = "list_dir"
@@ -103,20 +175,41 @@ DEFINITION = {
 }
 
 
+def _safe_path(path: str) -> str | None:
+    """返回规范化后的绝对路径；不合法返回 None。"""
+    if not path:
+        return None
+    expanded = os.path.expanduser(path)
+    # 必须本身就是绝对路径（realpath 会把相对路径变成绝对路径，所以先查）
+    if not os.path.isabs(expanded):
+        return None
+    # Block path traversal — 两种分隔符都查
+    if ".." in path.split("/") or ".." in path.split("\\"):
+        return None
+    # realpath 解析符号链接，防止经由 symlink 逃出校验
+    return os.path.realpath(expanded)
+
+
 def execute(args: dict) -> str:
-    path = args["path"]
+    p = _safe_path(args["path"])
+    if p is None:
+        return "⛔ Blocked: path traversal not allowed"
     try:
-        entries = os.listdir(path)
-        lines = [f"  {'📁' if os.path.isdir(os.path.join(path, e)) else '📄'} {e}"
+        entries = os.listdir(p)
+        lines = [f"  {'📁' if os.path.isdir(os.path.join(p, e)) else '📄'} {e}"
                  for e in sorted(entries)]
-        return "目录内容:\\n" + "\\n".join(lines)
+        return "目录内容:\n" + "\n".join(lines)
     except Exception as e:
         return f"错误：{e}"
 ''',
-    "run_cmd.py": '''"""Run a shell command and return its output."""
+    'run_cmd.py': r'''"""Run a shell command and return its output. ⚠️ Requires user confirmation."""
+import platform
 import re
 import shlex
 import subprocess
+
+_IS_WINDOWS = platform.system() == "Windows"
+_WIN_CMDS = r"|dir|cd|where|ver|type|find|findstr" if _IS_WINDOWS else ""
 
 NAME = "run_cmd"
 PERMISSION = "confirm"
@@ -125,50 +218,130 @@ DEFINITION = {
     "type": "function",
     "function": {
         "name": "run_cmd",
-        "description": "Run a shell command and return its output.",
+        "description": "Run ONE single command and return its output (no shell). ⚠️ Requires user confirmation. Destructive commands are always blocked. Do NOT use shell operators like && | ; > < — they are not supported; call this tool once per command instead.",
         "parameters": {
             "type": "object",
             "properties": {
-                "cmd": {"type": "string", "description": "The shell command to execute."}
+                "cmd": {"type": "string", "description": "A single command with arguments, e.g. 'python3 -m pytest -v'. No shell operators (&& | ; >)."}
             },
             "required": ["cmd"]
         }
     }
 }
 
-_DANGEROUS = [
-    r"rm\\s+(-[a-z]*[rf]|--recursive|--force)",
-    r">\\s*/dev/(sd|nvme|hd|disk|dm-)",
-    r"\\bsudo\\b", r"\\bshutdown\\b", r"\\breboot\\b",
-    r"\\bcurl\\b.*\\|\\s*(ba)?sh\\b", r"\\bwget\\b.*\\|\\s*(ba)?sh\\b",
+# ── Blocked patterns (checked case-insensitive) ──
+_DESTRUCTIVE_PATTERNS = [
+    # File system destruction
+    r"rm\s+(-[a-z]*[rf]|--recursive|--force)",
+    r">\s*/dev/(sd|nvme|hd|disk|dm-)",
+    r"dd\s+if=",
+    r"mkfs",
+    r"mkswap",
+    r"wipefs",
+    # Privilege escalation / system control
+    r"\bsudo\b", r"\bdoas\b", r"\bsu\s",
+    r"\bshutdown\b", r"\breboot\b", r"\bhalt\b", r"\bpoweroff\b",
+    r"\binit\s+[0-6]",
+    r"\bsystemctl\s+(shutdown|reboot|halt|poweroff|suspend)",
+    r"\blaunchctl\s+(unload|remove)",
+    # Fork bomb / resource exhaustion
+    r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;",
+    r"\bperl\s+-e\b",  # often used for obfuscation
+    # Network dangerous
+    r"\biptables\s+-F\b", r"\bpfctl\s+-d\b",
+    # Write to critical paths
+    r">\s*/etc/", r">>\s*/etc/",
+    r">\s*/System/", r">>\s*/System/",
+    r"chmod\s+[0-7]*7[0-7]*\s+/",
+    r"chown\s+-R\s+",
 ]
 
+_OBFUSCATION_PATTERNS = [
+    r"\beval\s", r"\bbase64\s+(-d|--decode)", r"\bxxd\s+-r",
+    r"`[^`]+`",  # backtick subshell
+    r"\$\([^)]+\)",  # $() subshell
+    r"\\x[0-9a-fA-F]{2}",  # hex-encoded chars in command
+    r"\bcurl\b.*\|\s*(ba)?sh\b", r"\bwget\b.*\|\s*(ba)?sh\b",  # curl | sh
+]
+
+# Commands that are always allowed (whitelist override for common dev tools)
+_ALWAYS_ALLOWED = re.compile(
+    r"^(ls|pwd|echo|cat|head|tail|wc|file|which|whoami|uname|date|env|printenv"
+    + _WIN_CMDS
+    + r")$"
+)
+
+# Shell operators that are NOT supported because we run with shell=False.
+# If these slip through, shlex.split() passes them as literal arguments and the
+# command silently misbehaves (e.g. "cd x && pytest" only runs `cd`, exits 0,
+# prints nothing — the agent then hallucinates success). Detect and reject loudly.
+_SHELL_OPERATORS = re.compile(r"(&&|\|\||\||;|\$\(|>|<)")
+
+
+def _reject_shell_operators(cmd: str) -> str | None:
+    """Return an error string if cmd uses shell syntax we can't execute, else None."""
+    m = _SHELL_OPERATORS.search(cmd)
+    if not m:
+        return None
+    return (
+        f"⛔ 不支持 shell 操作符 '{m.group(1)}'：本工具以 shell=False 直接执行，"
+        f"无法解释 {m.group(1)}，否则只会运行第一个命令并把其余当参数（静默失败）。\n"
+        "请拆成多次调用，每次只运行一条命令，例如：\n"
+        "  ❌ cd /tmp/x && python3 -m pytest -v\n"
+        "  ✅ 第1次 run_cmd: cd /tmp/x    第2次 run_cmd: python3 -m pytest -v\n"
+        "重定向(>)和管道(|)同样不支持；需要输出时请让命令直接打印到 stdout。"
+    )
+
+
 def execute(args: dict) -> str:
-    cmd = args["cmd"].strip()
+    cmd = (args.get("cmd") or args.get("command", "")).strip()
     cmd_lower = cmd.lower()
-    for pattern in _DANGEROUS:
-        if re.search(pattern, cmd_lower):
-            return f"⛔ Blocked unsafe command: {cmd}"
-    if len(cmd) > 1000:
-        return f"⛔ Command too long"
-    try:
+
+    # ── Reject unsupported shell syntax FIRST (before whitelist shortcut) ──
+    rejected = _reject_shell_operators(cmd)
+    if rejected:
+        return rejected
+
+    # ── Whitelist check for simple safe commands ──
+    base_cmd = cmd_lower.split()[0] if cmd_lower.split() else ""
+    if _ALWAYS_ALLOWED.match(base_cmd) and len(cmd) < 200:
         try:
-            tokens = shlex.split(cmd)
-        except ValueError as e:
-            return f"命令格式错误: {e}"
-        r = subprocess.run(tokens, shell=False, capture_output=True, text=True, timeout=30)
+            r = subprocess.run(shlex.split(cmd), shell=False, capture_output=True, text=True, timeout=10)
+            return r.stdout.strip() or r.stderr.strip() or "(无输出)"
+        except subprocess.TimeoutExpired:
+            return f"超时: {cmd}"
+        except Exception as e:
+            return f"错误：{e}"
+
+    # ── Block destructive patterns ──
+    for pattern in _DESTRUCTIVE_PATTERNS:
+        if re.search(pattern, cmd_lower):
+            return f"⛔ Blocked destructive command: {cmd}"
+
+    # ── Block obfuscation attempts ──
+    for pattern in _OBFUSCATION_PATTERNS:
+        if re.search(pattern, cmd_lower):
+            return f"⛔ Blocked potentially unsafe command: {cmd}"
+
+    # ── Length limit ──
+    if len(cmd) > 1000:
+        return f"⛔ Command too long ({len(cmd)} chars, max 1000)"
+
+    # ── Execute ──
+    try:
+        r = subprocess.run(shlex.split(cmd), shell=False, capture_output=True, text=True, timeout=30)
         out = r.stdout.strip()
         if r.returncode != 0:
-            out += f"\\n(退出码: {r.returncode})"
+            out += f"\n(退出码: {r.returncode})"
             if r.stderr.strip():
-                out += f"\\n{r.stderr.strip()}"
+                out += f"\n{r.stderr.strip()}"
         return out or "(无输出)"
     except subprocess.TimeoutExpired:
         return f"超时: {cmd}"
     except Exception as e:
         return f"错误：{e}"
 ''',
-    "open_folder.py": '''"""Open a folder in Finder (macOS only)."""
+    'open_folder.py': r'''"""Open a folder in Finder (macOS only)."""
 import os
 import platform
 import subprocess
@@ -192,21 +365,44 @@ DEFINITION = {
 }
 
 IS_MACOS = platform.system() == "Darwin"
-IS_WINDOWS = platform.system() == "Windows"
+
+
+def _safe_path(path: str) -> str | None:
+    """返回规范化后的绝对路径；不合法返回 None。"""
+    if not path:
+        return None
+    expanded = os.path.expanduser(path)
+    # 必须本身就是绝对路径（realpath 会把相对路径变成绝对路径，所以先查）
+    if not os.path.isabs(expanded):
+        return None
+    # Block path traversal — 两种分隔符都查
+    if ".." in path.split("/") or ".." in path.split("\\"):
+        return None
+    # realpath 解析符号链接，防止经由 symlink 逃出校验
+    return os.path.realpath(expanded)
 
 
 def execute(args: dict) -> str:
-    path = args["path"]
+    p = _safe_path(args["path"])
+    if p is None:
+        return "⛔ Blocked: path traversal not allowed"
     if IS_MACOS:
-        subprocess.Popen(["open", path])
-    elif IS_WINDOWS:
-        os.startfile(path)
-    else:
-        subprocess.Popen(["xdg-open", path])
-    return f"✅ 已打开：{path}"
+        subprocess.Popen(["open", p])
+        return f"✅ 已在 Finder 中打开：{p}"
+    # Fallback: list directory on non-macOS
+    try:
+        entries = os.listdir(p)
+        lines = [f"  {'📁' if os.path.isdir(os.path.join(p, e)) else '📄'} {e}"
+                 for e in sorted(entries)]
+        return "目录内容:\n" + "\n".join(lines)
+    except Exception as e:
+        return f"错误：{e}"
 ''',
-    "open_app.py": '''"""Open a macOS application by name. Supports both English and Chinese names."""
+    'open_app.py': r'''"""Open an application by name. macOS native, Windows via start."""
+import platform
 import subprocess
+
+IS_WINDOWS = platform.system() == "Windows"
 
 NAME = "open_app"
 PERMISSION = "confirm"
@@ -215,11 +411,11 @@ DEFINITION = {
     "type": "function",
     "function": {
         "name": "open_app",
-        "description": "Open a macOS application by name.",
+        "description": "Open a macOS application by name. Use this when the user asks to open an app. Supports both English names (Photos, Safari, Mail) and Chinese names (照片/相册, 浏览器, 邮件).",
         "parameters": {
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "App name in English or Chinese."}
+                "name": {"type": "string", "description": "App name in English or Chinese (e.g., 'Photos', 'Safari', '照片', '浏览器')."}
             },
             "required": ["name"]
         }
@@ -244,16 +440,28 @@ _APP_ALIASES = {
     "查找": "Find My", "find my": "Find My",
 }
 
+
 def execute(args: dict) -> str:
     name = args["name"]
     resolved = _APP_ALIASES.get(name, name)
+    if IS_WINDOWS:
+        try:
+            subprocess.Popen(["cmd", "/c", "start", "", resolved])
+            return f"✅ 已打开：{resolved}"
+        except Exception as e:
+            return f"无法打开 {resolved}: {e}"
     try:
-        subprocess.Popen(["open", "-a", resolved])
+        r = subprocess.run(["open", "-a", resolved], capture_output=True, text=True, timeout=5)
+        if r.returncode != 0:
+            err = r.stderr.strip() or "应用不存在或无法打开"
+            return f"❌ 无法打开 {resolved}: {err}"
         return f"✅ 已打开应用：{resolved}"
+    except subprocess.TimeoutExpired:
+        return f"❌ 打开 {resolved} 超时"
     except Exception as e:
         return f"无法打开应用 {resolved}: {e}"
 ''',
-    "search_files.py": '''"""Search for files matching a glob pattern in a directory."""
+    'search_files.py': r'''"""Search for files matching a glob pattern in a directory."""
 import glob as glob_mod
 import os
 
@@ -277,11 +485,31 @@ DEFINITION = {
 }
 
 
+def _safe_path(path: str) -> str | None:
+    """返回规范化后的绝对路径；不合法返回 None。"""
+    if not path:
+        return None
+    expanded = os.path.expanduser(path)
+    # 必须本身就是绝对路径（realpath 会把相对路径变成绝对路径，所以先查）
+    if not os.path.isabs(expanded):
+        return None
+    # Block path traversal — 两种分隔符都查
+    if ".." in path.split("/") or ".." in path.split("\\"):
+        return None
+    # realpath 解析符号链接，防止经由 symlink 逃出校验
+    return os.path.realpath(expanded)
+
+
 def execute(args: dict) -> str:
-    directory = args["directory"]
+    directory = _safe_path(args["directory"])
+    if directory is None:
+        return "⛔ Blocked: path traversal not allowed"
     pattern = args["pattern"]
+    # pattern 不允许是绝对路径或包含 '..'（否则可逃出 directory）
+    if os.path.isabs(pattern) or ".." in pattern.split("/") or ".." in pattern.split("\\"):
+        return f"⛔ Blocked: pattern 不允许是绝对路径或包含 '..' - {pattern}"
     try:
-        search_path = os.path.join(os.path.expanduser(directory), pattern)
+        search_path = os.path.join(directory, pattern)
         matches = glob_mod.glob(search_path, recursive=True)
         if not matches:
             return f"No files matching '{pattern}' found in {directory}"
@@ -289,16 +517,18 @@ def execute(args: dict) -> str:
         for m in sorted(matches)[:50]:
             icon = "📁" if os.path.isdir(m) else "📄"
             lines.append(f"  {icon} {m}")
-        result = f"Search results for '{pattern}' in {directory}:\\n" + "\\n".join(lines)
+        result = f"Search results for '{pattern}' in {directory}:\n" + "\n".join(lines)
         if len(matches) > 50:
-            result += f"\\n  ... and {len(matches) - 50} more results"
+            result += f"\n  ... and {len(matches) - 50} more results"
         return result
     except Exception as e:
         return f"Error searching files: {e}"
 ''',
-    "tavily_search.py": '''"""Search the web using Tavily Search API."""
+    'tavily_search.py': r'''"""Search the web using Tavily Search API."""
+import asyncio
 import json
 import os
+import subprocess
 from pathlib import Path
 
 import httpx
@@ -314,9 +544,19 @@ DEFINITION = {
         "parameters": {
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "The search query. Be specific and use keywords."},
-                "search_depth": {"type": "string", "enum": ["basic", "advanced"], "description": "Search depth: 'basic' (faster, 1-2s) or 'advanced' (thorough, 5-10s). Default: basic."},
-                "max_results": {"type": "integer", "description": "Max results to return (1-10). Default: 5."},
+                "query": {
+                    "type": "string",
+                    "description": "The search query. Be specific and use keywords."
+                },
+                "search_depth": {
+                    "type": "string",
+                    "enum": ["basic", "advanced"],
+                    "description": "Search depth: 'basic' (faster, 1-2s) or 'advanced' (thorough, 5-10s). Default: basic."
+                },
+                "max_results": {
+                    "type": "integer",
+                    "description": "Max results to return (1-10). Default: 5."
+                },
             },
             "required": ["query"],
         },
@@ -327,6 +567,7 @@ CONFIG_FILE = Path.home() / ".local-ai-os" / "config.json"
 
 
 def _get_api_key() -> str | None:
+    """Read Tavily API key from config file or environment variable."""
     env_key = os.environ.get("TAVILY_API_KEY")
     if env_key:
         return env_key
@@ -352,65 +593,128 @@ def _get_api_key() -> str | None:
 async def execute(args: dict) -> str:
     api_key = _get_api_key()
     if not api_key:
-        return "⚠️ Tavily API Key 未配置。请在应用的「技能」界面中找到 Web Search (Tavily)，填写 API Key。免费注册：https://tavily.com"
+        return (
+            "⚠️ Tavily API Key 未配置。\n"
+            "请在应用的「技能」界面中找到 Web Search (Tavily)，填写 API Key。\n"
+            "免费注册：https://tavily.com"
+        )
 
     query = args["query"]
     search_depth = args.get("search_depth", "basic")
-    max_results = min(args.get("max_results", 5), 10)
+    try:
+        n = int(args.get("max_results", 5))
+    except (TypeError, ValueError):
+        n = 5
+    max_results = max(1, min(n, 10))
 
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(30)) as client:
             resp = await client.post(
-                TAVILY_API_URL,
-                json={"api_key": api_key, "query": query, "search_depth": search_depth, "max_results": max_results},
+                os.environ.get("TAVILY_API_URL", "https://api.tavily.com/search"),
+                json={
+                    "api_key": api_key,
+                    "query": query,
+                    "search_depth": search_depth,
+                    "max_results": max_results,
+                },
+                timeout=30,
             )
             resp.raise_for_status()
             data = resp.json()
-        results = data.get("results", [])
-        answer = data.get("answer", "")
-        if not results and not answer:
-            return f"🔍 Tavily 搜索: {query}\\n\\n未找到相关结果。"
-        lines = [f"🔍 Tavily 搜索: {query}\\n"]
-        if answer:
-            lines.append(f"📝 {answer}\\n")
-        if results:
-            lines.append(f"📎 共 {len(results)} 条结果:\\n")
-            for i, r in enumerate(results, 1):
-                title = r.get("title", "No title")
-                url = r.get("url", "")
-                content = r.get("content", "")
-                if len(content) > 300:
-                    content = content[:300] + "..."
-                lines.append(f"{i}. **{title}**")
-                lines.append(f"   {url}")
-                lines.append(f"   {content}\\n")
-        return "\\n".join(lines)
+
+            results = data.get("results", [])
+            answer = data.get("answer", "")
+
+            if not results and not answer:
+                return f"🔍 Tavily 搜索: {query}\n\n未找到相关结果。"
+
+            lines = [f"🔍 Tavily 搜索: {query}\n"]
+
+            if answer:
+                lines.append(f"📝 {answer}\n")
+
+            if results:
+                lines.append(f"📎 共 {len(results)} 条结果:\n")
+                for i, r in enumerate(results, 1):
+                    title = r.get("title", "No title")
+                    url = r.get("url", "")
+                    content = r.get("content", "")
+                    if len(content) > 300:
+                        content = content[:300] + "..."
+                    lines.append(f"{i}. **{title}**")
+                    lines.append(f"   {url}")
+                    lines.append(f"   {content}\n")
+
+            return "\n".join(lines)
+
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 401:
             return "⚠️ Tavily API Key 无效或已过期。请在技能设置中更新 API Key。"
         return f"⚠️ Tavily 搜索失败: HTTP {e.response.status_code}"
+    except httpx.ConnectError:
+        return "⚠️ 无法连接 Tavily API (api.tavily.com)。请检查网络连接。"
     except Exception as e:
         return f"⚠️ Tavily 搜索异常: {e}"
 ''',
 }
 
 def _seed_default_plugins():
-    """Create default plugin files on first run if plugins dir is empty."""
+    """Create default plugin files on first run; refresh stale seeds the user hasn't modified.
+
+    Manifest (PLUGINS_DIR/.seed_manifest.json) records filename → sha256 of the seed
+    source at write time. On startup:
+      - file missing                    → write seed, record hash
+      - file hash == manifest hash      → user didn't touch it → overwrite with new seed
+      - file hash != manifest hash      → user modified it → leave it alone
+    """
     try:
         PLUGINS_DIR.mkdir(parents=True, exist_ok=True)
+        manifest_path = PLUGINS_DIR / ".seed_manifest.json"
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if not isinstance(manifest, dict):
+                manifest = {}
+        except Exception:
+            manifest = {}
         for filename, source in _SEED_PLUGINS.items():
             filepath = PLUGINS_DIR / filename
+            new_hash = _sha256(source)
             if not filepath.exists():
-                filepath.write_text(source, encoding="utf-8")
+                _atomic_write(filepath, source)
+                manifest[filename] = new_hash
+                continue
+            try:
+                current_hash = _sha256(filepath.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            old_hash = manifest.get(filename)
+            if old_hash and current_hash == old_hash:
+                # 用户没改过旧 seed → 用新 seed 覆盖并更新 manifest
+                if current_hash != new_hash:
+                    _atomic_write(filepath, source)
+                manifest[filename] = new_hash
+            # else: 用户改过了（或无 manifest 记录无法判断）→ 跳过不动
+        _atomic_write(manifest_path, json.dumps(manifest, ensure_ascii=False, indent=2))
     except Exception:
         logger.warning("Failed to seed default plugins", exc_info=True)
+
+
+def _sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _atomic_write(filepath: Path, content: str):
+    """先写临时文件再 os.replace，避免崩溃留下半截文件。"""
+    tmp_path = filepath.with_name(filepath.name + ".tmp")
+    tmp_path.write_text(content, encoding="utf-8")
+    os.replace(tmp_path, filepath)
 
 
 def load_plugins(fallback_tools, fallback_dispatch, fallback_permissions):
     """
     Scan plugins/ for .py files exporting NAME, DEFINITION, PERMISSION, execute().
     Returns (tools, dispatch, permissions, hooks).
-    Falls back to provided hardcoded definitions if no plugins are found.
+    Fallback definitions are merged in for any tool name the plugins don't provide.
     """
     _seed_default_plugins()
 
@@ -431,14 +735,6 @@ def load_plugins(fallback_tools, fallback_dispatch, fallback_permissions):
             except Exception:
                 logger.warning("Failed to load plugin", exc_info=True)
 
-    if not plugins:
-        return (
-            list(fallback_tools),
-            dict(fallback_dispatch),
-            dict(fallback_permissions),
-            {},
-        )
-
     tools = []
     dispatch = {}
     permissions = {}
@@ -446,10 +742,28 @@ def load_plugins(fallback_tools, fallback_dispatch, fallback_permissions):
 
     for mod in plugins:
         name = mod.NAME
+        if name in dispatch:
+            # 重名插件：先加载的赢，跳过后者
+            logger.warning("Duplicate plugin NAME %r in %s — keeping the first one loaded", name, getattr(mod, "__file__", "?"))
+            continue
         tools.append(mod.DEFINITION)
         dispatch[name] = mod.execute
         permissions[name] = mod.PERMISSION
         if hasattr(mod, "HOOKS") and isinstance(mod.HOOKS, dict):
             hooks[name] = mod.HOOKS
+
+    # 合并 fallback：插件没有的工具名用 fallback 补齐（而不是有一个插件就全丢）
+    for name, func in (fallback_dispatch or {}).items():
+        if name not in dispatch:
+            dispatch[name] = func
+    for name, perm in (fallback_permissions or {}).items():
+        if name not in permissions:
+            permissions[name] = perm
+    for tool_def in (fallback_tools or []):
+        fname = tool_def.get("function", {}).get("name") if isinstance(tool_def, dict) else None
+        if fname and fname in dispatch and not any(
+            isinstance(t, dict) and t.get("function", {}).get("name") == fname for t in tools
+        ):
+            tools.append(tool_def)
 
     return tools, dispatch, permissions, hooks

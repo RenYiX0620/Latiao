@@ -2,6 +2,7 @@
 import asyncio
 import json
 import os
+import subprocess
 from pathlib import Path
 
 import httpx
@@ -44,6 +45,16 @@ def _get_api_key() -> str | None:
     env_key = os.environ.get("TAVILY_API_KEY")
     if env_key:
         return env_key
+    # Try macOS Keychain via security CLI
+    try:
+        result = subprocess.run(
+            ["security", "find-generic-password", "-s", "com.latiao.desktop", "-a", "tavily_api_key", "-w"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except Exception:
+        pass
     try:
         if CONFIG_FILE.exists():
             cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
@@ -64,7 +75,11 @@ async def execute(args: dict) -> str:
 
     query = args["query"]
     search_depth = args.get("search_depth", "basic")
-    max_results = min(args.get("max_results", 5), 10)
+    try:
+        n = int(args.get("max_results", 5))
+    except (TypeError, ValueError):
+        n = 5
+    max_results = max(1, min(n, 10))
 
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(30)) as client:
