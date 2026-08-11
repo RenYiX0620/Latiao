@@ -1,16 +1,22 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
 echo "=== 1/4 下载 llama-server.exe ==="
-LLAMA_TAG=$(curl -s https://api.github.com/repos/ggml-org/llama.cpp/releases/latest | jq -r '.tag_name')
-curl -L "https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_TAG}/llama-${LLAMA_TAG}-bin-win-cpu-x64.zip" \
-     -o /tmp/llama.zip
-unzip -o -j /tmp/llama.zip "*/llama-server.exe" -d sidecar/
+LLAMA_TAG=$(curl -sf https://api.github.com/repos/ggml-org/llama.cpp/releases/latest | jq -r '.tag_name')
+if [ -z "$LLAMA_TAG" ] || [ "$LLAMA_TAG" = "null" ]; then
+  echo "error: 无法从 GitHub API 获取 llama.cpp 最新 release tag" >&2
+  exit 1
+fi
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$TMP_DIR"' EXIT
+curl -fL "https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_TAG}/llama-${LLAMA_TAG}-bin-win-cpu-x64.zip" \
+     -o "$TMP_DIR/llama.zip"
+unzip -o -j "$TMP_DIR/llama.zip" "*/llama-server.exe" -d sidecar/
 echo "llama-server.exe: $(sidecar/llama-server.exe --version 2>&1 || echo 'ok')"
 
 echo "=== 2/4 PyInstaller 打包 sidecar ==="
 cd sidecar
-pip install pyinstaller
+pip install "pyinstaller==6.*"
 pyinstaller latiao.spec
 cd ..
 

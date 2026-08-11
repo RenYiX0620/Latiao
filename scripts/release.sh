@@ -20,6 +20,10 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
+# 失败路径也清理临时产物（与成功路径一致：.release-notes.md / latest.json）
+cleanup() { rm -f "$PROJECT_DIR/.release-notes.md" "$PROJECT_DIR/latest.json"; }
+trap cleanup EXIT
+
 # ─── Color helpers ────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
 info()  { echo -e "${CYAN}[info]${NC} $1"; }
@@ -47,7 +51,7 @@ else
   read -p "Enter new version (leave empty to keep current): " VERSION
   VERSION="${VERSION:-$CURRENT_VERSION}"
 fi
-if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
+if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
   err "Invalid version: $VERSION (expected semver like 0.2.0)"; exit 1
 fi
 if [ "$VERSION" != "$CURRENT_VERSION" ]; then
@@ -138,7 +142,7 @@ ARCHIVE_PATH="$BUNDLE_DIR/$ARCHIVE_NAME"
 
 info "Archive: $ARCHIVE_NAME"
 cd "$BUNDLE_DIR"
-tar czf "$ARCHIVE_NAME" "Latiao.app"
+tar czf "$ARCHIVE_NAME" "$(basename "$APP_BUNDLE")"
 cd "$PROJECT_DIR"
 ok "Archive created: $ARCHIVE_NAME"
 
@@ -198,6 +202,20 @@ ok "Tagged $TAG"
 
 # ─── GitHub Release ──────────────────────────────────────────────────────
 echo ""
+# 幂等：同名 release 已存在则先删掉，让脚本可重跑
+if gh release view "$TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
+  warn "Release $TAG already exists - deleting before re-creating"
+  gh release delete "$TAG" --repo "$GH_REPO" --yes
+fi
+
+# dmg glob 无匹配时不要传字面 '*.dmg'（nullglob + bash 3.2 安全的空数组展开）
+shopt -s nullglob
+DMG_FILES=("$PROJECT_DIR/src-tauri/target/release/bundle/dmg"/*.dmg)
+shopt -u nullglob
+if [ ${#DMG_FILES[@]} -eq 0 ]; then
+  warn "No .dmg found in bundle/dmg - release will not include an installer asset"
+fi
+
 info "Creating GitHub release $TAG..."
 gh release create "$TAG" \
   --repo "$GH_REPO" \
@@ -206,7 +224,7 @@ gh release create "$TAG" \
   --latest \
   "$ARCHIVE_PATH" \
   "$SIG_FILE" \
-  "$PROJECT_DIR/src-tauri/target/release/bundle/dmg"/*.dmg \
+  ${DMG_FILES[@]+"${DMG_FILES[@]}"} \
   latest.json
 
 ok "GitHub release: https://github.com/$GH_REPO/releases/tag/$TAG"

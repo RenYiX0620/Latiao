@@ -7,7 +7,7 @@ a = Analysis(
         ('agents/*.txt', 'agents'),
         ('skills/', 'skills'),
         ('plugins/', 'plugins'),
-        ('.env', '.'),
+        # 注意：不要把 .env 打进 exe（含密钥）
     ],
     hiddenimports=[
         'uvicorn.logging', 'uvicorn.loops', 'uvicorn.protocols',

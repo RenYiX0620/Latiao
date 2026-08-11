@@ -34,6 +34,20 @@ info()  { echo -e "${CYAN}[info]${NC} $1"; }
 ok()    { echo -e "${GREEN}[ok]${NC}   $1"; }
 err()   { echo -e "${RED}[err]${NC}  $1"; }
 
+# ─── Idempotency guard ──────────────────────────────────────────────────────
+# Skip the destructive "rm -rf → re-download from github" cycle when a working
+# portable Python is already present. This is what broke deploys when
+# github.com was unreachable (the rm had already wiped a good install).
+# Override with: FORCE_REINSTALL=1 bash scripts/setup-portable-python.sh
+if [ -z "${FORCE_REINSTALL:-}" ] && [ -x "$PYTHON_DIR/bin/python3" ]; then
+  if "$PYTHON_DIR/bin/python3" -c "import fastapi, uvicorn, httpx" 2>/dev/null; then
+    ok "Portable Python already present and functional — skipping download/install."
+    ok "  (set FORCE_REINSTALL=1 to force a clean re-download from github)"
+    exit 0
+  fi
+  info "Existing portable Python failed import check — reinstalling."
+fi
+
 # ─── Step 1: Clean previous python/ (if any) ───────────────────────────────
 if [ -d "$PYTHON_DIR" ]; then
   info "Removing old portable Python at $PYTHON_DIR"
@@ -43,7 +57,8 @@ fi
 # ─── Step 2: Download python-build-standalone ───────────────────────────────
 TMP_DIR="$(mktemp -d)"
 TARBALL_PATH="$TMP_DIR/$PYTHON_TARBALL"
-trap "rm -rf $TMP_DIR" EXIT
+# 单引号 trap：$TMP_DIR 在执行时展开；变量加引号防空格/空值炸掉 rm -rf
+trap 'rm -rf "$TMP_DIR"' EXIT
 
 info "Downloading portable Python ${PYTHON_VERSION}..."
 if command -v curl &>/dev/null; then
@@ -52,6 +67,29 @@ else
   wget -q --show-progress -O "$TARBALL_PATH" "$DOWNLOAD_URL"
 fi
 ok "Downloaded $PYTHON_TARBALL"
+
+# ─── Step 2b: Verify SHA256 against the release's SHA256SUMS ────────────────
+# python-build-standalone 每个 release 都发布 SHA256SUMS（与 tarball 同一目录）。
+# 校验失败即退出，绝不解压来路不明的运行时。
+SUMS_URL="https://github.com/indygreg/python-build-standalone/releases/download/${BUILD_DATE}/SHA256SUMS"
+SUMS_PATH="$TMP_DIR/SHA256SUMS"
+info "Downloading SHA256SUMS for integrity check..."
+if command -v curl &>/dev/null; then
+  curl -fsSL -o "$SUMS_PATH" "$SUMS_URL"
+else
+  wget -q -O "$SUMS_PATH" "$SUMS_URL"
+fi
+EXPECTED_LINE=$(grep " $PYTHON_TARBALL\$" "$SUMS_PATH" || true)
+if [ -z "$EXPECTED_LINE" ]; then
+  err "SHA256SUMS 中未找到 $PYTHON_TARBALL 的校验值 — 拒绝继续"
+  exit 1
+fi
+if (cd "$TMP_DIR" && echo "$EXPECTED_LINE" | shasum -a 256 -c -); then
+  ok "SHA256 checksum verified"
+else
+  err "SHA256 校验失败：$PYTHON_TARBALL 已损坏或被篡改 — 拒绝继续"
+  exit 1
+fi
 
 # ─── Step 3: Extract to sidecar/python/ ────────────────────────────────────
 info "Extracting to $PYTHON_DIR ..."
