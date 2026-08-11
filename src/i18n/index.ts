@@ -9,7 +9,8 @@ export function useTranslation() {
     let text = (entry ? entry[lang] : undefined) || entry?.zh || key;
     if (vars) {
       for (const [k, v] of Object.entries(vars)) {
-        text = text.replace(`{${k}}`, String(v));
+        // Replace every occurrence, not just the first
+        text = text.split(`{${k}}`).join(String(v));
       }
     }
     return text;

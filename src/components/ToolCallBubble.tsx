@@ -56,7 +56,7 @@ const ToolCallBubble = memo(function ToolCallBubble({ msg, onConfirm }: {
                     href={href}
                     onClick={(e) => {
                       e.preventDefault();
-                      if (href) openUrl(href);
+                      if (href) openUrl(href).catch(() => {});
                     }}
                     style={{ color: "#2563eb", cursor: "pointer", textDecoration: "underline" }}
                     {...props}

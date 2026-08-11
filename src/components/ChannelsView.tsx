@@ -27,7 +27,7 @@ export default function ChannelsView() {
       try {
         const saved = await invoke("get_secret", { key: CHANNEL_KEYCHAIN_KEY }).catch(() => null) as string | null;
         if (saved) setConfigs(JSON.parse(saved));
-      } catch { /* keychain not available */ }
+      } catch (e) { console.warn("Failed to load channel tokens from keychain", e); }
       setLoaded(true);
     })();
   }, []);
@@ -40,7 +40,7 @@ export default function ChannelsView() {
         if (Object.keys(configs).length > 0) {
           await invoke("store_secret", { key: CHANNEL_KEYCHAIN_KEY, value: JSON.stringify(configs) });
         }
-      } catch { /* ignore */ }
+      } catch (e) { console.warn("Failed to persist channel tokens to keychain", e); }
     }, 1000);
     return () => clearTimeout(timer);
   }, [configs, loaded]);
@@ -55,7 +55,7 @@ export default function ChannelsView() {
       delete next[key];
       // If all configs cleared, delete from keychain
       if (Object.keys(next).length === 0) {
-        invoke("delete_secret", { key: CHANNEL_KEYCHAIN_KEY }).catch(() => {});
+        invoke("delete_secret", { key: CHANNEL_KEYCHAIN_KEY }).catch((e) => console.warn("Failed to delete channel tokens from keychain", e));
       }
       return next;
     });
@@ -80,6 +80,7 @@ export default function ChannelsView() {
               {isActive ? (
                 <div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 8 }}>
                   <input
+                    type="password"
                     className="form-input"
                     style={{ margin: 0, fontSize: 11, padding: "6px 10px", fontFamily: "var(--font-mono)" }}
                     placeholder={ch.placeholder}

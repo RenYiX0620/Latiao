@@ -1,6 +1,7 @@
 /* ═══════════ Types ═══════════ */
 
 export interface Message {
+  id?: string;
   role: "user" | "assistant" | "tool";
   content: string;
   type?: "file" | "text" | "image" | "audio" | "translation" | "tool_call";

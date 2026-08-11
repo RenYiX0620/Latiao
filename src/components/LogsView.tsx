@@ -1,4 +1,4 @@
-import { useState, useMemo, useCallback } from "react";
+import { useState, useMemo, useRef, useEffect } from "react";
 import { useTranslation } from "../i18n";
 
 interface LogEntry {
@@ -35,6 +35,12 @@ export default function LogsView({ logs }: LogsViewProps) {
     return c;
   }, [logs]);
 
+  // Scroll to bottom whenever new (filtered) entries arrive and autoScroll is on
+  const panelRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (autoScroll) panelRef.current?.scrollTo({ top: panelRef.current.scrollHeight });
+  }, [filtered, autoScroll]);
+
   return (
     <div>
       {/* Toolbar */}
@@ -59,7 +65,7 @@ export default function LogsView({ logs }: LogsViewProps) {
       {/* Log panel */}
       <div
         className="log-panel"
-        ref={useCallback((el: HTMLDivElement | null) => { if (autoScroll && el) el.scrollTop = el.scrollHeight; }, [autoScroll])}
+        ref={panelRef}
         style={{ display: "block", maxHeight: "calc(100vh - 220px)", overflowY: "auto" }}
       >
         {filtered.length === 0 ? (

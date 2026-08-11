@@ -13,6 +13,15 @@ const ERROR_TEXTS: Record<string, { title: string; reload: string }> = {
   ru: { title: '⚠️ Сбой', reload: 'Перезагрузить' },
 };
 
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+}
+
 function showErrorOverlay(message: string, stack?: string) {
   const existing = document.getElementById('global-error-overlay')
   if (existing) existing.remove()
@@ -22,9 +31,9 @@ function showErrorOverlay(message: string, stack?: string) {
   overlay.id = 'global-error-overlay'
   overlay.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;z-index:99999;padding:40px;font-family:system-ui,sans-serif;background:#1a1a2e;color:#eee;overflow:auto'
   overlay.innerHTML = `
-    <h1 style="color:#e74c3c">${t.title}</h1>
-    <pre style="background:#0d0d1a;padding:20px;border-radius:8px;overflow:auto;font-size:13px;line-height:1.6;color:#ff6b6b;white-space:pre-wrap;word-break:break-all">${message}\n\n${stack || ''}</pre>
-    <button style="margin-top:20px;padding:10px 24px;font-size:14px;background:#e74c3c;color:#fff;border:none;border-radius:6px;cursor:pointer" onclick="document.getElementById('global-error-overlay')?.remove();location.reload()">${t.reload}</button>
+    <h1 style="color:#e74c3c">${escapeHtml(t.title)}</h1>
+    <pre style="background:#0d0d1a;padding:20px;border-radius:8px;overflow:auto;font-size:13px;line-height:1.6;color:#ff6b6b;white-space:pre-wrap;word-break:break-all">${escapeHtml(message)}\n\n${escapeHtml(stack || '')}</pre>
+    <button style="margin-top:20px;padding:10px 24px;font-size:14px;background:#e74c3c;color:#fff;border:none;border-radius:6px;cursor:pointer" onclick="document.getElementById('global-error-overlay')?.remove();location.reload()">${escapeHtml(t.reload)}</button>
   `
   document.body.appendChild(overlay)
 }
@@ -33,6 +42,13 @@ window.addEventListener('error', (e) => {
   showErrorOverlay(e.message, e.error?.stack)
 })
 window.addEventListener('unhandledrejection', (e) => {
+  // Benign opener-plugin rejections (e.g. user cancelled, no handler for the
+  // URL scheme) must not crash the whole UI with the fullscreen overlay.
+  const reasonText = String(e.reason?.message ?? e.reason ?? '')
+  if (/opener|open_url/i.test(reasonText)) {
+    console.warn('Ignoring benign opener rejection:', e.reason)
+    return
+  }
   showErrorOverlay(`Unhandled Promise Rejection: ${e.reason}`, e.reason?.stack)
 })
 

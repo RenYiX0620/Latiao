@@ -35,10 +35,12 @@ export default function ToolsView({ tools, setTools, showToast }: ToolsViewProps
               e.stopPropagation();
               const newPerm = isSafe ? "confirm" : "safe";
               try {
-                await fetch(SIDECAR + "/v1/permissions", {
+                const resp = await fetch(SIDECAR + "/v1/permissions", {
                   method: "POST", headers: { "Content-Type": "application/json" },
                   body: JSON.stringify({ tool: tool.name, permission: newPerm }),
                 });
+                // Only apply the local optimistic update when the server accepted it
+                if (!resp.ok) { showToast(t("tools.toggle_fail")); return; }
                 setTools(prev => prev.map(t2 => t2.name === tool.name ? { ...t2, permission: newPerm } : t2));
                 showToast(`${tool.name} → ${newPerm === "safe" ? t("tools.safe") : t("tools.confirm")}`);
               } catch (e) { console.error(e); showToast(t("tools.toggle_fail")); }

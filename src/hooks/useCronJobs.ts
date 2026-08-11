@@ -24,7 +24,8 @@ export function useCronJobs(showToast: (msg: string) => void) {
     try {
       const data = await sidecarFetch("/v1/cron", "POST", newCron);
       if (data.status === "ok") {
-        setCronJobs(prev => [...prev, data.job]);
+        // Dedupe: the 10s poll may have already delivered this job
+        setCronJobs(prev => prev.some(j => j.id === data.job.id) ? prev : [...prev, data.job]);
         setNewCron({ schedule: "0 9 * * *", task: "", action: "notify" });
         showToast(t("cron.created"));
       }
@@ -40,9 +41,12 @@ export function useCronJobs(showToast: (msg: string) => void) {
 
   const deleteCronJob = useCallback(async (jobId: string) => {
     try {
-      await sidecarFetch(`/v1/cron/${jobId}`, "DELETE");
-      setCronJobs(prev => prev.filter(j => j.id !== jobId));
-      showToast(t("cron.deleted"));
+      const data = await sidecarFetch(`/v1/cron/${jobId}`, "DELETE");
+      // Only remove locally when the server confirmed the delete
+      if (data.status === "ok") {
+        setCronJobs(prev => prev.filter(j => j.id !== jobId));
+        showToast(t("cron.deleted"));
+      }
     } catch (e) { console.error(e); }
   }, [showToast, t]);
 

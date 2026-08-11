@@ -42,6 +42,10 @@ const PLAN_MODE_PROMPT =
 
 const SIDECAR = "http://127.0.0.1:8765";
 
+// Unique id for each chat message so list rendering can use a stable key
+// (index keys break when tool messages are spliced into the middle).
+const msgId = () => `msg_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
 const AGENT_NAME_KEYS: Record<string, string> = {
   latiao: "agent.latiao", "code-reviewer": "agent.code_reviewer",
   "doc-generator": "agent.doc_generator", debugger: "agent.debugger",
@@ -227,7 +231,7 @@ const [timeFilter, setTimeFilter] = useState("all");
     const timer = setTimeout(async () => {
       try {
         await invoke("store_secret", { key: "cloud_models", value: JSON.stringify(cloudModels) });
-      } catch { /* ignore */ }
+      } catch (e) { console.warn("Failed to persist cloud models to keychain", e); }
     }, 1000);
     return () => clearTimeout(timer);
   }, [cloudModels, cloudModelsLoaded]);
@@ -241,7 +245,7 @@ const [timeFilter, setTimeFilter] = useState("all");
         if (url.protocol !== "http:" && url.protocol !== "https:") return;
         if (["127.0.0.1", "localhost", "tauri.localhost"].includes(url.hostname)) return;
         e.preventDefault();
-        invoke("plugin:opener|open_url", { url: a.href });
+        invoke("plugin:opener|open_url", { url: a.href }).catch(() => {});
       } catch {}
     };
     document.addEventListener("click", handler, true);
@@ -317,15 +321,13 @@ const [timeFilter, setTimeFilter] = useState("all");
     const tick = async () => {
       // Unified sidecar heartbeat
       try {
-        const resp = await fetch(SIDECAR + "/v1/heartbeat");
+        const resp = await fetch(SIDECAR + "/v1/heartbeat", { signal: AbortSignal.timeout(5000) });
         const data = await resp.json();
         if (data.status === "ok") {
           setSidecarStatus("online");
-          setLocalLLMStatus(data.local_llm);
-          // Downloads
-          const map: Record<string, DownloadState> = {};
-          (data.downloads || []).forEach((d: DownloadState) => { map[d.model_id || ""] = d; });
-          setDownloadProgress(map);
+          // Guard: never overwrite a good status with an undefined payload field
+          if (data.local_llm != null) setLocalLLMStatus(data.local_llm);
+          // Downloads are owned by the 2s poller below (single writer, no flicker)
           // Learnings
           setRecentLearnings(data.learnings || []);
         } else {
@@ -335,7 +337,7 @@ const [timeFilter, setTimeFilter] = useState("all");
 
       // Fetch recent logs (always, cheap ring-buffer read)
       try {
-        const lr = await fetch(SIDECAR + "/v1/logs?limit=100");
+        const lr = await fetch(SIDECAR + "/v1/logs?limit=100", { signal: AbortSignal.timeout(5000) });
         const ld = await lr.json();
         if (ld.status === "ok") setGatewayLogs(ld.logs || []);
       } catch { /* ignore */ }
@@ -351,6 +353,10 @@ const [timeFilter, setTimeFilter] = useState("all");
   const [hfResults, setHfResults] = useState<HFModelResult[]>([]);
   const [searching, setSearching] = useState(false);
   const [downloadProgress, setDownloadProgress] = useState<Record<string, DownloadState>>({});
+  // Mirror for the poll loop: lets the interval check current progress without
+  // re-subscribing on every state change.
+  const downloadProgressRef = useRef(downloadProgress);
+  downloadProgressRef.current = downloadProgress;
   const [fixing, setFixing] = useState("");
   const [contextLimit, setContextLimit] = useState(8192);
   const [contextEstimate, setContextEstimate] = useState<{max_context: number; recommended_context: number; ram_available_gb: number; memory_for_context_gb: number} | null>(null);
@@ -362,24 +368,39 @@ const [timeFilter, setTimeFilter] = useState("all");
       const resp = await fetch(SIDECAR + "/v1/local-llm/estimate-context" + params);
       const data = await resp.json();
       if (data.max_context) setContextEstimate(data);
-      if (data.current_context) setContextLimit(data.current_context);
+      if (data.current_context) {
+        setContextLimit(data.current_context);
+        contextLimitCommittedRef.current = data.current_context;
+      }
     } catch { /* ignore */ }
   };
   useEffect(() => { fetchContextEstimate(); }, []);
 
-  // Set context limit
-  const updateContextLimit = async (limit: number) => {
+  // Set context limit — local state updates immediately (smooth slider), the
+  // POST is debounced 300ms, and a failed POST rolls back to the last value the
+  // server actually accepted.
+  const contextLimitCommittedRef = useRef(contextLimit);
+  const contextLimitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const updateContextLimit = (limit: number) => {
     setContextLimit(limit);
-    try {
-      await fetch(SIDECAR + "/v1/local-llm/context-limit", {
-        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ limit }),
-      });
-    } catch { /* ignore */ }
+    if (contextLimitTimerRef.current) clearTimeout(contextLimitTimerRef.current);
+    contextLimitTimerRef.current = setTimeout(async () => {
+      try {
+        const resp = await fetch(SIDECAR + "/v1/local-llm/context-limit", {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ limit }),
+        });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        contextLimitCommittedRef.current = limit;
+      } catch {
+        setContextLimit(contextLimitCommittedRef.current);
+      }
+    }, 300);
   };
+  useEffect(() => () => { if (contextLimitTimerRef.current) clearTimeout(contextLimitTimerRef.current); }, []);
 
   // Fetch setup check on mount
   const fetchSetup = () => {
-    fetch(SIDECAR + "/v1/local-llm/setup").then(r => r.json()).then(d => setSetupCheck(d)).catch(() => {});
+    fetch(SIDECAR + "/v1/local-llm/setup").then(r => r.json()).then(d => setSetupCheck(d)).catch((e) => console.warn("Setup check failed", e));
   };
   useEffect(() => { fetchSetup(); }, []);
 
@@ -399,35 +420,44 @@ const [timeFilter, setTimeFilter] = useState("all");
   };
 
   // ── Download progress polling (like LM Studio) ──
+  // Single writer for downloadProgress. Always fetches once on mount; the 2s
+  // interval only keeps polling while at least one download is in progress.
   useEffect(() => {
     const poll = async () => {
       try {
-        const resp = await fetch(SIDECAR + "/v1/local-llm/downloads");
+        const resp = await fetch(SIDECAR + "/v1/local-llm/downloads", { signal: AbortSignal.timeout(5000) });
         const data = await resp.json();
         if (data.status === "ok" && Array.isArray(data.downloads)) {
           const progress: Record<string, DownloadState> = {};
-          for (const dl of data.downloads) {
-            progress[dl.model_id] = dl;
+          for (const dl of data.downloads as (DownloadState & { name?: string })[]) {
+            const key = dl.model_id || dl.name || JSON.stringify(dl).slice(0, 40);
+            if (key) progress[key] = dl;
           }
           setDownloadProgress(progress);
         }
       } catch { /* ignore poll errors */ }
     };
     poll();
-    const interval = setInterval(poll, 2000);
+    const interval = setInterval(() => {
+      const active = Object.values(downloadProgressRef.current).some((d) => d.status === "downloading");
+      if (active) poll();
+    }, 2000);
     return () => clearInterval(interval);
   }, []);
 
+  // Monotonic request id so only the latest search response is applied
+  const searchReqRef = useRef(0);
   const searchHF = useCallback(async (query?: string, library?: string) => {
     const q = query ?? hfSearch;
+    const reqId = ++searchReqRef.current;
     setSearching(true);
     try {
       const libParam = library ? `&library=${encodeURIComponent(library)}` : "";
-      const resp = await fetch(`${SIDECAR}/v1/local-llm/search?q=${encodeURIComponent(q)}&limit=30${libParam}`);
+      const resp = await fetch(`${SIDECAR}/v1/local-llm/search?q=${encodeURIComponent(q)}&limit=30${libParam}`, { signal: AbortSignal.timeout(5000) });
       const data = await resp.json();
-      if (data.status === "ok") setHfResults(data.results);
+      if (reqId === searchReqRef.current && data.status === "ok") setHfResults(data.results);
     } catch (e) { console.error(e) }
-    setSearching(false);
+    if (reqId === searchReqRef.current) setSearching(false);
   }, [hfSearch]);
 
   // Auto-search with debounce as user types
@@ -451,8 +481,9 @@ const [timeFilter, setTimeFilter] = useState("all");
         const dlData = await dlResp.json();
         if (dlData.status === "ok" && Array.isArray(dlData.downloads)) {
           const progress: Record<string, DownloadState> = {};
-          for (const dl of dlData.downloads) {
-            if (dl.model_id) progress[dl.model_id] = dl;
+          for (const dl of dlData.downloads as (DownloadState & { name?: string })[]) {
+            const key = dl.model_id || dl.name || JSON.stringify(dl).slice(0, 40);
+            if (key) progress[key] = dl;
           }
           setDownloadProgress(prev => ({ ...prev, ...progress }));
         }
@@ -516,7 +547,7 @@ const [timeFilter, setTimeFilter] = useState("all");
   /* ── Session Management ── */
   const switchSession = (idx: number) => { setCurrentIdx(idx); setPendingFile(null); setActiveView("chat"); };
   const deleteSession = (idx: number) => {
-    const makeNew = () => ({ id: `session_${Math.random().toString(36).substring(7)}`, name: "session.default", messages: [] as Message[], selectedModel: "" });
+    const makeNew = () => ({ id: `session_${Math.random().toString(36).substring(7)}`, name: "session.default", messages: [] as Message[], selectedModel: "", lastActive: Date.now() });
     setSessions((prev) => {
       const next = prev.filter((_, i) => i !== idx);
       if (next.length === 0) return [makeNew()];
@@ -525,10 +556,13 @@ const [timeFilter, setTimeFilter] = useState("all");
     if (currentIdx >= idx) setCurrentIdx((c) => Math.max(0, c - 1));
   };
   /* ── Toast ── */
+  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const showToast = useCallback((msg: string, type?: string) => {
     setToast(msg);
     setToastType(type || "info");
-    setTimeout(() => setToast(null), 2200);
+    // Clear any previous auto-dismiss timer so a new toast isn't cut short
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    toastTimerRef.current = setTimeout(() => setToast(null), 2200);
   }, []);
 
   // Extracted hooks (cron + skills — depend on showToast)
@@ -561,9 +595,26 @@ const [timeFilter, setTimeFilter] = useState("all");
     const decoder = new TextDecoder();
     let buffer = "", full = "";
 
+    // Inactivity watchdog: if the stream goes silent for too long (e.g. the
+    // local model server hangs on an unsupported request, or a tool call blocks
+    // without emitting events), abort so isProcessing always resets instead of
+    // leaving the red Stop button stuck forever. Reset on every received chunk.
+    const WATCHDOG_MS = 90_000;
+    let watchdog: ReturnType<typeof setTimeout> | null = null;
+    const armWatchdog = () => {
+      if (watchdog) clearTimeout(watchdog);
+      watchdog = setTimeout(() => {
+        try { reader.cancel("watchdog-timeout").catch(() => {}); } catch { /* noop */ }
+      }, WATCHDOG_MS);
+    };
+    const disarmWatchdog = () => { if (watchdog) { clearTimeout(watchdog); watchdog = null; } };
+    armWatchdog();
+
+    try {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
+      armWatchdog();
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split("\n");
       buffer = lines.pop() || "";
@@ -573,14 +624,16 @@ const [timeFilter, setTimeFilter] = useState("all");
           if (data === "[DONE]") return full;
           try {
             const parsed = JSON.parse(data);
+            // Error events must reach the outer catch (and finally sendMessage's
+            // ❌ error display) instead of being swallowed as "malformed event".
+            if (parsed.error) throw new Error(parsed.error);
             try {
-              if (parsed.error) throw new Error(parsed.error);
               if (parsed.event === "tool_confirm") {
                 setAgentPhase(t("agent.phase_confirm", { tool: parsed.tool || "" }));
                 setMessages((prev) => {
                   const msgs = [...prev];
                   msgs.splice(msgs.length - 1, 0, {
-                    role: "tool", type: "tool_call", content: "",
+                    id: msgId(), role: "tool", type: "tool_call", content: "",
                     callId: parsed.call_id, toolName: parsed.tool, toolArgs: parsed.args, toolStatus: "confirming",
                   });
                   return msgs;
@@ -592,7 +645,7 @@ const [timeFilter, setTimeFilter] = useState("all");
                   if (idx !== -1) { msgs[idx] = { ...msgs[idx], toolStatus: "running" }; }
                   else {
                     msgs.splice(msgs.length - 1, 0, {
-                      role: "tool", type: "tool_call", content: "",
+                      id: msgId(), role: "tool", type: "tool_call", content: "",
                       callId: parsed.call_id, toolName: parsed.tool, toolArgs: parsed.args, toolStatus: "running",
                     });
                   }
@@ -621,12 +674,15 @@ const [timeFilter, setTimeFilter] = useState("all");
                   return msgs;
                 });
               }
-            } catch { /* skip malformed event */ }
+            } catch (e) { console.warn("Skipping malformed stream event", e); }
           } catch (e) { if (e instanceof SyntaxError) continue; throw e; }
         }
       }
     }
     return full;
+    } finally {
+      disarmWatchdog();
+    }
   };
 
   const confirmTool = useCallback(async (callId: string, approved: boolean) => {
@@ -639,7 +695,7 @@ const [timeFilter, setTimeFilter] = useState("all");
         showToast(t("toast.timeout"));
         setMessages(prev => prev.map(m => m.callId === callId && m.toolStatus === "confirming" ? { ...m, toolStatus: "error" as const, toolResult: t("toast.timeout_detail") } : m));
       }
-    } catch (e) { console.error(e) }
+    } catch (e) { console.error(e); showToast(t("toast.confirm_fail")); }
   }, [showToast, setMessages, t]);
 
   const stopGeneration = useCallback(() => {
@@ -656,40 +712,74 @@ const [timeFilter, setTimeFilter] = useState("all");
   const sendMessage = async () => {
     const text = prompt;
     if (!text.trim() && !pendingFile) return;
+    // Re-entrancy guard: if a previous request is still streaming, ignore
+    // duplicate sends (double-click, repeated Enter, etc.). Without this,
+    // concurrent agent loops pile up (msg_count doubles each send), the
+    // local model server gets hammered by parallel requests + retry storms,
+    // and the sidecar eventually crashes -> "Unhandled Promise Rejection".
+    if (isProcessing) return;
+
+    // Guard: block sending images to a local model that lacks vision support.
+    // Otherwise the local server (mlx_lm/llama.cpp) hangs or errors on the
+    // image_url content array, the stream never closes cleanly, and
+    // isProcessing stays true forever (red Stop button never reverts).
+    const cloudCfgPre = session.selectedModel
+      ? cloudModels.find((m) => m.name === session.selectedModel)
+      : undefined;
+    const isLocalTarget = !cloudCfgPre;
+    if (pendingFile?.type === "image" && isLocalTarget && !localLLMStatus?.has_image_support) {
+      showToast(t("toast.no_vision"), "warn");
+      setPendingFile(null);
+      return;
+    }
+
     setPrompt("");
     setIsProcessing(true);
     setAgentPhase(t("agent.phase_analyze"));
 
-    const userMsg: Message = { role: "user", content: text || "Analyze this file" };
+    const userMsg: Message = { id: msgId(), role: "user", content: text || "Analyze this file" };
     if (pendingFile) {
       userMsg.type = pendingFile.type === "image" ? "image" : "file";
       userMsg.filename = pendingFile.name;
-      if (pendingFile.base64) { userMsg.imageBase64 = pendingFile.base64; userMsg.imageMime = pendingFile.mimeType; }
+      if (pendingFile.base64) {
+        userMsg.imageBase64 = pendingFile.base64;
+        userMsg.imageMime = pendingFile.mimeType;
+        // imagePreview drives the in-bubble thumbnail (ChatView.tsx); without it
+        // the screenshot history collapses to a "[File: ...]" text line.
+        if (pendingFile.type === "image" && pendingFile.preview) userMsg.imagePreview = pendingFile.preview;
+      }
       userMsg.content = text || `[File: ${pendingFile.name}]`;
     }
 
     setMessages((prev) => [...prev, userMsg]);
 
-    const assistantPlaceholder: Message = { role: "assistant", content: "" };
+    const assistantPlaceholder: Message = { id: msgId(), role: "assistant", content: "" };
     setMessages((prev) => [...prev, assistantPlaceholder]);
 
     try {
       const apiMessages = buildApiMessages(session, userMsg, planMode, lang);
-      const cloudCfg = session.selectedModel
-        ? cloudModels.find((m) => m.name === session.selectedModel)
-        : undefined;
       const opts: Record<string, unknown> = { agent: activeAgent };
       if (session.selectedModel) opts.model = session.selectedModel;
-      if (cloudCfg) opts.cloudConfig = { key: cloudCfg.key, endpoint: cloudCfg.endpoint, protocol: cloudCfg.protocol || "openai" };
+      if (cloudCfgPre) opts.cloudConfig = { key: cloudCfgPre.key, endpoint: cloudCfgPre.endpoint, protocol: cloudCfgPre.protocol || "openai" };
 
       const controller = new AbortController();
       abortControllerRef.current = controller;
       await streamChat(apiMessages, opts, controller.signal);
     } catch (e) {
+      const aborted = (e as { name?: string })?.name === "AbortError";
       setMessages((prev) => {
         const msgs = [...prev];
         const last = msgs[msgs.length - 1];
-        if (last?.role === "assistant") msgs[msgs.length - 1] = { ...last, content: `❌ ${e}` };
+        if (last?.role === "assistant") {
+          if (aborted) {
+            // User pressed Stop: keep whatever was already generated instead of
+            // overwriting it with an error. Drop only a still-empty placeholder.
+            if (last.content) msgs[msgs.length - 1] = { ...last, content: `${last.content}\n\n(已停止)` };
+            else msgs.pop();
+          } else {
+            msgs[msgs.length - 1] = { ...last, content: `❌ ${e}` };
+          }
+        }
         return msgs;
       });
     } finally {
@@ -779,18 +869,26 @@ const [timeFilter, setTimeFilter] = useState("all");
         return;
       }
       const stream = await nav.mediaDevices.getUserMedia({ audio: true });
-      const mediaRecorder = new MediaRecorder(stream, { mimeType: "audio/webm" });
+      let mediaRecorder: MediaRecorder;
+      try {
+        mediaRecorder = new MediaRecorder(stream, { mimeType: "audio/webm" });
+      } catch (e) {
+        // Construction failed (e.g. unsupported mimeType) — release the mic
+        stream.getTracks().forEach((t) => t.stop());
+        throw e;
+      }
       mediaRecorderRef.current = mediaRecorder;
       audioChunksRef.current = [];
       mediaRecorder.ondataavailable = (event) => { if (event.data.size > 0) audioChunksRef.current.push(event.data); };
       mediaRecorder.onstop = async () => {
         setIsRecording(false);
         const audioBlob = new Blob(audioChunksRef.current, { type: "audio/webm" });
-        const arrayBuffer = await audioBlob.arrayBuffer();
-        const uint8Array = new Uint8Array(arrayBuffer);
-        let binary = "";
-        for (let i = 0; i < uint8Array.byteLength; i++) binary += String.fromCharCode(uint8Array[i]);
-        const base64 = btoa(binary);
+        const base64 = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve((reader.result as string).split(",")[1] || "");
+          reader.onerror = () => reject(reader.error);
+          reader.readAsDataURL(audioBlob);
+        });
 
         try {
           const resp = await fetch(SIDECAR + "/v1/recognize_speech", {

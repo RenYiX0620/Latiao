@@ -12,14 +12,17 @@ export type SidecarData = Record<string, any>;
 
 /**
  * Call the sidecar via Rust IPC proxy (invoke). Returns parsed JSON.
+ * Times out after 30s so a hung Rust/sidecar request can't wedge the UI.
  */
 export async function sidecarFetch(path: string, method: "GET" | "POST" | "DELETE" = "GET", body?: unknown): Promise<SidecarData> {
   const { invoke } = await import("@tauri-apps/api/core");
-  const raw = await invoke("sidecar_proxy", {
+  const request = invoke("sidecar_proxy", {
     url: SIDECAR + path,
     method,
     body: body ? JSON.stringify(body) : null,
-  }) as string;
+  }) as Promise<string>;
+  const timeout = new Promise<never>((_, reject) => setTimeout(() => reject(new Error("sidecar_proxy timeout (30s)")), 30_000));
+  const raw = await Promise.race([request, timeout]);
   return JSON.parse(raw) as SidecarData;
 }
 

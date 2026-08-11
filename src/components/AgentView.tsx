@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import { ask } from "@tauri-apps/plugin-dialog";
 import { sidecarFetch } from "../utils/api";
 import { useTranslation } from "../i18n";
 
@@ -107,7 +108,7 @@ export default function AgentView({ activeAgent, setActiveAgent, showToast }: Ag
 
   const handleOpenFile = async (id: string, section?: string) => {
     try {
-      const url = "/v1/identity/open/" + id + (section ? "?section=" + section : "");
+      const url = "/v1/identity/open/" + encodeURIComponent(id) + (section ? "?section=" + encodeURIComponent(section) : "");
       const data = await sidecarFetch(url, "POST");
       if (data.status !== "ok") showToast(data.message || "打开失败");
     } catch { showToast(t("agent.conn_fail")); }
@@ -188,7 +189,8 @@ export default function AgentView({ activeAgent, setActiveAgent, showToast }: Ag
               {Array.isArray(a.tools) ? t("agent.tools_count", { count: a.tools.length }) : t("agent.tools_all")}
             </span>
             <button className="btn btn-sm btn-ghost" style={{ marginTop: 2 }}
-              onClick={() => {
+              onClick={(e) => {
+                e.stopPropagation();
                 if (a.id === activeAgent) return;
                 if (pendingSwitch === a.id) {
                   setActiveAgent(a.id);
@@ -202,7 +204,11 @@ export default function AgentView({ activeAgent, setActiveAgent, showToast }: Ag
             </button>
             {a.custom && (
               <button className="btn btn-sm btn-ghost" style={{ color: "var(--danger)", fontSize: 10 }}
-                onClick={() => handleDelete(a.id)}>{t("agent.delete")}</button>
+                onClick={async (e) => {
+                  e.stopPropagation();
+                  const ok = await ask(t("agent.delete") + ": " + (a.name.startsWith("agent.") ? t(a.name) : a.name) + "?", { title: t("agent.delete"), kind: "warning" });
+                  if (ok) handleDelete(a.id);
+                }}>{t("agent.delete")}</button>
             )}
           </div>
         </div>

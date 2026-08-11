@@ -68,9 +68,12 @@ export function useSkills(showToast: (msg: string) => void) {
 
   const deleteSkill = useCallback(async (key: string) => {
     try {
-      await sidecarFetch(`/v1/skills/${key}`, "DELETE");
-      setSkills(prev => prev.filter(s => s.key !== key));
-      showToast(t("skills.deleted"));
+      const data = await sidecarFetch(`/v1/skills/${key}`, "DELETE");
+      // Only remove locally when the server confirmed the delete
+      if (data.status === "ok") {
+        setSkills(prev => prev.filter(s => s.key !== key));
+        showToast(t("skills.deleted"));
+      }
     } catch (e) { console.error("Failed to delete skill:", e); }
   }, [showToast, t]);
 

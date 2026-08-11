@@ -1,8 +1,17 @@
-import { lazy, Suspense, useState } from "react";
+import { lazy, Suspense, useState, useEffect, useCallback, useRef } from "react";
 import { fetch } from "@tauri-apps/plugin-http";
 import { open, ask } from "@tauri-apps/plugin-dialog";
 import { useTranslation } from "../i18n";
 import type { HFModelResult, DownloadState, SetupIssue, LLMStatus } from "../types";
+
+/** A locally-downloaded model file discovered by the sidecar. */
+interface LocalModelInfo {
+  id: string;
+  name: string;
+  path: string;
+  size: string;
+  format: string;
+}
 
 const ReactMarkdown = lazy(() => import("react-markdown"));
 const SIDECAR = "http://127.0.0.1:8765";
@@ -122,18 +131,35 @@ interface Props {
 export default function LocalModelsTab(props: Props) {
   const { localLLMStatus, localModelId, setLocalModelId, setupCheck, hfSearch, setHfSearch, hfResults, searching, searchHF, downloadProgress, downloadModel, pauseDownload, cancelDownload, resumeDownload, startLocalLLM, stopLocalLLM, fixing, runFix, showToast, contextLimit, setContextLimit, contextEstimate, fetchContextEstimate } = props;
   const { t } = useTranslation();
-  const isRunning = localLLMStatus.status === "running";
-  const isStarting = localLLMStatus.status === "starting";
+  const isRunning = localLLMStatus?.status === "running";
+  const isStarting = localLLMStatus?.status === "starting";
   const [showSearch, setShowSearch] = useState(false);
   const [searchFilter, setSearchFilter] = useState("");
   const [detailModelId, setDetailModelId] = useState("");
   const [detailData, setDetailData] = useState<Record<string, unknown> | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
+  const [localModels, setLocalModels] = useState<LocalModelInfo[]>([]);
+
+  const fetchLocalModels = useCallback(async () => {
+    try {
+      const resp = await fetch(SIDECAR + "/v1/local-llm/models");
+      const data = await resp.json();
+      if (data.status === "ok" && Array.isArray(data.models)) {
+        setLocalModels(data.models as LocalModelInfo[]);
+      }
+    } catch { /* sidecar not ready yet - silently skip */ }
+  }, []);
+
+  // Refresh the local model list on mount and whenever a model finishes
+  // starting/stopping (so a freshly downloaded model shows up).
+  useEffect(() => { fetchLocalModels(); }, [fetchLocalModels, localLLMStatus.status]);
 
   const filteredResults = searchFilter ? hfResults.filter(m => m.tags?.some(t => t.toLowerCase().includes(searchFilter))) : hfResults;
 
   const openSearch = () => { setShowSearch(true); setHfSearch(""); setDetailModelId(""); setDetailData(null); searchHF(""); };
-  const fetchModelDetail = async (modelId: string) => { setDetailModelId(modelId); setDetailData(null); setDetailLoading(true); try { const resp = await fetch(SIDECAR + "/v1/local-llm/model-detail?model_id=" + encodeURIComponent(modelId)); setDetailData(await resp.json()); } catch { setDetailData({ status: "error", message: "加载失败" }); } setDetailLoading(false); };
+  // Monotonic request id so a slow detail response can't clobber a newer selection
+  const detailReqRef = useRef(0);
+  const fetchModelDetail = async (modelId: string) => { const reqId = ++detailReqRef.current; setDetailModelId(modelId); setDetailData(null); setDetailLoading(true); try { const resp = await fetch(SIDECAR + "/v1/local-llm/model-detail?model_id=" + encodeURIComponent(modelId)); const data = await resp.json(); if (reqId === detailReqRef.current) setDetailData(data); } catch { if (reqId === detailReqRef.current) setDetailData({ status: "error", message: "加载失败" }); } if (reqId === detailReqRef.current) setDetailLoading(false); };
   const deleteModelFile = async (modelId: string) => { try { const resp = await fetch(SIDECAR + "/v1/local-llm/delete-model", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model_id: modelId }) }); const data = await resp.json(); showToast(data.message || t("local.deleted")); if (data.status === "ok" && detailModelId) fetchModelDetail(detailModelId); } catch(e) { console.error(e); showToast(t("local.delete_fail")); } };
 
   return (
@@ -159,7 +185,7 @@ export default function LocalModelsTab(props: Props) {
             <div style={{ fontSize: 15, fontWeight: 600, color: isRunning ? "var(--success)" : isStarting ? "var(--warning)" : "var(--text-muted)" }}>{isRunning ? t("local.status_running") : isStarting ? t("local.status_starting") : t("local.status_stopped")}</div>
             <div style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 2 }}>{localLLMStatus.message || t("local.ready")}</div>
             {isRunning && <>
-              <div style={{ fontSize: 11, color: "var(--text-secondary)", marginTop: 6, fontFamily: "var(--font-mono)", display: "flex", gap: 16, flexWrap: "wrap" }}><span>🖥 {localLLMStatus.model_name || localLLMStatus.model_id}</span><span>🔌 :{localLLMStatus.port}</span><span>📐 {localLLMStatus.token_limit.toLocaleString()} tokens</span>{localLLMStatus.gpu_layers !== undefined && <span>🧮 {localLLMStatus.gpu_layers === -1 ? "Auto GPU" : `${localLLMStatus.gpu_layers} layers`}</span>}</div>
+              <div style={{ fontSize: 11, color: "var(--text-secondary)", marginTop: 6, fontFamily: "var(--font-mono)", display: "flex", gap: 16, flexWrap: "wrap" }}><span>🖥 {localLLMStatus.model_name || localLLMStatus.model_id}</span><span>🔌 :{localLLMStatus.port}</span><span>📐 {(localLLMStatus.token_limit ?? 0).toLocaleString()} tokens</span>{localLLMStatus.gpu_layers !== undefined && <span>🧮 {localLLMStatus.gpu_layers === -1 ? "Auto GPU" : `${localLLMStatus.gpu_layers} layers`}</span>}</div>
               <div style={{ marginTop: 8, display: "flex", gap: 8 }}><button className="btn btn-sm btn-primary" onClick={stopLocalLLM} style={{ padding: "6px 16px" }}>⏹ {t("local.stop_btn")}</button><button className="btn btn-sm btn-ghost" style={{ padding: "6px 16px", color: "var(--danger)" }} onClick={async () => { const mid = localLLMStatus.model_id; if (!mid) return; const ok = await ask(t("local.delete_model_confirm") + "\n" + mid); if (!ok) return; try { await stopLocalLLM(); const resp = await fetch(SIDECAR + "/v1/local-llm/delete-model", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model_id: mid }) }); const data = await resp.json(); showToast(data.message || t("local.deleted")); } catch(e) { console.error(e); showToast(t("local.delete_fail")); } }}>{t("local.delete_model_btn")}</button></div>
             </>}
           </div>
@@ -205,6 +231,26 @@ export default function LocalModelsTab(props: Props) {
               <button className="btn btn-md btn-primary" style={{ minWidth: 100, padding: "8px 16px" }} onClick={() => startLocalLLM()} disabled={isStarting}>{isStarting ? "⏳ " + t("local.starting") : "🚀 " + t("local.start")}</button>
             </div>
             <div style={{ fontSize: 10, color: "var(--text-muted)", marginTop: 8 }}>{t("local.start_hint")} {localLLMStatus.backend === "mlx" ? t("local.mlx") : t("local.llamacpp")}</div>
+            {localModels.length > 0 && (
+              <div style={{ marginTop: 12 }}>
+                <div style={{ fontSize: 11, fontWeight: 700, color: "var(--text-secondary)", marginBottom: 6, display: "flex", alignItems: "center", gap: 6 }}>
+                  📥 {t("local.downloaded_models")}
+                  <button className="btn btn-sm btn-ghost" style={{ fontSize: 9, padding: "1px 6px" }} onClick={fetchLocalModels} title={t("local.refresh")}>↻</button>
+                </div>
+                <div style={{ maxHeight: 220, overflowY: "auto" }} className="custom-scrollbar">
+                  {localModels.map(m => (
+                    <div key={m.path} style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 10px", borderRadius: 8, marginBottom: 4, background: "var(--bg-input)", border: "1px solid var(--border-default)" }}>
+                      <span style={{ fontSize: 9, fontWeight: 700, fontFamily: "var(--font-mono)", padding: "2px 6px", borderRadius: 4, background: m.format === "gguf" ? "var(--accent-soft)" : "rgba(99,102,241,0.12)", color: m.format === "gguf" ? "var(--accent)" : "#6366f1", minWidth: 38, textAlign: "center", textTransform: "uppercase" }}>{m.format}</span>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontSize: 11, fontWeight: 500, color: "var(--text-primary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{m.name}</div>
+                        <div style={{ fontSize: 9, color: "var(--text-muted)" }}>{m.size}</div>
+                      </div>
+                      <button className="btn btn-sm btn-primary" style={{ padding: "4px 12px", fontSize: 10, flexShrink: 0 }} onClick={() => startLocalLLM(m.name + (m.format === "gguf" ? ".gguf" : ".mlx"))} disabled={isStarting}>🚀 {t("local.load")}</button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
         </div>
       )}

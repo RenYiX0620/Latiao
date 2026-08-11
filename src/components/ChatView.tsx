@@ -59,6 +59,14 @@ export default memo(function ChatView({
   const promptRef = useRef(prompt);
   useEffect(() => { promptRef.current = prompt; }, [prompt]);
 
+  // Sync external prompt changes (e.g. speech recognition, session switch,
+  // send clearing) back into the uncontrolled contentEditable div. Only write
+  // when out of sync so we never fight the user's own typing (onInput).
+  useEffect(() => {
+    const el = editableRef.current;
+    if (el && el.textContent !== prompt) el.textContent = prompt;
+  }, [prompt]);
+
   const handleEditableInput = useCallback(() => {
     const el = editableRef.current;
     if (!el) return;
@@ -98,14 +106,14 @@ export default memo(function ChatView({
           messages.map((msg, i) => {
             if (msg.type === "tool_call" || msg.role === "tool") {
               return (
-                <div key={i} className="msg">
+                <div key={msg.id ?? i} className="msg">
                   <div className="msg-role">{t("chat.role_assistant")}</div>
                   <ToolCallBubble msg={msg} onConfirm={confirmTool} />
                 </div>
               );
             }
             return (
-              <div key={i} className={`msg${msg.role === "user" ? " user" : ""}`}>
+              <div key={msg.id ?? i} className={`msg${msg.role === "user" ? " user" : ""}`}>
                 <div className="msg-role">{msg.role === "user" ? t("chat.role_you") : t("chat.role_assistant")}</div>
                 {msg.role === "user" && msg.imagePreview ? (
                   <div>
@@ -124,7 +132,7 @@ export default memo(function ChatView({
                                 href={href}
                                 onClick={(e) => {
                                   e.preventDefault();
-                                  if (href) openUrl(href);
+                                  if (href) openUrl(href).catch(() => {});
                                 }}
                                 style={{ color: "#2563eb", cursor: "pointer", textDecoration: "underline" }}
                                 {...props}
@@ -144,7 +152,7 @@ export default memo(function ChatView({
                           },
                         }}
                       >
-                        {(msg.content || "").replace(/```tool\s+\w+\s*\n\{[^}]*\}\n```/g, "").replace(/^```\s*\n?/gm, "").trim()}
+                        {(msg.content || "").replace(/```tool\s+\w+\s*\n\{[^}]*\}\n```/g, "").trim()}
                       </ReactMarkdown>
                     ) : (msg.content)}
                   </div>
