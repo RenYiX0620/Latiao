@@ -244,7 +244,8 @@ async def _match_skill(user_query: str) -> str | None:
         if not api_url:
             return None
         async with httpx.AsyncClient(timeout=httpx.Timeout(10)) as client:
-            r = await client.post(api_url, json={
+            async with _local_llm_serialized(api_url):
+                r = await client.post(api_url, json={
                 "model": SUBAGENT_MODEL,
                 "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": 10,
@@ -317,6 +318,40 @@ def _spawn(coro) -> asyncio.Task:
     _background_tasks.add(t)
     t.add_done_callback(_background_tasks.discard)
     return t
+
+
+# llama_cpp.server 是单模型实例，多个流式生成请求并发时会崩溃
+# （连接被 peer 关闭 → 上层表现为"空响应/任务执行一半停止"）。
+# 主对话 agent 循环与 cron 任务并发调用本地模型是实际触发场景——
+# 所有打到本地端口的模型请求必须串行执行。
+_local_llm_stream_lock = asyncio.Lock()
+
+
+def _is_local_llm_url(api_url: str | None) -> bool:
+    return bool(api_url) and ("127.0.0.1" in api_url or "localhost" in api_url)
+
+
+@asynccontextmanager
+async def _local_llm_serialized(api_url: str | None):
+    """非流式本地请求串行化：本地 llama.cpp 时持锁，云端不设限。"""
+    _local = _is_local_llm_url(api_url)
+    if _local:
+        await _local_llm_stream_lock.acquire()
+    try:
+        yield
+    finally:
+        if _local:
+            _local_llm_stream_lock.release()
+
+
+@asynccontextmanager
+async def _local_llm_stream(client, api_url: str, body: dict, headers: dict):
+    """流式请求本地/云端模型。本地 llama.cpp 时持锁直到流读完，
+    防止并发流式生成导致 server 崩溃（连接被 peer 关闭）。"""
+    async with _local_llm_serialized(api_url):
+        async with client.stream("POST", api_url, json=body, headers=headers) as r:
+            r.raise_for_status()  # httpx 不自动抛 4xx/5xx，必须显式检查
+            yield r
 
 # ═══════════════════════════════════════════════════════
 #  Multi-Agent System: LaTiao orchestrator + specialists
@@ -861,7 +896,8 @@ async def _delegate_task(agent_type: str, task: str) -> str:
                     "frequency_penalty": 0.6,
                 "stop": ["<|im_end|>", "<|endoftext|>", "<end_of_turn>", "<eos>", "</s>"],
                 }
-                r = await client.post(api_url, json=body, headers=sub_headers)
+                async with _local_llm_serialized(api_url):
+                    r = await client.post(api_url, json=body, headers=sub_headers)
                 if r.status_code != 200:
                     return f"[Sub-agent: {agent_type}] HTTP {r.status_code}"
 
@@ -2551,8 +2587,8 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
 
             streamed_text = ""
             logger.info(f"[LOCAL-AGENT] Iteration {iteration}: calling LLM, msgs={len(loop_msgs)}, first_user_content_len={len(loop_msgs[-1].get('content','')) if loop_msgs else 0}")
-            async with client.stream("POST", api_url, json=body, headers=headers) as r:
-                r.raise_for_status()  # httpx 不自动抛 4xx/5xx，必须显式检查
+            # 本地 llama.cpp 并发流式请求会崩溃 → _local_llm_stream 内部串行化
+            async with _local_llm_stream(client, api_url, body, headers) as r:
                 async for line in r.aiter_lines():
                     if line and line.startswith("data: "):
                         data_str = line[6:]
@@ -3113,7 +3149,8 @@ async def chat_completion(request: Request):
                             loop_msgs.insert(0, {"role": "system", "content": local_tools_prompt})
 
                     if use_prompt_tools:
-                        resp = await client.post(api_url, json={
+                        async with _local_llm_serialized(api_url):
+                            resp = await client.post(api_url, json={
                             "model": model, "messages": loop_msgs,
                             "max_tokens": _resolve_max_tokens(model), "stream": False,
                             "temperature": 0.5,
@@ -4466,7 +4503,8 @@ async def _execute_cron_job(job: dict):
                     # 本地模型不支持原生 function calling，只对云端发送 tools
                     req_body["tools"] = active_tools
                     req_body["tool_choice"] = "auto"
-                resp = await client.post(api_url, json=req_body, headers=headers)
+                async with _local_llm_serialized(api_url):
+                    resp = await client.post(api_url, json=req_body, headers=headers)
                 resp.raise_for_status()  # httpx 不自动抛 4xx/5xx，必须显式检查
                 resp_data = resp.json()
                 choices = resp_data.get("choices", [])
