@@ -113,6 +113,9 @@ class LocalLLMEngine:
         self.server_port = 1235
         self.server_status = "stopped"  # stopped | starting | running | error
         self.status_message = ""
+        # User explicitly requested a stop — get_status() must NOT flip back to
+        # "running" via the reconnect probe while the port is still draining.
+        self._explicit_stop = False
         self.has_image_support = False
         # _find_gguf 结果缓存（30s TTL），避免重复全盘 rglob 扫描
         self._gguf_find_cache: dict[str, tuple[float, str | None]] = {}
@@ -647,7 +650,12 @@ class LocalLLMEngine:
         # If engine thinks we're stopped but a model server is still on our port
         # (e.g. sidecar restarted, model process outlived it), reconnect so the UI
         # shows accurate status without waiting for a chat request.
-        if self.server_status == "stopped" and self._probe_port(self.server_port):
+        # BUT: never do this right after the user explicitly pressed stop — the
+        # model process may still be draining (killing a multi-GB model takes a
+        # moment) and the port probe would flip the UI back to "running", making
+        # it look like the stop did nothing.
+        if (self.server_status == "stopped" and not self._explicit_stop
+                and self._probe_port(self.server_port)):
             self.server_status = "running"
             self.status_message = "(reconnected after sidecar restart)"
             if not self._active_backend:
@@ -1116,6 +1124,7 @@ class LocalLLMEngine:
         # start/stop 主流程持锁，避免并发 start/stop 竞态
         # （RLock：内部错误路径会再调 stop_model）
         with self._proc_lock:
+            self._explicit_stop = False
             # Kill any stale process on the target port before starting
             self._kill_port(port)
             if self._process and self._process.poll() is None:
@@ -1195,6 +1204,15 @@ class LocalLLMEngine:
                 self._process = None
             # Belt-and-suspenders: ensure port is actually free
             self._kill_port(self.server_port)
+            self._explicit_stop = True
+            # Wait for the port to truly drain before reporting status. Without
+            # this, get_status() runs while the dying process still holds the
+            # socket and the reconnect probe flips status back to "running" —
+            # the UI then shows the model as still loaded after pressing stop.
+            for _ in range(10):
+                if not self._probe_port(self.server_port, timeout=1):
+                    break
+                time.sleep(0.5)
             self.server_status = "stopped"
             self.status_message = "已停止"
             self.current_model_id = ""
