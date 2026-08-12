@@ -116,6 +116,13 @@ class LocalLLMEngine:
         # User explicitly requested a stop — get_status() must NOT flip back to
         # "running" via the reconnect probe while the port is still draining.
         self._explicit_stop = False
+        # External engine mode (LM Studio / Ollama): when an external
+        # OpenAI-compatible server is running, Latiao forwards local-model
+        # requests to it instead of launching its own llama.cpp process.
+        # Needed for models whose GGUF architecture (e.g. muse-glimmer) the
+        # bundled llama-cpp-python does not support yet, but LM Studio does.
+        self._external_engine = ""   # "" | "lmstudio" | "ollama"
+        self._external_url = ""      # e.g. "http://127.0.0.1:1234/v1"
         self.has_image_support = False
         # _find_gguf 结果缓存（30s TTL），避免重复全盘 rglob 扫描
         self._gguf_find_cache: dict[str, tuple[float, str | None]] = {}
@@ -675,6 +682,14 @@ class LocalLLMEngine:
         }
 
     def is_running(self) -> bool:
+        # External engine mode: rely on the external server (no own process).
+        if self._external_engine and self._external_url:
+            try:
+                import urllib.request
+                urllib.request.urlopen(f"{self._external_url}/models", timeout=3)
+                return True
+            except Exception:
+                return False
         if not self._process or self._process.poll() is not None:
             return False
         try:
@@ -685,6 +700,10 @@ class LocalLLMEngine:
             return False
 
     def get_api_url(self) -> str:
+        # External engine mode: requests go to LM Studio / Ollama, not our own
+        # llama.cpp process (which may not support the model's architecture).
+        if self._external_engine and self._external_url:
+            return self._external_url.rstrip("/")
         if self.is_running():
             return f"http://127.0.0.1:{self.server_port}/v1"
         # Engine was restarted — check if a model server is still running on our port
@@ -696,6 +715,28 @@ class LocalLLMEngine:
                 self._active_backend = self.backend  # best guess: platform default
             return f"http://127.0.0.1:{self.server_port}/v1"
         return ""
+
+    def _probe_external_engine(self) -> tuple[str, str, str] | None:
+        """Detect an external OpenAI-compatible local server (LM Studio 1234,
+        Ollama 11434). Returns (engine_name, base_url, loaded_model_id) or None.
+        Requires the server to have a model loaded (LM Studio must have a model
+        running in its UI; Ollama requires one pulled)."""
+        import urllib.request
+        candidates = [
+            ("lmstudio", "http://127.0.0.1:1234/v1"),
+            ("ollama", "http://127.0.0.1:11434/v1"),
+        ]
+        for name, base in candidates:
+            try:
+                with urllib.request.urlopen(f"{base}/models", timeout=2) as resp:
+                    data = json.loads(resp.read().decode("utf-8", errors="replace"))
+                models = data.get("data") or []
+                if models:
+                    mid = models[0].get("id", "")
+                    return (name, base, mid)
+            except Exception:
+                continue
+        return None
 
     @staticmethod
     def _probe_port(port: int, timeout: float = 5) -> bool:
@@ -1125,6 +1166,30 @@ class LocalLLMEngine:
         # （RLock：内部错误路径会再调 stop_model）
         with self._proc_lock:
             self._explicit_stop = False
+
+            # ── External engine mode (LM Studio / Ollama) ──
+            # If an external server is running WITH a model loaded, use it for
+            # local-model requests. This bypasses llama-cpp-python entirely, so
+            # models whose GGUF architecture isn't supported by the bundled
+            # build (e.g. muse-glimmer) can still be used via LM Studio.
+            external = self._probe_external_engine()
+            if external:
+                eng_name, eng_url, eng_model = external
+                self._external_engine = eng_name
+                self._external_url = eng_url
+                self.current_model_id = model_id
+                self.current_model_name = Path(model_id).stem
+                self.server_status = "running"
+                self.status_message = f"通过 {eng_name} 加载 ({eng_model})"
+                self._active_backend = eng_name
+                self.server_port = port  # keep for status display
+                self.has_image_support = False
+                return self.get_status()
+
+            # No external engine — clear stale external mode before self-start
+            self._external_engine = ""
+            self._external_url = ""
+
             # Kill any stale process on the target port before starting
             self._kill_port(port)
             if self._process and self._process.poll() is None:
@@ -1187,6 +1252,18 @@ class LocalLLMEngine:
 
     def stop_model(self) -> dict:
         with self._proc_lock:
+            # External engine mode: the model runs inside LM Studio/Ollama —
+            # never kill their process or their port, just drop our state.
+            if self._external_engine:
+                self._external_engine = ""
+                self._external_url = ""
+                self.server_status = "stopped"
+                self.status_message = "已停止（外部引擎未受影响）"
+                self.current_model_id = ""
+                self.current_model_name = ""
+                self._active_backend = ""
+                self.has_image_support = False
+                return self.get_status()
             if self._process:
                 try:
                     self._process.terminate()
