@@ -894,7 +894,7 @@ async def _delegate_task(agent_type: str, task: str) -> str:
                     "stream": False,
                     "temperature": 0.5,
                     "frequency_penalty": 0.6,
-                "stop": ["<|im_end|>", "<|endoftext|>", "<end_of_turn>", "<eos>", "</s>"],
+                "stop": ["<|im_end|>", "<|endoftext|>", "<end_of_turn>", "<eos>"],
                 }
                 async with _local_llm_serialized(api_url):
                     r = await client.post(api_url, json=body, headers=sub_headers)
@@ -2020,7 +2020,7 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                 "max_tokens": _resolve_max_tokens(model), "stream": True,
                 "temperature": 0.5,
                 "frequency_penalty": 0.6,
-                "stop": ["<|im_end|>", "<|endoftext|>", "<end_of_turn>", "<eos>", "</s>"],
+                "stop": ["<|im_end|>", "<|endoftext|>", "<end_of_turn>", "<eos>"],
             }
 
             streamed_text = ""
@@ -2582,7 +2582,7 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                 "max_tokens": _resolve_max_tokens(model), "stream": True,
                 "temperature": 0.5,
                 "frequency_penalty": 0.6,
-                "stop": ["<|im_end|>", "<|endoftext|>", "<end_of_turn>", "<eos>", "</s>"],
+                "stop": ["<|im_end|>", "<|endoftext|>", "<end_of_turn>", "<eos>"],
             }
 
             streamed_text = ""
@@ -3155,7 +3155,7 @@ async def chat_completion(request: Request):
                             "max_tokens": _resolve_max_tokens(model), "stream": False,
                             "temperature": 0.5,
                             "frequency_penalty": 0.6,
-                "stop": ["<|im_end|>", "<|endoftext|>", "<end_of_turn>", "<eos>", "</s>"],
+                "stop": ["<|im_end|>", "<|endoftext|>", "<end_of_turn>", "<eos>"],
                         }, headers=headers)
                     else:
                         resp = await client.post(api_url, json={
@@ -3164,7 +3164,7 @@ async def chat_completion(request: Request):
                             "max_tokens": 2048, "stream": False,
                             "temperature": 0.5,
                             "frequency_penalty": 0.6,
-                "stop": ["<|im_end|>", "<|endoftext|>", "<end_of_turn>", "<eos>", "</s>"],
+                "stop": ["<|im_end|>", "<|endoftext|>", "<end_of_turn>", "<eos>"],
                         }, headers=headers)
                     resp.raise_for_status()  # httpx 不自动抛 4xx/5xx，必须显式检查
                     resp_data = resp.json()
@@ -3302,7 +3302,7 @@ async def chat_completion(request: Request):
                 "model": model, "messages": messages, "max_tokens": 1024,
                 "temperature": 0.5,
                 "frequency_penalty": 0.6,
-                "stop": ["<|im_end|>", "<|endoftext|>", "<end_of_turn>", "<eos>", "</s>"],
+                "stop": ["<|im_end|>", "<|endoftext|>", "<end_of_turn>", "<eos>"],
             }, headers=headers)
             resp.raise_for_status()  # httpx 不自动抛 4xx/5xx，必须显式检查
             resp_data = resp.json()
@@ -4497,7 +4497,7 @@ async def _execute_cron_job(job: dict):
                     "max_tokens": 2048, "stream": False,
                     "temperature": 0.5,
                     "frequency_penalty": 0.6,
-                "stop": ["<|im_end|>", "<|endoftext|>", "<end_of_turn>", "<eos>", "</s>"],
+                "stop": ["<|im_end|>", "<|endoftext|>", "<end_of_turn>", "<eos>"],
                 }
                 if not is_local:
                     # 本地模型不支持原生 function calling，只对云端发送 tools
