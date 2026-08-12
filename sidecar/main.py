@@ -348,6 +348,13 @@ async def _local_llm_serialized(api_url: str | None):
 async def _local_llm_stream(client, api_url: str, body: dict, headers: dict):
     """流式请求本地/云端模型。本地 llama.cpp 时持锁直到流读完，
     防止并发流式生成导致 server 崩溃（连接被 peer 关闭）。"""
+    # 诊断 dump: 本地请求时保存原始 body,便于对比重放
+    if _is_local_llm_url(api_url):
+        try:
+            with open("/tmp/llm_body_dump.json", "w", encoding="utf-8") as _f:
+                _f.write(json.dumps({"api_url": api_url, "body": body}, ensure_ascii=False, indent=1))
+        except Exception:
+            pass
     async with _local_llm_serialized(api_url):
         async with client.stream("POST", api_url, json=body, headers=headers) as r:
             r.raise_for_status()  # httpx 不自动抛 4xx/5xx，必须显式检查
@@ -2596,6 +2603,7 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
             }
 
             streamed_text = ""
+            _raw_delta_count = 0  # 诊断: 统计收到的 delta 数(空响应时判断是模型真空还是解析丢了)
             logger.info(f"[LOCAL-AGENT] Iteration {iteration}: calling LLM, msgs={len(loop_msgs)}, first_user_content_len={len(loop_msgs[-1].get('content','')) if loop_msgs else 0}")
             # 本地 llama.cpp 并发流式请求会崩溃 → _local_llm_stream 内部串行化
             async with _local_llm_stream(client, api_url, body, headers) as r:
@@ -2610,6 +2618,7 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                             if not choices:
                                 continue  # usage-only chunk（仅 token 统计，无 delta）
                             delta = choices[0].get("delta", {})
+                            _raw_delta_count += 1
                             content = delta.get("content", "")
                             # LM Studio/方舟等返回 reasoning_content,OpenAI o 系列返回 reasoning
                             reasoning = delta.get("reasoning") or delta.get("reasoning_content") or ""
@@ -2740,8 +2749,8 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                 text_only_streak += 1
                 continue
             if not streamed_text.strip() and text_only_streak < max_stagnation:
-                # Empty response from local model — retry with a nudge
-                logger.warning(f"[LOCAL-AGENT] Iteration {iteration}: empty response, retrying")
+                # Empty response from local model - retry with a nudge
+                logger.warning(f"[LOCAL-AGENT] Iteration {iteration}: empty response, retrying (streamed_text={len(streamed_text)} chars, raw_deltas={_raw_delta_count}, tool_calls={len(tool_calls)}, msgs={len(current_msgs)}, last_role={current_msgs[-1].get('role') if current_msgs else '?'})")
                 nudge_text = _get_localized_text(_detect_user_language(_extract_last_user_text(current_msgs)), {
                     "zh": "⚠️ 你上一轮的回复是空的。请直接回复用户，或者使用工具完成任务。如果需要调用工具，使用 ```tool 格式。",
                     "en": "⚠️ Your last response was empty. Please respond to the user directly, or use a tool. To call a tool, use the ```tool format.",

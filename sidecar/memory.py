@@ -427,7 +427,9 @@ async def _refine_learnings(tool_name: str, args: dict, result: str, session_id:
         if cloud_config and cloud_config.get("endpoint"):
             refine_model = cloud_config.get("model", SUBAGENT_MODEL)
         async with httpx.AsyncClient(timeout=httpx.Timeout(15)) as client:
-            r = await client.post(api_url, json={
+            # 本地 llama.cpp 并发请求会崩溃 -> 走 main 的串行锁
+            async with main._local_llm_serialized(api_url):
+                r = await client.post(api_url, json={
                 "model": refine_model,
                 "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": 80,
@@ -479,6 +481,7 @@ def _is_duplicate_learning(summary: str, threshold: float = 0.7) -> bool:
 async def _maybe_generate_skill(tool_name: str, args: dict, result: str):
     """Auto-generate a SKILL.md when the same tool succeeds repeatedly.
     Inspired by MUSE-Autoskill: Agent self-evolves by creating reusable skills."""
+    import main  # lazy: 本地请求串行锁
     # Only track read_file for skill generation (most reusable pattern)
     if tool_name not in ("read_file", "write_file", "run_cmd"):
         return
@@ -520,7 +523,9 @@ async def _maybe_generate_skill(tool_name: str, args: dict, result: str):
                 f"技能文档 (SKILL.md):"
             )
             async with httpx.AsyncClient(timeout=httpx.Timeout(30)) as client:
-                r = await client.post(
+                # 本地 llama.cpp 并发请求会崩溃 -> 走 main 的串行锁
+                async with main._local_llm_serialized(LM_STUDIO_URL):
+                    r = await client.post(
                     LM_STUDIO_URL,
                     json={
                         "model": SUBAGENT_MODEL,
@@ -662,13 +667,16 @@ def _extract_learnings_heuristic(user_text: str, session_id: str) -> int:
 
 async def _summarize_learning(raw_content: str) -> str:
     """Use LLM to compress a raw learning into a concise semantic summary (1-2 sentences)."""
+    import main  # lazy: 本地请求串行锁
     try:
         prompt = (
             "将以下知识片段压缩为一到两句中文摘要，只保留可操作的结论，去掉冗余细节。\n\n"
             f"原文: {raw_content[:500]}\n\n摘要:"
         )
         async with httpx.AsyncClient(timeout=httpx.Timeout(30)) as client:
-            r = await client.post(
+            # 本地 llama.cpp 并发请求会崩溃 -> 走 main 的串行锁
+            async with main._local_llm_serialized(LM_STUDIO_URL):
+                r = await client.post(
                 LM_STUDIO_URL,
                 json={
                     "model": SUBAGENT_MODEL,
