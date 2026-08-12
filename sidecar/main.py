@@ -27,6 +27,15 @@ if len(sys.argv) > 1 and sys.argv[1] == "--mx-query":
     sys.exit(0)
 
 import os
+# bundled Python 缺系统 CA 证书链 → HTTPS 握手失败（whisper 模型下载、
+# huggingface_hub 等走 requests/httpx 的请求）。用 certifi 的 CA 兜底，
+# 必须在任何 HTTP 库初始化前设置。
+try:
+    import certifi as _certifi
+    os.environ.setdefault("SSL_CERT_FILE", _certifi.where())
+    os.environ.setdefault("REQUESTS_CA_BUNDLE", _certifi.where())
+except ImportError:
+    pass
 if sys.platform == "win32" and getattr(sys, 'frozen', False):
     if sys.stdout is None:
         log_dir = os.path.join(os.environ.get("TEMP", "."))
@@ -3466,11 +3475,23 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
 # ── Whisper model cache (lazy-load once, reuse across requests) ──
 _whisper_model = None
 
+_WHISPER_DIR = Path.home() / ".local-ai-os" / "whisper-tiny"
+
+
 def _get_whisper_model():
     global _whisper_model
     if _whisper_model is None:
         from faster_whisper import WhisperModel
-        _whisper_model = WhisperModel("tiny", device="cpu", compute_type="int8")
+        # 优先本地目录加载: huggingface.co 在国内不可达(502),huggingface_hub
+        # 的 httpx 也不吃 SSL_CERT_FILE 环境变量。已预下载模型文件到
+        # ~/.local-ai-os/whisper-tiny/(镜像下载,见部署脚本),离线可用。
+        local_model = _WHISPER_DIR / "model.bin"
+        if local_model.exists():
+            _whisper_model = WhisperModel(str(_WHISPER_DIR), device="cpu", compute_type="int8")
+        else:
+            # fallback: 尝试镜像在线下载
+            os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+            _whisper_model = WhisperModel("tiny", device="cpu", compute_type="int8")
     return _whisper_model
 
 
