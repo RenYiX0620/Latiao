@@ -2693,7 +2693,19 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
             )
             if has_recent_tool_result and text_only_streak < max_stagnation and streamed_text.strip():
                 # Model returned text after a tool result but didn't call another tool.
-                # It might think the task is done when it's not. Force one more check.
+                # 推理模型(Muse/Qwen3.5)经常先输出 <think> 思考 + 规划文字,
+                # 下一轮才实际调用工具--这不是停滞,不该 nudge 打断节奏。
+                # 只有当模型明确在"闲聊/总结"而非"规划下一步工具调用"时才 nudge。
+                _planning_signals = ("tool", "工具", "读取", "查询", "搜索", "执行", "调用",
+                                     "read_file", "list_dir", "run_cmd", "write_file",
+                                     "search", "tavily", "mx_query", "step", "步骤", "下一步")
+                _is_planning = any(sig in streamed_text.lower() for sig in _planning_signals)
+                if _is_planning and text_only_streak < 2:
+                    # 模型在规划下一步,给它一轮空间自然调工具,不 nudge
+                    current_msgs.append({"role": "assistant", "content": streamed_text.strip()})
+                    text_only_streak += 1
+                    text_output_delivered = True
+                    continue
                 logger.info(f"[LOCAL-AGENT] Iteration {iteration}: model returned text after tool result, pushing for continuation")
                 current_msgs.append({
                     "role": "system",
