@@ -168,6 +168,9 @@ const [timeFilter, setTimeFilter] = useState("all");
   const fileInputRef = useRef<HTMLInputElement>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
+  // 边录边转写: 录音中是否仍在进行 + 上一块是否还在识别(串行,避免堆积)
+  const isRecordingRef = useRef(false);
+  const transcribingRef = useRef(false);
   /* ── Persistence: debounce during SSE streaming, immediate otherwise ── */
   const isProcessingRef = useRef(isProcessing);
   isProcessingRef.current = isProcessing;
@@ -896,16 +899,43 @@ const [timeFilter, setTimeFilter] = useState("all");
       }
       mediaRecorderRef.current = mediaRecorder;
       audioChunksRef.current = [];
-      mediaRecorder.ondataavailable = (event) => { if (event.data.size > 0) audioChunksRef.current.push(event.data); };
+      isRecordingRef.current = true;
+
+      // 录音中每 3 秒一块,边录边转写追加到输入框(停止后用完整音频覆盖为最终准确文本)
+      const blobToBase64 = (blob: Blob): Promise<string> => new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve((reader.result as string).split(",")[1] || "");
+        reader.onerror = () => reject(reader.error);
+        reader.readAsDataURL(blob);
+      });
+      const transcribeChunk = async (blob: Blob) => {
+        if (transcribingRef.current) return; // 上一块还在识别,跳过这块避免堆积
+        transcribingRef.current = true;
+        try {
+          const base64 = await blobToBase64(blob);
+          const resp = await fetch(SIDECAR + "/v1/recognize_speech", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ audio_base64: base64, mime_type: "audio/webm" }),
+          });
+          const data = await resp.json();
+          if (data.status === "success" && data.text && data.text !== "(未识别到语音内容)") {
+            setPrompt(prev => (prev ? prev + " " : "") + data.text);
+          }
+        } catch { /* 实时块识别失败静默,最终完整识别兜底 */ }
+        finally { transcribingRef.current = false; }
+      };
+
+      mediaRecorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          audioChunksRef.current.push(event.data);
+          if (isRecordingRef.current) transcribeChunk(event.data);
+        }
+      };
       mediaRecorder.onstop = async () => {
+        isRecordingRef.current = false;
         setIsRecording(false);
         const audioBlob = new Blob(audioChunksRef.current, { type: "audio/webm" });
-        const base64 = await new Promise<string>((resolve, reject) => {
-          const reader = new FileReader();
-          reader.onload = () => resolve((reader.result as string).split(",")[1] || "");
-          reader.onerror = () => reject(reader.error);
-          reader.readAsDataURL(audioBlob);
-        });
+        const base64 = await blobToBase64(audioBlob);
 
         try {
           const resp = await fetch(SIDECAR + "/v1/recognize_speech", {
@@ -914,12 +944,13 @@ const [timeFilter, setTimeFilter] = useState("all");
           });
           const data = await resp.json();
           if (data.text) {
+            // 完整音频识别更准 → 覆盖实时追加的文本
             setPrompt(data.text);
           }
         } catch (e) { console.error(e); showToast(t("toast.speech_fail")); }
         stream.getTracks().forEach((t) => t.stop());
       };
-      mediaRecorder.start();
+      mediaRecorder.start(3000); // 3s 一块,支持边录边转写
       setIsRecording(true);
     } catch {
       setIsRecording(false);
