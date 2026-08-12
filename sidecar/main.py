@@ -1824,6 +1824,16 @@ async def _handle_tool_execution(tc: dict, current_msgs: list, session_id: str,
     elif reflection_note:
         tool_content = f"{result}\n\n[Self-Reflection: {reflection_note}]"
 
+    # 截断过长的工具结果:本地模型上下文有限(8K-32K tokens),
+    # 39KB 的 raw.json 全塞进去会导致输入超长 -> 空响应。
+    # 保留前 3000 字符(够模型理解数据结构)+ 提示完整数据已保存。
+    MAX_TOOL_RESULT = 3000
+    if len(tool_content) > MAX_TOOL_RESULT:
+        tool_content = (
+            tool_content[:MAX_TOOL_RESULT]
+            + f"\n\n... (工具结果过长,已截断。完整结果 {len(result)} 字符已记录,"
+            + "如需查看特定部分请用 read_file 分段读取对应文件。)"
+        )
     current_msgs.append({"role": "tool", "tool_call_id": call_id, "content": tool_content})
     return verify_failed, events
 

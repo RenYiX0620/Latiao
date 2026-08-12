@@ -52,6 +52,25 @@ def execute(args: dict) -> str:
     if os.path.basename(p) in _BLOCKED_FILE_NAMES:
         return f"⛔ Blocked: 不允许读取敏感文件 - {p}"
     try:
+        # 先检测是否为二进制文件(xlsx/zip/png 等),避免 utf-8 codec 报错
+        # 让模型困惑。读前 1KB 探测 NUL 字节或已知二进制魔数。
+        _BINARY_EXTS = {".xlsx", ".xls", ".pdf", ".png", ".jpg", ".jpeg", ".gif",
+                        ".bmp", ".webp", ".zip", ".gz", ".tar", ".7z", ".rar",
+                        ".mp3", ".mp4", ".mov", ".avi", ".woff", ".woff2",
+                        ".ttf", ".otf", ".icns", ".ico", ".class", ".so", ".dylib", ".dll", ".exe"}
+        ext = os.path.splitext(p)[1].lower()
+        is_binary = ext in _BINARY_EXTS
+        if not is_binary:
+            # 探测文件内容:前 1024 字节含 NUL -> 二进制
+            with open(p, "rb") as bf:
+                head = bf.read(1024)
+            if b"\x00" in head:
+                is_binary = True
+        if is_binary:
+            return (f"⚠️ 这是二进制文件({ext or '未知格式'}),无法作为文本读取。\n"
+                    f"文件: {p}\n"
+                    f"如需查看数据,请读取对应的文本格式文件(如 _raw.json / _description.txt)。")
+
         with open(p, "r", encoding="utf-8") as f:
             content = f.read(MAX_READ_SIZE + 1)
         if len(content) > MAX_READ_SIZE:
@@ -64,5 +83,9 @@ def execute(args: dict) -> str:
         return content
     except FileNotFoundError:
         return f"错误：文件不存在 - {p}"
+    except UnicodeDecodeError:
+        return (f"⚠️ 文件编码不是 UTF-8,无法作为文本读取。\n"
+                f"文件: {p}\n"
+                f"如需查看数据,请读取对应的文本格式文件(如 _raw.json / _description.txt)。")
     except Exception as e:
         return f"错误：{e}"
