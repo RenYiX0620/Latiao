@@ -2054,6 +2054,12 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
             if stagnation_warning:
                 current_msgs.append({"role": "system", "content": stagnation_warning})
 
+            # DeepSeek 推理模型: 每轮迭代前确保 tool_calls 的 assistant
+            # 消息带 reasoning_content(旧消息或思考文本场景)
+            for _m in current_msgs:
+                if (_m.get("role") == "assistant" and _m.get("tool_calls")
+                        and "reasoning_content" not in _m):
+                    _m["reasoning_content"] = ""
             body = {
                 "model": model, "messages": current_msgs,
                 "tools": active_tools, "tool_choice": "auto",
@@ -2064,6 +2070,7 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
             }
 
             streamed_text = ""
+            reasoning_text = ""  # 累积 reasoning_content——DeepSeek 推理模型要求传回
             tool_call_bufs: dict[int, dict] = {}
 
             async with client.stream("POST", api_url, json=body, headers=headers) as r:
@@ -2100,6 +2107,7 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                             elif reasoning:
                                 # Reasoning model (Qwen3.6, DeepSeek-R1, etc.) — stream thinking as content
                                 # so the UI doesn't appear frozen during the thinking phase
+                                reasoning_text += reasoning
                                 streamed_text += reasoning
                                 if len(_deduplicate_response(streamed_text)) < len(streamed_text):
                                     continue
@@ -2149,6 +2157,9 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                 current_msgs.append({
                     "role": "assistant",
                     "content": _deduplicate_response(streamed_text) if streamed_text else None,
+                    # DeepSeek 推理模型: tool_calls 的 assistant 消息必须带
+                    # reasoning_content,否则下一轮 400
+                    "reasoning_content": reasoning_text,
                     "tool_calls": tool_calls,
                 })
                 has_called_tool = True
@@ -3083,6 +3094,13 @@ async def chat_completion(request: Request):
 
     # Assemble full message context (identity, env, skills, agent, image)
     messages = _build_chat_messages(body, messages, matched_skill)
+    # DeepSeek 推理模型(thinking mode)要求: content 为 null 的 assistant
+    # 消息(工具调用轮)必须带 reasoning_content,否则下一轮请求 400。
+    # 旧会话历史缺失该字段 → 补空值兜底(实测空字符串可接受)。
+    for _m in messages:
+        if (_m.get("role") == "assistant" and _m.get("tool_calls")
+                and "reasoning_content" not in _m):
+            _m["reasoning_content"] = ""
     model = body.get("model") or SUBAGENT_MODEL
     
     # ── Auto-route: if no explicit model selected, pick based on task intent ──
