@@ -1588,7 +1588,7 @@ def _resolve_max_tokens(model: str) -> int:
     non-reasoning models get a smaller, cheaper budget.
     """
     m = (model or "").lower()
-    if any(k in m for k in ("r1", "o1", "o3", "o4", "reason", "qwq", "qwen3", "think")):
+    if any(k in m for k in ("r1", "o1", "o3", "o4", "reason", "qwq", "qwen3", "think", "muse", "glimmer", "deepseek")):
         return 12288
     return 6144
 
@@ -2601,7 +2601,8 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                                 continue  # usage-only chunk（仅 token 统计，无 delta）
                             delta = choices[0].get("delta", {})
                             content = delta.get("content", "")
-                            reasoning = delta.get("reasoning", "")
+                            # LM Studio/方舟等返回 reasoning_content,OpenAI o 系列返回 reasoning
+                            reasoning = delta.get("reasoning") or delta.get("reasoning_content") or ""
                             if content:
                                 streamed_text += content
                                 # Anti-repetition: skip tokens after the first complete intro
