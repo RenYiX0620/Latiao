@@ -1180,25 +1180,25 @@ class LocalLLMEngine:
             self._explicit_stop = False
 
             # ── External engine mode (LM Studio / Ollama) ──
-            # If an external server is running WITH a model loaded, use it for
-            # local-model requests. This bypasses llama-cpp-python entirely, so
-            # models whose GGUF architecture isn't supported by the bundled
-            # build (e.g. muse-glimmer) can still be used via LM Studio.
-            external = self._probe_external_engine()
-            if external:
-                eng_name, eng_url, eng_model = external
-                self._external_engine = eng_name
-                self._external_url = eng_url
-                self.current_model_id = model_id
-                self.current_model_name = Path(model_id).stem
-                self.server_status = "running"
-                self.status_message = f"通过 {eng_name} 加载 ({eng_model})"
-                self._active_backend = eng_name
-                self.server_port = port  # keep for status display
-                self.has_image_support = False
-                return self.get_status()
+            # 默认关闭：辣条自启引擎加载模型。仅当环境变量
+            # LATIAO_EXTERNAL_ENGINE=1 时才探测外部服务（用于 llama-cpp-python
+            # 暂不支持的模型架构，如 muse-glimmer）。
+            if os.environ.get("LATIAO_EXTERNAL_ENGINE", ""):
+                external = self._probe_external_engine()
+                if external:
+                    eng_name, eng_url, eng_model = external
+                    self._external_engine = eng_name
+                    self._external_url = eng_url
+                    self.current_model_id = model_id
+                    self.current_model_name = Path(model_id).stem
+                    self.server_status = "running"
+                    self.status_message = f"通过 {eng_name} 加载 ({eng_model})"
+                    self._active_backend = eng_name
+                    self.server_port = port  # keep for status display
+                    self.has_image_support = False
+                    return self.get_status()
 
-            # No external engine — clear stale external mode before self-start
+            # No external engine - clear stale external mode before self-start
             self._external_engine = ""
             self._external_url = ""
 
