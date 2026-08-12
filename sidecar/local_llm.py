@@ -647,6 +647,18 @@ class LocalLLMEngine:
     # ── Server status ──
 
     def get_status(self) -> dict:
+        # External engine mode: probe the external server each call. If LM
+        # Studio / Ollama was closed or its model unloaded, drop our state so
+        # the UI reflects reality instead of showing "running" on a dead target.
+        if self._external_engine and self._external_url:
+            if not self._probe_external_engine():
+                self._external_engine = ""
+                self._external_url = ""
+                self.server_status = "stopped"
+                self.status_message = "外部引擎已断开"
+                self.current_model_id = ""
+                self.current_model_name = ""
+                self._active_backend = ""
         if self._process and self._process.poll() is not None:
             # Only overwrite if not already set to a detailed error by startup
             if self.server_status != "error":
