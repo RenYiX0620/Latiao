@@ -36,6 +36,11 @@ try:
     os.environ.setdefault("REQUESTS_CA_BUNDLE", _certifi.where())
 except ImportError:
     pass
+# 部署时 app 被重建可能导致运行中进程的 CWD 失效 → 启动即修复
+try:
+    os.getcwd()
+except OSError:
+    os.chdir(os.path.expanduser("~"))
 if sys.platform == "win32" and getattr(sys, 'frozen', False):
     if sys.stdout is None:
         log_dir = os.path.join(os.environ.get("TEMP", "."))
@@ -327,6 +332,15 @@ def _spawn(coro) -> asyncio.Task:
     _background_tasks.add(t)
     t.add_done_callback(_background_tasks.discard)
     return t
+
+
+def _safe_cwd() -> str:
+    """获取当前工作目录。部署时 app 被 rm -rf 重建,运行中 sidecar 的 CWD
+    指向已删除目录,os.getcwd() 会抛 FileNotFoundError → 回退 home。"""
+    try:
+        return os.getcwd()
+    except OSError:
+        return str(Path.home())
 
 
 # llama_cpp.server 是单模型实例，多个流式生成请求并发时会崩溃
@@ -2832,7 +2846,7 @@ def _build_chat_messages(body: dict, messages: list, matched_skill: str|None = N
 
     # Environment info
     home = str(Path.home())
-    cwd = os.getcwd()
+    cwd = _safe_cwd()
     now = datetime.now().strftime("%Y-%m-%d (%A) %H:%M:%S")
     
     # Detect user language for system prompt localization
@@ -4509,7 +4523,7 @@ async def _execute_cron_job(job: dict):
 
     # Build messages with identity, env, and tools enabled
     home = str(Path.home())
-    cwd = os.getcwd()
+    cwd = _safe_cwd()
     now = datetime.now().strftime("%Y-%m-%d (%A) %H:%M:%S")
     agent_cfg = _get_agent_config("latiao")
 
