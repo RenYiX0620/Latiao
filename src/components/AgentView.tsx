@@ -55,23 +55,23 @@ export default function AgentView({ activeAgent, setActiveAgent, showToast }: Ag
   const [pendingSwitch, setPendingSwitch] = useState<string | null>(null);
   const [newAgent, setNewAgent] = useState({ id: "", name: "", identity: "", tools: ["read_file", "list_dir", "search_files"] as string[] });
 
-  const fetchAgents = async () => {
-    try {
-      const data = await sidecarFetch("/v1/agents");
-      if (data.status === "ok") {
-        const agents = (data.agents as AgentInfo[]).map((a: AgentInfo) => {
-          const i18n = BUILTIN_AGENT_I18N[a.id];
-          if (i18n && !a.custom) {
-            return { ...a, name: i18n.name, display: i18n.display };
-          }
-          return a;
-        });
-        setAgents(agents);
-      }
-    } catch { /* sidecar not running */ }
+  const fetchAgents = () => {
+    sidecarFetch("/v1/agents")
+      .then((data) => {
+        if (data.status === "ok") {
+          setAgents((data.agents as AgentInfo[]).map((a: AgentInfo) => {
+            const i18n = BUILTIN_AGENT_I18N[a.id];
+            if (i18n && !a.custom) {
+              return { ...a, name: i18n.name, display: i18n.display };
+            }
+            return a;
+          }));
+        }
+      })
+      .catch(() => { /* sidecar not running */ });
   };
 
-  useEffect(() => { fetchAgents(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { fetchAgents(); }, []);
 
   const toggleTool = (tool: string) => {
     setNewAgent(prev => ({

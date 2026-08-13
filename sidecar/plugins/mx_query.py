@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """mx_query - 妙想金融数据查询工具"""
-import subprocess, sys, json, os, tempfile
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 NAME = "mx_query"
@@ -28,7 +30,7 @@ def execute(args: dict) -> str:
     query = args.get("query", "")
     if not query:
         return "Error: query parameter is required"
-    
+
     import multiprocessing
 
     if getattr(sys, "frozen", False):

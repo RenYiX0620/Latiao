@@ -1,19 +1,15 @@
 """Memory System — self-learning, TF-IDF, preferences, and skill generation."""
-import logging
-import asyncio
 import json
+import logging
 import math
-import os
 import re
-import threading
 import uuid
 from datetime import datetime
-from pathlib import Path
-from typing import Any
 
 import httpx
-from config import LM_STUDIO_URL, SUBAGENT_MODEL, SKILLS_DIR
-from db import _get_db, _db_write_lock
+
+from config import LM_STUDIO_URL, SKILLS_DIR, SUBAGENT_MODEL
+from db import _db_write_lock
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +32,6 @@ def _tokenize_zh(text: str) -> list[str]:
     """Simple Chinese tokenizer: bigram characters + whole words.
     E.g. '项目结构' → ['项目', '目结', '结构', '项目结构']"""
     # Extract Chinese chars and alphanumeric tokens
-    import unicodedata
     tokens = []
     # Chinese bigrams
     chinese_chars = []
@@ -107,15 +102,15 @@ def _build_tfidf_index():
         ).fetchall()
     except Exception:
         return [], {}, {}
-    
+
     if not rows:
         return [], {}, {}
-    
+
     # Build vocabulary and document vectors
     docs = []
     doc_info = []
     all_tokens = set()
-    
+
     for row in rows:
         text = f"{row[1]} {row[2]}"
         tokens = _tokenize_zh(text)
@@ -131,15 +126,14 @@ def _build_tfidf_index():
             "confidence": row[3], "hit_count": row[4], "source_type": row[5],
         })
         all_tokens.update(tf.keys())
-    
+
     # Compute IDF
-    import math
     N = len(docs)
     idf = {}
     for token in all_tokens:
         df = sum(1 for d in docs if token in d)
         idf[token] = math.log((N + 1) / (df + 1)) + 1
-    
+
     # Build document vectors (sparse as dict)
     doc_vectors = []
     for doc in docs:
@@ -152,7 +146,7 @@ def _build_tfidf_index():
         norm = math.sqrt(norm) if norm > 0 else 1
         # Normalize
         doc_vectors.append({k: v / norm for k, v in vec.items()})
-    
+
     _TFIDF_CACHE = (doc_info, doc_vectors, idf)
     _TFIDF_CACHE_DIRTY = False
     return doc_info, doc_vectors, idf
@@ -163,17 +157,16 @@ def _tfidf_search(query: str, limit: int = 5) -> list[dict]:
     doc_info, doc_vectors, idf = _build_tfidf_index()
     if not doc_vectors:
         return []
-    
+
     # Build query vector
     query_tokens = _tokenize_zh(query)
     if not query_tokens:
         return []
-    
-    import math
+
     q_tf = {}
     for t in query_tokens:
         q_tf[t] = q_tf.get(t, 0) + 1
-    
+
     q_vec = {}
     q_norm = 0
     for token, tf in q_tf.items():
@@ -182,7 +175,7 @@ def _tfidf_search(query: str, limit: int = 5) -> list[dict]:
         q_norm += w * w
     q_norm = math.sqrt(q_norm) if q_norm > 0 else 1
     q_vec = {k: v / q_norm for k, v in q_vec.items()}
-    
+
     # Score all documents
     scores = []
     for i, dv in enumerate(doc_vectors):
@@ -194,15 +187,15 @@ def _tfidf_search(query: str, limit: int = 5) -> list[dict]:
         # Boost by confidence and hit_count
         boost = doc_info[i]["confidence"] * (1.0 + doc_info[i]["hit_count"] * 0.05)
         scores.append((dot * boost, i))
-    
+
     scores.sort(reverse=True)
-    
+
     results = []
     for score, idx in scores[:limit]:
         if score < 0.01:  # Skip near-zero matches
             continue
         results.append(doc_info[idx])
-    
+
     return results
 
 
@@ -213,10 +206,10 @@ def _retrieve_relevant_learnings(query: str, limit: int = MAX_LEARNINGS_INJECT) 
     Falls back to FTS5/LIKE if TF-IDF returns nothing."""
     # Priority 1: TF-IDF semantic search (handles Chinese well)
     results = _tfidf_search(query, limit)
-    
+
     if results:
         return results
-    
+
     # Fallback: FTS5 + LIKE for backward compatibility
     try:
         conn = _get_db()
@@ -490,12 +483,12 @@ async def _maybe_generate_skill(tool_name: str, args: dict, result: str):
     if not is_success:
         _skill_gen_tracker[tool_name] = 0
         return
-    
+
     count = _skill_gen_tracker.get(tool_name, 0) + 1
     _skill_gen_tracker[tool_name] = count
     if count < _SKILL_GENERATION_THRESHOLD:
         return
-    
+
     # Generate skill from accumulated learnings about this tool pattern
     _skill_gen_tracker[tool_name] = 0  # Reset counter
     try:
@@ -506,9 +499,9 @@ async def _maybe_generate_skill(tool_name: str, args: dict, result: str):
         ).fetchall()
         if not rows:
             return
-        
+
         skill_name = f"{tool_name}-patterns"
-        
+
         # Try to use LLM to synthesize a coherent skill document
         skill_content = None
         try:
@@ -543,7 +536,7 @@ async def _maybe_generate_skill(tool_name: str, args: dict, result: str):
                         logger.info("LLM-synthesized skill: %s", skill_name)
         except Exception:
             logger.info("LLM synthesis unavailable, using raw concatenation for skill: %s", skill_name)
-        
+
         # Fallback: build skill from raw learnings
         if not skill_content:
             skill_content = f"# {tool_name} 使用模式\n\n"
@@ -554,7 +547,7 @@ async def _maybe_generate_skill(tool_name: str, args: dict, result: str):
                 skill_content += f"- **{topic}**: {content} (置信度: {bar})\n"
             skill_content += f"\n## 注意事项\n\n- 此技能由 Agent 自动生成，基于 {len(rows)} 次成功调用\n"
             skill_content += "- 使用前请确认适用场景\n"
-        
+
         # Write to skills directory
         skill_key = re.sub(r'[^a-z0-9-]', '', skill_name.lower().replace(" ", "-"))[:40]
         filepath = SKILLS_DIR / f"{skill_key}.md"

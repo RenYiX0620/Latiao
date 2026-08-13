@@ -3,7 +3,6 @@ import asyncio
 import logging
 import sqlite3
 import threading
-from pathlib import Path
 
 from config import PROGRESS_DIR
 

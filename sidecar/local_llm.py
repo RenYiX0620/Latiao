@@ -14,17 +14,18 @@ import logging
 import os
 import platform
 import re as _re
-import subprocess
-import sys
-import threading
-import time
-from pathlib import Path
 
 # Module-level TLS context for HuggingFace API + model downloads.
 # Verified via certifi's bundled CAs — sidesteps the broken system cert chain
 # on some macOS/Python combos that prompted the old unverified context. Model
 # files are still hash-verified by huggingface_hub as a second layer.
 import ssl
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
 import certifi
 
 try:
@@ -252,7 +253,7 @@ class LocalLLMEngine:
             dl_info["downloaded_bytes"] = 0
         try:
             import urllib.request
-            from concurrent.futures import ThreadPoolExecutor, as_completed
+            from concurrent.futures import ThreadPoolExecutor
 
             cache_root = str(self._cache_dir.parent)
 
@@ -295,8 +296,10 @@ class LocalLLMEngine:
                     if chunk_plan and chunk_plan[-1][1] != total_size - 1:
                         # Remote file changed size since last attempt — discard stale parts.
                         for p in (dl_info.get("chunk_paths") or []):
-                            try: os.unlink(p)
-                            except OSError: pass
+                            try:
+                                os.unlink(p)
+                            except OSError:
+                                pass
                         chunk_plan = None
                     if not chunk_plan:
                         num_threads = min(6, max(2, total_size // (300 * 1024 * 1024)))  # 1 thread per 300MB, max 6
@@ -428,8 +431,10 @@ class LocalLLMEngine:
 
                         # Collect results
                         for f in futures:
-                            try: f.result()
-                            except: pass
+                            try:
+                                f.result()
+                            except Exception:
+                                pass
 
                         # A newer resume superseded this worker — leave the .part
                         # files (with their partial progress) for the new worker.
@@ -440,8 +445,10 @@ class LocalLLMEngine:
                         # 先查 cancelled，避免取消状态被下面的 error 覆盖
                         if dl_info.get("status") == "cancelled":
                             for sp in chunk_part_paths:
-                                try: os.unlink(sp)
-                                except OSError: pass
+                                try:
+                                    os.unlink(sp)
+                                except OSError:
+                                    pass
                             dl_info.pop("chunk_ranges", None)
                             dl_info.pop("chunk_paths", None)
                             return
@@ -466,7 +473,8 @@ class LocalLLMEngine:
                             with open(sp, "rb") as inp:
                                 while True:
                                     data = inp.read(8 * 1024 * 1024)
-                                    if not data: break
+                                    if not data:
+                                        break
                                     out.write(data)
                             os.unlink(sp)
                     dl_info.pop("chunk_ranges", None)
@@ -487,7 +495,8 @@ class LocalLLMEngine:
                                     self._save_download_state()  # 暂停时把进度落盘
                                     return
                                 chunk = resp2.read(1024 * 1024)
-                                if not chunk: break
+                                if not chunk:
+                                    break
                                 f.write(chunk)
                                 downloaded += len(chunk)
                                 now = time.time()
@@ -603,8 +612,10 @@ class LocalLLMEngine:
         dl_info["status"] = "cancelled"
         # Discard any preserved chunk parts so cancel truly frees the space.
         for p in (dl_info.get("chunk_paths") or []):
-            try: os.unlink(p)
-            except OSError: pass
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
         dl_info.pop("chunk_ranges", None)
         dl_info.pop("chunk_paths", None)
         dl_info["message"] = "已取消"
@@ -1543,7 +1554,9 @@ def get_model_detail(model_id: str) -> dict:
                     quant = ""
                     for q in ["Q2_K","Q3_K_S","Q3_K_M","Q3_K_L","Q4_0","Q4_K_S","Q4_K_M",
                               "Q5_0","Q5_K_S","Q5_K_M","Q6_K","Q8_0","F16","IQ","fp16"]:
-                        if q in fname: quant = q; break
+                        if q in fname:
+                            quant = q
+                            break
                     siblings.append({"filename": fname, "size": size_str, "size_bytes": size_bytes, "quant": quant})
 
         # Readme excerpt
