@@ -108,33 +108,41 @@ fn delete_secret(key: String) -> Result<(), String> {
     }
 }
 
-/// Cross-platform stubs: non-macOS platforms use in-memory storage for now.
-/// TODO: Windows Credential Manager + Linux Secret Service integration.
+/// Windows: store secrets in %APPDATA%\latiao\secrets\<key>.
+/// (cmdkey 写入的凭据无法读取明文，改为文件存储保证读写一致)
 #[cfg(target_os = "windows")]
-#[tauri::command]
-fn store_secret(key: String, value: String) -> Result<(), String> {
-    use std::process::Stdio;
-    let status = Command::new("cmdkey")
-        .args(["/add", &format!("latiao:{}", key), "/user", "latiao", "/pass", &value])
-        .stdout(Stdio::null()).stderr(Stdio::null())
-        .status().map_err(|e| format!("cmdkey failed: {}", e))?;
-    if status.success() { Ok(()) } else { Err("cmdkey exited non-zero".into()) }
+fn secret_file(key: &str) -> std::path::PathBuf {
+    let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".into());
+    let dir = std::path::Path::new(&base).join("latiao").join("secrets");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join(sanitize_secret_key(key))
+}
+
+#[cfg(target_os = "windows")]
+fn sanitize_secret_key(key: &str) -> String {
+    // 防止路径穿越：只保留安全字符
+    key.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-').collect()
 }
 
 #[cfg(target_os = "windows")]
 #[tauri::command]
-fn get_secret(_key: String) -> Result<String, String> {
-    Err("Not found".into())
+fn store_secret(key: String, value: String) -> Result<(), String> {
+    std::fs::write(secret_file(&key), value).map_err(|e| format!("write secret failed: {}", e))
+}
+
+#[cfg(target_os = "windows")]
+#[tauri::command]
+fn get_secret(key: String) -> Result<String, String> {
+    std::fs::read_to_string(secret_file(&key)).map_err(|_| "Not found".into())
 }
 
 #[cfg(target_os = "windows")]
 #[tauri::command]
 fn delete_secret(key: String) -> Result<(), String> {
-    use std::process::Stdio;
-    Command::new("cmdkey")
-        .args(["/delete", &format!("latiao:{}", key)])
-        .stdout(Stdio::null()).stderr(Stdio::null())
-        .status().map_err(|e| format!("cmdkey failed: {}", e))?;
+    let f = secret_file(&key);
+    if f.exists() {
+        std::fs::remove_file(&f).map_err(|e| format!("delete secret failed: {}", e))?;
+    }
     Ok(())
 }
 

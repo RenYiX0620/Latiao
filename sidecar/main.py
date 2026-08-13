@@ -21,9 +21,13 @@ if len(sys.argv) > 1 and sys.argv[1] == "--mx-query":
     sys.argv = [sys.argv[0]] + sys.argv[2:]
     from skills.mx_data.mx_data import MXData
     query = " ".join(sys.argv[1:])
-    mx = MXData()
-    result = mx.query(query)
-    print(mx.format_terminal(result, *mx.parse_result(result)))
+    try:
+        mx = MXData()
+        result = mx.query(query)
+        print(mx.format_terminal(result, *mx.parse_result(result)))
+    except Exception as e:
+        print(f"妙想金融查询不可用: {e}", file=sys.stderr)
+        sys.exit(1)
     sys.exit(0)
 
 import os
@@ -82,7 +86,7 @@ logger = logging.getLogger("latiao-sidecar")
 # Load .env file manually
 env_path = Path(__file__).parent / ".env"
 if env_path.exists():
-    for _line in env_path.read_text().splitlines():
+    for _line in env_path.read_text(encoding="utf-8").splitlines():
         _line = _line.strip()
         if _line and not _line.startswith("#") and "=" in _line:
             _k, _v = _line.split("=", 1)
@@ -894,7 +898,7 @@ async def _delegate_task(agent_type: str, task: str) -> str:
             for _ in range(3):
                 body = {
                     "model": SUBAGENT_MODEL,
-                    "messages": current_msgs,
+                    "messages": _sanitize_tool_messages(current_msgs),
                     "tools": sub_tools,
                     "tool_choice": "auto",
                     "max_tokens": 1024,
@@ -903,6 +907,7 @@ async def _delegate_task(agent_type: str, task: str) -> str:
                     "frequency_penalty": 0.6,
                 "stop": ["<|im_end|>", "<|endoftext|>", "<end_of_turn>", "<eos>"],
                 }
+                _inject_thinking_disabled(body, SUBAGENT_MODEL)
                 async with _local_llm_serialized(api_url):
                     r = await client.post(api_url, json=body, headers=sub_headers)
                 if r.status_code != 200:
@@ -1243,6 +1248,16 @@ async def _auto_verify(tool_name: str, args: dict, result: str) -> str:
 # Initialize plugin system at module load (seeded inside _load_plugins)
 TOOLS, TOOL_DISPATCH, TOOL_PERMISSIONS, TOOL_HOOKS = load_plugins(_FALLBACK_TOOLS, _FALLBACK_DISPATCH, _FALLBACK_PERMISSIONS)
 
+# 去重：DeepSeek 等 API 要求 tools 名字唯一，重复直接 400
+_seen_tool_names: set[str] = set()
+_unique_tools: list[dict] = []
+for _t in TOOLS:
+    _n = _t.get("function", {}).get("name") if isinstance(_t, dict) else None
+    if _n and _n not in _seen_tool_names:
+        _seen_tool_names.add(_n)
+        _unique_tools.append(_t)
+TOOLS = _unique_tools
+
 # Append delegate_task to TOOLS (not a plugin — built-in sub-agent system)
 _delegate_tool_def = {
     "type": "function",
@@ -1259,7 +1274,9 @@ _delegate_tool_def = {
         },
     },
 }
-TOOLS.append(_delegate_tool_def)
+# delegate_task 只在 TOOLS 里不存在时追加（load_plugins 的 fallback 可能已包含，避免重复）
+if not any(isinstance(t, dict) and t.get("function", {}).get("name") == "delegate_task" for t in TOOLS):
+    TOOLS.append(_delegate_tool_def)
 TOOL_DISPATCH["delegate_task"] = lambda args: _delegate_task(args.get("agent", "code-reviewer"), args.get("task", ""))
 TOOL_PERMISSIONS["delegate_task"] = "safe"
 
@@ -1490,8 +1507,8 @@ TOOL_CATEGORIES = {
     "file_write": ["write_file"],
     "command": ["run_cmd"],
     "app": ["open_app", "open_folder"],
-    "web": ["tavily_search", "web_search"],
-    "financial": ["mx_query"],
+    "web": ["tavily_search", "web_search", "bing_search"],
+    "financial": ["mx_query", "ak_finance"],
 }
 
 INTENT_PATTERNS = [
@@ -1529,16 +1546,26 @@ def _filter_tools(user_text: str, all_tools: list[dict]) -> list[dict]:
     if "financial" not in allowed_categories and "web" not in allowed_categories:
         allowed_tools.add("tavily_search")
         allowed_tools.add("mx_query")
+        allowed_tools.add("bing_search")
+        allowed_tools.add("ak_finance")
     filtered = [t for t in all_tools if t.get("function", {}).get("name") in allowed_tools]
     return filtered if filtered else all_tools
 
 
 
 def _cap_tools(tools: list[dict], cap: int = 8) -> list[dict]:
-    """Cap tool count, keeping essential tools (read_file, write_file, list_dir) first."""
+    """Cap tool count, keeping essential tools (read_file, write_file, list_dir) first.
+    先去重（DeepSeek 等 API 要求工具名唯一，重复名字直接 400）。"""
+    seen: set[str] = set()
+    uniq: list[dict] = []
+    for t in tools:
+        n = t.get("function", {}).get("name")
+        if n and n not in seen:
+            seen.add(n)
+            uniq.append(t)
     essential = {"read_file", "write_file", "list_dir"}
-    priority = [t for t in tools if t.get("function", {}).get("name") in essential]
-    others = [t for t in tools if t.get("function", {}).get("name") not in essential]
+    priority = [t for t in uniq if t.get("function", {}).get("name") in essential]
+    others = [t for t in uniq if t.get("function", {}).get("name") not in essential]
     return priority + others[:max(0, cap - len(priority))]
 
 
@@ -1598,6 +1625,48 @@ def _resolve_max_tokens(model: str) -> int:
     if any(k in m for k in ("r1", "o1", "o3", "o4", "reason", "qwq", "qwen3", "think", "muse", "glimmer", "deepseek")):
         return 12288
     return 6144
+
+
+def _inject_thinking_disabled(body: dict, model: str) -> dict:
+    """DeepSeek V4 思考模式下，多轮/工具调用请求必须回传上一轮的 reasoning_content，
+    否则 API 返回 400（"The reasoning_content in the thinking mode must be passed back"）。
+    Latiao 的 agent 循环不做 reasoning_content 回传，这里对 DeepSeek 模型显式关闭
+    思考模式，避免多轮对话 400。其它 OpenAI 兼容端点忽略该参数，不受影响。"""
+    if isinstance(model, str) and "deepseek" in model.lower():
+        body["thinking"] = {"type": "disabled"}
+    return body
+
+
+def _sanitize_tool_messages(msgs: list[dict]) -> list[dict]:
+    """DeepSeek 等 API 严格校验：assistant 消息带 tool_calls 时，后续必须有
+    对应的 tool 结果消息（tool_call_id 一一对应），否则返回 400：
+    "An assistant message with 'tool_calls' must be followed by tool messages..."
+    历史消息可能因工具中断/前端保存丢失 tool 结果 → 自动补空结果消息，避免 400。
+    补丁必须紧跟缺失点插入（任何非 tool 消息出现前），保证顺序合法。"""
+    out: list[dict] = []
+    pending_ids: set[str] = set()
+    for msg in msgs:
+        role = msg.get("role")
+        if role == "assistant" and msg.get("tool_calls"):
+            pending_ids = {tc.get("id") for tc in msg["tool_calls"] if tc.get("id")}
+            out.append(msg)
+            continue
+        if role == "tool":
+            tid = msg.get("tool_call_id")
+            if tid in pending_ids:
+                pending_ids.discard(tid)
+            out.append(msg)
+            continue
+        if pending_ids:  # 遇到非 tool 消息（user/system/assistant）时，未响应的 tool_call 先补空
+            for tid in pending_ids:
+                out.append({"role": "tool", "tool_call_id": tid, "content": "[工具结果缺失，已自动补空]"})
+            pending_ids = set()
+        out.append(msg)
+    if pending_ids:  # 消息末尾仍有未响应的 tool_call
+        for tid in pending_ids:
+            out.append({"role": "tool", "tool_call_id": tid, "content": "[工具结果缺失，已自动补空]"})
+    return out
+
 
 
 # Session state tracking: session_id → {phase, round, stalled_rounds, last_action}
@@ -2032,19 +2101,34 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                 current_msgs.append({"role": "system", "content": stagnation_warning})
 
             body = {
-                "model": model, "messages": current_msgs,
+                "model": model, "messages": _sanitize_tool_messages(current_msgs),
                 "tools": active_tools, "tool_choice": "auto",
                 "max_tokens": _resolve_max_tokens(model), "stream": True,
                 "temperature": 0.5,
                 "frequency_penalty": 0.6,
                 "stop": ["<|im_end|>", "<|endoftext|>", "<end_of_turn>", "<eos>"],
             }
+            _inject_thinking_disabled(body, model)
 
             streamed_text = ""
             tool_call_bufs: dict[int, dict] = {}
 
             async with client.stream("POST", api_url, json=body, headers=headers) as r:
+                if r.status_code != 200:
+                    try:
+                        err_body = (await r.aread()).decode("utf-8", errors="replace")[:800]
+                    except Exception:
+                        err_body = "<read failed>"
+                    logger.error("Agent stream HTTP %d body: %s", r.status_code, err_body)
                 r.raise_for_status()  # httpx 不自动抛 4xx/5xx，必须显式检查
+                msg_digest = [
+                    (m.get("role"), len(str(m.get("content") or "")),
+                     bool(m.get("tool_calls")), str(m.get("tool_call_id") or "")[:8])
+                    for m in body.get("messages", [])
+                ]
+                logger.info("AGENT-REQ: url=%s model=%s thinking=%s msgs=%d tools=%d digest=%s",
+                            api_url, body.get("model"), body.get("thinking"), len(current_msgs),
+                            len(body.get("tools", [])), msg_digest[-12:])
                 async for line in r.aiter_lines():
                     if line and line.startswith("data: "):
                         data_str = line[6:]
@@ -2595,12 +2679,13 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                 loop_msgs.insert(0, {"role": "system", "content": current_prompt})
 
             body = {
-                "model": model, "messages": loop_msgs,
+                "model": model, "messages": _sanitize_tool_messages(loop_msgs),
                 "max_tokens": _resolve_max_tokens(model), "stream": True,
                 "temperature": 0.5,
                 "frequency_penalty": 0.6,
                 "stop": ["<|im_end|>", "<|endoftext|>", "<end_of_turn>", "<eos>"],
             }
+            _inject_thinking_disabled(body, model)
 
             streamed_text = ""
             _raw_delta_count = 0  # 诊断: 统计收到的 delta 数(空响应时判断是模型真空还是解析丢了)
@@ -3077,8 +3162,16 @@ async def chat_completion(request: Request):
             logger.info("Auto-route: chat task → using local model (free)")
             # Keep local model for casual chat
             pass
+        # 兜底：本地模型未运行时（cron/notify/sub-agent 等内部请求也不带 cloud_config），
+        # 只要有可用的云模型配置就自动使用，避免 api_url 为空导致 UnsupportedProtocol 崩溃
+        if not cloud_config and not local_llm.get_api_url() and _has_cloud_models():
+            logger.info("Auto-route: no local LLM, falling back to cloud model")
+            cloud_config = _get_best_cloud_config()
+            if cloud_config:
+                model = cloud_config.get("model", model)
     
     logger.info("Chat request: model=%s, msg_count=%d, stream=%s", model, len(messages), body.get("stream", False))
+    logger.info("Chat request cloud_config present: %s, endpoint=%s", bool(cloud_config), (cloud_config or {}).get("endpoint", "NONE"))
 
     skip_tools = body.get("skip_tools", False)
     agent_id = body.get("agent", "latiao")
@@ -3114,7 +3207,9 @@ async def chat_completion(request: Request):
                     # 含响应体片段，便于诊断"任务中断"的真实原因
                     resp_body = ""
                     try:
-                        resp_body = e.response.text[:500] if e.response is not None else ""
+                        if e.response is not None:
+                            # 流式响应没有 .text，需要 aread() 读取 body
+                            resp_body = (await e.response.aread()).decode("utf-8", errors="replace")[:800]
                     except Exception:
                         pass
                     logger.error(
@@ -3182,22 +3277,22 @@ async def chat_completion(request: Request):
 
                     if use_prompt_tools:
                         async with _local_llm_serialized(api_url):
-                            resp = await client.post(api_url, json={
-                            "model": model, "messages": loop_msgs,
+                            resp = await client.post(api_url, json=_inject_thinking_disabled({
+                            "model": model, "messages": _sanitize_tool_messages(loop_msgs),
                             "max_tokens": _resolve_max_tokens(model), "stream": False,
                             "temperature": 0.5,
                             "frequency_penalty": 0.6,
                 "stop": ["<|im_end|>", "<|endoftext|>", "<end_of_turn>", "<eos>"],
-                        }, headers=headers)
+                        }, model), headers=headers)
                     else:
-                        resp = await client.post(api_url, json={
-                            "model": model, "messages": current_msgs,
+                        resp = await client.post(api_url, json=_inject_thinking_disabled({
+                            "model": model, "messages": _sanitize_tool_messages(current_msgs),
                             "tools": active_tools, "tool_choice": "auto",
                             "max_tokens": 2048, "stream": False,
                             "temperature": 0.5,
                             "frequency_penalty": 0.6,
                 "stop": ["<|im_end|>", "<|endoftext|>", "<end_of_turn>", "<eos>"],
-                        }, headers=headers)
+                        }, model), headers=headers)
                     resp.raise_for_status()  # httpx 不自动抛 4xx/5xx，必须显式检查
                     resp_data = resp.json()
                     choices = resp_data.get("choices", [])
@@ -3291,7 +3386,7 @@ async def chat_completion(request: Request):
                 system_msgs = [m for m in msgs_for_model if m.get("role") == "system"]
                 other_msgs = [m for m in msgs_for_model if m.get("role") != "system"]
                 msgs_for_model = system_msgs + other_msgs[-20:]
-            lm_body = {"model": model, "messages": msgs_for_model, "stream": True, "max_tokens": 2048, "temperature": 0.5, "frequency_penalty": 0.6, "stop": ["<|im_end|>", "<|endoftext|>"]}
+            lm_body = _inject_thinking_disabled({"model": model, "messages": msgs_for_model, "stream": True, "max_tokens": 2048, "temperature": 0.5, "frequency_penalty": 0.6, "stop": ["<|im_end|>", "<|endoftext|>"]}, model)
             try:
                 async with httpx.AsyncClient(timeout=httpx.Timeout(120)) as c:
                     async with c.stream("POST", api_url, json=lm_body, headers=headers) as r:
@@ -4525,7 +4620,7 @@ async def _execute_cron_job(job: dict):
         async with httpx.AsyncClient(timeout=httpx.Timeout(120)) as client:
             for _ in range(10):  # max 10 iterations for cron
                 req_body = {
-                    "model": model, "messages": current_msgs,
+                    "model": model, "messages": _sanitize_tool_messages(current_msgs),
                     "max_tokens": 2048, "stream": False,
                     "temperature": 0.5,
                     "frequency_penalty": 0.6,

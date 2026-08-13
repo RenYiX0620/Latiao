@@ -14,10 +14,12 @@ a = Analysis(
         'fastapi', 'httpx', 'certifi',
         'sqlite3', 'asyncio',
         'pyyaml',
+        # mx_query 金融工具：--mx-query 模式下需要 import（目录已改为合法包名 mx_data）
+        'skills', 'skills.mx_data', 'skills.mx_data.mx_data',
     ],
     hookspath=[],
     runtime_hooks=[],
-    excludes=['llama_cpp', 'mlx_lm', 'torch', 'numpy', 'tensorflow'],
+    excludes=['llama_cpp', 'mlx_lm', 'torch', 'tensorflow'],
 )
 pyz = PYZ(a.pure, a.zipped_data)
 exe = EXE(
