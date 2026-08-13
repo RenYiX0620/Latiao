@@ -1,7 +1,7 @@
 import { lazy, Suspense, useState, useEffect, useCallback, useRef } from "react";
-import { fetch } from "@tauri-apps/plugin-http";
 import { open, ask } from "@tauri-apps/plugin-dialog";
 import { useTranslation } from "../i18n";
+import { authFetch } from "../utils/api";
 import type { HFModelResult, DownloadState, SetupIssue, LLMStatus } from "../types";
 
 /** A locally-downloaded model file discovered by the sidecar. */
@@ -14,7 +14,6 @@ interface LocalModelInfo {
 }
 
 const ReactMarkdown = lazy(() => import("react-markdown"));
-const SIDECAR = "http://127.0.0.1:8765";
 
 function ModelDetailPanel({ modelId, detailData, detailLoading, downloadProgress, downloadModel, pauseDownload, cancelDownload, resumeDownload, startLocalLLM, deleteModelFile, fetchModelDetail, onClose }: {
   modelId: string; detailData: Record<string, unknown> | null; detailLoading: boolean;
@@ -140,14 +139,15 @@ export default function LocalModelsTab(props: Props) {
   const [detailLoading, setDetailLoading] = useState(false);
   const [localModels, setLocalModels] = useState<LocalModelInfo[]>([]);
 
-  const fetchLocalModels = useCallback(async () => {
-    try {
-      const resp = await fetch(SIDECAR + "/v1/local-llm/models");
-      const data = await resp.json();
-      if (data.status === "ok" && Array.isArray(data.models)) {
-        setLocalModels(data.models as LocalModelInfo[]);
-      }
-    } catch { /* sidecar not ready yet - silently skip */ }
+  const fetchLocalModels = useCallback(() => {
+    authFetch("/v1/local-llm/models")
+      .then(resp => resp.json())
+      .then((data) => {
+        if (data.status === "ok" && Array.isArray(data.models)) {
+          setLocalModels(data.models as LocalModelInfo[]);
+        }
+      })
+      .catch(() => { /* sidecar not ready yet - silently skip */ });
   }, []);
 
   // Refresh the local model list on mount and whenever a model finishes
@@ -159,8 +159,8 @@ export default function LocalModelsTab(props: Props) {
   const openSearch = () => { setShowSearch(true); setHfSearch(""); setDetailModelId(""); setDetailData(null); searchHF(""); };
   // Monotonic request id so a slow detail response can't clobber a newer selection
   const detailReqRef = useRef(0);
-  const fetchModelDetail = async (modelId: string) => { const reqId = ++detailReqRef.current; setDetailModelId(modelId); setDetailData(null); setDetailLoading(true); try { const resp = await fetch(SIDECAR + "/v1/local-llm/model-detail?model_id=" + encodeURIComponent(modelId)); const data = await resp.json(); if (reqId === detailReqRef.current) setDetailData(data); } catch { if (reqId === detailReqRef.current) setDetailData({ status: "error", message: "加载失败" }); } if (reqId === detailReqRef.current) setDetailLoading(false); };
-  const deleteModelFile = async (modelId: string) => { try { const resp = await fetch(SIDECAR + "/v1/local-llm/delete-model", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model_id: modelId }) }); const data = await resp.json(); showToast(data.message || t("local.deleted")); if (data.status === "ok" && detailModelId) fetchModelDetail(detailModelId); } catch(e) { console.error(e); showToast(t("local.delete_fail")); } };
+  const fetchModelDetail = async (modelId: string) => { const reqId = ++detailReqRef.current; setDetailModelId(modelId); setDetailData(null); setDetailLoading(true); try { const resp = await authFetch("/v1/local-llm/model-detail?model_id=" + encodeURIComponent(modelId)); const data = await resp.json(); if (reqId === detailReqRef.current) setDetailData(data); } catch { if (reqId === detailReqRef.current) setDetailData({ status: "error", message: "加载失败" }); } if (reqId === detailReqRef.current) setDetailLoading(false); };
+  const deleteModelFile = async (modelId: string) => { try { const resp = await authFetch("/v1/local-llm/delete-model", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model_id: modelId }) }); const data = await resp.json(); showToast(data.message || t("local.deleted")); if (data.status === "ok" && detailModelId) fetchModelDetail(detailModelId); } catch(e) { console.error(e); showToast(t("local.delete_fail")); } };
 
   return (
     <div style={{ position: "relative" }}>
@@ -186,7 +186,7 @@ export default function LocalModelsTab(props: Props) {
             <div style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 2 }}>{localLLMStatus.message || t("local.ready")}</div>
             {isRunning && <>
               <div style={{ fontSize: 11, color: "var(--text-secondary)", marginTop: 6, fontFamily: "var(--font-mono)", display: "flex", gap: 16, flexWrap: "wrap" }}><span>🖥 {localLLMStatus.model_name || localLLMStatus.model_id}</span><span>🔌 :{localLLMStatus.port}</span><span>📐 {(localLLMStatus.token_limit ?? 0).toLocaleString()} tokens</span>{localLLMStatus.gpu_layers !== undefined && <span>🧮 {localLLMStatus.gpu_layers === -1 ? "Auto GPU" : `${localLLMStatus.gpu_layers} layers`}</span>}</div>
-              <div style={{ marginTop: 8, display: "flex", gap: 8 }}><button className="btn btn-sm btn-primary" onClick={stopLocalLLM} style={{ padding: "6px 16px" }}>⏹ {t("local.stop_btn")}</button><button className="btn btn-sm btn-ghost" style={{ padding: "6px 16px", color: "var(--danger)" }} onClick={async () => { const mid = localLLMStatus.model_id; if (!mid) return; const ok = await ask(t("local.delete_model_confirm") + "\n" + mid); if (!ok) return; try { await stopLocalLLM(); const resp = await fetch(SIDECAR + "/v1/local-llm/delete-model", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model_id: mid }) }); const data = await resp.json(); showToast(data.message || t("local.deleted")); } catch(e) { console.error(e); showToast(t("local.delete_fail")); } }}>{t("local.delete_model_btn")}</button></div>
+              <div style={{ marginTop: 8, display: "flex", gap: 8 }}><button className="btn btn-sm btn-primary" onClick={stopLocalLLM} style={{ padding: "6px 16px" }}>⏹ {t("local.stop_btn")}</button><button className="btn btn-sm btn-ghost" style={{ padding: "6px 16px", color: "var(--danger)" }} onClick={async () => { const mid = localLLMStatus.model_id; if (!mid) return; const ok = await ask(t("local.delete_model_confirm") + "\n" + mid); if (!ok) return; try { await stopLocalLLM(); const resp = await authFetch("/v1/local-llm/delete-model", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model_id: mid }) }); const data = await resp.json(); showToast(data.message || t("local.deleted")); } catch(e) { console.error(e); showToast(t("local.delete_fail")); } }}>{t("local.delete_model_btn")}</button></div>
             </>}
           </div>
         </div>

@@ -4,7 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type { Message, PendingFile, SessionInfo, ViewId, CloudModel, DownloadState, HFModelResult, LLMStatus } from "./types";
 // API keys stored in OS keychain via Rust commands (store_secret/get_secret/delete_secret)
 import { useSessions } from "./hooks/useSessions";
-import { sidecarFetch, waitForSidecar } from "./utils/api";
+import { sidecarFetch, waitForSidecar, authFetch } from "./utils/api";
 import { useTranslation } from "./i18n";
 import { useCronJobs } from "./hooks/useCronJobs";
 import { useSkills } from "./hooks/useSkills";
@@ -249,7 +249,7 @@ const [timeFilter, setTimeFilter] = useState("all");
         if (["127.0.0.1", "localhost", "tauri.localhost"].includes(url.hostname)) return;
         e.preventDefault();
         invoke("plugin:opener|open_url", { url: a.href }).catch(() => {});
-      } catch {}
+      } catch { /* malformed href — not a link worth opening */ }
     };
     document.addEventListener("click", handler, true);
     return () => document.removeEventListener("click", handler, true);
@@ -324,7 +324,7 @@ const [timeFilter, setTimeFilter] = useState("all");
     const tick = async () => {
       // Unified sidecar heartbeat
       try {
-        const resp = await fetch(SIDECAR + "/v1/heartbeat", { signal: AbortSignal.timeout(5000) });
+        const resp = await authFetch("/v1/heartbeat", { signal: AbortSignal.timeout(5000) });
         const data = await resp.json();
         if (data.status === "ok") {
           setSidecarStatus("online");
@@ -340,7 +340,7 @@ const [timeFilter, setTimeFilter] = useState("all");
 
       // Fetch recent logs (always, cheap ring-buffer read)
       try {
-        const lr = await fetch(SIDECAR + "/v1/logs?limit=100", { signal: AbortSignal.timeout(5000) });
+        const lr = await authFetch("/v1/logs?limit=100", { signal: AbortSignal.timeout(5000) });
         const ld = await lr.json();
         if (ld.status === "ok") setGatewayLogs(ld.logs || []);
       } catch { /* ignore */ }
@@ -368,7 +368,7 @@ const [timeFilter, setTimeFilter] = useState("all");
   const fetchContextEstimate = async (modelPath?: string) => {
     try {
       const params = modelPath ? `?model_path=${encodeURIComponent(modelPath)}` : "";
-      const resp = await fetch(SIDECAR + "/v1/local-llm/estimate-context" + params);
+      const resp = await authFetch("/v1/local-llm/estimate-context" + params);
       const data = await resp.json();
       if (data.max_context) setContextEstimate(data);
       if (data.current_context) {
@@ -389,7 +389,7 @@ const [timeFilter, setTimeFilter] = useState("all");
     if (contextLimitTimerRef.current) clearTimeout(contextLimitTimerRef.current);
     contextLimitTimerRef.current = setTimeout(async () => {
       try {
-        const resp = await fetch(SIDECAR + "/v1/local-llm/context-limit", {
+        const resp = await authFetch("/v1/local-llm/context-limit", {
           method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ limit }),
         });
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
@@ -403,14 +403,14 @@ const [timeFilter, setTimeFilter] = useState("all");
 
   // Fetch setup check on mount
   const fetchSetup = () => {
-    fetch(SIDECAR + "/v1/local-llm/setup").then(r => r.json()).then(d => setSetupCheck(d)).catch((e) => console.warn("Setup check failed", e));
+    authFetch("/v1/local-llm/setup").then(r => r.json()).then(d => setSetupCheck(d)).catch((e) => console.warn("Setup check failed", e));
   };
   useEffect(() => { fetchSetup(); }, []);
 
   const runFix = async (fixType: string, fixPkg: string) => {
     setFixing(fixPkg);
     try {
-      const resp = await fetch(SIDECAR + "/v1/local-llm/fix", {
+      const resp = await authFetch("/v1/local-llm/fix", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ fix_type: fixType, fix_pkg: fixPkg }),
       });
@@ -428,7 +428,7 @@ const [timeFilter, setTimeFilter] = useState("all");
   useEffect(() => {
     const poll = async () => {
       try {
-        const resp = await fetch(SIDECAR + "/v1/local-llm/downloads", { signal: AbortSignal.timeout(5000) });
+        const resp = await authFetch("/v1/local-llm/downloads", { signal: AbortSignal.timeout(5000) });
         const data = await resp.json();
         if (data.status === "ok" && Array.isArray(data.downloads)) {
           const progress: Record<string, DownloadState> = {};
@@ -456,7 +456,7 @@ const [timeFilter, setTimeFilter] = useState("all");
     setSearching(true);
     try {
       const libParam = library ? `&library=${encodeURIComponent(library)}` : "";
-      const resp = await fetch(`${SIDECAR}/v1/local-llm/search?q=${encodeURIComponent(q)}&limit=30${libParam}`, { signal: AbortSignal.timeout(5000) });
+      const resp = await authFetch(`/v1/local-llm/search?q=${encodeURIComponent(q)}&limit=30${libParam}`, { signal: AbortSignal.timeout(5000) });
       const data = await resp.json();
       if (reqId === searchReqRef.current && data.status === "ok") setHfResults(data.results);
     } catch (e) { console.error(e) }
@@ -473,14 +473,14 @@ const [timeFilter, setTimeFilter] = useState("all");
   const downloadModel = async (modelId: string) => {
     showToast(t("toast.dl_start", { name: modelId.split("/").pop() || modelId }));
     try {
-      const resp = await fetch(SIDECAR + "/v1/local-llm/download", {
+      const resp = await authFetch("/v1/local-llm/download", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ model_id: modelId }),
       });
       const data = await resp.json();
       if (data.status === "ok") {
         // Immediately fetch downloads to show UI feedback
-        const dlResp = await fetch(SIDECAR + "/v1/local-llm/downloads");
+        const dlResp = await authFetch("/v1/local-llm/downloads");
         const dlData = await dlResp.json();
         if (dlData.status === "ok" && Array.isArray(dlData.downloads)) {
           const progress: Record<string, DownloadState> = {};
@@ -497,21 +497,21 @@ const [timeFilter, setTimeFilter] = useState("all");
   };
 
   const pauseDownload = async (modelId: string) => {
-    await fetch(SIDECAR + "/v1/local-llm/download/pause", {
+    await authFetch("/v1/local-llm/download/pause", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ model_id: modelId }),
     });
   };
 
   const resumeDownload = async (modelId: string) => {
-    await fetch(SIDECAR + "/v1/local-llm/download/resume", {
+    await authFetch("/v1/local-llm/download/resume", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ model_id: modelId }),
     });
   };
 
   const cancelDownload = async (modelId: string) => {
-    await fetch(SIDECAR + "/v1/local-llm/download/cancel", {
+    await authFetch("/v1/local-llm/download/cancel", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ model_id: modelId }),
     });
@@ -523,7 +523,7 @@ const [timeFilter, setTimeFilter] = useState("all");
     if (modelId) setLocalModelId(modelId);
     try {
       setLocalLLMStatus(prev => ({ ...prev, status: "starting", message: t("toast.starting") }));
-      const resp = await fetch(SIDECAR + "/v1/local-llm/start", {
+      const resp = await authFetch("/v1/local-llm/start", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ model_id: mid }),
       });
@@ -538,7 +538,7 @@ const [timeFilter, setTimeFilter] = useState("all");
 
   const stopLocalLLM = async () => {
     try {
-      const resp = await fetch(SIDECAR + "/v1/local-llm/stop", { method: "POST" });
+      const resp = await authFetch("/v1/local-llm/stop", { method: "POST" });
       const data = await resp.json();
       setLocalLLMStatus(data);
       // Restore the default UI after unloading: clear the model-id input and
@@ -593,11 +593,11 @@ const [timeFilter, setTimeFilter] = useState("all");
 
     let response: Response;
     try {
-      response = await fetch(SIDECAR + "/v1/chat/completions", {
+      response = await authFetch("/v1/chat/completions", {
         method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal,
       });
     } catch (e) {
-      throw new Error(`无法连接 Sidecar\n原始错误: ${e}`);
+      throw new Error(`无法连接 Sidecar\n原始错误: ${e}`, { cause: e });
     }
     if (!response.ok || !response.body) throw new Error(`HTTP ${response.status}`);
 
@@ -703,7 +703,7 @@ const [timeFilter, setTimeFilter] = useState("all");
 
   const confirmTool = useCallback(async (callId: string, approved: boolean) => {
     try {
-      const resp = await fetch(SIDECAR + "/v1/confirm_tool", {
+      const resp = await authFetch("/v1/confirm_tool", {
         method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ call_id: callId, approved }),
       });
       const data = await resp.json();
@@ -913,7 +913,7 @@ const [timeFilter, setTimeFilter] = useState("all");
         transcribingRef.current = true;
         try {
           const base64 = await blobToBase64(blob);
-          const resp = await fetch(SIDECAR + "/v1/recognize_speech", {
+          const resp = await authFetch("/v1/recognize_speech", {
             method: "POST", headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ audio_base64: base64, mime_type: "audio/webm" }),
           });
@@ -938,7 +938,7 @@ const [timeFilter, setTimeFilter] = useState("all");
         const base64 = await blobToBase64(audioBlob);
 
         try {
-          const resp = await fetch(SIDECAR + "/v1/recognize_speech", {
+          const resp = await authFetch("/v1/recognize_speech", {
             method: "POST", headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ audio_base64: base64, mime_type: "audio/webm" }),
           });
@@ -963,7 +963,7 @@ const [timeFilter, setTimeFilter] = useState("all");
     setTestingModel(modelName);
     setTestResult("");
     try {
-      const resp = await fetch(SIDECAR + "/v1/test_connection", {
+      const resp = await authFetch("/v1/test_connection", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ model: modelName, key, endpoint, protocol }),
       });

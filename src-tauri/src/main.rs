@@ -1,15 +1,58 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::process::{Child, Command};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
+
+/// Per-run sidecar auth token — generated once at startup, injected into the
+/// sidecar process via the LATIAO_AUTH_TOKEN env var and exposed to the
+/// frontend through the get_auth_token command. Stable across sidecar
+/// restarts so the frontend's cached token stays valid.
+static AUTH_TOKEN: OnceLock<String> = OnceLock::new();
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    s
+}
+
+/// Generate a random auth token. macOS/Linux: 32 bytes from /dev/urandom,
+/// hex-encoded (64 chars). Windows/fallback: timestamp + PID (simple — the
+/// threat model here is "local process can't guess it easily", not crypto).
+fn generate_auth_token() -> String {
+    #[cfg(not(target_os = "windows"))]
+    {
+        use std::io::Read;
+        let mut buf = [0u8; 32];
+        if std::fs::File::open("/dev/urandom")
+            .and_then(|mut f| f.read_exact(&mut buf))
+            .is_ok()
+        {
+            return hex_encode(&buf);
+        }
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    format!("{:x}-{:x}", now, std::process::id())
+}
 
 /// Proxy HTTP request to sidecar — bypasses Tauri HTTP plugin entirely.
 /// Allowlist: only http://127.0.0.1:8765 (the local sidecar). Prevents the
 /// webview from abusing this command as an open proxy / SSRF surface
 /// (incl. `@`-userinfo host spoofing and cloud-metadata endpoints).
 #[tauri::command]
-async fn sidecar_proxy(url: String, method: String, body: Option<String>) -> Result<String, String> {
+async fn sidecar_proxy(
+    url: String,
+    method: String,
+    body: Option<String>,
+    token: Option<String>,
+) -> Result<String, String> {
     let parsed = reqwest::Url::parse(&url)
         .map_err(|e| format!("Invalid URL: {}", e))?;
     let allowed = parsed.scheme() == "http"
@@ -34,9 +77,26 @@ async fn sidecar_proxy(url: String, method: String, body: Option<String>) -> Res
     if let Some(b) = body {
         req = req.header("Content-Type", "application/json").body(b);
     }
+    // Local auth: forward the frontend-supplied token as X-Latiao-Token so the
+    // sidecar can verify it. Empty token (non-Tauri/no-auth mode) is skipped.
+    if let Some(t) = token {
+        if !t.is_empty() {
+            req = req.header("X-Latiao-Token", t);
+        }
+    }
     let resp = req.send().await.map_err(|e| format!("Request failed: {}", e))?;
     let text = resp.text().await.map_err(|e| format!("Read failed: {}", e))?;
     Ok(text)
+}
+
+/// Return the per-run sidecar auth token so the frontend can attach it as the
+/// X-Latiao-Token header on sidecar requests.
+#[tauri::command]
+fn get_auth_token() -> Result<String, String> {
+    AUTH_TOKEN
+        .get()
+        .cloned()
+        .ok_or_else(|| "Auth token not initialized".to_string())
 }
 
 /// Store a secret in the macOS Keychain via the `security` CLI.
@@ -298,6 +358,7 @@ fn start_sidecar() -> Option<Child> {
     match cmd
         .current_dir(&sidecar_dir)
         .env("LATIAO_CTX_LEN", "64000")
+        .env("LATIAO_AUTH_TOKEN", AUTH_TOKEN.get().map(|s| s.as_str()).unwrap_or(""))
         .spawn()
     {
         Ok(child) => {
@@ -313,6 +374,7 @@ fn start_sidecar() -> Option<Child> {
 
 fn main() {
     eprintln!("[Latiao] App starting...");
+    let _ = AUTH_TOKEN.set(generate_auth_token());
     let sidecar = start_sidecar();
     let sidecar_ok = sidecar.is_some();
     if !sidecar_ok {
@@ -325,7 +387,7 @@ fn main() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
 .manage(SidecarProcess(Mutex::new(sidecar)))
-        .invoke_handler(tauri::generate_handler![sidecar_proxy, restart_sidecar, store_secret, get_secret, delete_secret, open_model_dir])
+        .invoke_handler(tauri::generate_handler![sidecar_proxy, get_auth_token, restart_sidecar, store_secret, get_secret, delete_secret, open_model_dir])
         .setup(move |app| {
             if !sidecar_ok {
                 // Sidecar didn't start — tell the user instead of leaving them
