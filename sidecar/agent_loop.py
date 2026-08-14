@@ -377,7 +377,10 @@ _delegate_tool_def = {
         },
     },
 }
-TOOLS.append(_delegate_tool_def)
+# 防重复: fallback 合并可能已加入 delegate_task(拆分前就存在此 bug,
+# 导致 Iteration 3 全量工具时 DeepSeek 报 "Tool names must be unique" 400)
+if not any(t.get("function", {}).get("name") == "delegate_task" for t in TOOLS):
+    TOOLS.append(_delegate_tool_def)
 TOOL_DISPATCH["delegate_task"] = lambda args: _delegate_task(args.get("agent", "code-reviewer"), args.get("task", ""))
 TOOL_PERMISSIONS["delegate_task"] = "safe"
 
