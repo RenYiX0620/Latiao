@@ -1128,6 +1128,9 @@ class LocalLLMEngine:
         chat_fmt = self._guess_chat_format(model_path)
         if chat_fmt:
             cmd += ["--chat-template", chat_fmt]
+        # 注意：原生 llama-server 的 interrupt-requests 默认即关闭（新请求排队
+        # 而非掐断当前生成），与 macOS 路径显式 --interrupt_requests False
+        # 行为一致，无需额外参数。
 
         env = os.environ.copy()
         env.pop("HF_ENDPOINT", None)

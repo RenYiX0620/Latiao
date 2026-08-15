@@ -55,7 +55,10 @@ jobs:
           SIG_FILE=$(find "$BUNDLE" -name "*.sig" 2>/dev/null | head -1)
           echo "=== Build artifacts ==="
           find "$BUNDLE" -type f | sort
-          if [ -z "$DMG_FILE" ]; then echo "ERROR: no DMG"; exit 1; fi
+          if [ -z "$DMG_FILE" ]; then
+            echo "No DMG (macOS bundle not produced) - skipping Sparkle manifest"
+            exit 0
+          fi
           SIG=$(cat "$SIG_FILE" 2>/dev/null || echo "")
           echo '{"version":"'$VERSION'","notes":"Latiao v'$VERSION'","pub_date":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'","platforms":{"darwin-aarch64":{"url":"https://github.com/RenYiX0620/Latiao/releases/download/'$GITHUB_REF_NAME'/Latiao_'$VERSION'_aarch64.dmg","signature":"'$SIG'"}}}' > "$BUNDLE/dmg/latest.json"
           echo "Manifest: $(cat "$BUNDLE/dmg/latest.json")"
