@@ -1,6 +1,7 @@
 """Database connection and schema management for Latiao sidecar."""
 import asyncio
 import logging
+import re
 import sqlite3
 import threading
 
@@ -32,9 +33,16 @@ def _get_db() -> sqlite3.Connection:
 
 
 
+# Only allow simple SQL identifiers (table/column names) in DDL to satisfy
+# static analysis tools — _create_table is always called with hardcoded literals.
+_VALID_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
 def _create_table(conn: sqlite3.Connection, name: str, columns: str, extras: list[str] | None = None):
     """Create a table + FTS5 virtual table + triggers if they don't exist."""
     try:
+        if not _VALID_IDENTIFIER.match(name):
+            raise ValueError(f"Invalid table name: {name!r}")
         conn.execute(f"CREATE TABLE IF NOT EXISTS {name} ({columns})")
     except Exception:
         # 主表失败才整体放弃该表（extras 依附于主表，建了也没意义）

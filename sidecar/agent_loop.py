@@ -75,10 +75,44 @@ def _safe_cwd() -> str:
 # 主对话 agent 循环与 cron 任务并发调用本地模型是实际触发场景——
 # 所有打到本地端口的模型请求必须串行执行。
 _local_llm_stream_lock = asyncio.Lock()
+# 引擎疑似损坏的时间戳：流被取消（停止按钮/新消息）或空响应后置位，
+# 下一次本地请求在锁内先验证引擎健康，避免向残留线程竞争损坏的引擎发请求。
+_llm_suspect_since: float | None = None
 
 
 def _is_local_llm_url(api_url: str | None) -> bool:
     return bool(api_url) and ("127.0.0.1" in api_url or "localhost" in api_url)
+
+
+async def _verify_llm_health(api_url: str) -> bool:
+    """锁内健康验证：发一个最小生成请求，确认引擎能正常产出文本。
+    失败时直接杀掉引擎进程并复位状态，让 UI 提示重新加载模型。"""
+    ok = False
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(25)) as c:
+            resp = await c.post(api_url, json={
+                "model": "health-check", "stream": False, "max_tokens": 4,
+                "messages": [{"role": "user", "content": "hi"}],
+            })
+            resp.raise_for_status()
+            data = resp.json()
+            content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
+            ok = bool(content.strip())
+    except Exception:
+        ok = False
+    if not ok:
+        try:
+            from urllib.parse import urlparse
+            engine = local_llm._engine
+            port = urlparse(api_url).port or engine.server_port
+            engine._kill_port(port)
+            if port == engine.server_port:
+                engine.server_status = "stopped"
+                engine.status_message = ""
+        except Exception:
+            pass
+        logger.warning("本地模型引擎健康检查失败（%s），已停止引擎进程", api_url)
+    return ok
 
 
 @asynccontextmanager
@@ -99,9 +133,24 @@ async def _local_llm_stream(client, api_url: str, body: dict, headers: dict):
     """流式请求本地/云端模型。本地 llama.cpp 时持锁直到流读完，
     防止并发流式生成导致 server 崩溃（连接被 peer 关闭）。"""
     async with _local_llm_serialized(api_url):
-        async with client.stream("POST", api_url, json=body, headers=headers) as r:
-            r.raise_for_status()  # httpx 不自动抛 4xx/5xx，必须显式检查
-            yield r
+        global _llm_suspect_since
+        if _is_local_llm_url(api_url) and _llm_suspect_since is not None:
+            ok = await _verify_llm_health(api_url)
+            if not ok:
+                raise httpx.ConnectError(
+                    "本地模型引擎状态异常，已自动停止。请重新加载本地模型。"
+                )
+            _llm_suspect_since = None
+        try:
+            async with client.stream("POST", api_url, json=body, headers=headers) as r:
+                r.raise_for_status()  # httpx 不自动抛 4xx/5xx，必须显式检查
+                yield r
+        except asyncio.CancelledError:
+            if _is_local_llm_url(api_url):
+                # 流被取消（用户点停止/发了新消息）→ 引擎生成线程可能残留
+                # 并继续跑 llama.cpp，下次请求前必须验证健康
+                _llm_suspect_since = _llm_suspect_since or time.monotonic()
+            raise
 
 # ═══════════════════════════════════════════════════════
 #  Multi-Agent System: LaTiao orchestrator + specialists
@@ -1793,6 +1842,11 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
             if not streamed_text.strip() and text_only_streak < max_stagnation:
                 # Empty response from local model - retry with a nudge
                 logger.warning(f"[LOCAL-AGENT] Iteration {iteration}: empty response, retrying (streamed_text={len(streamed_text)} chars, raw_deltas={_raw_delta_count}, tool_calls={len(tool_calls)}, msgs={len(current_msgs)}, last_role={current_msgs[-1].get('role') if current_msgs else '?'})")
+                if _raw_delta_count <= 1 and _is_local_llm_url(api_url):
+                    # 流正常结束却只收到 role 空块 → 引擎疑似损坏（残留线程竞争）。
+                    # 标记后下一次请求会在锁内先验证健康，坏引擎会被杀掉。
+                    global _llm_suspect_since
+                    _llm_suspect_since = _llm_suspect_since or time.monotonic()
                 nudge_text = _get_localized_text(_detect_user_language(_extract_last_user_text(current_msgs)), {
                     "zh": "⚠️ 你上一轮的回复是空的。请直接回复用户，或者使用工具完成任务。如果需要调用工具，使用 ```tool 格式。",
                     "en": "⚠️ Your last response was empty. Please respond to the user directly, or use a tool. To call a tool, use the ```tool format.",

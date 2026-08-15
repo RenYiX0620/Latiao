@@ -354,28 +354,30 @@ async def chat_completion(request: Request):
             lm_body = {"model": model, "messages": msgs_for_model, "stream": True, "max_tokens": 2048, "temperature": 0.5, "frequency_penalty": 0.6, "stop": ["<|im_end|>", "<|endoftext|>"]}
             try:
                 async with httpx.AsyncClient(timeout=httpx.Timeout(120)) as c:
-                    async with c.stream("POST", api_url, json=lm_body, headers=headers) as r:
-                        r.raise_for_status()  # httpx 不自动抛 4xx/5xx，必须显式检查
-                        async for line in r.aiter_lines():
-                            if line and line.startswith("data: "):
-                                data_str = line[6:]
-                                if data_str == "[DONE]":
-                                    yield "data: [DONE]\n\n"
-                                    return
-                                try:
-                                    event = json.loads(data_str)
-                                    delta = event.get("choices", [{}])[0].get("delta", {})
-                                    text = delta.get("content", "")
-                                    reasoning = delta.get("reasoning", "")
-                                    if reasoning:
-                                        yield f"data: {json.dumps({'content': reasoning})}\n\n"
-                                    if text:
-                                        yield f"data: {json.dumps({'content': text})}\n\n"
-                                except (json.JSONDecodeError, KeyError, IndexError):
-                                    pass  # Malformed SSE event — skip, try next
-                                except Exception:
-                                    logger.warning("Unexpected error in SSE stream fallback", exc_info=True)
-                                    raise
+                    # 本地引擎并发流式请求会崩溃 → 与 agent loop 共用串行锁
+                    async with _local_llm_serialized(api_url):
+                        async with c.stream("POST", api_url, json=lm_body, headers=headers) as r:
+                            r.raise_for_status()  # httpx 不自动抛 4xx/5xx，必须显式检查
+                            async for line in r.aiter_lines():
+                                if line and line.startswith("data: "):
+                                    data_str = line[6:]
+                                    if data_str == "[DONE]":
+                                        yield "data: [DONE]\n\n"
+                                        return
+                                    try:
+                                        event = json.loads(data_str)
+                                        delta = event.get("choices", [{}])[0].get("delta", {})
+                                        text = delta.get("content", "")
+                                        reasoning = delta.get("reasoning", "")
+                                        if reasoning:
+                                            yield f"data: {json.dumps({'content': reasoning})}\n\n"
+                                        if text:
+                                            yield f"data: {json.dumps({'content': text})}\n\n"
+                                    except (json.JSONDecodeError, KeyError, IndexError):
+                                        pass  # Malformed SSE event — skip, try next
+                                    except Exception:
+                                        logger.warning("Unexpected error in SSE stream fallback", exc_info=True)
+                                        raise
             except (httpx.ConnectError, httpx.RemoteProtocolError):
                 yield f"data: {json.dumps({'error': '无法连接模型服务。请检查 LM Studio 或本地 LLM 是否已启动。'})}\n\n"
                 yield "data: [DONE]\n\n"
@@ -390,14 +392,16 @@ async def chat_completion(request: Request):
     resp_data = {}
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(120)) as c:
-            resp = await c.post(api_url, json={
-                "model": model, "messages": messages, "max_tokens": 1024,
-                "temperature": 0.5,
-                "frequency_penalty": 0.6,
-                "stop": ["<|im_end|>", "<|endoftext|>", "<end_of_turn>", "<eos>"],
-            }, headers=headers)
-            resp.raise_for_status()  # httpx 不自动抛 4xx/5xx，必须显式检查
-            resp_data = resp.json()
+            # 本地引擎并发请求会崩溃 → 与 agent loop 共用串行锁
+            async with _local_llm_serialized(api_url):
+                resp = await c.post(api_url, json={
+                    "model": model, "messages": messages, "max_tokens": 1024,
+                    "temperature": 0.5,
+                    "frequency_penalty": 0.6,
+                    "stop": ["<|im_end|>", "<|endoftext|>", "<end_of_turn>", "<eos>"],
+                }, headers=headers)
+                resp.raise_for_status()  # httpx 不自动抛 4xx/5xx，必须显式检查
+                resp_data = resp.json()
     except (httpx.ConnectError, httpx.RemoteProtocolError):
         return JSONResponse(
             {"error": "无法连接模型服务。请检查 LM Studio 或本地 LLM 是否已启动。"},
