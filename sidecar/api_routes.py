@@ -1180,6 +1180,7 @@ async def heartbeat():
         "downloads": list(local_llm._engine._downloads.values()),
         "local_llm": local_llm.get_status(),
         "learnings": _get_recent_learnings(10),
+        "cron_events": cron.get_recent_cron_events(10),
     }
 
 
@@ -1213,6 +1214,9 @@ async def get_cron_jobs():
 async def create_cron_job(request: Request):
     """Create a new cron job."""
     body = await _json_body(request)
+    invalid = cron._validate_schedule(body.get("schedule", ""))
+    if invalid:
+        return JSONResponse({"status": "error", "message": f"cron 表达式无效: {invalid}"}, status_code=400)
     job = {
         "id": str(uuid.uuid4()),
         "schedule": body.get("schedule", "0 9 * * *"),
@@ -1235,6 +1239,9 @@ async def update_cron_job(job_id: str, request: Request):
         for job in cron._cron_jobs:
             if job["id"] == job_id:
                 if "schedule" in body:
+                    invalid = cron._validate_schedule(body["schedule"])
+                    if invalid:
+                        return JSONResponse({"status": "error", "message": f"cron 表达式无效: {invalid}"}, status_code=400)
                     job["schedule"] = body["schedule"]
                 if "task" in body:
                     job["task"] = body["task"]

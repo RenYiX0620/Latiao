@@ -1,13 +1,27 @@
 import { useTranslation } from "../i18n";
 
+export interface CronJob {
+  id: string;
+  schedule: string;
+  task: string;
+  enabled: boolean;
+  action: string;
+  last_run?: string;
+  last_status?: string;
+  last_result?: string;
+}
+
 interface CronViewProps {
-  cronJobs: { id: string; schedule: string; task: string; enabled: boolean; action: string }[];
+  cronJobs: CronJob[];
   newCron: { schedule: string; task: string; action: string };
   setNewCron: (c: { schedule: string; task: string; action: string }) => void;
   toggleCronJob: (jobId: string) => void;
   deleteCronJob: (jobId: string) => void;
   addCronJob: () => void;
 }
+
+const statusKey = (s?: string) =>
+  s === "success" ? "cron.status_success" : s === "error" ? "cron.status_error" : "cron.status_skipped";
 
 export default function CronView({ cronJobs, newCron, setNewCron, toggleCronJob, deleteCronJob, addCronJob }: CronViewProps) {
   const { t } = useTranslation();
@@ -21,6 +35,16 @@ export default function CronView({ cronJobs, newCron, setNewCron, toggleCronJob,
             <span className={`badge ${c.enabled ? "badge-active" : "badge-inactive"}`}>{c.enabled ? t("cron.running") : t("cron.paused")}</span>
             <button className="btn-icon" style={{ fontSize: 12, marginLeft: "auto", flexShrink: 0, color: "var(--text-muted)" }}
               onClick={(e) => { e.stopPropagation(); deleteCronJob(c.id); }} title={t("cron.delete")}>✕</button>
+            {c.last_run ? (
+              <div style={{ flexBasis: "100%", fontSize: 10, color: "var(--text-muted)", marginTop: 2 }}>
+                {t("cron.last_run_at", { time: c.last_run.replace("T", " ").slice(5, 16) })}
+                {" · "}
+                {t(statusKey(c.last_status))}
+                {c.last_result ? ` · ${c.last_result.replace(/\s+/g, " ").slice(0, 60)}` : ""}
+              </div>
+            ) : (
+              <div style={{ flexBasis: "100%", fontSize: 10, color: "var(--text-muted)", marginTop: 2 }}>{t("cron.never_run")}</div>
+            )}
           </div>
         ))}
       </div>

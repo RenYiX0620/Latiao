@@ -115,6 +115,8 @@ const [timeFilter, setTimeFilter] = useState("all");
   const [prompt, setPrompt] = useState("");
   const [isProcessing, setIsProcessing] = useState(false);
   const abortControllerRef = useRef<AbortController | null>(null);
+  // 已提示过的 cron 完成事件（ts+task 键），防止 5s 心跳对同一事件反复弹 toast
+  const lastCronEventRef = useRef<string>("");
   const [pendingFile, setPendingFile] = useState<PendingFile | null>(null);
   const [isRecording, setIsRecording] = useState(false);
   const [cloudModels, setCloudModels] = useState<CloudModel[]>([]);
@@ -333,6 +335,14 @@ const [timeFilter, setTimeFilter] = useState("all");
           // Downloads are owned by the 2s poller below (single writer, no flicker)
           // Learnings
           setRecentLearnings(data.learnings || []);
+          // Cron completion toasts (skip "skipped" to avoid spam)
+          for (const ev of (data.cron_events || []) as { ts: string; task: string; status: string }[]) {
+            const key = `${ev.ts}|${ev.task}`;
+            if (ev.status !== "skipped" && key > lastCronEventRef.current) {
+              lastCronEventRef.current = key;
+              showToast(t(ev.status === "error" ? "toast.cron_fail" : "toast.cron_done", { task: ev.task }), ev.status === "error" ? "warn" : undefined);
+            }
+          }
         } else {
           setSidecarStatus("offline");
         }

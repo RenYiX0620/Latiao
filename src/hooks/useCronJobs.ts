@@ -2,9 +2,9 @@ import { useState, useEffect, useCallback } from "react";
 import { sidecarFetch } from "../utils/api";
 import { useTranslation } from "../i18n";
 
-export function useCronJobs(showToast: (msg: string) => void) {
+export function useCronJobs(showToast: (msg: string, type?: string) => void) {
   const { t } = useTranslation();
-  const [cronJobs, setCronJobs] = useState<{id: string; schedule: string; task: string; enabled: boolean; action: string}[]>([]);
+  const [cronJobs, setCronJobs] = useState<{id: string; schedule: string; task: string; enabled: boolean; action: string; last_run?: string; last_status?: string; last_result?: string}[]>([]);
   const [newCron, setNewCron] = useState({ schedule: "0 9 * * *", task: "", action: "notify" });
 
   useEffect(() => {
@@ -21,6 +21,7 @@ export function useCronJobs(showToast: (msg: string) => void) {
 
   const addCronJob = useCallback(async () => {
     if (!newCron.task.trim()) { showToast(t("cron.fill_task")); return; }
+    if (newCron.schedule.trim().split(/\s+/).length !== 5) { showToast(t("cron.invalid_expr"), "warn"); return; }
     try {
       const data = await sidecarFetch("/v1/cron", "POST", newCron);
       if (data.status === "ok") {

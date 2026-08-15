@@ -387,15 +387,19 @@ async def lifespan(app: FastAPI):
     _create_default_identity()
     _init_db()
     _seed_default_cron()
+    from cron import _load_cron_state, run_cron_catchup
+    _load_cron_state()  # 恢复跨重启的去重状态，防止同分钟重复执行
     _load_skill_index()  # Load skill index at startup
     # Write PID file so the Rust process manager can find us (after _init_db creates dir)
     SIDECAR_PID = PROGRESS_DIR / "sidecar.pid"
     SIDECAR_PID.write_text(str(os.getpid()))
     cron_task = asyncio.create_task(_cron_loop())
+    catchup_task = asyncio.create_task(run_cron_catchup())  # 补跑关闭期间错过的任务
     logger.info("Sidecar 启动 — cron loop started")
     yield
     SIDECAR_PID.unlink(missing_ok=True)
     cron_task.cancel()
+    catchup_task.cancel()
     logger.info("Sidecar 关闭")
 
 app = FastAPI(

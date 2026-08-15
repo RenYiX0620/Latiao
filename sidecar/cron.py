@@ -49,6 +49,96 @@ _cron_jobs: list[dict] = []
 _cron_lock = threading.Lock()  # protects concurrent read/write to _cron_jobs
 _cron_last_run: dict[str, str] = {}  # job_id → last run timestamp
 
+# 执行状态持久化：跨重启的去重分钟表 + 最近完成事件（前端 toast 通知用）
+CRON_STATE_FILE = PROGRESS_DIR / "cron_state.json"
+_cron_state: dict = {"last_run": {}, "events": []}
+_MAX_EVENTS = 50          # 事件环上限（心跳只取最近 10 分钟，50 条足够）
+_CATCHUP_WINDOW_HOURS = 24  # 补跑回溯窗口：更早的错过视为放弃
+
+
+def _load_cron_state():
+    """启动时恢复跨重启的去重状态（防止重启后同一分钟重复执行）。"""
+    try:
+        if CRON_STATE_FILE.exists():
+            data = json.loads(CRON_STATE_FILE.read_text(encoding="utf-8"))
+            _cron_state["last_run"] = data.get("last_run", {})
+            _cron_state["events"] = data.get("events", [])
+            _cron_last_run.update(_cron_state["last_run"])
+    except Exception:
+        logger.warning("Failed to load cron state", exc_info=True)
+
+
+def _save_cron_state():
+    try:
+        PROGRESS_DIR.mkdir(parents=True, exist_ok=True)
+        CRON_STATE_FILE.write_text(
+            json.dumps(_cron_state, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        logger.warning("Failed to save cron state", exc_info=True)
+
+
+def _push_cron_event(task: str, status: str, summary: str, action: str):
+    """记录一次任务完成事件（供前端轮询心跳时弹 toast）。"""
+    _cron_state["events"].append({
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "task": task, "status": status,
+        "summary": summary[:200], "action": action,
+    })
+    if len(_cron_state["events"]) > _MAX_EVENTS:
+        _cron_state["events"] = _cron_state["events"][-_MAX_EVENTS:]
+    _save_cron_state()
+
+
+def get_recent_cron_events(minutes: int = 10) -> list[dict]:
+    """心跳用：返回最近 N 分钟的完成事件。"""
+    cutoff = datetime.now().timestamp() - minutes * 60
+    out = []
+    for e in _cron_state["events"]:
+        try:
+            if datetime.fromisoformat(e["ts"]).timestamp() >= cutoff:
+                out.append(e)
+        except (KeyError, ValueError):
+            continue
+    return out
+
+
+_FIELD_RANGES = {"minute": (0, 59), "hour": (0, 23), "dom": (1, 31), "month": (1, 12), "dow": (0, 7)}
+
+
+def _validate_schedule(expr: str) -> str | None:
+    """校验 5 段 cron 表达式，合法返回 None，否则返回中文错误说明。"""
+    if not expr or not isinstance(expr, str):
+        return "表达式不能为空"
+    parts = expr.strip().split()
+    if len(parts) != 5:
+        return "必须是 5 段格式：分 时 日 月 周（如 0 9 * * *）"
+    names = ["分", "时", "日", "月", "周"]
+    keys = ["minute", "hour", "dom", "month", "dow"]
+    for i, (field, name) in enumerate(zip(parts, names, strict=True)):
+        rng = _FIELD_RANGES[keys[i]]
+        for token in field.split(","):
+            token = token.strip()
+            if token == "*":
+                continue
+            if token.startswith("*/"):
+                step = token[2:]
+                if not step.isdigit() or not (1 <= int(step) <= rng[1]):
+                    return f"第{i+1}段({name})步进值无效: {token}"
+                continue
+            if "-" in token:
+                lo, _, hi = token.partition("-")
+                if not (lo.isdigit() and hi.isdigit()):
+                    return f"第{i+1}段({name})范围无效: {token}"
+                lo_v, hi_v = int(lo), int(hi)
+                if not (rng[0] <= lo_v <= rng[1] and rng[0] <= hi_v <= rng[1] and lo_v <= hi_v):
+                    return f"第{i+1}段({name})范围超出 {rng[0]}-{rng[1]}: {token}"
+                continue
+            if not token.isdigit() or not (rng[0] <= int(token) <= rng[1]):
+                return f"第{i+1}段({name})取值应在 {rng[0]}-{rng[1]}: {token}"
+    return None
+
+
+
 
 def _cron_field_matches(field: str, value: int, dow_value: int = -1) -> bool:
     """Check if a single cron field matches the current value. Supports *, */N, N, N,M,O."""
@@ -111,16 +201,21 @@ def _get_due_jobs(now: datetime) -> list[dict]:
 
 
 def _mark_cron_run(job_ids: list[str], now: datetime):
-    """标记任务已执行（写入 _cron_last_run）。仅对确认要执行的任务调用。"""
+    """标记任务已执行（写入 _cron_last_run + 持久化）。仅对确认要执行的任务调用。"""
     now_str = now.strftime("%Y-%m-%d %H:%M")
     with _cron_lock:
         for job_id in job_ids:
             _cron_last_run[job_id] = now_str
+            _cron_state["last_run"][job_id] = now_str
+    _save_cron_state()
 
 
 def _create_cron(schedule, task):
     import uuid as _uid
     from datetime import datetime
+    err = _validate_schedule(schedule)
+    if err:
+        return "创建失败，cron 表达式无效: " + err + "。正确格式: 分 时 日 月 周，例如 \"0 9 * * *\" 表示每天 9 点。"
     job = {"id": str(_uid.uuid4()), "schedule": schedule, "task": task, "name": task,
            "action": "execute", "enabled": True, "created_at": datetime.now().isoformat(), "last_run": ""}
     with _cron_lock:
@@ -195,6 +290,7 @@ async def _execute_cron_job(job: dict):
     protocol, api_url, headers, is_local = _resolve_api_target(cloud)
     if not api_url:
         logger.warning("Cron job skipped: no API target（云端未配置且本地模型未运行）: %s", task[:50])
+        _record_cron_result(job, "skipped", "跳过：无可用模型（云端未配置且本地模型未运行）")
         return
     model = (cloud or {}).get("model") or SUBAGENT_MODEL
     agent_tools = _get_agent_tools("latiao", TOOLS)
@@ -279,9 +375,11 @@ async def _execute_cron_job(job: dict):
                         break
                     continue
         ai_content = full_content or "(无输出)"
+        _record_cron_result(job, "success", ai_content)
     except Exception as e:
         ai_content = f"[Cron 任务执行失败: {e}]"
         logger.warning("Cron LLM call failed: %s", e)
+        _record_cron_result(job, "error", str(e))
 
     # Record to memory DB with AI result
     try:
@@ -298,6 +396,73 @@ async def _execute_cron_job(job: dict):
         logger.warning("Failed to record cron job to memory DB", exc_info=True)
 
     logger.info("Cron job completed: %s", task[:50])
+
+
+
+def _record_cron_result(job: dict, status: str, summary: str):
+    """任务结束时更新 job 的执行状态与历史，并推送完成事件。"""
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    with _cron_lock:
+        job["last_run"] = now_iso
+        job["last_status"] = status
+        job["last_result"] = summary[:200]
+        history = job.setdefault("history", [])
+        history.append({"ts": now_iso, "status": status, "summary": summary[:200]})
+        if len(history) > 20:
+            del history[:-20]
+        _save_cron(_cron_jobs)
+    _push_cron_event(job.get("task", ""), status, summary, job.get("action", "notify"))
+
+
+def _find_missed_jobs(now: datetime) -> list[dict]:
+    """找出窗口期内本应执行却没执行的任务（App 关闭/睡眠期间错过）。
+
+    逐分钟回扫最近 24h（1440 次/job，开销可忽略）；任务从不曾运行时
+    以 created_at 为回扫起点。每个任务最多补跑一次。
+    """
+    missed = []
+    window_start = now.timestamp() - _CATCHUP_WINDOW_HOURS * 3600
+    with _cron_lock:
+        # 保留原始引用：执行结束时要更新 _cron_jobs 里的真实对象（last_status 等）
+        jobs_snapshot = [j for j in _cron_jobs if j.get("enabled", True)]
+    for job in jobs_snapshot:
+        try:
+            last_iso = job.get("last_run", "") or ""
+            if last_iso:
+                last_dt = datetime.fromisoformat(last_iso)
+                scan_from = max(last_dt.timestamp(), window_start)
+            else:
+                created = datetime.fromisoformat(job.get("created_at", "") or datetime.now().isoformat())
+                scan_from = max(created.timestamp(), window_start)
+            t = scan_from
+            # 对齐到下一分钟
+            t = (int(t // 60) + 1) * 60
+            while t < now.timestamp():
+                dt = datetime.fromtimestamp(t)
+                if _cron_matches(job["schedule"], dt):
+                    missed.append(job)
+                    break
+                t += 60
+        except (ValueError, KeyError):
+            continue
+    return missed
+
+
+async def run_cron_catchup():
+    """启动时补跑错过的任务（App 关闭期间到期的）。"""
+    from agent_loop import _spawn
+    now = datetime.now()
+    try:
+        missed = _find_missed_jobs(now)
+    except Exception:
+        logger.warning("Cron catch-up scan failed", exc_info=True)
+        return
+    if not missed:
+        return
+    for job in missed:
+        logger.info("Cron catch-up: %s (错过窗口内的一次执行)", job.get("task", "")[:50])
+        _mark_cron_run([job["id"]], now)
+        _spawn(_run_cron_job_guarded(job))
 
 
 async def _run_cron_job_guarded(job: dict):
