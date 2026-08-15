@@ -26,3 +26,11 @@ tauri-key.pub
 tauri-key
 tauri-key.pub
 outputs/
+
+# Windows 构建产物（不应入库）
+sidecar/sidecar.exe
+sidecar/llama-server.exe
+sidecar/*.dll
+sidecar/build/
+sidecar/dist/
+scripts/build-win.sh.bak

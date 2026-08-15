@@ -26,7 +26,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": ["msi"],
     "macOS": {
       "entitlements": "entitlements.plist",
       "infoPlist": "Info.plist"

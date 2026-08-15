@@ -394,9 +394,11 @@ async def _delegate_task(agent_type: str, task: str) -> str:
         AGENT_PROFILES,
         TOOL_PERMISSIONS,
         TOOLS,
+        _inject_thinking_disabled,
         _last_cloud_config,
         _local_llm_serialized,
         _resolve_api_target,
+        _sanitize_tool_messages,
         execute_tool,
     )
     from main import SUBAGENT_MODEL
@@ -423,7 +425,7 @@ async def _delegate_task(agent_type: str, task: str) -> str:
             for _ in range(3):
                 body = {
                     "model": SUBAGENT_MODEL,
-                    "messages": current_msgs,
+                    "messages": _sanitize_tool_messages(current_msgs),
                     "tools": sub_tools,
                     "tool_choice": "auto",
                     "max_tokens": 1024,
@@ -432,6 +434,7 @@ async def _delegate_task(agent_type: str, task: str) -> str:
                     "frequency_penalty": 0.6,
                 "stop": ["<|im_end|>", "<|endoftext|>", "<end_of_turn>", "<eos>"],
                 }
+                _inject_thinking_disabled(body, SUBAGENT_MODEL)
                 async with _local_llm_serialized(api_url):
                     r = await client.post(api_url, json=body, headers=sub_headers)
                 if r.status_code != 200:

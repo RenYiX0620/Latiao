@@ -209,7 +209,7 @@ class LocalLLMEngine:
     def _load_download_state(self):
         try:
             if self._download_state_file.exists():
-                saved = json.loads(self._download_state_file.read_text())
+                saved = json.loads(self._download_state_file.read_text(encoding="utf-8"))
                 for k, v in saved.items():
                     if v.get("status") not in ("downloading", "paused"):
                         self._downloads[k] = v

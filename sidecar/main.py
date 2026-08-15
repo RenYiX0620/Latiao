@@ -28,9 +28,13 @@ if len(sys.argv) > 1 and sys.argv[1] == "--mx-query":
     sys.argv = [sys.argv[0]] + sys.argv[2:]
     from skills.mx_data.mx_data import MXData
     query = " ".join(sys.argv[1:])
-    mx = MXData()
-    result = mx.query(query)
-    print(mx.format_terminal(result, *mx.parse_result(result)))
+    try:
+        mx = MXData()
+        result = mx.query(query)
+        print(mx.format_terminal(result, *mx.parse_result(result)))
+    except Exception as e:
+        print(f"妙想金融查询不可用: {e}", file=sys.stderr)
+        sys.exit(1)
     sys.exit(0)
 
 import os
@@ -160,7 +164,7 @@ logger = logging.getLogger("latiao-sidecar")
 # Load .env file manually
 env_path = Path(__file__).parent / ".env"
 if env_path.exists():
-    for _line in env_path.read_text().splitlines():
+    for _line in env_path.read_text(encoding="utf-8").splitlines():
         _line = _line.strip()
         if _line and not _line.startswith("#") and "=" in _line:
             _k, _v = _line.split("=", 1)

@@ -20,7 +20,7 @@ def _load_agent_identity(agent_id: str, fallback: str) -> str:
     for section in sections:
         sf = agents_dir / f"{agent_id}_{section}.txt"
         if sf.exists():
-            txt = sf.read_text().strip()
+            txt = sf.read_text(encoding="utf-8").strip()
             header = f"# {agent_id} - {section}"
             if txt and txt != header and txt != f"{header}\n\n（此部分内容待补充）":
                 parts.append(f"## {section}\n{txt}")
@@ -34,7 +34,7 @@ def _load_agent_identity(agent_id: str, fallback: str) -> str:
         return fallback
     if agent_file.exists():
         try:
-            return agent_file.read_text()
+            return agent_file.read_text(encoding="utf-8")
         except Exception as e:
             logger.warning("Failed to load agent identity from %s: %s", agent_file, e)
     return fallback

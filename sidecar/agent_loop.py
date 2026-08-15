@@ -410,6 +410,16 @@ async def _auto_verify(tool_name: str, args: dict, result: str) -> str:
 # Initialize plugin system at module load (seeded inside _load_plugins)
 TOOLS, TOOL_DISPATCH, TOOL_PERMISSIONS, TOOL_HOOKS = load_plugins(_FALLBACK_TOOLS, _FALLBACK_DISPATCH, _FALLBACK_PERMISSIONS)
 
+# 去重：DeepSeek 等 API 要求 tools 名字唯一，重复直接 400
+_seen_tool_names: set[str] = set()
+_unique_tools: list[dict] = []
+for _t in TOOLS:
+    _n = _t.get("function", {}).get("name") if isinstance(_t, dict) else None
+    if _n and _n not in _seen_tool_names:
+        _seen_tool_names.add(_n)
+        _unique_tools.append(_t)
+TOOLS = _unique_tools
+
 # Append delegate_task to TOOLS (not a plugin — built-in sub-agent system)
 _delegate_tool_def = {
     "type": "function",
@@ -568,8 +578,8 @@ TOOL_CATEGORIES = {
     "file_write": ["write_file"],
     "command": ["run_cmd"],
     "app": ["open_app", "open_folder"],
-    "web": ["tavily_search", "web_search"],
-    "financial": ["mx_query"],
+    "web": ["tavily_search", "web_search", "bing_search"],
+    "financial": ["mx_query", "ak_finance"],
 }
 
 INTENT_PATTERNS = [
@@ -607,16 +617,26 @@ def _filter_tools(user_text: str, all_tools: list[dict]) -> list[dict]:
     if "financial" not in allowed_categories and "web" not in allowed_categories:
         allowed_tools.add("tavily_search")
         allowed_tools.add("mx_query")
+        allowed_tools.add("bing_search")
+        allowed_tools.add("ak_finance")
     filtered = [t for t in all_tools if t.get("function", {}).get("name") in allowed_tools]
     return filtered if filtered else all_tools
 
 
 
 def _cap_tools(tools: list[dict], cap: int = 8) -> list[dict]:
-    """Cap tool count, keeping essential tools (read_file, write_file, list_dir) first."""
+    """Cap tool count, keeping essential tools (read_file, write_file, list_dir) first.
+    先去重（DeepSeek 等 API 要求工具名唯一，重复名字直接 400）。"""
+    seen: set[str] = set()
+    uniq: list[dict] = []
+    for t in tools:
+        n = t.get("function", {}).get("name")
+        if n and n not in seen:
+            seen.add(n)
+            uniq.append(t)
     essential = {"read_file", "write_file", "list_dir"}
-    priority = [t for t in tools if t.get("function", {}).get("name") in essential]
-    others = [t for t in tools if t.get("function", {}).get("name") not in essential]
+    priority = [t for t in uniq if t.get("function", {}).get("name") in essential]
+    others = [t for t in uniq if t.get("function", {}).get("name") not in essential]
     return priority + others[:max(0, cap - len(priority))]
 
 
@@ -663,6 +683,45 @@ GOAL_MODE_PROMPT = """
 
 用户只关心目标是否达成，不关心你用什么工具。
 """
+
+def _inject_thinking_disabled(body: dict, model: str) -> dict:
+    """DeepSeek 思考模式下，多轮/工具调用请求必须回传上一轮的 reasoning_content，
+    否则 API 返回 400。这里对 DeepSeek 模型显式关闭思考模式，避免多轮对话 400。
+    其它 OpenAI 兼容端点忽略该参数，不受影响。"""
+    if isinstance(model, str) and "deepseek" in model.lower():
+        body["thinking"] = {"type": "disabled"}
+    return body
+
+
+def _sanitize_tool_messages(msgs: list[dict]) -> list[dict]:
+    """DeepSeek 等 API 严格校验：assistant 消息带 tool_calls 时，后续必须有
+    对应的 tool 结果消息（tool_call_id 一一对应），否则返回 400。
+    历史消息可能因工具中断/前端保存丢失 tool 结果 → 自动补空结果消息，避免 400。
+    补丁必须紧跟缺失点插入（任何非 tool 消息出现前），保证顺序合法。"""
+    out: list[dict] = []
+    pending_ids: set[str] = set()
+    for msg in msgs:
+        role = msg.get("role")
+        if role == "assistant" and msg.get("tool_calls"):
+            pending_ids = {tc.get("id") for tc in msg["tool_calls"] if tc.get("id")}
+            out.append(msg)
+            continue
+        if role == "tool":
+            tid = msg.get("tool_call_id")
+            if tid in pending_ids:
+                pending_ids.discard(tid)
+            out.append(msg)
+            continue
+        if pending_ids:  # 遇到非 tool 消息时，未响应的 tool_call 先补空
+            for tid in pending_ids:
+                out.append({"role": "tool", "tool_call_id": tid, "content": "[工具结果缺失，已自动补空]"})
+            pending_ids = set()
+        out.append(msg)
+    if pending_ids:  # 消息末尾仍有未响应的 tool_call
+        for tid in pending_ids:
+            out.append({"role": "tool", "tool_call_id": tid, "content": "[工具结果缺失，已自动补空]"})
+    return out
+
 
 def _resolve_max_tokens(model: str) -> int:
     """Pick max_tokens by model family.
@@ -1118,19 +1177,26 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                         and "reasoning_content" not in _m):
                     _m["reasoning_content"] = ""
             body = {
-                "model": model, "messages": current_msgs,
+                "model": model, "messages": _sanitize_tool_messages(current_msgs),
                 "tools": active_tools, "tool_choice": "auto",
                 "max_tokens": _resolve_max_tokens(model), "stream": True,
                 "temperature": 0.5,
                 "frequency_penalty": 0.6,
                 "stop": ["<|im_end|>", "<|endoftext|>", "<end_of_turn>", "<eos>"],
             }
+            _inject_thinking_disabled(body, model)
 
             streamed_text = ""
             reasoning_text = ""  # 累积 reasoning_content——DeepSeek 推理模型要求传回
             tool_call_bufs: dict[int, dict] = {}
 
             async with client.stream("POST", api_url, json=body, headers=headers) as r:
+                if r.status_code != 200:
+                    try:
+                        err_body = (await r.aread()).decode("utf-8", errors="replace")[:800]
+                    except Exception:
+                        err_body = "<read failed>"
+                    logger.error("Agent stream HTTP %d body: %s", r.status_code, err_body)
                 r.raise_for_status()  # httpx 不自动抛 4xx/5xx，必须显式检查
                 async for line in r.aiter_lines():
                     if line and line.startswith("data: "):

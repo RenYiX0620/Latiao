@@ -53,7 +53,7 @@ def execute(args: dict) -> str:
     base = Path(__file__).resolve().parent
     mx_data = None
     for _ in range(6):
-        cand = base / "skills" / "mx-data" / "mx_data.py"
+        cand = base / "skills" / "mx_data" / "mx_data.py"
         if cand.exists():
             mx_data = cand
             break
