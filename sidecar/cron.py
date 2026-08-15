@@ -48,6 +48,7 @@ def _save_cron(jobs: list[dict]):
 _cron_jobs: list[dict] = []
 _cron_lock = threading.Lock()  # protects concurrent read/write to _cron_jobs
 _cron_last_run: dict[str, str] = {}  # job_id → last run timestamp
+_running_jobs: set[str] = set()  # 正在执行的任务 id（前端显示"执行中"）
 
 # 执行状态持久化：跨重启的去重分钟表 + 最近完成事件（前端 toast 通知用）
 CRON_STATE_FILE = PROGRESS_DIR / "cron_state.json"
@@ -467,10 +468,15 @@ async def run_cron_catchup():
 
 async def _run_cron_job_guarded(job: dict):
     """带超时与异常保护的 cron 任务执行包装（后台任务异常不外抛）。"""
+    with _cron_lock:
+        _running_jobs.add(job["id"])
     try:
         await asyncio.wait_for(_execute_cron_job(job), timeout=600)
     except Exception:
         logger.warning("Cron job failed/timed out: %s", job.get("task", "")[:50], exc_info=True)
+    finally:
+        with _cron_lock:
+            _running_jobs.discard(job["id"])
 
 
 async def _cron_loop():

@@ -246,6 +246,10 @@ const T: Record<string, Record<Lang, string>> = {
   "cron.invalid_expr": { zh: "表达式无效：需 5 段（分 时 日 月 周），如 0 9 * * *", en: "Invalid: need 5 fields (min hour dom month dow)", ja: "無効: 5フィールド必要", ru: "Неверно: нужно 5 полей" },
   "toast.cron_done": { zh: "⏰ 定时任务完成: {task}", en: "⏰ Cron done: {task}", ja: "⏰ 完了: {task}", ru: "⏰ Готово: {task}" },
   "toast.cron_fail": { zh: "⏰ 定时任务失败: {task}", en: "⏰ Cron failed: {task}", ja: "⏰ 失敗: {task}", ru: "⏰ Ошибка: {task}" },
+  "cron.run_now": { zh: "立即执行", en: "Run now", ja: "今すぐ実行", ru: "Запустить" },
+  "cron.triggered": { zh: "已触发执行，完成后会通知你", en: "Triggered - will notify on completion", ja: "実行開始", ru: "Запущено" },
+  "cron.trigger_fail": { zh: "触发失败", en: "Trigger failed", ja: "失敗", ru: "Ошибка" },
+  "cron.running_now": { zh: "执行中…", en: "Running…", ja: "実行中…", ru: "Выполняется…" },
   // ── ToolsView ──
   "tools.safe": { zh: "自动执行", en: "Auto", ja: "自動", ru: "Авто" },
   "tools.confirm": { zh: "需确认", en: "Confirm", ja: "確認要", ru: "Подтв." },

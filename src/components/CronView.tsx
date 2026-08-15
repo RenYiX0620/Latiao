@@ -9,6 +9,7 @@ export interface CronJob {
   last_run?: string;
   last_status?: string;
   last_result?: string;
+  running?: boolean;
 }
 
 interface CronViewProps {
@@ -17,13 +18,14 @@ interface CronViewProps {
   setNewCron: (c: { schedule: string; task: string; action: string }) => void;
   toggleCronJob: (jobId: string) => void;
   deleteCronJob: (jobId: string) => void;
+  runCronJob: (jobId: string) => void;
   addCronJob: () => void;
 }
 
 const statusKey = (s?: string) =>
   s === "success" ? "cron.status_success" : s === "error" ? "cron.status_error" : "cron.status_skipped";
 
-export default function CronView({ cronJobs, newCron, setNewCron, toggleCronJob, deleteCronJob, addCronJob }: CronViewProps) {
+export default function CronView({ cronJobs, newCron, setNewCron, toggleCronJob, deleteCronJob, addCronJob, runCronJob }: CronViewProps) {
   const { t } = useTranslation();
   return (
     <>
@@ -33,9 +35,14 @@ export default function CronView({ cronJobs, newCron, setNewCron, toggleCronJob,
             <span className="cron-schedule">{c.schedule}</span>
             <span className="cron-task">{c.task}</span>
             <span className={`badge ${c.enabled ? "badge-active" : "badge-inactive"}`}>{c.enabled ? t("cron.running") : t("cron.paused")}</span>
+            <button className="btn-icon" style={{ fontSize: 12, flexShrink: 0, color: "var(--text-accent)" }}
+              onClick={(e) => { e.stopPropagation(); if (!c.running) runCronJob(c.id); }} title={c.running ? t("cron.running_now") : t("cron.run_now")}>{c.running ? "⏳" : "▶"}</button>
             <button className="btn-icon" style={{ fontSize: 12, marginLeft: "auto", flexShrink: 0, color: "var(--text-muted)" }}
               onClick={(e) => { e.stopPropagation(); deleteCronJob(c.id); }} title={t("cron.delete")}>✕</button>
-            {c.last_run ? (
+            {c.running && (
+              <div style={{ flexBasis: "100%", fontSize: 10, color: "var(--text-accent)", marginTop: 2 }}>⏳ {t("cron.running_now")}</div>
+            )}
+            {!c.running && c.last_run ? (
               <div style={{ flexBasis: "100%", fontSize: 10, color: "var(--text-muted)", marginTop: 2 }}>
                 {t("cron.last_run_at", { time: c.last_run.replace("T", " ").slice(5, 16) })}
                 {" · "}

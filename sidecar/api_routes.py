@@ -1281,9 +1281,9 @@ async def confirm_tool(request: Request):
 
 @app.get("/v1/cron")
 async def get_cron_jobs():
-    """List all cron jobs."""
+    """List all cron jobs (with running flag for the UI)."""
     with cron._cron_lock:
-        jobs = list(cron._cron_jobs)
+        jobs = [dict(j, running=j["id"] in cron._running_jobs) for j in cron._cron_jobs]
     return {"status": "ok", "jobs": jobs}
 
 
@@ -1306,6 +1306,18 @@ async def create_cron_job(request: Request):
         cron._cron_jobs.append(job)
         cron._save_cron(cron._cron_jobs)
     return {"status": "ok", "job": job}
+
+
+@app.post("/v1/cron/{job_id}/run")
+async def run_cron_job_now(job_id: str):
+    """立即手动触发一次任务执行（不等待计划时间）。"""
+    with cron._cron_lock:
+        job = next((j for j in cron._cron_jobs if j["id"] == job_id), None)
+    if not job:
+        return {"status": "error", "message": "任务不存在"}
+    from agent_loop import _spawn
+    _spawn(cron._run_cron_job_guarded(job))
+    return {"status": "ok", "message": "已触发执行"}
 
 
 @app.put("/v1/cron/{job_id}")

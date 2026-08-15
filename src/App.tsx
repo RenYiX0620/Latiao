@@ -591,7 +591,7 @@ const [timeFilter, setTimeFilter] = useState("all");
   }, []);
 
   // Extracted hooks (cron + skills — depend on showToast)
-  const { cronJobs, newCron, setNewCron, addCronJob, toggleCronJob, deleteCronJob } = useCronJobs(showToast);
+  const { cronJobs, newCron, setNewCron, addCronJob, toggleCronJob, deleteCronJob, runCronJob } = useCronJobs(showToast);
   const { skills, newSkill, setNewSkill, toggleSkill, deleteSkill, addSkill, tavilyKey, saveTavilyKey, deleteTavilyKey } = useSkills(showToast);
 
   /* ── Stream Chat (preserved from original) ── */
@@ -1167,7 +1167,7 @@ const [timeFilter, setTimeFilter] = useState("all");
           </div>
           <div className="page-body">
             <CronView key={lang} cronJobs={cronJobs} newCron={newCron} setNewCron={setNewCron}
-              toggleCronJob={toggleCronJob} deleteCronJob={deleteCronJob} addCronJob={addCronJob} />
+              toggleCronJob={toggleCronJob} deleteCronJob={deleteCronJob} addCronJob={addCronJob} runCronJob={runCronJob} />
           </div>
         </div>
         {/* ═══ Channels View ═══ */}

@@ -4,7 +4,7 @@ import { useTranslation } from "../i18n";
 
 export function useCronJobs(showToast: (msg: string, type?: string) => void) {
   const { t } = useTranslation();
-  const [cronJobs, setCronJobs] = useState<{id: string; schedule: string; task: string; enabled: boolean; action: string; last_run?: string; last_status?: string; last_result?: string}[]>([]);
+  const [cronJobs, setCronJobs] = useState<{id: string; schedule: string; task: string; enabled: boolean; action: string; last_run?: string; last_status?: string; last_result?: string; running?: boolean}[]>([]);
   const [newCron, setNewCron] = useState({ schedule: "0 9 * * *", task: "", action: "notify" });
 
   useEffect(() => {
@@ -40,6 +40,13 @@ export function useCronJobs(showToast: (msg: string, type?: string) => void) {
     } catch (e) { console.error(e); }
   }, []);
 
+  const runCronJob = useCallback(async (jobId: string) => {
+    try {
+      const data = await sidecarFetch(`/v1/cron/${jobId}/run`, "POST");
+      if (data.status === "ok") showToast(t("cron.triggered"));
+    } catch (e) { console.error(e); showToast(t("cron.trigger_fail")); }
+  }, [showToast, t]);
+
   const deleteCronJob = useCallback(async (jobId: string) => {
     try {
       const data = await sidecarFetch(`/v1/cron/${jobId}`, "DELETE");
@@ -51,5 +58,5 @@ export function useCronJobs(showToast: (msg: string, type?: string) => void) {
     } catch (e) { console.error(e); }
   }, [showToast, t]);
 
-  return { cronJobs, newCron, setNewCron, addCronJob, toggleCronJob, deleteCronJob };
+  return { cronJobs, newCron, setNewCron, addCronJob, toggleCronJob, deleteCronJob, runCronJob };
 }
