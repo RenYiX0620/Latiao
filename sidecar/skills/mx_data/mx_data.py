@@ -3,15 +3,17 @@
 # 基于东方财富妙想API提供金融数据查询能力
 # 输出 Excel（多sheet）+ 描述 txt
 
-import os
-import sys
 import json
+import os
 import re
+import sys
 import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
 import openpyxl
 import requests
-from pathlib import Path
-from typing import Dict, List, Optional, Any, Tuple
+
 
 def safe_filename(s: str, max_len: int = 80) -> str:
     """Convert query string to safe filename """
@@ -96,7 +98,7 @@ def table_to_rows(block: Dict[str, Any]) -> Tuple[List[Dict[str, str]], List[str
                 rows = table
             else:
                 rows = [
-                    dict(zip([f"column_{i}" for i in range(len(table[0]))], row))
+                    dict(zip([f"column_{i}" for i in range(len(table[0]))], row, strict=False))
                     for row in table
                 ]
         else:
@@ -124,7 +126,7 @@ def table_to_rows(block: Dict[str, Any]) -> Tuple[List[Dict[str, str]], List[str
                 label = format_indicator_label(str(key), name_map, code_map)
                 if label:  # only add non-empty labels
                     fieldnames.append(label)
-        
+
         # Build one row per date
         for row_idx, date in enumerate(headers):
             row = {"date": flatten_value(date)}
@@ -138,7 +140,7 @@ def table_to_rows(block: Dict[str, Any]) -> Tuple[List[Dict[str, str]], List[str
                 value = raw_values[row_idx] if row_idx < len(raw_values) else ""
                 row[label] = flatten_value(value)
             rows.append(row)
-        
+
         return rows, fieldnames
 
     if len(headers) == 1 and data_key_count >= 1:
@@ -156,9 +158,9 @@ def table_to_rows(block: Dict[str, Any]) -> Tuple[List[Dict[str, str]], List[str
 
 class MXData:
     """妙想金融数据查询客户端"""
-    
+
     BASE_URL = "https://mkapi2.dfcfs.com/finskillshub/api/claw/query"
-    
+
     def __init__(self, api_key: Optional[str] = None):
         """
         初始化客户端
@@ -171,7 +173,7 @@ class MXData:
                 "export MX_APIKEY=your_api_key_here\n"
                 "或者在初始化时传入 api_key 参数"
             )
-    
+
     def query(self, tool_query: str) -> Dict[str, Any]:
         """
         查询金融数据
@@ -185,11 +187,11 @@ class MXData:
         data = {
             "toolQuery": tool_query
         }
-        
+
         response = requests.post(self.BASE_URL, headers=headers, json=data, timeout=30)
         response.raise_for_status()
         return response.json()
-    
+
     @staticmethod
     def parse_result(result: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[str], int, Optional[str]]:
         """
@@ -201,23 +203,23 @@ class MXData:
         message = result.get("message", "")
         if status != 0:
             return [], [], 0, f"顶层错误: 状态码 {status} - {message}"
-        
+
         data = result.get("data", {})
         inner_data = data.get("data", {})
         search_result = inner_data.get("searchDataResultDTO", {})
         dto_list = search_result.get("dataTableDTOList", [])
-        
+
         if not dto_list:
             return [], [], 0, "接口返回中无 dataTableDTOList"
-        
+
         condition_parts: List[str] = []
         tables: List[Dict[str, Any]] = []
         total_rows = 0
-        
+
         for i, dto in enumerate(dto_list):
             if not isinstance(dto, dict):
                 continue
-            
+
             sheet_name = safe_filename(
                 dto.get("title") or dto.get("inputTitle") or dto.get("entityName") or f"表{i + 1}"
             )
@@ -225,17 +227,17 @@ class MXData:
             if condition is not None and condition != "":
                 entity = dto.get("entityName") or sheet_name
                 condition_parts.append(f"[{entity}]\n{condition}")
-            
+
             rows, fieldnames = table_to_rows(dto)
             if not rows:
                 continue
             tables.append({"sheet_name": sheet_name, "rows": rows, "fieldnames": fieldnames})
             total_rows += len(rows)
-        
+
         if not tables:
             return [], condition_parts, 0, "dataTableDTOList 中无有效 table 数据"
         return tables, condition_parts, total_rows, None
-    
+
     @staticmethod
     def format_terminal(result: Dict[str, Any], tables: List[Dict[str, Any]], total_rows: int) -> str:
         """Format result for terminal display"""
@@ -245,12 +247,12 @@ class MXData:
         if status != 0:
             output.append(f"**错误**: 状态码 {status} - {message}")
             return "\n".join(output)
-        
+
         data = result.get("data", {})
         inner_data = data.get("data", {})
         search_result = inner_data.get("searchDataResultDTO", {})
         entity_tags = search_result.get("entityTagDTOList", [])
-        
+
         if entity_tags:
             output.append("**查询证券**:")
             entities = []
@@ -261,9 +263,9 @@ class MXData:
                 entities.append(f"- {name} ({code}) - {type_name}")
             output.append("\n".join(entities))
             output.append("")
-        
+
         output.append(f"**查询结果**: {len(tables)} 个表，共 {total_rows} 行数据\n")
-        
+
         # Only preview first 20 rows of first table on terminal
         if tables:
             first = tables[0]
@@ -277,15 +279,15 @@ class MXData:
                     cells = [str(row.get(f, "")) for f in fieldnames]
                     output.append("| " + " | ".join(cells) + " |")
                 if len(first["rows"]) > 20:
-                    output.append(f"| ... | " * (len(fieldnames) - 1) + "... |")
+                    output.append("| ... | " * (len(fieldnames) - 1) + "... |")
                 output.append("")
-        
+
         question_id = search_result.get("questionId", "")
         if question_id:
             output.append(f"*查询ID: {question_id}*")
-        
+
         return "\n".join(output)
-    
+
     @staticmethod
     def write_output_files(
         query_text: str,
@@ -298,7 +300,7 @@ class MXData:
         safe_name = safe_filename(query_text)
         file_path = output_dir / f"mx_data_{safe_name}.xlsx"
         desc_path = output_dir / f"mx_data_{safe_name}_description.txt"
-        
+
         # Write all tables to a single Excel file with multiple sheets
         wb = openpyxl.Workbook()
         wb.remove(wb.active)  # remove default empty sheet
@@ -310,7 +312,7 @@ class MXData:
                 for col_idx, value in enumerate(row, 1):
                     ws.cell(row=row_idx, column=col_idx, value=value)
         wb.save(file_path)
-        
+
         # Write description file
         description_lines = [
             "金融数据查询结果说明",
@@ -326,7 +328,7 @@ class MXData:
             description_lines.append("")
             description_lines.append("筛选条件:")
             description_lines.extend(condition_parts)
-        
+
         desc_path.write_text("\n".join(description_lines), encoding="utf-8")
         return file_path, desc_path
 
@@ -359,7 +361,7 @@ def main():
         print(f"默认输出目录: {_default_output}/")
         print("示例: python mx_data.py \"同花顺最近3年每天的最新价\"")
         sys.exit(1)
-    
+
     _default_output = Path.home() / ".local-ai-os" / "mx_output"
     # Build query
     if len(sys.argv) >= 3 and sys.argv[1] == "--query":
@@ -372,28 +374,28 @@ def main():
     else:
         query = " ".join(sys.argv[1:])
         output_dir = _default_output
-    
+
     # Ensure output directory exists
     output_dir.mkdir(parents=True, exist_ok=True)
-    
+
     try:
         mx = MXData()
         result = mx.query(query)
         tables, condition_parts, total_rows, err = mx.parse_result(result)
-        
+
         if err:
             print(f"错误: {err}")
             sys.exit(1)
-        
+
         # Terminal preview
         print(mx.format_terminal(result, tables, total_rows))
-        
+
         # Write Excel (multiple sheets) + description txt
         file_path, desc_path = mx.write_output_files(query, output_dir, tables, total_rows, condition_parts)
         print(f"\n✅ Excel 文件: {file_path}")
         print(f"📄 描述文件: {desc_path}")
         print(f"📊 总行数: {total_rows}, 表数: {len(tables)}")
-        
+
         # Save original JSON
         json_filename = output_dir / f"mx_data_{safe_filename(query)}_raw.json"
         with open(json_filename, "w", encoding="utf-8") as f:
@@ -404,7 +406,7 @@ def main():
         removed = cleanup_old_outputs(output_dir, max_age_days=3)
         if removed:
             print(f"🧹 已清理 {removed} 个过期文件(>3天)")
-            
+
     except Exception as e:
         print(f"错误: {str(e)}", file=sys.stderr)
         sys.exit(1)

@@ -10,20 +10,54 @@ const SIDECAR = "http://127.0.0.1:8765";
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export type SidecarData = Record<string, any>;
 
+let _token: string | null = null;
+
+/**
+ * Fetch the per-run sidecar auth token from Rust (generated once at startup,
+ * injected into the sidecar via LATIAO_AUTH_TOKEN). Cached after first call.
+ * Falls back to "" outside Tauri / when the command is unavailable — the
+ * sidecar only enforces auth when it was started with a token injected.
+ */
+export async function getToken(): Promise<string> {
+  if (_token !== null) return _token;
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    _token = (await invoke("get_auth_token")) as string;
+  } catch {
+    _token = "";
+  }
+  return _token;
+}
+
 /**
  * Call the sidecar via Rust IPC proxy (invoke). Returns parsed JSON.
  * Times out after 30s so a hung Rust/sidecar request can't wedge the UI.
  */
 export async function sidecarFetch(path: string, method: "GET" | "POST" | "DELETE" = "GET", body?: unknown): Promise<SidecarData> {
   const { invoke } = await import("@tauri-apps/api/core");
+  const token = await getToken();
   const request = invoke("sidecar_proxy", {
     url: SIDECAR + path,
     method,
     body: body ? JSON.stringify(body) : null,
+    token,
   }) as Promise<string>;
   const timeout = new Promise<never>((_, reject) => setTimeout(() => reject(new Error("sidecar_proxy timeout (30s)")), 30_000));
   const raw = await Promise.race([request, timeout]);
   return JSON.parse(raw) as SidecarData;
+}
+
+/**
+ * fetch() + sidecar local-auth token header (X-Latiao-Token).
+ * /health needs no token; every /v1/* call should go through this.
+ * Uses the Tauri HTTP plugin fetch (works inside webview CSP).
+ */
+export async function authFetch(path: string, init?: RequestInit): Promise<Response> {
+  const { fetch: pluginFetch } = await import("@tauri-apps/plugin-http");
+  const headers = new Headers(init?.headers);
+  const token = await getToken();
+  if (token) headers.set("X-Latiao-Token", token);
+  return pluginFetch(SIDECAR + path, { ...init, headers });
 }
 
 /**

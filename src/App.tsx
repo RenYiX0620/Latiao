@@ -4,7 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type { Message, PendingFile, SessionInfo, ViewId, CloudModel, DownloadState, HFModelResult, LLMStatus } from "./types";
 // API keys stored in OS keychain via Rust commands (store_secret/get_secret/delete_secret)
 import { useSessions } from "./hooks/useSessions";
-import { sidecarFetch, waitForSidecar } from "./utils/api";
+import { sidecarFetch, waitForSidecar, authFetch } from "./utils/api";
 import { useTranslation } from "./i18n";
 import { useCronJobs } from "./hooks/useCronJobs";
 import { useSkills } from "./hooks/useSkills";
@@ -115,6 +115,15 @@ const [timeFilter, setTimeFilter] = useState("all");
   const [prompt, setPrompt] = useState("");
   const [isProcessing, setIsProcessing] = useState(false);
   const abortControllerRef = useRef<AbortController | null>(null);
+  // 已提示过的 cron 完成事件（ts+task 键），防止 5s 心跳对同一事件反复弹 toast
+  const lastCronEventRef = useRef<string>("");
+  // useSessions 的 setter 每次渲染重建，心跳 effect（空依赖）需要最新引用
+  const setSessionsRef = useRef(setSessions);
+  setSessionsRef.current = setSessions;
+  const setCurrentIdxRef = useRef(setCurrentIdx);
+  setCurrentIdxRef.current = setCurrentIdx;
+  const setActiveViewRef = useRef(setActiveView);
+  setActiveViewRef.current = setActiveView;
   const [pendingFile, setPendingFile] = useState<PendingFile | null>(null);
   const [isRecording, setIsRecording] = useState(false);
   const [cloudModels, setCloudModels] = useState<CloudModel[]>([]);
@@ -168,6 +177,9 @@ const [timeFilter, setTimeFilter] = useState("all");
   const fileInputRef = useRef<HTMLInputElement>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
+  // 边录边转写: 录音中是否仍在进行 + 上一块是否还在识别(串行,避免堆积)
+  const isRecordingRef = useRef(false);
+  const transcribingRef = useRef(false);
   /* ── Persistence: debounce during SSE streaming, immediate otherwise ── */
   const isProcessingRef = useRef(isProcessing);
   isProcessingRef.current = isProcessing;
@@ -231,6 +243,11 @@ const [timeFilter, setTimeFilter] = useState("all");
     const timer = setTimeout(async () => {
       try {
         await invoke("store_secret", { key: "cloud_models", value: JSON.stringify(cloudModels) });
+        // 同步一份到 sidecar config.json：cron 定时任务/自动路由在后台运行，
+        // 拿不到每次请求携带的 cloud_config，必须从持久化配置读取。
+        // sidecar 冷启动可能尚未就绪 -> waitForSidecar 等待后重试
+        const { sidecarFetchWithRetry } = await import("./utils/api");
+        await sidecarFetchWithRetry("/v1/settings/cloud-models", "POST", { models: cloudModels }, 3);
       } catch (e) { console.warn("Failed to persist cloud models to keychain", e); }
     }, 1000);
     return () => clearTimeout(timer);
@@ -246,7 +263,7 @@ const [timeFilter, setTimeFilter] = useState("all");
         if (["127.0.0.1", "localhost", "tauri.localhost"].includes(url.hostname)) return;
         e.preventDefault();
         invoke("plugin:opener|open_url", { url: a.href }).catch(() => {});
-      } catch {}
+      } catch { /* malformed href — not a link worth opening */ }
     };
     document.addEventListener("click", handler, true);
     return () => document.removeEventListener("click", handler, true);
@@ -321,7 +338,7 @@ const [timeFilter, setTimeFilter] = useState("all");
     const tick = async () => {
       // Unified sidecar heartbeat
       try {
-        const resp = await fetch(SIDECAR + "/v1/heartbeat", { signal: AbortSignal.timeout(5000) });
+        const resp = await authFetch("/v1/heartbeat", { signal: AbortSignal.timeout(5000) });
         const data = await resp.json();
         if (data.status === "ok") {
           setSidecarStatus("online");
@@ -330,6 +347,31 @@ const [timeFilter, setTimeFilter] = useState("all");
           // Downloads are owned by the 2s poller below (single writer, no flicker)
           // Learnings
           setRecentLearnings(data.learnings || []);
+          // Cron completion toasts (skip "skipped" to avoid spam)
+          for (const ev of (data.cron_events || []) as { ts: string; task: string; status: string; summary?: string; full?: string }[]) {
+            const key = `${ev.ts}|${ev.task}`;
+            if (ev.status !== "skipped" && key > lastCronEventRef.current) {
+              lastCronEventRef.current = key;
+              // 跨重启去重：已显示过的事件不再重复弹 toast / 插入聊天
+              let shown: string[] = [];
+              try { shown = JSON.parse(localStorage.getItem("latiao_cron_shown") || "[]"); } catch { /* ignore */ }
+              if (shown.includes(key)) continue;
+              shown.push(key);
+              if (shown.length > 100) shown.splice(0, shown.length - 100);
+              localStorage.setItem("latiao_cron_shown", JSON.stringify(shown));
+              const header = t(ev.status === "error" ? "toast.cron_fail" : "toast.cron_done", { task: ev.task });
+              showToast(header, ev.status === "error" ? "warn" : undefined);
+              // 自动新建专属聊天会话，完整结果写入其中（不混入当前对话）
+              const content = `**${header}**\n\n${(ev.full || ev.summary || "").trim() || "(无输出)"}`;
+              const s = newSession();
+              const name = `⏰ ${ev.task.replace(/[🔍📋📊⚡📈]|\s*\(记录到记忆库\)/g, "").trim().slice(0, 20)} ${ev.ts.slice(5, 16).replace("T", " ")}`;
+              const sess = { ...s, name, messages: [{ id: msgId(), role: "assistant" as const, content }], lastActive: Date.now() };
+              // 新会话插到列表顶部并切换到聊天页，确保用户立刻看得到
+              setSessionsRef.current((prev) => [sess, ...prev]);
+              setCurrentIdxRef.current(0);
+              setActiveViewRef.current("chat");
+            }
+          }
         } else {
           setSidecarStatus("offline");
         }
@@ -337,7 +379,7 @@ const [timeFilter, setTimeFilter] = useState("all");
 
       // Fetch recent logs (always, cheap ring-buffer read)
       try {
-        const lr = await fetch(SIDECAR + "/v1/logs?limit=100", { signal: AbortSignal.timeout(5000) });
+        const lr = await authFetch("/v1/logs?limit=100", { signal: AbortSignal.timeout(5000) });
         const ld = await lr.json();
         if (ld.status === "ok") setGatewayLogs(ld.logs || []);
       } catch { /* ignore */ }
@@ -365,7 +407,7 @@ const [timeFilter, setTimeFilter] = useState("all");
   const fetchContextEstimate = async (modelPath?: string) => {
     try {
       const params = modelPath ? `?model_path=${encodeURIComponent(modelPath)}` : "";
-      const resp = await fetch(SIDECAR + "/v1/local-llm/estimate-context" + params);
+      const resp = await authFetch("/v1/local-llm/estimate-context" + params);
       const data = await resp.json();
       if (data.max_context) setContextEstimate(data);
       if (data.current_context) {
@@ -386,7 +428,7 @@ const [timeFilter, setTimeFilter] = useState("all");
     if (contextLimitTimerRef.current) clearTimeout(contextLimitTimerRef.current);
     contextLimitTimerRef.current = setTimeout(async () => {
       try {
-        const resp = await fetch(SIDECAR + "/v1/local-llm/context-limit", {
+        const resp = await authFetch("/v1/local-llm/context-limit", {
           method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ limit }),
         });
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
@@ -400,14 +442,14 @@ const [timeFilter, setTimeFilter] = useState("all");
 
   // Fetch setup check on mount
   const fetchSetup = () => {
-    fetch(SIDECAR + "/v1/local-llm/setup").then(r => r.json()).then(d => setSetupCheck(d)).catch((e) => console.warn("Setup check failed", e));
+    authFetch("/v1/local-llm/setup").then(r => r.json()).then(d => setSetupCheck(d)).catch((e) => console.warn("Setup check failed", e));
   };
   useEffect(() => { fetchSetup(); }, []);
 
   const runFix = async (fixType: string, fixPkg: string) => {
     setFixing(fixPkg);
     try {
-      const resp = await fetch(SIDECAR + "/v1/local-llm/fix", {
+      const resp = await authFetch("/v1/local-llm/fix", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ fix_type: fixType, fix_pkg: fixPkg }),
       });
@@ -425,7 +467,7 @@ const [timeFilter, setTimeFilter] = useState("all");
   useEffect(() => {
     const poll = async () => {
       try {
-        const resp = await fetch(SIDECAR + "/v1/local-llm/downloads", { signal: AbortSignal.timeout(5000) });
+        const resp = await authFetch("/v1/local-llm/downloads", { signal: AbortSignal.timeout(5000) });
         const data = await resp.json();
         if (data.status === "ok" && Array.isArray(data.downloads)) {
           const progress: Record<string, DownloadState> = {};
@@ -453,7 +495,7 @@ const [timeFilter, setTimeFilter] = useState("all");
     setSearching(true);
     try {
       const libParam = library ? `&library=${encodeURIComponent(library)}` : "";
-      const resp = await fetch(`${SIDECAR}/v1/local-llm/search?q=${encodeURIComponent(q)}&limit=30${libParam}`, { signal: AbortSignal.timeout(5000) });
+      const resp = await authFetch(`/v1/local-llm/search?q=${encodeURIComponent(q)}&limit=30${libParam}`, { signal: AbortSignal.timeout(5000) });
       const data = await resp.json();
       if (reqId === searchReqRef.current && data.status === "ok") setHfResults(data.results);
     } catch (e) { console.error(e) }
@@ -470,14 +512,14 @@ const [timeFilter, setTimeFilter] = useState("all");
   const downloadModel = async (modelId: string) => {
     showToast(t("toast.dl_start", { name: modelId.split("/").pop() || modelId }));
     try {
-      const resp = await fetch(SIDECAR + "/v1/local-llm/download", {
+      const resp = await authFetch("/v1/local-llm/download", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ model_id: modelId }),
       });
       const data = await resp.json();
       if (data.status === "ok") {
         // Immediately fetch downloads to show UI feedback
-        const dlResp = await fetch(SIDECAR + "/v1/local-llm/downloads");
+        const dlResp = await authFetch("/v1/local-llm/downloads");
         const dlData = await dlResp.json();
         if (dlData.status === "ok" && Array.isArray(dlData.downloads)) {
           const progress: Record<string, DownloadState> = {};
@@ -494,21 +536,21 @@ const [timeFilter, setTimeFilter] = useState("all");
   };
 
   const pauseDownload = async (modelId: string) => {
-    await fetch(SIDECAR + "/v1/local-llm/download/pause", {
+    await authFetch("/v1/local-llm/download/pause", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ model_id: modelId }),
     });
   };
 
   const resumeDownload = async (modelId: string) => {
-    await fetch(SIDECAR + "/v1/local-llm/download/resume", {
+    await authFetch("/v1/local-llm/download/resume", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ model_id: modelId }),
     });
   };
 
   const cancelDownload = async (modelId: string) => {
-    await fetch(SIDECAR + "/v1/local-llm/download/cancel", {
+    await authFetch("/v1/local-llm/download/cancel", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ model_id: modelId }),
     });
@@ -520,7 +562,7 @@ const [timeFilter, setTimeFilter] = useState("all");
     if (modelId) setLocalModelId(modelId);
     try {
       setLocalLLMStatus(prev => ({ ...prev, status: "starting", message: t("toast.starting") }));
-      const resp = await fetch(SIDECAR + "/v1/local-llm/start", {
+      const resp = await authFetch("/v1/local-llm/start", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ model_id: mid }),
       });
@@ -535,7 +577,7 @@ const [timeFilter, setTimeFilter] = useState("all");
 
   const stopLocalLLM = async () => {
     try {
-      const resp = await fetch(SIDECAR + "/v1/local-llm/stop", { method: "POST" });
+      const resp = await authFetch("/v1/local-llm/stop", { method: "POST" });
       const data = await resp.json();
       setLocalLLMStatus(data);
       // Restore the default UI after unloading: clear the model-id input and
@@ -573,7 +615,7 @@ const [timeFilter, setTimeFilter] = useState("all");
   }, []);
 
   // Extracted hooks (cron + skills — depend on showToast)
-  const { cronJobs, newCron, setNewCron, addCronJob, toggleCronJob, deleteCronJob } = useCronJobs(showToast);
+  const { cronJobs, newCron, setNewCron, addCronJob, toggleCronJob, deleteCronJob, runCronJob } = useCronJobs(showToast);
   const { skills, newSkill, setNewSkill, toggleSkill, deleteSkill, addSkill, tavilyKey, saveTavilyKey, deleteTavilyKey } = useSkills(showToast);
 
   /* ── Stream Chat (preserved from original) ── */
@@ -590,11 +632,11 @@ const [timeFilter, setTimeFilter] = useState("all");
 
     let response: Response;
     try {
-      response = await fetch(SIDECAR + "/v1/chat/completions", {
+      response = await authFetch("/v1/chat/completions", {
         method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal,
       });
     } catch (e) {
-      throw new Error(`无法连接 Sidecar\n原始错误: ${e}`);
+      throw new Error(`无法连接 Sidecar\n原始错误: ${e}`, { cause: e });
     }
     if (!response.ok || !response.body) throw new Error(`HTTP ${response.status}`);
 
@@ -700,7 +742,7 @@ const [timeFilter, setTimeFilter] = useState("all");
 
   const confirmTool = useCallback(async (callId: string, approved: boolean) => {
     try {
-      const resp = await fetch(SIDECAR + "/v1/confirm_tool", {
+      const resp = await authFetch("/v1/confirm_tool", {
         method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ call_id: callId, approved }),
       });
       const data = await resp.json();
@@ -896,30 +938,58 @@ const [timeFilter, setTimeFilter] = useState("all");
       }
       mediaRecorderRef.current = mediaRecorder;
       audioChunksRef.current = [];
-      mediaRecorder.ondataavailable = (event) => { if (event.data.size > 0) audioChunksRef.current.push(event.data); };
+      isRecordingRef.current = true;
+
+      // 录音中每 3 秒一块,边录边转写追加到输入框(停止后用完整音频覆盖为最终准确文本)
+      const blobToBase64 = (blob: Blob): Promise<string> => new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve((reader.result as string).split(",")[1] || "");
+        reader.onerror = () => reject(reader.error);
+        reader.readAsDataURL(blob);
+      });
+      const transcribeChunk = async (blob: Blob) => {
+        if (transcribingRef.current) return; // 上一块还在识别,跳过这块避免堆积
+        transcribingRef.current = true;
+        try {
+          const base64 = await blobToBase64(blob);
+          const resp = await authFetch("/v1/recognize_speech", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ audio_base64: base64, mime_type: "audio/webm" }),
+          });
+          const data = await resp.json();
+          if (data.status === "success" && data.text && data.text !== "(未识别到语音内容)") {
+            setPrompt(prev => (prev ? prev + " " : "") + data.text);
+          }
+        } catch { /* 实时块识别失败静默,最终完整识别兜底 */ }
+        finally { transcribingRef.current = false; }
+      };
+
+      mediaRecorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          audioChunksRef.current.push(event.data);
+          if (isRecordingRef.current) transcribeChunk(event.data);
+        }
+      };
       mediaRecorder.onstop = async () => {
+        isRecordingRef.current = false;
         setIsRecording(false);
         const audioBlob = new Blob(audioChunksRef.current, { type: "audio/webm" });
-        const base64 = await new Promise<string>((resolve, reject) => {
-          const reader = new FileReader();
-          reader.onload = () => resolve((reader.result as string).split(",")[1] || "");
-          reader.onerror = () => reject(reader.error);
-          reader.readAsDataURL(audioBlob);
-        });
+        const base64 = await blobToBase64(audioBlob);
 
         try {
-          const resp = await fetch(SIDECAR + "/v1/recognize_speech", {
+          const resp = await authFetch("/v1/recognize_speech", {
             method: "POST", headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ audio_base64: base64, mime_type: "audio/webm" }),
           });
           const data = await resp.json();
           if (data.text) {
+            // 完整音频识别更准 → 覆盖实时追加的文本
             setPrompt(data.text);
           }
         } catch (e) { console.error(e); showToast(t("toast.speech_fail")); }
         stream.getTracks().forEach((t) => t.stop());
       };
-      mediaRecorder.start();
+      mediaRecorder.start(3000); // 3s 一块,支持边录边转写
       setIsRecording(true);
     } catch {
       setIsRecording(false);
@@ -932,7 +1002,7 @@ const [timeFilter, setTimeFilter] = useState("all");
     setTestingModel(modelName);
     setTestResult("");
     try {
-      const resp = await fetch(SIDECAR + "/v1/test_connection", {
+      const resp = await authFetch("/v1/test_connection", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ model: modelName, key, endpoint, protocol }),
       });
@@ -1121,7 +1191,7 @@ const [timeFilter, setTimeFilter] = useState("all");
           </div>
           <div className="page-body">
             <CronView key={lang} cronJobs={cronJobs} newCron={newCron} setNewCron={setNewCron}
-              toggleCronJob={toggleCronJob} deleteCronJob={deleteCronJob} addCronJob={addCronJob} />
+              toggleCronJob={toggleCronJob} deleteCronJob={deleteCronJob} addCronJob={addCronJob} runCronJob={runCronJob} />
           </div>
         </div>
         {/* ═══ Channels View ═══ */}

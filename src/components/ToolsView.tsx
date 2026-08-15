@@ -1,6 +1,6 @@
 import { useTranslation } from "../i18n";
+import { authFetch } from "../utils/api";
 
-const SIDECAR = "http://127.0.0.1:8765";
 
 interface ToolsViewProps {
   tools: { name: string; description: string; parameters: Record<string, unknown>; permission: string; usage_count: number }[];
@@ -35,7 +35,7 @@ export default function ToolsView({ tools, setTools, showToast }: ToolsViewProps
               e.stopPropagation();
               const newPerm = isSafe ? "confirm" : "safe";
               try {
-                const resp = await fetch(SIDECAR + "/v1/permissions", {
+                const resp = await authFetch("/v1/permissions", {
                   method: "POST", headers: { "Content-Type": "application/json" },
                   body: JSON.stringify({ tool: tool.name, permission: newPerm }),
                 });

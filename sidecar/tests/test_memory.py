@@ -1,7 +1,9 @@
 """Tests for memory module pure functions."""
-import unittest
+import re as _re
 import sys
+import unittest
 from pathlib import Path
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from memory import _quick_reflect
 
@@ -42,7 +44,7 @@ class TestQuickReflect(unittest.TestCase):
 
 
 # Local copy of main.py's dedup function for testing
-import re as _re
+
 
 def _test_dedup(text):
     if not text:

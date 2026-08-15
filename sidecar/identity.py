@@ -1,8 +1,6 @@
 """Identity System — agent identity files, intents, and profile management."""
 import logging
-import os
 import re
-from datetime import datetime
 from pathlib import Path
 
 from config import PROGRESS_DIR
@@ -15,7 +13,7 @@ IDENTITY_FILES = ["IDENTITY.md", "SOUL.md", "AGENTS.md", "USER.md"]
 def _load_agent_identity(agent_id: str, fallback: str) -> str:
     """Load agent identity from agents/{agent_id}.txt or merge from section files."""
     agents_dir = Path(__file__).resolve().parent / "agents"
-    
+
     # Try loading from section files first (latiao_IDENTITY.txt + latiao_SOUL.txt + ...)
     sections = ["IDENTITY", "SOUL", "AGENTS", "USER"]
     parts = []
@@ -26,10 +24,10 @@ def _load_agent_identity(agent_id: str, fallback: str) -> str:
             header = f"# {agent_id} - {section}"
             if txt and txt != header and txt != f"{header}\n\n（此部分内容待补充）":
                 parts.append(f"## {section}\n{txt}")
-    
+
     if parts:
         return "\n\n".join(parts)
-    
+
     # Fall back to combined identity file
     agent_file = (agents_dir / f"{agent_id}.txt").resolve()
     if not str(agent_file).startswith(str(agents_dir.resolve()) + "/"):

@@ -19,7 +19,7 @@ jobs:
           cache: npm
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: "3.11"
       - uses: dtolnay/rust-toolchain@stable
 
       - run: npm install
@@ -55,7 +55,10 @@ jobs:
           SIG_FILE=$(find "$BUNDLE" -name "*.sig" 2>/dev/null | head -1)
           echo "=== Build artifacts ==="
           find "$BUNDLE" -type f | sort
-          if [ -z "$DMG_FILE" ]; then echo "ERROR: no DMG"; exit 1; fi
+          if [ -z "$DMG_FILE" ]; then
+            echo "No DMG (macOS bundle not produced) - skipping Sparkle manifest"
+            exit 0
+          fi
           SIG=$(cat "$SIG_FILE" 2>/dev/null || echo "")
           echo '{"version":"'$VERSION'","notes":"Latiao v'$VERSION'","pub_date":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'","platforms":{"darwin-aarch64":{"url":"https://github.com/RenYiX0620/Latiao/releases/download/'$GITHUB_REF_NAME'/Latiao_'$VERSION'_aarch64.dmg","signature":"'$SIG'"}}}' > "$BUNDLE/dmg/latest.json"
           echo "Manifest: $(cat "$BUNDLE/dmg/latest.json")"
@@ -66,5 +69,56 @@ jobs:
             src-tauri/target/release/bundle/dmg/*.dmg
             src-tauri/target/release/bundle/dmg/*.sig
             src-tauri/target/release/bundle/dmg/latest.json
+          draft: false
+          generate_release_notes: true
+
+  build-windows:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: dtolnay/rust-toolchain@stable
+
+      - run: npm install
+
+      - name: Build sidecar (PyInstaller)
+        run: |
+          cd sidecar
+          python -m pip install -r requirements.txt
+          python -m pip install "pyinstaller==6.*"
+          python -m PyInstaller latiao.spec
+          Copy-Item dist/sidecar.exe -Destination . -Force
+
+      - name: Download llama-server.exe
+        run: |
+          $headers = @{ "User-Agent" = "Latiao-CI" }
+          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest" -Headers $headers
+          $tag = $release.tag_name
+          $zipUrl = "https://github.com/ggml-org/llama.cpp/releases/download/$tag/llama-$tag-bin-win-cpu-x64.zip"
+          Invoke-WebRequest -Uri $zipUrl -OutFile "$env:RUNNER_TEMP\llama.zip"
+          Expand-Archive -Path "$env:RUNNER_TEMP\llama.zip" -DestinationPath "$env:RUNNER_TEMP\llama" -Force
+          $exe = Get-ChildItem -Path "$env:RUNNER_TEMP\llama" -Recurse -Filter "llama-server.exe" | Select-Object -First 1
+          Copy-Item $exe.FullName -Destination "sidecar\llama-server.exe" -Force
+
+      - name: Build Tauri MSI
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+        run: npm run tauri build -- --target x86_64-pc-windows-msvc
+
+      - name: Upload MSI to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
           draft: false
           generate_release_notes: true

@@ -5,6 +5,7 @@ import re
 
 # 东方财富风控会拒绝 python-requests 默认 UA → 全局打浏览器 UA 补丁
 import requests.utils
+
 _BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
 _orig_default_headers = requests.utils.default_headers

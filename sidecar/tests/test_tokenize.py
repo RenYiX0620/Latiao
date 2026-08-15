@@ -1,6 +1,6 @@
 """Tests for Chinese tokenization (_tokenize_zh)."""
-import unittest
 import sys
+import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))

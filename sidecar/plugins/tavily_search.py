@@ -1,5 +1,4 @@
 """Search the web using Tavily Search API."""
-import asyncio
 import json
 import os
 import subprocess

@@ -14,17 +14,18 @@ import logging
 import os
 import platform
 import re as _re
-import subprocess
-import sys
-import threading
-import time
-from pathlib import Path
 
 # Module-level TLS context for HuggingFace API + model downloads.
 # Verified via certifi's bundled CAs — sidesteps the broken system cert chain
 # on some macOS/Python combos that prompted the old unverified context. Model
 # files are still hash-verified by huggingface_hub as a second layer.
 import ssl
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
 import certifi
 
 try:
@@ -113,6 +114,10 @@ class LocalLLMEngine:
         self.server_port = 1235
         self.server_status = "stopped"  # stopped | starting | running | error
         self.status_message = ""
+        # 引擎健康状态：agent 层发现异常（空响应/中断残留）后 mark_engine_suspect，
+        # 下一次请求前强制发 mini 请求验证，失败则杀掉引擎进程避免继续带病运行。
+        self._health_ok = True
+        self._health_verified_at = 0.0
         # User explicitly requested a stop — get_status() must NOT flip back to
         # "running" via the reconnect probe while the port is still draining.
         self._explicit_stop = False
@@ -252,7 +257,7 @@ class LocalLLMEngine:
             dl_info["downloaded_bytes"] = 0
         try:
             import urllib.request
-            from concurrent.futures import ThreadPoolExecutor, as_completed
+            from concurrent.futures import ThreadPoolExecutor
 
             cache_root = str(self._cache_dir.parent)
 
@@ -295,8 +300,10 @@ class LocalLLMEngine:
                     if chunk_plan and chunk_plan[-1][1] != total_size - 1:
                         # Remote file changed size since last attempt — discard stale parts.
                         for p in (dl_info.get("chunk_paths") or []):
-                            try: os.unlink(p)
-                            except OSError: pass
+                            try:
+                                os.unlink(p)
+                            except OSError:
+                                pass
                         chunk_plan = None
                     if not chunk_plan:
                         num_threads = min(6, max(2, total_size // (300 * 1024 * 1024)))  # 1 thread per 300MB, max 6
@@ -428,8 +435,10 @@ class LocalLLMEngine:
 
                         # Collect results
                         for f in futures:
-                            try: f.result()
-                            except: pass
+                            try:
+                                f.result()
+                            except Exception:
+                                pass
 
                         # A newer resume superseded this worker — leave the .part
                         # files (with their partial progress) for the new worker.
@@ -440,8 +449,10 @@ class LocalLLMEngine:
                         # 先查 cancelled，避免取消状态被下面的 error 覆盖
                         if dl_info.get("status") == "cancelled":
                             for sp in chunk_part_paths:
-                                try: os.unlink(sp)
-                                except OSError: pass
+                                try:
+                                    os.unlink(sp)
+                                except OSError:
+                                    pass
                             dl_info.pop("chunk_ranges", None)
                             dl_info.pop("chunk_paths", None)
                             return
@@ -466,7 +477,8 @@ class LocalLLMEngine:
                             with open(sp, "rb") as inp:
                                 while True:
                                     data = inp.read(8 * 1024 * 1024)
-                                    if not data: break
+                                    if not data:
+                                        break
                                     out.write(data)
                             os.unlink(sp)
                     dl_info.pop("chunk_ranges", None)
@@ -487,7 +499,8 @@ class LocalLLMEngine:
                                     self._save_download_state()  # 暂停时把进度落盘
                                     return
                                 chunk = resp2.read(1024 * 1024)
-                                if not chunk: break
+                                if not chunk:
+                                    break
                                 f.write(chunk)
                                 downloaded += len(chunk)
                                 now = time.time()
@@ -603,8 +616,10 @@ class LocalLLMEngine:
         dl_info["status"] = "cancelled"
         # Discard any preserved chunk parts so cancel truly frees the space.
         for p in (dl_info.get("chunk_paths") or []):
-            try: os.unlink(p)
-            except OSError: pass
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
         dl_info.pop("chunk_ranges", None)
         dl_info.pop("chunk_paths", None)
         dl_info["message"] = "已取消"
@@ -719,8 +734,12 @@ class LocalLLMEngine:
         if self.is_running():
             return f"http://127.0.0.1:{self.server_port}/v1"
         # Engine was restarted — check if a model server is still running on our port
-        # (e.g. sidecar was killed and restarted, but model process outlived it)
+        # (e.g. sidecar was killed and restarted, but model process outlived it).
+        # 复用的可能是旧会话遗留的引擎（参数/状态未知，甚至已损坏）——
+        # 必须实测健康后才复用，否则空响应/挂起会全部传导给用户。
         if self._probe_port(self.server_port):
+            if not self.ensure_engine_healthy():
+                return ""
             self.server_status = "running"
             self.status_message = "(reconnected after sidecar restart)"
             if not self._active_backend:
@@ -772,6 +791,54 @@ class LocalLLMEngine:
             # /v1/models may return empty body on some servers (MLX) —
             # the TCP connect above already confirmed the port is alive
             return True
+
+    def mark_engine_suspect(self):
+        """Agent 层发现引擎行为异常（空响应/流被中断后残留线程）时调用，
+        下一次请求前强制做一次健康验证，避免继续向损坏的引擎发请求。"""
+        self._health_verified_at = 0.0
+
+    def verify_engine_health(self, timeout: float = 20) -> bool:
+        """向引擎发一个最小 chat 请求，确认它能真正产出文本。
+
+        被中断/长时间运行的 llama.cpp 引擎可能处于"端口活着但生成异常"的
+        状态（空响应/挂起），只探测端口发现不了，必须实测生成。
+        """
+        import urllib.request
+        if not self._probe_port(self.server_port, timeout=1):
+            return False
+        try:
+            body = json.dumps({
+                "model": "health-check", "stream": False, "max_tokens": 4,
+                "messages": [{"role": "user", "content": "hi"}],
+            }).encode()
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{self.server_port}/v1/chat/completions",
+                data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=timeout, context=_ssl_ctx) as resp:
+                data = json.loads(resp.read())
+            content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
+            return bool(content.strip())
+        except Exception:
+            return False
+
+    def ensure_engine_healthy(self, force: bool = False) -> bool:
+        """TTL 缓存的健康检查。引擎异常时直接杀掉进程并复位状态，
+        让 UI 显示"未加载"而不是继续向损坏的引擎发请求。"""
+        now = time.time()
+        if not force and self._health_ok and now - self._health_verified_at < 30:
+            return True
+        ok = self.verify_engine_health()
+        self._health_ok = ok
+        self._health_verified_at = now
+        if not ok:
+            logger.warning("本地模型引擎健康检查失败，停止引擎进程")
+            self._kill_port(self.server_port)
+            self.server_status = "stopped"
+            self.status_message = ""
+        return ok
 
     # ── Start / Stop ──
 
@@ -959,6 +1026,11 @@ class LocalLLMEngine:
                 "--host", "127.0.0.1",
                 "--n_ctx", str(self.model_token_limit),
                 "--n_gpu_layers", str(self.n_gpu_layers),
+                # sidecar 已用 asyncio 锁串行化所有请求；引擎自带的
+                # interrupt_requests 会在新请求到达时强掐正在生成的流，
+                # 而生成线程无法被取消，导致残留线程与新请求并发访问模型
+                # 实例 → 空响应/挂起/崩溃。必须关闭。
+                "--interrupt_requests", "False",
             ]
             # ── Auto-select KV cache quant based on model quant ──
             # Q4 model → Q4_0 KV; Q5+ model → Q8_0 KV
@@ -1056,6 +1128,9 @@ class LocalLLMEngine:
         chat_fmt = self._guess_chat_format(model_path)
         if chat_fmt:
             cmd += ["--chat-template", chat_fmt]
+        # 注意：原生 llama-server 的 interrupt-requests 默认即关闭（新请求排队
+        # 而非掐断当前生成），与 macOS 路径显式 --interrupt_requests False
+        # 行为一致，无需额外参数。
 
         env = os.environ.copy()
         env.pop("HF_ENDPOINT", None)
@@ -1543,7 +1618,9 @@ def get_model_detail(model_id: str) -> dict:
                     quant = ""
                     for q in ["Q2_K","Q3_K_S","Q3_K_M","Q3_K_L","Q4_0","Q4_K_S","Q4_K_M",
                               "Q5_0","Q5_K_S","Q5_K_M","Q6_K","Q8_0","F16","IQ","fp16"]:
-                        if q in fname: quant = q; break
+                        if q in fname:
+                            quant = q
+                            break
                     siblings.append({"filename": fname, "size": size_str, "size_bytes": size_bytes, "quant": quant})
 
         # Readme excerpt
