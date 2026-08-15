@@ -122,8 +122,8 @@ const [timeFilter, setTimeFilter] = useState("all");
   setSessionsRef.current = setSessions;
   const setCurrentIdxRef = useRef(setCurrentIdx);
   setCurrentIdxRef.current = setCurrentIdx;
-  const sessionsLenRef = useRef(sessions.length);
-  sessionsLenRef.current = sessions.length;
+  const setActiveViewRef = useRef(setActiveView);
+  setActiveViewRef.current = setActiveView;
   const [pendingFile, setPendingFile] = useState<PendingFile | null>(null);
   const [isRecording, setIsRecording] = useState(false);
   const [cloudModels, setCloudModels] = useState<CloudModel[]>([]);
@@ -366,10 +366,10 @@ const [timeFilter, setTimeFilter] = useState("all");
               const s = newSession();
               const name = `⏰ ${ev.task.replace(/[🔍📋📊⚡📈]|\s*\(记录到记忆库\)/g, "").trim().slice(0, 20)} ${ev.ts.slice(5, 16).replace("T", " ")}`;
               const sess = { ...s, name, messages: [{ id: msgId(), role: "assistant" as const, content }], lastActive: Date.now() };
-              const idx = sessionsLenRef.current;
-              sessionsLenRef.current = idx + 1;
-              setSessionsRef.current((prev) => [...prev, sess]);
-              setCurrentIdxRef.current(idx);
+              // 新会话插到列表顶部并切换到聊天页，确保用户立刻看得到
+              setSessionsRef.current((prev) => [sess, ...prev]);
+              setCurrentIdxRef.current(0);
+              setActiveViewRef.current("chat");
             }
           }
         } else {
