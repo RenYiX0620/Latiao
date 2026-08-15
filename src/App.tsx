@@ -236,6 +236,11 @@ const [timeFilter, setTimeFilter] = useState("all");
     const timer = setTimeout(async () => {
       try {
         await invoke("store_secret", { key: "cloud_models", value: JSON.stringify(cloudModels) });
+        // 同步一份到 sidecar config.json：cron 定时任务/自动路由在后台运行，
+        // 拿不到每次请求携带的 cloud_config，必须从持久化配置读取。
+        // sidecar 冷启动可能尚未就绪 -> waitForSidecar 等待后重试
+        const { sidecarFetchWithRetry } = await import("./utils/api");
+        await sidecarFetchWithRetry("/v1/settings/cloud-models", "POST", { models: cloudModels }, 3);
       } catch (e) { console.warn("Failed to persist cloud models to keychain", e); }
     }, 1000);
     return () => clearTimeout(timer);

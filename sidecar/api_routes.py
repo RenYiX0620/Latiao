@@ -145,6 +145,27 @@ async def chat_completion(request: Request):
     # 不要在这里重新读取 cloud_config：上面的自动路由可能已为代码任务
     # 选中了云端模型，重新从 body 取值会把路由结果覆盖回 None → 又落回本地模型。
     _last_cloud_config.set(cloud_config)
+    # 兜底持久化：后台任务（cron/自动路由）读 config.json，看不到请求级配置。
+    # 前端启动同步可能因 sidecar 未就绪而失败，这里在首个真实请求时补写。
+    if cloud_config and cloud_config.get("endpoint"):
+        try:
+            _cfg = {}
+            if CONFIG_FILE.exists():
+                _cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            _entry = {
+                "name": str(cloud_config.get("model", ""))[:100],
+                "endpoint": str(cloud_config["endpoint"])[:500],
+                "key": str(cloud_config.get("key", ""))[:500],
+                "protocol": str(cloud_config.get("protocol", "openai"))[:30],
+            }
+            _models = [m for m in _cfg.get("cloud_models", [])
+                       if not (m.get("name") == _entry["name"] and m.get("endpoint") == _entry["endpoint"])]
+            _models.append(_entry)
+            _cfg["cloud_models"] = _models[-10:]
+            CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            CONFIG_FILE.write_text(json.dumps(_cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            logger.debug("Failed to persist cloud_config on request", exc_info=True)
     use_stream = body.get("stream", False)
 
     # Resolve API target
@@ -1040,6 +1061,62 @@ async def delete_skill(key: str):
     _save_skills_config(cfg)
     main._loaded_skills = _load_skills()
     return {"status": "ok"}
+
+
+# ── Cloud model config endpoints (cron/auto-route 可见的持久化配置) ──
+
+
+@app.get("/v1/settings/cloud-models")
+async def get_cloud_models():
+    """List configured cloud models (keys masked)."""
+    models: list = []
+    try:
+        if CONFIG_FILE.exists():
+            cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            models = cfg.get("cloud_models", [])
+    except Exception:
+        logger.warning("Failed to read cloud models config", exc_info=True)
+    masked = []
+    for m in models:
+        key = m.get("key", "")
+        masked.append({
+            "name": m.get("name", ""), "endpoint": m.get("endpoint", ""),
+            "protocol": m.get("protocol", "openai"),
+            "has_key": bool(key),
+            "key_masked": (key[:6] + "••••" + key[-4:]) if len(key) > 10 else ("••••" if key else ""),
+        })
+    return {"status": "ok", "models": masked}
+
+
+@app.post("/v1/settings/cloud-models")
+async def set_cloud_models(request: Request):
+    """Persist cloud models to config.json so background tasks (cron, auto-route)
+    can use them. 前端每次保存模型时同步一份过来（与 OS keychain 双写，同 tavily key 模式）。"""
+    body = await _json_body(request)
+    models = body.get("models", [])
+    if not isinstance(models, list):
+        return {"status": "error", "message": "models must be a list"}
+    clean = []
+    for m in models:
+        if not isinstance(m, dict) or not m.get("endpoint"):
+            continue
+        clean.append({
+            "name": str(m.get("name", ""))[:100],
+            "endpoint": str(m["endpoint"])[:500],
+            "key": str(m.get("key", ""))[:500],
+            "protocol": str(m.get("protocol", "openai"))[:30],
+        })
+    try:
+        cfg = {}
+        if CONFIG_FILE.exists():
+            cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        cfg["cloud_models"] = clean
+        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        CONFIG_FILE.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        logger.warning("Failed to save cloud models config", exc_info=True)
+        return {"status": "error", "message": "写入配置失败"}
+    return {"status": "ok", "count": len(clean)}
 
 
 # ── Tavily API Key management endpoints ──
