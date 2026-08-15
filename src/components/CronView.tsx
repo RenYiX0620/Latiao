@@ -28,7 +28,7 @@ const statusKey = (s?: string) =>
 export default function CronView({ cronJobs, newCron, setNewCron, toggleCronJob, deleteCronJob, addCronJob, runCronJob }: CronViewProps) {
   const { t } = useTranslation();
   return (
-    <>
+    <div style={{ maxWidth: 720, margin: "0 auto" }}>
       <div className="cron-list">
         {cronJobs.map((c) => (
           <div key={c.id} className="cron-item" onClick={() => toggleCronJob(c.id)}>
@@ -68,6 +68,6 @@ export default function CronView({ cronJobs, newCron, setNewCron, toggleCronJob,
       <div style={{ fontSize: 10, color: "var(--text-muted)", marginTop: 8 }}>
         {t("cron.format_hint")}
       </div>
-    </>
+    </div>
   );
 }
