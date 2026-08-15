@@ -117,9 +117,13 @@ const [timeFilter, setTimeFilter] = useState("all");
   const abortControllerRef = useRef<AbortController | null>(null);
   // 已提示过的 cron 完成事件（ts+task 键），防止 5s 心跳对同一事件反复弹 toast
   const lastCronEventRef = useRef<string>("");
-  // useSessions 的 setMessages 每次渲染重建，心跳 effect 需要最新引用
-  const setMessagesRef = useRef(setMessages);
-  setMessagesRef.current = setMessages;
+  // useSessions 的 setter 每次渲染重建，心跳 effect（空依赖）需要最新引用
+  const setSessionsRef = useRef(setSessions);
+  setSessionsRef.current = setSessions;
+  const setCurrentIdxRef = useRef(setCurrentIdx);
+  setCurrentIdxRef.current = setCurrentIdx;
+  const sessionsLenRef = useRef(sessions.length);
+  sessionsLenRef.current = sessions.length;
   const [pendingFile, setPendingFile] = useState<PendingFile | null>(null);
   const [isRecording, setIsRecording] = useState(false);
   const [cloudModels, setCloudModels] = useState<CloudModel[]>([]);
@@ -344,7 +348,7 @@ const [timeFilter, setTimeFilter] = useState("all");
           // Learnings
           setRecentLearnings(data.learnings || []);
           // Cron completion toasts (skip "skipped" to avoid spam)
-          for (const ev of (data.cron_events || []) as { ts: string; task: string; status: string; summary?: string }[]) {
+          for (const ev of (data.cron_events || []) as { ts: string; task: string; status: string; summary?: string; full?: string }[]) {
             const key = `${ev.ts}|${ev.task}`;
             if (ev.status !== "skipped" && key > lastCronEventRef.current) {
               lastCronEventRef.current = key;
@@ -357,11 +361,15 @@ const [timeFilter, setTimeFilter] = useState("all");
               localStorage.setItem("latiao_cron_shown", JSON.stringify(shown));
               const header = t(ev.status === "error" ? "toast.cron_fail" : "toast.cron_done", { task: ev.task });
               showToast(header, ev.status === "error" ? "warn" : undefined);
-              // 结果写入当前聊天会话，用户切回聊天页即可看到
-              setMessagesRef.current((prev) => [...prev, {
-                id: msgId(), role: "assistant",
-                content: `⏰ **${header}**\n\n${(ev.summary || "").trim() || "(无输出)"}`,
-              }]);
+              // 自动新建专属聊天会话，完整结果写入其中（不混入当前对话）
+              const content = `**${header}**\n\n${(ev.full || ev.summary || "").trim() || "(无输出)"}`;
+              const s = newSession();
+              const name = `⏰ ${ev.task.replace(/[🔍📋📊⚡📈]|\s*\(记录到记忆库\)/g, "").trim().slice(0, 20)} ${ev.ts.slice(5, 16).replace("T", " ")}`;
+              const sess = { ...s, name, messages: [{ id: msgId(), role: "assistant" as const, content }], lastActive: Date.now() };
+              const idx = sessionsLenRef.current;
+              sessionsLenRef.current = idx + 1;
+              setSessionsRef.current((prev) => [...prev, sess]);
+              setCurrentIdxRef.current(idx);
             }
           }
         } else {

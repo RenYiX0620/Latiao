@@ -78,12 +78,13 @@ def _save_cron_state():
         logger.warning("Failed to save cron state", exc_info=True)
 
 
-def _push_cron_event(task: str, status: str, summary: str, action: str):
-    """记录一次任务完成事件（供前端轮询心跳时弹 toast）。"""
+def _push_cron_event(task: str, status: str, summary: str, action: str, full: str = ""):
+    """记录一次任务完成事件（供前端轮询心跳时弹 toast / 新建会话展示）。"""
     _cron_state["events"].append({
         "ts": datetime.now().isoformat(timespec="seconds"),
         "task": task, "status": status,
         "summary": summary[:200], "action": action,
+        "full": (full or summary)[:4000],  # 完整结果（新会话展示用）
     })
     if len(_cron_state["events"]) > _MAX_EVENTS:
         _cron_state["events"] = _cron_state["events"][-_MAX_EVENTS:]
@@ -412,7 +413,7 @@ def _record_cron_result(job: dict, status: str, summary: str):
         if len(history) > 20:
             del history[:-20]
         _save_cron(_cron_jobs)
-    _push_cron_event(job.get("task", ""), status, summary, job.get("action", "notify"))
+    _push_cron_event(job.get("task", ""), status, summary, job.get("action", "notify"), summary)
 
 
 def _find_missed_jobs(now: datetime) -> list[dict]:
