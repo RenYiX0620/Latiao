@@ -489,7 +489,8 @@ body {
 /* ── Cron ── */
 .cron-list { display: flex; flex-direction: column; gap: 8px; }
 .cron-item {
-  display: flex; align-items: center; gap: 14px; padding: 12px 16px;
+  display: flex; align-items: center; gap: 10px; padding: 10px 14px;
+  width: fit-content; min-width: 60%; max-width: 100%;
   background: var(--bg-card); border: 1px solid var(--border-default);
   border-radius: var(--radius-lg); transition: all 0.15s ease; cursor: pointer;
 }
