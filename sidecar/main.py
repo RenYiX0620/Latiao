@@ -390,9 +390,9 @@ async def lifespan(app: FastAPI):
     _load_permissions()
     _create_default_identity()
     _init_db()
-    _seed_default_cron()
     from cron import _load_cron_state, run_cron_catchup
-    _load_cron_state()  # 恢复跨重启的去重状态，防止同分钟重复执行
+    _load_cron_state()  # 恢复跨重启状态（去重表 + seeded 标记），必须先于播种
+    _seed_default_cron()
     _load_skill_index()  # Load skill index at startup
     # Write PID file so the Rust process manager can find us (after _init_db creates dir)
     SIDECAR_PID = PROGRESS_DIR / "sidecar.pid"
