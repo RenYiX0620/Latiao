@@ -229,9 +229,16 @@ def _create_cron(schedule, task):
 # ── Seed default cron jobs ──
 
 def _seed_default_cron():
-    """Create default cron jobs if cron.json is empty."""
+    """首次启动时播种默认任务（seeded 标记持久化）。
+
+    只在从未初始化过（无 seeded 标记且 cron.json 为空）时播种一次；
+    用户删除全部任务后 cron.json 为空，但 seeded 标记已存在——
+    重启不会再恢复默认任务。
+    """
     global _cron_jobs
     _cron_jobs = _load_cron()
+    if _cron_state.get("seeded"):
+        return
     if not _cron_jobs:
         _cron_jobs = [
             {"id": str(uuid.uuid4()), "schedule": "0 9 * * *", "task": "📋 每日摘要 (记录到记忆库)", "action": "notify", "enabled": True, "created_at": datetime.now().isoformat()},
@@ -239,6 +246,8 @@ def _seed_default_cron():
             {"id": str(uuid.uuid4()), "schedule": "0 18 * * 5", "task": "📊 每周汇总 (记录到记忆库)", "action": "notify", "enabled": False, "created_at": datetime.now().isoformat()},
         ]
         _save_cron(_cron_jobs)
+    _cron_state["seeded"] = True
+    _save_cron_state()
 
 
 async def _execute_cron_job(job: dict):

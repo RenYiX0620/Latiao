@@ -120,5 +120,41 @@ class TestRecordResult(unittest.TestCase):
             del cron._save_cron_state
 
 
+class TestSeedDefaultCron(unittest.TestCase):
+    def test_seeded_prevents_reseeding(self):
+        # 已初始化（seeded=True）且用户删光任务 → 重启不恢复默认任务
+        cron._cron_state["seeded"] = True
+        saved = []
+        cron._load_cron = lambda: []  # 模拟用户删光后磁盘上的空列表
+        cron._save_cron = lambda jobs: saved.append(jobs)
+        cron._save_cron_state = lambda: None
+        try:
+            cron._seed_default_cron()
+            self.assertEqual(cron._cron_jobs, [])
+            self.assertEqual(saved, [])  # 不写盘、不播种
+        finally:
+            cron._cron_state["seeded"] = False
+            del cron._load_cron
+            del cron._save_cron
+            del cron._save_cron_state
+
+    def test_first_launch_seeds_once(self):
+        # 首次启动：无 seeded 标记 + 空列表 → 播种并写入标记
+        cron._cron_state.pop("seeded", None)
+        saved = []
+        cron._load_cron = lambda: []
+        cron._save_cron = lambda jobs: saved.append(jobs)
+        cron._save_cron_state = lambda: None
+        try:
+            cron._seed_default_cron()
+            self.assertEqual(len(cron._cron_jobs), 3)
+            self.assertTrue(cron._cron_state["seeded"])
+        finally:
+            cron._cron_state.pop("seeded", None)
+            del cron._load_cron
+            del cron._save_cron
+            del cron._save_cron_state
+
+
 if __name__ == "__main__":
     unittest.main()
