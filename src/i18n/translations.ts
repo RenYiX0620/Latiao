@@ -268,6 +268,7 @@ const T: Record<string, Record<Lang, string>> = {
   "tool.truncated": { zh: "仅显示前 {count} 字符（共 {total}）", en: "Showing first {count} of {total}", ja: "先頭{count}文字（全{total}）", ru: "{count} из {total}" },
   "tool.expand": { zh: "展开全部", en: "Expand All", ja: "全て展開", ru: "Развернуть" },
   "tool.confirm_text": { zh: "是否允许执行此工具？", en: "Allow this tool?", ja: "このツールを実行しますか？", ru: "Разрешить?" },
+  "tool.confirm_toast": { zh: "🔔 需要你确认：{tool}（聊天中已出现允许/拒绝按钮）", en: "🔔 Confirm needed: {tool} (Allow/Deny buttons in chat)", ja: "🔔 確認が必要: {tool}", ru: "🔔 Требуется подтверждение: {tool}" },
   "tool.allow": { zh: "允许", en: "Allow", ja: "許可", ru: "Да" },
   "tool.deny": { zh: "拒绝", en: "Deny", ja: "拒否", ru: "Нет" },
   // ── Toast / Misc ──
