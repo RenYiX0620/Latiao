@@ -679,6 +679,7 @@ const [timeFilter, setTimeFilter] = useState("all");
             try {
               if (parsed.event === "tool_confirm") {
                 setAgentPhase(t("agent.phase_confirm", { tool: parsed.tool || "" }));
+                showToast(t("tool.confirm_toast", { tool: parsed.tool || "" }), "warn");
                 setMessages((prev) => {
                   const msgs = [...prev];
                   msgs.splice(msgs.length - 1, 0, {
