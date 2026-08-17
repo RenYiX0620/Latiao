@@ -648,7 +648,7 @@ const [timeFilter, setTimeFilter] = useState("all");
     // local model server hangs on an unsupported request, or a tool call blocks
     // without emitting events), abort so isProcessing always resets instead of
     // leaving the red Stop button stuck forever. Reset on every received chunk.
-    const WATCHDOG_MS = 90_000;
+    const WATCHDOG_MS = 180_000;  // 本地模型 prefill 可能 60-100s 无数据，90s 会误断流
     let watchdog: ReturnType<typeof setTimeout> | null = null;
     const armWatchdog = () => {
       if (watchdog) clearTimeout(watchdog);
@@ -680,6 +680,9 @@ const [timeFilter, setTimeFilter] = useState("all");
               if (parsed.event === "tool_confirm") {
                 setAgentPhase(t("agent.phase_confirm", { tool: parsed.tool || "" }));
                 showToast(t("tool.confirm_toast", { tool: parsed.tool || "" }), "warn");
+                // 等待用户确认可能超过看门狗时限——确认期间暂停看门狗，
+                // 用户点允许/拒绝后 tool_start/tool_end 数据到达即自动恢复
+                disarmWatchdog();
                 setMessages((prev) => {
                   const msgs = [...prev];
                   msgs.splice(msgs.length - 1, 0, {
