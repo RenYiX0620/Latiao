@@ -14,7 +14,7 @@
       {
         "fullscreen": false,
         "resizable": true,
-        "title": "\u8fa3\u6761 Latiao",
+        "title": "辣条 Latiao",
         "width": 1200,
         "height": 800,
         "useHttpsScheme": false
@@ -26,7 +26,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["msi"],
+    "targets": "all",
     "macOS": {
       "entitlements": "entitlements.plist",
       "infoPlist": "Info.plist"
