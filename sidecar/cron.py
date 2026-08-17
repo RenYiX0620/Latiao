@@ -64,6 +64,8 @@ def _load_cron_state():
             data = json.loads(CRON_STATE_FILE.read_text(encoding="utf-8"))
             _cron_state["last_run"] = data.get("last_run", {})
             _cron_state["events"] = data.get("events", [])
+            if data.get("seeded"):
+                _cron_state["seeded"] = True
             _cron_last_run.update(_cron_state["last_run"])
     except Exception:
         logger.warning("Failed to load cron state", exc_info=True)

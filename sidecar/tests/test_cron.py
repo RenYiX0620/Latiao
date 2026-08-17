@@ -138,6 +138,34 @@ class TestSeedDefaultCron(unittest.TestCase):
             del cron._save_cron
             del cron._save_cron_state
 
+    def test_load_state_restores_seeded(self):
+        # 文件里有 seeded 标记 → 重启加载后 _seed_default_cron 不再播种
+        import tempfile
+        tmp = tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w", encoding="utf-8")
+        tmp.write('{"last_run": {}, "events": [], "seeded": true}')
+        tmp.close()
+        old_file = cron.CRON_STATE_FILE
+        cron.CRON_STATE_FILE = __import__("pathlib").Path(tmp.name)
+        cron._cron_state = {"last_run": {}, "events": []}
+        try:
+            cron._load_cron_state()
+            self.assertTrue(cron._cron_state.get("seeded"))
+            cron._cron_jobs = []
+            cron._load_cron = lambda: []
+            saved = []
+            cron._save_cron = lambda jobs: saved.append(jobs)
+            try:
+                cron._seed_default_cron()
+                self.assertEqual(cron._cron_jobs, [])  # seeded 生效，不播种
+            finally:
+                del cron._load_cron
+                del cron._save_cron
+        finally:
+            cron.CRON_STATE_FILE = old_file
+            cron._cron_state = {"last_run": {}, "events": []}
+            cron._cron_state.pop("seeded", None)
+            __import__("os").unlink(tmp.name)
+
     def test_first_launch_seeds_once(self):
         # 首次启动：无 seeded 标记 + 空列表 → 播种并写入标记
         cron._cron_state.pop("seeded", None)
