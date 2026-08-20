@@ -25,8 +25,36 @@ DEFINITION = {
     }
 }
 
+# 接口对查询措辞敏感：某些问法（如"本周涨跌幅表现"）东方财富解析不出结果，
+# 返回"无 dataTableDTOList"。失败时自动尝试规范化变体，避免模型措辞不当导致
+# 整个工具降级到网页搜索（搜索数据精度远不如金融接口）。
+_EMPTY_RESULT_SIGNS = ("无 dataTableDTOList", "接口返回中无", "dataTableDTOList")
+
+
+def _query_variants(query: str) -> list[str]:
+    """生成查询词的规范化变体（去重保序），最多 3 个。"""
+    variants = [query]
+    q2 = (query
+          .replace("本周涨跌幅表现", "本周行情涨跌幅")
+          .replace("涨跌幅表现", "行情涨跌幅")
+          .replace("涨跌幅走势", "行情涨跌幅")
+          .replace("最新走势", "行情")
+          .replace("最新行情走势", "行情"))
+    if q2 != query and q2 not in variants:
+        variants.append(q2)
+    q3 = query.replace("本周", "").replace("周度", "")
+    if q3 != query and q3 not in variants:
+        variants.append(q3)
+    return variants[:3]
+
+
+def _is_empty_result(text: str) -> bool:
+    return any(sig in text for sig in _EMPTY_RESULT_SIGNS)
+
+
 def execute(args: dict) -> str:
-    """Execute a financial data query using the mx_data skill."""
+    """Execute a financial data query using the mx_data skill.
+    查询失败（接口无法解析措辞）时自动用规范化变体重试。"""
     query = args.get("query", "")
     if not query:
         return "Error: query parameter is required"
@@ -35,20 +63,24 @@ def execute(args: dict) -> str:
 
     if getattr(sys, "frozen", False):
         multiprocessing.freeze_support()
-        try:
-            result = subprocess.run(
-                [sys.executable, "--mx-query", query],
-                capture_output=True, text=True, timeout=120,
-                env={**os.environ}
-            )
-            if result.returncode == 0:
-                return result.stdout.strip() or "查询完成，无输出"
-            detail = result.stderr.strip() or result.stdout.strip() or "无输出"
-            return f"Error (exit {result.returncode}): {detail}。本工具仅支持 A股/港股/基金/板块/指数，美股等其它市场请改用 tavily_search 重试。"
-        except subprocess.TimeoutExpired:
-            return "Error: Query timed out (120s)"
-        except Exception as e:
-            return f"Error: {str(e)}"
+        for q in _query_variants(query):
+            try:
+                result = subprocess.run(
+                    [sys.executable, "--mx-query", q],
+                    capture_output=True, text=True, timeout=120,
+                    env={**os.environ}
+                )
+                if result.returncode == 0:
+                    return result.stdout.strip() or "查询完成，无输出"
+                detail = result.stderr.strip() or result.stdout.strip() or "无输出"
+                if _is_empty_result(detail):
+                    continue  # 措辞不被接口识别 → 换变体重试
+                return f"Error (exit {result.returncode}): {detail}。本工具仅支持 A股/港股/基金/板块/指数，美股等其它市场请改用 tavily_search 重试。"
+            except subprocess.TimeoutExpired:
+                return "Error: Query timed out (120s)"
+            except Exception as e:
+                return f"Error: {str(e)}"
+        return "Error: 查询未返回数据（已尝试多种措辞）。本工具仅支持 A股/港股/基金/板块/指数，美股等其它市场请改用 tavily_search 重试。"
 
     base = Path(__file__).resolve().parent
     mx_data = None
@@ -61,21 +93,25 @@ def execute(args: dict) -> str:
     if mx_data is None or not mx_data.exists():
         return "Error: mx_data.py not found (searched from plugins/ upward)"
 
-    try:
-        result = subprocess.run(
-            [sys.executable, str(mx_data), "--query", query],
-            capture_output=True, text=True, timeout=120,
-            env={**os.environ}
-        )
-        if result.returncode == 0:
-            return result.stdout.strip() or "查询完成，无输出"
-        else:
+    for q in _query_variants(query):
+        try:
+            result = subprocess.run(
+                [sys.executable, str(mx_data), "--query", q],
+                capture_output=True, text=True, timeout=120,
+                env={**os.environ}
+            )
+            if result.returncode == 0:
+                return result.stdout.strip() or "查询完成，无输出"
             detail = result.stderr.strip() or result.stdout.strip() or "无输出"
+            if _is_empty_result(detail):
+                continue  # 措辞不被接口识别 → 换变体重试
             return f"Error (exit {result.returncode}): {detail}。本工具仅支持 A股/港股/基金/板块/指数，美股等其它市场请改用 tavily_search 重试。"
-    except subprocess.TimeoutExpired:
-        return "Error: Query timed out (120s)"
-    except Exception as e:
-        return f"Error: {str(e)}"
+        except subprocess.TimeoutExpired:
+            return "Error: Query timed out (120s)"
+        except Exception as e:
+            return f"Error: {str(e)}"
+    return "Error: 查询未返回数据（已尝试多种措辞）。本工具仅支持 A股/港股/基金/板块/指数，美股等其它市场请改用 tavily_search 重试。"
+
 
 if __name__ == "__main__":
     print(execute({"query": sys.argv[1] if len(sys.argv) > 1 else "测试"}))
