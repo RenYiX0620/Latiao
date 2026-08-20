@@ -143,6 +143,16 @@ class TestReflectionTrigger(unittest.TestCase):
         self.assertFalse(_should_reflect("light", "x" * 500, False))  # 云端短输出
         self.assertFalse(_should_reflect("light", "x" * 900, True))   # 本地不触发
 
+    def test_number_traceability(self):
+        from agent_loop import _find_unverified_numbers
+        report = "黄金板块本周上涨 12.35%，银行 +3.25%，美债收益率创 19 年新高（30 年期 5.33%），共 4 个交易日"
+        tools = ["黄金(板块) 成份区间涨跌幅 12.35% 2026-08-17至2026-08-20", "银行 +3.25%"]
+        unverified = _find_unverified_numbers(report, tools)
+        self.assertIn("5.33%", unverified)   # 美债数字无查询来源 → 被标记
+        self.assertIn("19 年", unverified)
+        self.assertNotIn("12.35%", unverified)  # 黄金有来源 → 不标记
+        self.assertNotIn("3.25%", unverified)
+
     def test_plan_trigger(self):
         from agent_loop import _should_plan
         self.assertTrue(_should_plan("帮我分析一下最近的A股大盘走势，写一份详细的行情分析报告，包括各板块表现", False))

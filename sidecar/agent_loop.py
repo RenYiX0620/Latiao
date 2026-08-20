@@ -761,18 +761,54 @@ _REFLECT_CHECKLISTS = {
 }
 
 
+_NUM_RE = re.compile(r"-?\d+(?:\.\d+)?%")
+_VOL_RE = re.compile(r"(?:\d+(?:\.\d+)?\s*(?:亿|万|万亿|亿元|万股|亿股|元|点|个|只|家|天|日|周|年))")
+
+
+def _extract_numbers(text: str) -> list[str]:
+    """提取文本中的百分数与带单位数字（去重保序）。"""
+    out: list[str] = []
+    for m in _NUM_RE.findall(text):
+        if m not in out:
+            out.append(m)
+    for m in _VOL_RE.findall(text):
+        if m not in out:
+            out.append(m)
+    return out
+
+
+def _find_unverified_numbers(text: str, tool_outputs: list[str]) -> list[str]:
+    """报告中出现的、但未能在本次工具查询结果中找到来源的数字。
+    用于反思环节逐项核实——机制化防编造，不依赖模型自觉。"""
+    haystack = "\n".join(tool_outputs)
+    return [n for n in _extract_numbers(text) if n not in haystack]
+
+
 async def _reflect_output(text: str, model: str, api_url: str, headers: dict,
-                          mode: str, client: httpx.AsyncClient) -> tuple[str, bool]:
+                          mode: str, client: httpx.AsyncClient,
+                          tool_outputs: list[str] | None = None) -> tuple[str, bool]:
     """对最终文本做一轮（light）或两轮（deep）自查反思。
     返回 (最终文本, 是否有修正)。有修正时前端替换最后一条消息。"""
     checklist = _REFLECT_CHECKLISTS.get(mode, _REFLECT_CHECKLISTS["light"])
     rounds = 2 if mode == "deep" else 1
     current = text
     changed = False
+    # 机制化溯源核查：报告里的数字若在本会话工具查询结果中找不到来源，
+    # 列出供反思模型逐项核实（不硬删，交给模型判断口径）
+    unverified = _find_unverified_numbers(current, tool_outputs or [])
+    unverified_note = ""
+    if unverified:
+        unverified_note = (
+            "\n\n⚠️ 数字溯源核查：以下数字在本会话的**工具查询结果中未找到来源**，"
+            "请逐项处理：\n"
+            + "\n".join(f"- {n}" for n in unverified[:15])
+            + "\n处理规则：属于查询数据（可能因口径/表述不同而未匹配）→ 保留；"
+              "属于宏观/外部数据且本次**没有查询过** → 删除该数字或改为不带具体数字的定性描述。"
+        )
     for _ in range(rounds):
         sys_prompt = (
             "你是输出质检员。检查下面这份回答，严格按清单逐项核对。\n"
-            f"检查清单：\n{checklist}\n\n"
+            f"检查清单：\n{checklist}{unverified_note}\n\n"
             "规则：\n"
             "- 如果发现实质问题（数据错误、遗漏关键结论、自相矛盾、格式损坏、明显不完整），"
             "输出修正后的完整版本。\n"
@@ -1470,7 +1506,8 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                 if not has_task_kw:
                     # ── 输出反思（可选档位）：修正后前端替换最后一条消息 ──
                     if _should_reflect(reflection_mode, streamed_text, _is_local_llm_url(api_url)):
-                        _revised, _changed = await _reflect_output(streamed_text, model, api_url, headers, reflection_mode, client)
+                        _tool_outs = [str(m.get("content") or "") for m in current_msgs if m.get("role") == "tool"]
+                        _revised, _changed = await _reflect_output(streamed_text, model, api_url, headers, reflection_mode, client, _tool_outs)
                         if _changed and _revised.strip():
                             streamed_text = _revised
                             yield {"event": "reflection_revised", "content": _revised}
@@ -1498,7 +1535,8 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                 continue
             # ── 输出反思（可选档位）：修正后前端替换最后一条消息 ──
             if _should_reflect(reflection_mode, streamed_text, _is_local_llm_url(api_url)):
-                _revised, _changed = await _reflect_output(streamed_text, model, api_url, headers, reflection_mode, client)
+                _tool_outs = [str(m.get("content") or "") for m in current_msgs if m.get("role") == "tool"]
+                _revised, _changed = await _reflect_output(streamed_text, model, api_url, headers, reflection_mode, client, _tool_outs)
                 if _changed and _revised.strip():
                     streamed_text = _revised
                     yield {"event": "reflection_revised", "content": _revised}
@@ -2079,7 +2117,8 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                 return
             # ── 输出反思（可选档位）：修正后前端替换最后一条消息 ──
             if _should_reflect(reflection_mode, streamed_text, _is_local_llm_url(api_url)):
-                _revised, _changed = await _reflect_output(streamed_text, model, api_url, headers, reflection_mode, client)
+                _tool_outs = [str(m.get("content") or "") for m in current_msgs if m.get("role") == "tool"]
+                _revised, _changed = await _reflect_output(streamed_text, model, api_url, headers, reflection_mode, client, _tool_outs)
                 if _changed and _revised.strip():
                     streamed_text = _revised
                     yield {"event": "reflection_revised", "content": _revised}
