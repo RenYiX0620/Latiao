@@ -684,6 +684,55 @@ GOAL_MODE_PROMPT = """
 用户只关心目标是否达成，不关心你用什么工具。
 """
 
+_PLAN_KEYWORDS = (
+    "分析", "报告", "调研", "研究", "构建", "搭建", "部署", "修复", "排查",
+    "优化", "重构", "设计", "开发", "写一个", "写一份", "写一篇", "总结",
+    "对比", "评估", "方案", "规划",
+    "analyze", "report", "research", "build", "deploy", "fix", "refactor",
+    "design", "develop", "compare", "evaluate", "plan",
+)
+
+
+def _should_plan(user_text: str, is_local: bool) -> bool:
+    """复杂任务触发规划模式：任务关键词 + 消息够长。本地模型不触发（避免额外等待）。"""
+    if is_local or not user_text or len(user_text.strip()) < 30:
+        return False
+    t = user_text.lower()
+    return any(k in t for k in _PLAN_KEYWORDS)
+
+
+async def _generate_plan(user_text: str, model: str, api_url: str, headers: dict,
+                         client: httpx.AsyncClient) -> str:
+    """生成执行计划（3-8 步编号列表）。失败返回空串（降级为普通执行）。"""
+    sys_prompt = (
+        "你是任务规划器。用户给了一个复杂任务，请输出一份简洁、可执行的计划。\n"
+        "要求：\n"
+        "1. 用编号列表列出 3-8 个步骤\n"
+        "2. 每步说明具体要做什么（可提及将使用的工具，如查询行情、读取文件、运行命令、生成报告）\n"
+        "3. 步骤具体可执行，不要空话，不要重复用户原文\n"
+        "4. 只输出计划本身，不要任何前后缀说明"
+    )
+    body = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": user_text},
+        ],
+        "max_tokens": 1024,
+        "stream": False,
+        "temperature": 0.3,
+    }
+    try:
+        resp = await client.post(api_url, json=body, headers=headers)
+        resp.raise_for_status()
+        data = resp.json()
+        plan = (data.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
+        return plan.strip()
+    except Exception as e:
+        logger.warning("Plan generation failed (fallback to direct execution): %s", e)
+        return ""
+
+
 def _should_reflect(mode: str, text: str, is_local: bool) -> bool:
     """反思触发条件：off 永不；light 仅云端长输出；deep 任何模型的长任务输出。"""
     if mode == "off" or not text or len(text.strip()) < 200:
@@ -1218,6 +1267,14 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
         active_tools = _cap_tools(active_tools, 5)
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(120)) as client:
+        # ── 规划模式：复杂任务先生成执行计划（显示给用户，按计划执行） ──
+        if _should_plan(last_user_text, _is_local_llm_url(api_url)):
+            _plan = await _generate_plan(last_user_text, model, api_url, headers, client)
+            if _plan:
+                yield {"event": "agent_plan", "content": _plan}
+                current_msgs.insert(0, {"role": "system",
+                    "content": "以下是已确定的执行计划，请严格按计划逐步执行（可调用工具）：\n" + _plan})
+
         while iteration < 50:  # hard cap at 50, dynamic exit via stagnation
             iteration += 1
             # Re-evaluate tool set every 3 iterations for multi-step tasks

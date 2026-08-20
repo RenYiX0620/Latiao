@@ -143,6 +143,13 @@ class TestReflectionTrigger(unittest.TestCase):
         self.assertFalse(_should_reflect("light", "x" * 500, False))  # 云端短输出
         self.assertFalse(_should_reflect("light", "x" * 900, True))   # 本地不触发
 
+    def test_plan_trigger(self):
+        from agent_loop import _should_plan
+        self.assertTrue(_should_plan("帮我分析一下最近的A股大盘走势，写一份详细的行情分析报告，包括各板块表现", False))
+        self.assertFalse(_should_plan("你好", False))            # 太短
+        self.assertFalse(_should_plan("帮我分析一下最近的A股大盘走势，写一份详细的行情分析报告，包括各板块表现", True))  # 本地不触发
+        self.assertFalse(_should_plan("今天天气怎么样啊，你觉得呢", False))  # 无任务关键词
+
     def test_deep_any_model_long_output(self):
         from agent_loop import _should_reflect
         self.assertTrue(_should_reflect("deep", "x" * 400, False))
