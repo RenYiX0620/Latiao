@@ -107,6 +107,12 @@ const [timeFilter, setTimeFilter] = useState("all");
   const [activeView, setActiveView] = useState<ViewId>("chat");
   const [modelTab, setModelTab] = useState<"cloud" | "local">("cloud");
 
+  // 输出反思档位：off | light | deep（默认 light，仅云端长输出触发）
+  const [reflectionMode, setReflectionMode] = useState<"off" | "light" | "deep">(
+    () => (localStorage.getItem("latiao_reflection") as "off" | "light" | "deep") || "light"
+  );
+  useEffect(() => { localStorage.setItem("latiao_reflection", reflectionMode); }, [reflectionMode]);
+
   const [planMode, setPlanMode] = useState<boolean>(() => {
     try { const saved = localStorage.getItem("local_ai_os_plan_mode"); return saved ? JSON.parse(saved) : false; }
     catch (e) { console.error(e); return false; }
@@ -624,7 +630,7 @@ const [timeFilter, setTimeFilter] = useState("all");
     opts?: { model?: string; agent?: string; cloudConfig?: Record<string, unknown>; skipTools?: boolean },
     signal?: AbortSignal,
   ): Promise<string> => {
-    const body: Record<string, unknown> = { messages, stream: true };
+    const body: Record<string, unknown> = { messages, stream: true, reflection_mode: reflectionMode };
     if (opts?.model) body.model = opts.model;
     if (opts?.agent) body.agent = opts.agent;
     if (opts?.cloudConfig) body.cloud_config = opts.cloudConfig;
@@ -691,6 +697,21 @@ const [timeFilter, setTimeFilter] = useState("all");
                   });
                   return msgs;
                 });
+              } else if (parsed.event === "reflection_revised") {
+                // 输出反思修正：把最后一条 assistant 消息替换为修正版
+                const revised = String(parsed.content ?? "");
+                if (revised.trim()) {
+                  setMessages((prev) => {
+                    const msgs = [...prev];
+                    for (let i = msgs.length - 1; i >= 0; i--) {
+                      if (msgs[i].role === "assistant" && msgs[i].content && msgs[i].content.trim()) {
+                        msgs[i] = { ...msgs[i], content: revised + "\n\n_✍️ 已自查修正_" };
+                        break;
+                      }
+                    }
+                    return msgs;
+                  });
+                }
               } else if (parsed.event === "tool_start") {
                 setMessages((prev) => {
                   const msgs = [...prev];
@@ -1237,6 +1258,7 @@ const [timeFilter, setTimeFilter] = useState("all");
             autoStartGateway={autoStartGateway} setAutoStartGateway={setAutoStartGateway}
             anonymousData={anonymousData} setAnonymousData={setAnonymousData}
             autoCheckUpdate={autoCheckUpdate} setAutoCheckUpdate={setAutoCheckUpdate}
+            reflectionMode={reflectionMode} setReflectionMode={setReflectionMode}
           />
         </div>
 

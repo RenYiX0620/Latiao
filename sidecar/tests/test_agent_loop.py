@@ -132,5 +132,23 @@ class TestDeduplicateResponse(unittest.TestCase):
         self.assertIsNone(main._deduplicate_response(None))
 
 
+class TestReflectionTrigger(unittest.TestCase):
+    def test_off_never_reflects(self):
+        from agent_loop import _should_reflect
+        self.assertFalse(_should_reflect("off", "x" * 5000, False))
+
+    def test_light_cloud_long_only(self):
+        from agent_loop import _should_reflect
+        self.assertTrue(_should_reflect("light", "x" * 900, False))   # 云端长输出
+        self.assertFalse(_should_reflect("light", "x" * 500, False))  # 云端短输出
+        self.assertFalse(_should_reflect("light", "x" * 900, True))   # 本地不触发
+
+    def test_deep_any_model_long_output(self):
+        from agent_loop import _should_reflect
+        self.assertTrue(_should_reflect("deep", "x" * 400, False))
+        self.assertTrue(_should_reflect("deep", "x" * 400, True))     # 本地也触发（用户自选）
+        self.assertFalse(_should_reflect("deep", "x" * 100, False))
+
+
 if __name__ == "__main__":
     unittest.main()
