@@ -20,6 +20,8 @@ interface SettingsViewProps {
   setAnonymousData: (v: boolean) => void;
   autoCheckUpdate: boolean;
   setAutoCheckUpdate: (v: boolean) => void;
+  reflectionMode: "off" | "light" | "deep";
+  setReflectionMode: (v: "off" | "light" | "deep") => void;
 }
 
 function toggleOnChange(setter: (v: boolean) => void, storageKey: string) {
@@ -37,14 +39,36 @@ export default function SettingsView({
   selectedModel, cloudModels, setActiveView,
   autoLaunch, setAutoLaunch, autoStartGateway, setAutoStartGateway,
   anonymousData, setAnonymousData, autoCheckUpdate, setAutoCheckUpdate,
+  reflectionMode, setReflectionMode,
 }: SettingsViewProps) {
   const { t, lang, setLanguage } = useTranslation();
+
+  const reflectionOptions: { value: "off" | "light" | "deep"; label: string }[] = [
+    { value: "off", label: t("settings.reflection_off") },
+    { value: "light", label: t("settings.reflection_light") },
+    { value: "deep", label: t("settings.reflection_deep") },
+  ];
 
   return (
     <div className="page-body">
       <div style={{ maxWidth: 620 }}>
 
-        <div className="settings-group">
+              <div className="settings-group">
+        <div className="settings-group-header">{t("settings.reflection_title")}</div>
+        <div style={{ padding: "10px 16px" }}>
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+            {reflectionOptions.map((o) => (
+              <button key={o.value} className={`btn btn-sm ${reflectionMode === o.value ? "btn-primary" : "btn-ghost"}`}
+                onClick={() => { setReflectionMode(o.value); localStorage.setItem("latiao_reflection", o.value); }}>
+                {o.label}
+              </button>
+            ))}
+          </div>
+          <div style={{ fontSize: 10, color: "var(--text-muted)", marginTop: 6 }}>{t("settings.reflection_desc")}</div>
+        </div>
+      </div>
+
+<div className="settings-group">
           <div className="settings-group-header">{t("settings.general")}</div>
           <div className="settings-row">
             <div><div className="settings-row-label">{t("settings.theme")}</div><div className="settings-row-desc">{t("settings.theme_desc")}</div></div>

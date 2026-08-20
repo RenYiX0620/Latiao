@@ -684,6 +684,77 @@ GOAL_MODE_PROMPT = """
 用户只关心目标是否达成，不关心你用什么工具。
 """
 
+def _should_reflect(mode: str, text: str, is_local: bool) -> bool:
+    """反思触发条件：off 永不；light 仅云端长输出；deep 任何模型的长任务输出。"""
+    if mode == "off" or not text or len(text.strip()) < 200:
+        return False
+    if mode == "light":
+        return not is_local and len(text) > 800
+    if mode == "deep":
+        return len(text) > 300  # 用户主动选重度，接受任何模型的等待代价
+    return False
+
+
+_REFLECT_CHECKLISTS = {
+    "light": (
+        "1. 事实/数据与提供的上下文一致，没有编造数字\n"
+        "2. 结构完整，有明确的结论\n"
+        "3. 没有明显截断、乱码或格式损坏"
+    ),
+    "deep": (
+        "1. 事实/数据与提供的上下文一致，没有编造数字\n"
+        "2. 逻辑自洽，前后不矛盾\n"
+        "3. 结论完整，回应了用户的所有诉求\n"
+        "4. 建议/步骤可执行、无歧义\n"
+        "5. 语言通顺，格式规范\n"
+        "6. 篇幅合适，不啰嗦也不过于简略"
+    ),
+}
+
+
+async def _reflect_output(text: str, model: str, api_url: str, headers: dict,
+                          mode: str, client: httpx.AsyncClient) -> tuple[str, bool]:
+    """对最终文本做一轮（light）或两轮（deep）自查反思。
+    返回 (最终文本, 是否有修正)。有修正时前端替换最后一条消息。"""
+    checklist = _REFLECT_CHECKLISTS.get(mode, _REFLECT_CHECKLISTS["light"])
+    rounds = 2 if mode == "deep" else 1
+    current = text
+    changed = False
+    for _ in range(rounds):
+        sys_prompt = (
+            "你是输出质检员。检查下面这份回答，严格按清单逐项核对。\n"
+            f"检查清单：\n{checklist}\n\n"
+            "规则：\n"
+            "- 如果发现实质问题（数据错误、遗漏关键结论、自相矛盾、格式损坏、明显不完整），"
+            "输出修正后的完整版本。\n"
+            "- 如果没有问题，**原样输出原文**，不要添加任何说明。\n"
+            "- 只输出最终版本本身，不要输出检查过程、不要加任何前缀。"
+        )
+        body = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": current},
+            ],
+            "max_tokens": max(2048, len(current) + 2000),
+            "stream": False,
+            "temperature": 0.2,
+        }
+        try:
+            resp = await client.post(api_url, json=body, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+            revised = (data.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
+            revised = revised.strip()
+            if revised and revised != current:
+                current = revised
+                changed = True
+        except Exception as e:
+            logger.warning("Reflection failed (keep original): %s", e)
+            break
+    return current, changed
+
+
 def _inject_thinking_disabled(body: dict, model: str) -> dict:
     """DeepSeek 思考模式下，多轮/工具调用请求必须回传上一轮的 reasoning_content，
     否则 API 返回 400。这里对 DeepSeek 模型显式关闭思考模式，避免多轮对话 400。
@@ -1094,7 +1165,7 @@ def _append_loop_log(line: str):
         pass  # 调试日志写失败不影响主流程
 
 
-async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: dict, session_id: str = "", agent_id: str = "latiao"):
+async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: dict, session_id: str = "", agent_id: str = "latiao", reflection_mode: str = "off"):
     """Agent loop: call LLM with tools. If tool_calls → execute → loop. If text → yield & done."""
     current_msgs = [dict(m) for m in messages]
     # Two-level compression: keep head + tail, prune middle (MUSE-Autoskill style)
@@ -1340,6 +1411,12 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                 user_q = last_user_text.strip().rstrip("?？") if last_user_text else ""
                 has_task_kw = any(kw in user_q for kw in ["运行", "执行", "做", "帮我", "写", "创建", "查", "搜", "找", "分析", "修复", "构建", "部署", "安装", "配置", "run", "build", "fix", "create", "search", "analyze", "deploy"])
                 if not has_task_kw:
+                    # ── 输出反思（可选档位）：修正后前端替换最后一条消息 ──
+                    if _should_reflect(reflection_mode, streamed_text, _is_local_llm_url(api_url)):
+                        _revised, _changed = await _reflect_output(streamed_text, model, api_url, headers, reflection_mode, client)
+                        if _changed and _revised.strip():
+                            streamed_text = _revised
+                            yield {"event": "reflection_revised", "content": _revised}
                     _track_progress(session_id, "completed", f"text_response ({len(streamed_text)} chars)")
                     return
                 # 任务型请求但模型只回文字不调工具 → nudge 促其行动（不再向用户重复流式输出）
@@ -1362,6 +1439,13 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                 current_msgs.append({"role": "system", "content": nudge_text})
                 text_only_streak += 1
                 continue
+            # ── 输出反思（可选档位）：修正后前端替换最后一条消息 ──
+            if _should_reflect(reflection_mode, streamed_text, _is_local_llm_url(api_url)):
+                _revised, _changed = await _reflect_output(streamed_text, model, api_url, headers, reflection_mode, client)
+                if _changed and _revised.strip():
+                    streamed_text = _revised
+                    yield {"event": "reflection_revised", "content": _revised}
+
             _track_progress(session_id, "completed", f"text_response ({len(streamed_text)} chars)")
             return
 
@@ -1617,7 +1701,7 @@ def _build_local_tools_prompt(active_tools: list[dict]) -> str:
 
 
 async def _local_agent_loop_stream(messages: list, model: str, api_url: str, headers: dict,
-                                    session_id: str = "", agent_id: str = "latiao"):
+                                    session_id: str = "", agent_id: str = "latiao", reflection_mode: str = "off"):
     """Local model agent loop: inject tools as prompt, parse tool calls from text."""
     current_msgs = [dict(m) for m in messages]
     # Truncate long history to prevent context overflow.
@@ -1936,6 +2020,13 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                 )}
                 _track_progress(session_id, "stalled", f"empty_response x{text_only_streak}")
                 return
+            # ── 输出反思（可选档位）：修正后前端替换最后一条消息 ──
+            if _should_reflect(reflection_mode, streamed_text, _is_local_llm_url(api_url)):
+                _revised, _changed = await _reflect_output(streamed_text, model, api_url, headers, reflection_mode, client)
+                if _changed and _revised.strip():
+                    streamed_text = _revised
+                    yield {"event": "reflection_revised", "content": _revised}
+
             _track_progress(session_id, "completed", f"text_response ({len(streamed_text)} chars)")
             logger.info(f"[LOCAL-AGENT] Iteration {iteration}: no tools, returning text ({len(streamed_text)} chars)")
             return

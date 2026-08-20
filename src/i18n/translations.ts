@@ -250,6 +250,11 @@ const T: Record<string, Record<Lang, string>> = {
   "cron.triggered": { zh: "已触发执行，完成后会通知你", en: "Triggered - will notify on completion", ja: "実行開始", ru: "Запущено" },
   "cron.trigger_fail": { zh: "触发失败", en: "Trigger failed", ja: "失敗", ru: "Ошибка" },
   "cron.running_now": { zh: "执行中…", en: "Running…", ja: "実行中…", ru: "Выполняется…" },
+  "settings.reflection_title": { zh: "输出反思", en: "Output Reflection", ja: "出力反省", ru: "Рефлексия" },
+  "settings.reflection_off": { zh: "关闭", en: "Off", ja: "オフ", ru: "Выкл" },
+  "settings.reflection_light": { zh: "轻度（推荐）", en: "Light (recommended)", ja: "軽度", ru: "Лёгкая" },
+  "settings.reflection_deep": { zh: "重度", en: "Deep", ja: "重度", ru: "Глубокая" },
+  "settings.reflection_desc": { zh: "轻度：云端模型长输出（>800字）自查 1 轮。重度：所有长任务输出自查 2 轮（本地模型会明显变慢）。修正后自动替换回答。", en: "Light: cloud long outputs (>800 chars) get 1 self-check round. Deep: all long task outputs get 2 rounds (slower on local models).", ja: "軽度：クラウド長出力を1回チェック。重度：全長出力を2回チェック。", ru: "Лёгкая: облачные длинные ответы, 1 проверка. Глубокая: всё, 2 проверки." },
   // ── ToolsView ──
   "tools.safe": { zh: "自动执行", en: "Auto", ja: "自動", ru: "Авто" },
   "tools.confirm": { zh: "需确认", en: "Confirm", ja: "確認要", ru: "Подтв." },
