@@ -697,6 +697,15 @@ const [timeFilter, setTimeFilter] = useState("all");
                   });
                   return msgs;
                 });
+              } else if (parsed.event === "agent_plan") {
+                // 规划模式：执行计划显示为一条消息
+                const plan = String(parsed.content ?? "");
+                if (plan.trim()) {
+                  setMessages((prev) => [...prev, {
+                    id: msgId(), role: "assistant",
+                    content: `📋 **执行计划**\n\n${plan}`,
+                  }]);
+                }
               } else if (parsed.event === "reflection_revised") {
                 // 输出反思修正：把最后一条 assistant 消息替换为修正版
                 const revised = String(parsed.content ?? "");
