@@ -28,22 +28,37 @@ const ToolCallBubble = memo(function ToolCallBubble({ msg, onConfirm }: {
   const chevron = expanded ? "▾" : "▸";
 
   // Derived: whether result needs truncation
-  const { truncated, displayContent, isMarkdown } = useMemo(() => {
+  const { truncated, displayContent, isMarkdown, previewContent, hasMore } = useMemo(() => {
     if (!msg.toolResult) return { truncated: false, displayContent: "", isMarkdown: false };
     const long = msg.toolResult.length > MAX_PREVIEW_CHARS;
-    const isMd = msg.toolResult.includes("## 🔍") || msg.toolResult.includes("⚠️") || msg.toolResult.includes("✅");
+    const isMd = msg.toolResult.includes("## 🔍") || msg.toolResult.includes("⚠️") || msg.toolResult.includes("✅")
+      || /[|]/.test(msg.toolResult) || msg.toolResult.startsWith("|");  // markdown 表格
+    const cleaned = msg.toolResult.replace(/\s+/g, " ").trim();
+    const preview = cleaned.slice(0, 220);
     return {
       truncated: long,
       displayContent: long && !fullExpanded
         ? msg.toolResult.slice(0, MAX_PREVIEW_CHARS)
         : msg.toolResult,
       isMarkdown: isMd,
+      previewContent: preview,
+      hasMore: cleaned.length > 220,
+      isError: msg.toolResult.startsWith("Error") || msg.toolResult.startsWith("⛔"),
     };
   }, [msg.toolResult, fullExpanded]);
 
   // Only render result when expanded
   const renderedResult = useMemo(() => {
-    if (!expanded || !msg.toolResult) return null;
+    if (!msg.toolResult) return null;
+    if (!expanded) {
+      // 默认显示结果预览（前 220 字符），点击头部展开完整内容
+      return (
+        <div className="tool-call-result tool-call-preview">
+          <span>{previewContent || "✅ 已完成"}{isMarkdown ? " · 点击展开" : ""}</span>
+          {hasMore && <span className="tool-call-more">… (点击展开)</span>}
+        </div>
+      );
+    }
     return (
       <div className="tool-call-result">
         {isMarkdown ? (

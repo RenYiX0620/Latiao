@@ -440,6 +440,8 @@ body {
 .tool-call-args { color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
 .tool-call-chevron { font-size: 9px; color: var(--text-muted); }
 .tool-call-spinner { font-size: 10px; color: var(--accent); animation: blink 1s infinite; }
+.tool-call-preview { font-size: 11px; color: var(--text-secondary); max-height: 42px; overflow: hidden; }
+.tool-call-more { color: var(--accent); opacity: 0.8; }
 .tool-call-result {
   padding: 7px 12px; border-top: 1px solid rgba(255,255,255,0.04);
   background: var(--bg-tool-result); max-height: 180px; overflow-y: auto;
