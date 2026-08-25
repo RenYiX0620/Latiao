@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::process::{Child, Command};
+use tauri::Manager;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -382,6 +383,35 @@ fn start_sidecar() -> Option<Child> {
     }
 }
 
+/// 系统托盘：关闭窗口后隐藏到托盘，托盘菜单可重新显示（保持 sidecar/定时任务运行）。
+fn setup_tray(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Error>> {
+    use tauri::menu::{MenuBuilder, MenuItemBuilder};
+    use tauri::tray::TrayIconBuilder;
+    let show = MenuItemBuilder::with_id("latiao_show", "显示辣条 Latiao").build(app)?;
+    let quit = MenuItemBuilder::with_id("latiao_quit", "退出").build(app)?;
+    let menu = MenuBuilder::new(app).items(&[&show, &quit]).build()?;
+    TrayIconBuilder::new()
+        .menu(&menu)
+        .on_menu_event(|app, event| {
+            match event.id().as_ref() {
+                "latiao_show" => {
+                    if let Some(w) = app.get_webview_window("main") {
+                        let _ = w.show();
+                        let _ = w.unminimize();
+                        let _ = w.set_focus();
+                    }
+                }
+                "latiao_quit" => {
+                    app.exit(0);
+                }
+                _ => {}
+            }
+        })
+        .build(app)?;
+    Ok(())
+}
+
+
 fn main() {
     eprintln!("[Latiao] App starting...");
     let _ = AUTH_TOKEN.set(generate_auth_token());
@@ -398,7 +428,15 @@ fn main() {
         .plugin(tauri_plugin_opener::init())
 .manage(SidecarProcess(Mutex::new(sidecar)))
         .invoke_handler(tauri::generate_handler![sidecar_proxy, get_auth_token, restart_sidecar, store_secret, get_secret, delete_secret, open_model_dir])
+        .on_window_event(|window, event| {
+            // 关闭 = 隐藏到托盘（定时任务/sidecar 持续运行），托盘菜单可退出
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                let _ = window.hide();
+                api.prevent_close();
+            }
+        })
         .setup(move |app| {
+            setup_tray(app.handle())?;
             if !sidecar_ok {
                 // Sidecar didn't start — tell the user instead of leaving them
                 // staring at a UI whose backend calls will all time out.
