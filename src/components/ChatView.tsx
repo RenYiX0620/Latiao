@@ -115,23 +115,35 @@ export default memo(function ChatView({
                 <div className="avatar-small">🤖</div>
                 <div className="msg-content">
                   <div className="msg-bubble">
-                    {msg.thinking && (
-                      <details className="thinking-block">
-                        <summary>🧠 思考过程</summary>
-                        <div>{msg.thinking}</div>
-                      </details>
-                    )}
-                    <ReactMarkdown remarkPlugins={[remarkGfm]} components={{
-                      code: ({ inline, className, children, ...props }: { inline?: boolean; className?: string; children?: React.ReactNode }) =>
-                        inline
-                          ? <code className={className} {...props}>{children}</code>
-                          : <CodeBlock language={(className || "").replace("language-", "")}>{String(children)}</CodeBlock>,
-                      a: ({ href, children }: { href?: string; children?: React.ReactNode }) => (
-                        <a href={href} onClick={(e) => { e.preventDefault(); if (href) openUrl(href); }}>{children}</a>
-                      ),
-                    }}>
-                      {msg.content}
-                    </ReactMarkdown>
+                    {(() => {
+                      // 思考内容显示：后端 reasoning 字段（推理模型）或本地 <think> 标签
+                      const localThink = msg.content.match(/^<think>([\s\S]*?)<\/think>\s*/);
+                      const thinkText = msg.thinking || (localThink ? localThink[1] : null);
+                      const bodyText = localThink ? msg.content.slice(localThink[0].length) : msg.content;
+                      return (
+                        <>
+                          {thinkText && (
+                            <details className="thinking-block">
+                              <summary>🧠 思考过程</summary>
+                              <div>{thinkText}</div>
+                            </details>
+                          )}
+                          {bodyText && (
+                            <ReactMarkdown remarkPlugins={[remarkGfm]} components={
+                              {
+                                code: ({ inline, className, children, ...props }: { inline?: boolean; className?: string; children?: React.ReactNode }) =>
+                                  inline
+                                    ? <code className={className} {...props}>{children}</code>
+                                    : <CodeBlock language={(className || "").replace("language-", "")}>{String(children)}</CodeBlock>,
+                                a: ({ href, children }: { href?: string; children?: React.ReactNode }) => (
+                                  <a href={href} onClick={(e) => { e.preventDefault(); if (href) openUrl(href); }}>{children}</a>
+                                ),
+                              }
+                            }>{bodyText}</ReactMarkdown>
+                          )}
+                        </>
+                      );
+                    })()}
                   </div>
                   <div className="msg-actions">
                     <button className="btn-icon" title={t("chat.copy")} onClick={() => {
