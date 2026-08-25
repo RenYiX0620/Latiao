@@ -34,7 +34,17 @@ const ToolCallBubble = memo(function ToolCallBubble({ msg, onConfirm }: {
     const isMd = msg.toolResult.includes("## 🔍") || msg.toolResult.includes("⚠️") || msg.toolResult.includes("✅")
       || /[|]/.test(msg.toolResult) || msg.toolResult.startsWith("|");  // markdown 表格
     const cleaned = msg.toolResult.replace(/\s+/g, " ").trim();
-    const preview = cleaned.slice(0, 220);
+    // 智能摘要：优先提取"查询证券/查询结果"这类标题行，跳过表格行（|...）
+    const titleMatch = msg.toolResult.match(/\*\*(查询[^\n]*|执行[^\n]*)\**/);
+    const summaryMatch = msg.toolResult.match(/(\d+\s*个表.*?数据|退出码[^，\n]+)/);
+    let preview = "";
+    if (msg.toolResult.startsWith("Error") || msg.toolResult.startsWith("⛔")) {
+      preview = cleaned.slice(0, 80);
+    } else if (titleMatch) {
+      preview = titleMatch[0] + (summaryMatch ? " · " + summaryMatch[0] : "");
+    } else {
+      preview = cleaned.slice(0, 80);
+    }
     return {
       truncated: long,
       displayContent: long && !fullExpanded
@@ -53,9 +63,9 @@ const ToolCallBubble = memo(function ToolCallBubble({ msg, onConfirm }: {
       // 默认显示结果预览（前 120 字符），点击头部展开完整内容
       return (
         <div className="tool-call-preview">
-          {isMarkdown && <span className="tool-call-more">📊 </span>}
-          <span>{previewContent || "✅ 已完成"}</span>
-          <span className="tool-call-more"> · 点击展开</span>
+          {isMarkdown && <span className="tool-call-more">📊</span>}
+          <span className="tool-call-preview-text">{previewContent || "✅ 已完成"}</span>
+          <span className="tool-call-more">▾</span>
         </div>
       );
     }
