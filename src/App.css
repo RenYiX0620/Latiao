@@ -325,10 +325,25 @@ body {
 /* ── Input Area ── */
 .input-area { padding: 12px 24px 18px; background: linear-gradient(0deg, var(--bg-root) 0%, transparent 100%); flex-shrink: 0; }
 .input-row {
-  display: flex; align-items: flex-end; gap: 8px; padding: 8px 14px;
+  display: flex; flex-direction: column; gap: 4px; padding: 12px 16px 8px;
   background: var(--bg-input); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
   border-radius: var(--radius-xl); border: 1px solid var(--border-default); transition: all 0.2s ease;
 }
+.input-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.toolbar-left { display: flex; align-items: center; gap: 4px; }
+.toolbar-right { display: flex; align-items: center; gap: 6px; }
+.btn-circle {
+  width: 30px; height: 30px; padding: 0; border-radius: 50%;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 15px; line-height: 1;
+}
+.btn-circle.btn-stop { background: var(--danger, #f87171); }
+.chat-statusbar {
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  font-size: 10px; color: var(--text-muted); padding: 6px 6px 0;
+  opacity: 0.85;
+}
+.statusbar-sep { opacity: 0.5; }
 .input-row:focus-within { border-color: var(--border-accent); box-shadow: 0 0 0 3px rgba(56,189,248,0.06); }
 .chat-input {
   flex: 1; background: 0 0; border: 0; color: var(--text-primary);

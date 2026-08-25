@@ -45,6 +45,11 @@ interface ChatViewProps {
   chatEndRef: React.RefObject<HTMLDivElement | null>;
   handleDrop?: (e: React.DragEvent) => void;
   onPasteImage?: (file: File) => void;
+  cloudModels: { name: string }[];
+  selectedModel: string;
+  onSelectModel: (m: string) => void;
+  onOpenSettings: () => void;
+  contextEstimate?: { max_context: number; recommended_context: number } | null;
 }
 
 export default memo(function ChatView({
@@ -53,122 +58,95 @@ export default memo(function ChatView({
   fileInputRef, mediaRecorderRef, isRecording,
   sendMessage, onStop, handleFileSelect, startRecording, confirmTool,
   chatEndRef, handleDrop, onPasteImage,
+  cloudModels, selectedModel, onSelectModel, onOpenSettings, contextEstimate,
 }: ChatViewProps) {
   const { t } = useTranslation();
   const editableRef = useRef<HTMLDivElement>(null);
-  const promptRef = useRef(prompt);
-  useEffect(() => { promptRef.current = prompt; }, [prompt]);
-
-  // Sync external prompt changes (e.g. speech recognition, session switch,
-  // send clearing) back into the uncontrolled contentEditable div. Only write
-  // when out of sync so we never fight the user's own typing (onInput).
-  useEffect(() => {
-    const el = editableRef.current;
-    if (el && el.textContent !== prompt) el.textContent = prompt;
-  }, [prompt]);
 
   const handleEditableInput = useCallback(() => {
-    const el = editableRef.current;
-    if (!el) return;
-    setPrompt(el.textContent || "");
+    if (editableRef.current) setPrompt(editableRef.current.innerText);
   }, [setPrompt]);
+
+  const handleEditableKeyDown = useCallback((e: React.KeyboardEvent) => {
+    if (e.key === "Enter" && !e.shiftKey && !isProcessing) {
+      e.preventDefault();
+      sendMessage();
+      // Clear the editable div after send (state handled by sendMessage's setPrompt(""))
+      if (editableRef.current) editableRef.current.innerText = "";
+    }
+  }, [sendMessage, isProcessing]);
 
   const handleSend = useCallback(() => {
     sendMessage();
-    // Clear the editable div after send (state handled by sendMessage's setPrompt(""))
-    setTimeout(() => {
-      if (editableRef.current && promptRef.current === "") {
-        editableRef.current.textContent = "";
-      }
-    }, 0);
+    if (editableRef.current) editableRef.current.innerText = "";
   }, [sendMessage]);
 
-  const handleEditableKeyDown = useCallback((e: React.KeyboardEvent) => {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      handleSend();
+  useEffect(() => {
+    if (!prompt && editableRef.current?.innerText !== "") {
+      editableRef.current!.innerText = "";
     }
-  }, [handleSend]);
+  }, [prompt]);
+
+  // 状态栏数据：轮数（user 消息数）、工具调用数、消息数、token 估算
+  const userTurns = messages.filter(m => m.role === "user").length || 0;
+  const toolCalls = messages.filter(m => m.role === "tool" || m.type === "tool_call").length || 0;
+  const estTokens = Math.round(messages.reduce((s, m) => s + m.content.length, 0) * 0.55); // 中文近似
 
   return (
     <>
-      <div className="chat-area"
-        onDrop={handleDrop}
-        onDragOver={e => e.preventDefault()}>
-        {messages.length === 0 ? (
-          <div className="chat-empty">
-            <div className="chat-empty-icon">💬</div>
-            <div className="chat-empty-title">{t("chat.empty_title")}</div>
-            <div className="chat-empty-desc" style={{ fontSize: 14, marginTop: -4 }}>Latiao</div>
-            <div className="chat-empty-desc" style={{ marginTop: 12 }}>{t("chat.empty_desc")}</div>
-          </div>
-        ) : (
-          messages.map((msg, i) => {
-            if (msg.type === "tool_call" || msg.role === "tool") {
-              return (
-                <div key={msg.id ?? i} className="msg">
-                  <div className="msg-role">{t("chat.role_assistant")}</div>
-                  <ToolCallBubble msg={msg} onConfirm={confirmTool} />
-                </div>
-              );
-            }
+      <div className="chat-scroll" onDrop={handleDrop} onDragOver={(e) => { if (handleDrop) e.preventDefault(); }}>
+        {messages.map((msg, i) => {
+          if (msg.role === "tool" || msg.type === "tool_call") {
+            return <ToolCallBubble key={msg.id || i} msg={msg} onConfirm={confirmTool} />;
+          }
+          if (msg.role === "assistant") {
             return (
-              <div key={msg.id ?? i} className={`msg${msg.role === "user" ? " user" : ""}`}>
-                <div className="msg-role">{msg.role === "user" ? t("chat.role_you") : t("chat.role_assistant")}</div>
-                {msg.role === "user" && msg.imagePreview ? (
-                  <div>
-                    {msg.imagePreview && <img src={msg.imagePreview} alt={msg.filename || "image"} style={{ maxWidth: 260, borderRadius: 8, marginBottom: 8 }} />}
-                    {msg.content && <div className="msg-bubble user">{msg.content}</div>}
+              <div key={msg.id || i} className={`msg-row assistant${msg.type === "file" ? " file" : ""}`}>
+                <div className="avatar-small">🤖</div>
+                <div className="msg-content">
+                  <div className="msg-bubble">
+                    <ReactMarkdown remarkPlugins={[remarkGfm]} components={{
+                      code: ({ inline, className, children, ...props }: { inline?: boolean; className?: string; children?: React.ReactNode }) =>
+                        inline
+                          ? <code className={className} {...props}>{children}</code>
+                          : <CodeBlock language={(className || "").replace("language-", "")}>{String(children)}</CodeBlock>,
+                      a: ({ href, children }: { href?: string; children?: React.ReactNode }) => (
+                        <a href={href} onClick={(e) => { e.preventDefault(); if (href) openUrl(href); }}>{children}</a>
+                      ),
+                    }}>
+                      {msg.content}
+                    </ReactMarkdown>
                   </div>
-                ) : (
-                  <div className={`msg-bubble ${msg.role}`}>
-                    {msg.role === "assistant" ? (
-                      <ReactMarkdown
-                        remarkPlugins={[remarkGfm]}
-                        components={{
-                          a({ href, children, ...props }) {
-                            return (
-                              <a
-                                href={href}
-                                onClick={(e) => {
-                                  e.preventDefault();
-                                  if (href) openUrl(href).catch(() => {});
-                                }}
-                                style={{ color: "#2563eb", cursor: "pointer", textDecoration: "underline" }}
-                                {...props}
-                              >
-                                {children}
-                              </a>
-                            );
-                          },
-                          code({ className, children, ...props }) {
-                            const match = /language-(\w+)/.exec(className || "");
-                            const codeStr = String(children).replace(/\n$/, "");
-                            const nodeProps = props as Record<string, unknown>;
-                            const inline = nodeProps.inline;
-                            return !inline && match ? (
-                              <CodeBlock language={match[1]}>{codeStr}</CodeBlock>
-                            ) : (<code className={className} {...props}>{children}</code>);
-                          },
-                        }}
-                      >
-                        {(msg.content || "").replace(/```tool\s+\w+\s*\n\{[^}]*\}\n```/g, "").trim()}
-                      </ReactMarkdown>
-                    ) : (msg.content)}
-                  </div>
-                )}
+                </div>
               </div>
             );
-          })
-        )}
-        {isProcessing && (
-          <div className="processing">
-            <span style={{ fontSize: 11 }}>{t("chat.processing")}</span>
-            <span className="processing-dot"></span>
-            <span className="processing-dot"></span>
-            <span className="processing-dot"></span>
-          </div>
-        )}
+          }
+          if (msg.type === "file") {
+            return (
+              <div key={msg.id || i} className={`msg-row user file`}>
+                <div className="avatar-small">🧑</div>
+                <div className="msg-content">
+                  <div className="msg-bubble">
+                    {msg.imagePreview ? (
+                      <img src={msg.imagePreview} alt="" style={{ maxWidth: 240 }} />
+                    ) : (
+                      <span>📄 {msg.filename}</span>
+                    )}
+                  </div>
+                  {msg.content && <div className="msg-bubble" style={{ marginTop: 6 }}>{msg.content}</div>}
+                </div>
+              </div>
+            );
+          }
+          return (
+            <div key={msg.id || i} className={`msg-row user${msg.type === "image" ? " file" : ""}`}>
+              <div className="avatar-small">🧑</div>
+              <div className="msg-content">
+                <div className="msg-bubble">{msg.content}</div>
+              </div>
+            </div>
+          );
+        })}
         <div ref={chatEndRef}></div>
       </div>
 
@@ -207,18 +185,58 @@ export default memo(function ChatView({
             aria-multiline="true"
           />
           <input type="file" ref={fileInputRef} style={{ display: "none" }} onChange={handleFileSelect} />
-          <button className="btn-icon" onClick={() => fileInputRef.current?.click()} title={t("chat.attach")}>📎</button>
-          <button className="btn-icon" onClick={isRecording ? () => mediaRecorderRef.current?.stop() : startRecording}
-            style={isRecording ? { color: "var(--danger)" } : undefined} title={t("chat.voice")}>{isRecording ? "⏹" : "🎙"}</button>
-          <button className="btn btn-sm btn-ghost"
-            style={{ padding: "4px 10px", fontSize: 10, marginRight: 4, background: planMode ? "var(--accent-soft)" : "transparent", borderColor: planMode ? "var(--border-accent)" : undefined, color: planMode ? "var(--accent)" : undefined }}
-            onClick={() => setPlanMode(!planMode)} title={t("chat.plan_mode")}>
-            📋 {t("chat.plan_mode_btn")}
-          </button>
-          {isProcessing ? (
-            <button className="btn-stop" onClick={onStop}>⏹ {t("chat.stop")}</button>
+          {/* 底部工具栏：左（附件/语音/模式）右（模型/设置/发送） */}
+          <div className="input-toolbar">
+            <div className="toolbar-left">
+              <button className="btn-icon" onClick={() => fileInputRef.current?.click()} title={t("chat.attach")}>＋</button>
+              <button className="btn-icon" onClick={isRecording ? () => mediaRecorderRef.current?.stop() : startRecording}
+                style={isRecording ? { color: "var(--danger)" } : undefined} title={t("chat.voice")}>{isRecording ? "⏹" : "🎙"}</button>
+              <button className="btn btn-sm btn-ghost"
+                style={{ padding: "3px 10px", fontSize: 10, background: planMode ? "var(--accent-soft)" : "transparent", borderColor: planMode ? "var(--border-accent)" : undefined, color: planMode ? "var(--accent)" : undefined }}
+                onClick={() => setPlanMode(!planMode)} title={t("chat.plan_mode")}>
+                📋 {planMode ? t("chat.plan_mode_on") : t("chat.plan_mode_btn")}
+              </button>
+            </div>
+            <div className="toolbar-right">
+              <select className="form-input" style={{
+                fontSize: 11, padding: "2px 6px", margin: 0, width: "auto", maxWidth: 180,
+                background: "transparent", border: "0", color: "var(--text-secondary)",
+                cursor: "pointer", outline: "none",
+              }}
+                value={selectedModel} onChange={(e) => onSelectModel(e.target.value)}
+                title={t("chat.model_select")}>
+                <option value="">{t("sidebar.auto_detect")}</option>
+                {cloudModels.map((m) => (
+                  <option key={m.name} value={m.name}>☁️ {m.name}</option>
+                ))}
+              </select>
+              <button className="btn-icon" onClick={onOpenSettings} title={t("chat.settings")}>⚙</button>
+              {isProcessing ? (
+                <button className="btn-send btn-circle" onClick={onStop} title={t("chat.stop")}>⏹</button>
+              ) : (
+                <button className="btn-send btn-circle" onClick={handleSend} title={t("chat.send")}>↑</button>
+              )}
+            </div>
+          </div>
+        </div>
+        {/* 会话状态栏 */}
+        <div className="chat-statusbar">
+          {userTurns > 0 ? (
+            <>
+              <span>{userTurns} 轮 · {toolCalls} 次工具调用</span>
+              <span className="statusbar-sep">|</span>
+              <span>{messages.length} 条消息</span>
+              <span className="statusbar-sep">|</span>
+              <span>~{estTokens.toLocaleString()} tokens</span>
+              {contextEstimate?.max_context ? (
+                <>
+                  <span className="statusbar-sep">|</span>
+                  <span>上下文 {Math.round((estTokens / contextEstimate.max_context) * 100)}%</span>
+                </>
+              ) : null}
+            </>
           ) : (
-            <button className="btn-send" onClick={handleSend}>{t("chat.send")}</button>
+            <span>{t("chat.status_hint")}</span>
           )}
         </div>
       </div>
