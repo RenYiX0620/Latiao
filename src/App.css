@@ -440,6 +440,10 @@ body {
 .tool-call-args { color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
 .tool-call-chevron { font-size: 9px; color: var(--text-muted); }
 .tool-call-spinner { font-size: 10px; color: var(--accent); animation: blink 1s infinite; }
+.tool-call-result-hint {
+  font-size: 10px; color: var(--success, #34d399); overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; max-width: 220px; flex-shrink: 1;
+}
 .tool-call-preview {
   font-size: 10.5px; color: var(--text-muted);
   padding: 0 8px 4px; display: flex; align-items: center; gap: 4px;

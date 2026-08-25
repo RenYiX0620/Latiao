@@ -60,14 +60,8 @@ const ToolCallBubble = memo(function ToolCallBubble({ msg, onConfirm }: {
   const renderedResult = useMemo(() => {
     if (!msg.toolResult) return null;
     if (!expanded) {
-      // 默认显示结果预览（前 120 字符），点击头部展开完整内容
-      return (
-        <div className="tool-call-preview">
-          {isMarkdown && <span className="tool-call-more">📊</span>}
-          <span className="tool-call-preview-text">{previewContent || "✅ 已完成"}</span>
-          <span className="tool-call-more">▾</span>
-        </div>
-      );
+      // ZCode 风格：默认完全折叠成一行（头部），点击才展开结果
+      return null;
     }
     return (
       <div className="tool-call-result">
@@ -123,6 +117,9 @@ const ToolCallBubble = memo(function ToolCallBubble({ msg, onConfirm }: {
         <span className="tool-call-name">{msg.toolName}</span>
         <span className="tool-call-args">{formatToolArgs(msg.toolArgs)}</span>
         {msg.toolStatus === "running" && <span className="tool-call-spinner">…</span>}
+        {!expanded && msg.toolStatus === "done" && previewContent && (
+          <span className="tool-call-result-hint">✓ {previewContent.slice(0, 30)}{previewContent.length > 30 ? "…" : ""}</span>
+        )}
         <span className="tool-call-chevron">{chevron}</span>
       </div>
       {msg.toolStatus === "confirming" && onConfirm && (
