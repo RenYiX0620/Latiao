@@ -45,6 +45,11 @@ const T: Record<string, Record<Lang, string>> = {
   "chat.access_confirm": { zh: "变更前确认", en: "Confirm before", ja: "変更前に確認", ru: "Подтверждать" },
   "chat.access_auto_edit": { zh: "自动编辑", en: "Auto Edit", ja: "自動編集", ru: "Авто-правка" },
   "chat.access_plan": { zh: "计划模式", en: "Plan Mode", ja: "プラン", ru: "План" },
+  "chat.copy": { zh: "复制", en: "Copy", ja: "コピー", ru: "Копировать" },
+  "chat.copied": { zh: "已复制", en: "Copied", ja: "コピー済み", ru: "Скопировано" },
+  "chat.copy_fail": { zh: "复制失败", en: "Copy failed", ja: "失敗", ru: "Ошибка" },
+  "chat.like": { zh: "赞", en: "Like", ja: "いいね", ru: "Нравится" },
+  "chat.dislike": { zh: "踩", en: "Dislike", ja: "残念", ru: "Не нравится" },
 
   "chat.access_full": { zh: "全部权限", en: "Full access", ja: "フル", ru: "Полный" },
   "chat.send": { zh: "发送", en: "Send", ja: "送信", ru: "Отправить" },

@@ -354,6 +354,17 @@ body {
   -webkit-user-modify: read-write-plaintext-only;
 }
 .chat-input:focus { outline: 0; }
+/* 消息操作栏（复制/点赞/点踩/时间） */
+.msg-actions {
+  display: flex; align-items: center; gap: 2px; margin-top: 3px;
+  opacity: 0; transition: opacity 0.15s ease; min-height: 18px;
+}
+.msg-row:hover .msg-actions { opacity: 1; }
+.msg-actions .btn-icon { font-size: 11px; color: var(--text-muted); padding: 1px 5px; }
+.msg-actions .btn-icon:hover { color: var(--text-primary); background: var(--bg-input); border-radius: 4px; }
+.msg-actions .btn-icon.active { color: var(--accent); background: var(--accent-soft); border-radius: 4px; }
+.msg-time { font-size: 10px; color: var(--text-disabled); margin-left: 6px; }
+
 /* Placeholder */
 .chat-input.is-empty::before {
   content: attr(data-placeholder);
