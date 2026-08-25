@@ -52,6 +52,7 @@ interface ChatViewProps {
   setAccessMode: (m: "read_only" | "confirm" | "auto_edit" | "plan" | "full") => void;
   contextEstimate?: { max_context: number; recommended_context: number } | null;
   showToast: (msg: string, type?: string) => void;
+  activeTask: string | null;
 }
 
 export default memo(function ChatView({
@@ -61,7 +62,7 @@ export default memo(function ChatView({
   sendMessage, onStop, handleFileSelect, startRecording, confirmTool,
   chatEndRef, handleDrop, onPasteImage,
   cloudModels, selectedModel, onSelectModel,
-  accessMode, setAccessMode, contextEstimate, showToast,
+  accessMode, setAccessMode, contextEstimate, showToast, activeTask,
 }: ChatViewProps) {
   const { t } = useTranslation();
   const handleEditableKeyDown = useCallback((e: React.KeyboardEvent) => {
@@ -96,6 +97,13 @@ export default memo(function ChatView({
 
   return (
     <>
+      {/* 任务执行状态条（工具执行中显示，完成后消失） */}
+      {activeTask && (
+        <div className="task-statusbar">
+          <span className="task-statusbar-dot">▣</span>
+          <span className="task-statusbar-label">{t("chat.task_running")} · {activeTask}</span>
+        </div>
+      )}
       <div className="chat-scroll" onDrop={handleDrop} onDragOver={(e) => { if (handleDrop) e.preventDefault(); }}>
         {messages.map((msg, i) => {
           if (msg.role === "tool" || msg.type === "tool_call") {
@@ -107,6 +115,12 @@ export default memo(function ChatView({
                 <div className="avatar-small">🤖</div>
                 <div className="msg-content">
                   <div className="msg-bubble">
+                    {msg.thinking && (
+                      <details className="thinking-block">
+                        <summary>🧠 思考过程</summary>
+                        <div>{msg.thinking}</div>
+                      </details>
+                    )}
                     <ReactMarkdown remarkPlugins={[remarkGfm]} components={{
                       code: ({ inline, className, children, ...props }: { inline?: boolean; className?: string; children?: React.ReactNode }) =>
                         inline

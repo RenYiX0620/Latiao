@@ -1450,7 +1450,7 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                                     continue
                                 if text_output_delivered:
                                     continue
-                                yield {"content": reasoning}
+                                yield {"reasoning": reasoning}
 
                             for tc_delta in delta.get("tool_calls", []):
                                 idx = tc_delta.get("index", 0)
@@ -2024,7 +2024,7 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                                     continue
                                 if text_output_delivered:
                                     continue
-                                yield {"content": reasoning}
+                                yield {"reasoning": reasoning}
                         except (json.JSONDecodeError, KeyError, TypeError, IndexError):
                             pass
                         except Exception:

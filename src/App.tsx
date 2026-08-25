@@ -131,6 +131,9 @@ const [timeFilter, setTimeFilter] = useState("all");
 
   const [prompt, setPrompt] = useState("");
   const [isProcessing, setIsProcessing] = useState(false);
+  // 当前执行中任务摘要（tool_start/tool_end 驱动，顶部状态条展示）
+  const [activeTask, setActiveTask] = useState<string | null>(null);
+  const activeTaskStackRef = useRef<string[]>([]);
   const abortControllerRef = useRef<AbortController | null>(null);
   // 已提示过的 cron 完成事件（ts+task 键），防止 5s 心跳对同一事件反复弹 toast
   const lastCronEventRef = useRef<string>("");
@@ -746,6 +749,8 @@ const [timeFilter, setTimeFilter] = useState("all");
                   });
                 }
               } else if (parsed.event === "tool_start") {
+                activeTaskStackRef.current.push(`${parsed.tool || ""} ${JSON.stringify(parsed.args || {}).slice(0, 60)}`);
+                setActiveTask(activeTaskStackRef.current[activeTaskStackRef.current.length - 1] || null);
                 setMessages((prev) => {
                   const msgs = [...prev];
                   const idx = msgs.findIndex((m) => m.callId === parsed.call_id && m.toolStatus === "confirming");
@@ -759,6 +764,8 @@ const [timeFilter, setTimeFilter] = useState("all");
                   return msgs;
                 });
               } else if (parsed.event === "tool_end") {
+                activeTaskStackRef.current.pop();
+                setActiveTask(activeTaskStackRef.current[activeTaskStackRef.current.length - 1] || null);
                 const rawResult = String(parsed.result ?? "");
                 const toolResult = rawResult.length > 10000
                   ? rawResult.slice(0, 10000) + `\n\n...(截断)`
@@ -769,6 +776,18 @@ const [timeFilter, setTimeFilter] = useState("all");
                   const idx = msgs.findIndex((m) => m.callId === parsed.call_id && (m.toolStatus === "running" || m.toolStatus === "confirming"));
                   if (idx !== -1) {
                     msgs[idx] = { ...msgs[idx], toolResult, toolStatus: isError ? "error" : "done", content: toolResult };
+                  }
+                  return msgs;
+                });
+              } else if (parsed.reasoning) {
+                // 思考内容：累积到最后一条 assistant 消息的 thinking 字段（灰块展示，不入正文）
+                setMessages((prev) => {
+                  const msgs = [...prev];
+                  const last = msgs[msgs.length - 1];
+                  if (last?.role === "assistant") {
+                    msgs[msgs.length - 1] = { ...last, thinking: (last.thinking || "") + parsed.reasoning };
+                  } else {
+                    msgs.push({ id: msgId(), role: "assistant", content: "", thinking: String(parsed.reasoning), ts: Date.now() });
                   }
                   return msgs;
                 });
@@ -1199,6 +1218,7 @@ const [timeFilter, setTimeFilter] = useState("all");
             accessMode={accessMode} setAccessMode={setAccessMode}
             contextEstimate={contextEstimate}
             showToast={showToast}
+            activeTask={activeTask}
           />
         </div>
 

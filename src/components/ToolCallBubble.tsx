@@ -94,9 +94,10 @@ const ToolCallBubble = memo(function ToolCallBubble({ msg, onConfirm }: {
   return (
     <div className={`tool-call ${statusClass}`}>
       <div className="tool-call-header" onClick={() => setExpanded(!expanded)}>
-        <span style={{ color: iconColor }}>◆</span>
+        <span style={{ color: iconColor }}>{msg.toolName === "run_cmd" ? "▣" : "◆"}</span>
         <span className="tool-call-name">{msg.toolName}</span>
         <span className="tool-call-args">{formatToolArgs(msg.toolArgs)}</span>
+        {msg.toolStatus === "running" && <span className="tool-call-spinner">…</span>}
         <span className="tool-call-chevron">{chevron}</span>
       </div>
       {msg.toolStatus === "confirming" && onConfirm && (
