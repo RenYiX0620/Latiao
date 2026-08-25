@@ -16,6 +16,7 @@ import CronView from "./components/CronView";
 import ChannelsView from "./components/ChannelsView";
 import AgentView from "./components/AgentView";
 import SettingsView from "./components/SettingsView";
+import RecoveryView from "./components/RecoveryView";
 import LogsView from "./components/LogsView";
 import "./App.css";
 
@@ -313,6 +314,15 @@ const [timeFilter, setTimeFilter] = useState("all");
   };
   useEffect(() => { fetchTools(); }, []);
 
+  // Fetch recent logs (supplier for recovery panel)
+  const fetchGatewayLogs = async () => {
+    try {
+      const lr = await authFetch("/v1/logs?limit=100", { signal: AbortSignal.timeout(5000) });
+      const ld = await lr.json();
+      if (ld.status === "ok") setGatewayLogs(ld.logs || []);
+    } catch { /* ignore */ }
+  };
+
   // Restart sidecar
   const handleRestartSidecar = async () => {
     setRestartingSidecar(true);
@@ -384,11 +394,7 @@ const [timeFilter, setTimeFilter] = useState("all");
       } catch { setSidecarStatus("offline"); }
 
       // Fetch recent logs (always, cheap ring-buffer read)
-      try {
-        const lr = await authFetch("/v1/logs?limit=100", { signal: AbortSignal.timeout(5000) });
-        const ld = await lr.json();
-        if (ld.status === "ok") setGatewayLogs(ld.logs || []);
-      } catch { /* ignore */ }
+      await fetchGatewayLogs();
     };
     tick();
     const interval = setInterval(tick, 5000);
@@ -1249,6 +1255,18 @@ const [timeFilter, setTimeFilter] = useState("all");
             <AgentView key={lang} activeAgent={activeAgent} setActiveAgent={setActiveAgent} showToast={showToast} />
           </div>
         </div>
+        {/* sidecar 完全不可用 → 恢复面板（诊断/重启/日志），替代空白界面 */}
+        {sidecarStatus !== "online" && (
+          <div className="view-panel active" id="view-recovery" style={{ zIndex: 100, position: "absolute", inset: 0, background: "var(--bg)" }}>
+            <RecoveryView
+              sidecarStatus={sidecarStatus}
+              restartingSidecar={restartingSidecar}
+              onRestartSidecar={handleRestartSidecar}
+              gatewayLogs={gatewayLogs}
+              fetchLogs={() => void fetchGatewayLogs()}
+            />
+          </div>
+        )}
         <div className={`view-panel${activeView === "settings" ? " active" : ""}`} id="view-settings">
           <div className="page-header">
             <div><div className="page-title">{t("page.settings")}</div><div className="page-desc">{t("page.settings_desc")}</div></div>

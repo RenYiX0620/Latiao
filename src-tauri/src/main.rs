@@ -391,6 +391,10 @@ fn setup_tray(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Error>> 
     let quit = MenuItemBuilder::with_id("latiao_quit", "退出").build(app)?;
     let menu = MenuBuilder::new(app).items(&[&show, &quit]).build()?;
     TrayIconBuilder::new()
+        .icon(tauri::image::Image::from_bytes(
+            include_bytes!("../icons/32x32.png"),
+        )?)
+        .tooltip("辣条 Latiao")
         .menu(&menu)
         .on_menu_event(|app, event| {
             match event.id().as_ref() {
@@ -438,13 +442,8 @@ fn main() {
         .setup(move |app| {
             setup_tray(app.handle())?;
             if !sidecar_ok {
-                // Sidecar didn't start — tell the user instead of leaving them
-                // staring at a UI whose backend calls will all time out.
-                use tauri_plugin_dialog::DialogExt;
-                app.dialog()
-                    .message("AI 后端进程(sidecar)启动失败。\n聊天、模型和工具功能暂时不可用。\n\n请尝试重启应用；若反复出现，请重新安装。")
-                    .title("Latiao 启动警告")
-                    .blocking_show();
+                // 启动失败：前端恢复面板会自动检测并展示自助恢复能力
+                // （健康探测 / 重启 sidecar / 导出日志），不再弹阻塞对话框。
             }
             Ok(())
         })
