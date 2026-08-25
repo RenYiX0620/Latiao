@@ -875,10 +875,10 @@ async def _reflect_output(text: str, model: str, api_url: str, headers: dict,
 
 
 def _inject_thinking_disabled(body: dict, model: str) -> dict:
-    """DeepSeek 思考模式下，多轮/工具调用请求必须回传上一轮的 reasoning_content，
-    否则 API 返回 400。这里对 DeepSeek 模型显式关闭思考模式，避免多轮对话 400。
+    """DeepSeek 思考模式已默认开启（reasoning_content 回传/工具消息补空已处理），
+    保留本钩子以支持将来按需禁用（如设置 LATIAO_DEEPSEEK_THINKING=off）。
     其它 OpenAI 兼容端点忽略该参数，不受影响。"""
-    if isinstance(model, str) and "deepseek" in model.lower():
+    if os.environ.get("LATIAO_DEEPSEEK_THINKING", "on") == "off"             and isinstance(model, str) and "deepseek" in model.lower():
         body["thinking"] = {"type": "disabled"}
     return body
 
