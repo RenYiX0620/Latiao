@@ -1165,6 +1165,11 @@ const [timeFilter, setTimeFilter] = useState("all");
             startRecording={startRecording} confirmTool={confirmTool}
             chatEndRef={chatEndRef} handleDrop={handleDrop}
             onPasteImage={(file) => processImageFile(file, `截图 ${new Date().toLocaleTimeString()}`)}
+            cloudModels={cloudModels}
+            selectedModel={session.selectedModel}
+            onSelectModel={setSelectedModel}
+            onOpenSettings={() => setActiveView("settings")}
+            contextEstimate={contextEstimate}
           />
         </div>
 

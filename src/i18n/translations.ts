@@ -36,6 +36,10 @@ const T: Record<string, Record<Lang, string>> = {
   "chat.voice": { zh: "语音", en: "Voice", ja: "音声", ru: "Голос" },
   "chat.plan_mode": { zh: "计划模式：分阶段执行", en: "Plan Mode: phased execution", ja: "計画モード: 段階的実行", ru: "Режим плана" },
   "chat.plan_mode_btn": { zh: "计划", en: "Plan", ja: "計画", ru: "План" },
+  "chat.plan_mode_on": { zh: "计划模式", en: "Plan On", ja: "プランON", ru: "План ВКЛ" },
+  "chat.model_select": { zh: "选择模型", en: "Select model", ja: "モデル選択", ru: "Выбрать модель" },
+  "chat.settings": { zh: "设置", en: "Settings", ja: "設定", ru: "Настройки" },
+  "chat.status_hint": { zh: "新会话 · 发送第一条消息开始", en: "New session · send a message to begin", ja: "新規セッション", ru: "Новая сессия" },
   "chat.send": { zh: "发送", en: "Send", ja: "送信", ru: "Отправить" },
   "chat.processing": { zh: "处理中", en: "Processing", ja: "処理中", ru: "Обработка" },
   // ── SettingsView ──
