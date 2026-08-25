@@ -40,6 +40,10 @@ const T: Record<string, Record<Lang, string>> = {
   "chat.model_select": { zh: "选择模型", en: "Select model", ja: "モデル選択", ru: "Выбрать модель" },
   "chat.settings": { zh: "设置", en: "Settings", ja: "設定", ru: "Настройки" },
   "chat.status_hint": { zh: "新会话 · 发送第一条消息开始", en: "New session · send a message to begin", ja: "新規セッション", ru: "Новая сессия" },
+  "chat.access_title": { zh: "权限模式", en: "Access mode", ja: "アクセス", ru: "Режим доступа" },
+  "chat.access_readonly": { zh: "只读", en: "Read Only", ja: "読み取りのみ", ru: "Чтение" },
+  "chat.access_workspace": { zh: "工作区读写", en: "Workspace Write", ja: "ワークスペース", ru: "Рабочая область" },
+  "chat.access_full": { zh: "全部权限", en: "Full access", ja: "フル", ru: "Полный" },
   "chat.send": { zh: "发送", en: "Send", ja: "送信", ru: "Отправить" },
   "chat.processing": { zh: "处理中", en: "Processing", ja: "処理中", ru: "Обработка" },
   // ── SettingsView ──

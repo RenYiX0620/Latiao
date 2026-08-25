@@ -598,6 +598,38 @@ INTENT_PATTERNS = [
 ]
 
 
+# 权限模式：read_only | workspace | full（用户会话级选择，与参考 UI 三档对应）
+READ_ONLY_TOOLS = {"read_file", "list_dir", "search_files", "tavily_search", "web_search", "bing_search"}
+# 工作区模式下禁用的系统级工具（仍可在 full 模式使用，confirm 规则照常）
+WORKSPACE_BLOCKED = {"run_cmd", "open_app", "open_folder", "write_file.sh", "delete_file", "move_file"}
+ACCESS_LEVELS = {"read_only", "workspace", "full"}
+
+
+def _filter_tools_by_access(tools: list[dict], access: str) -> list[dict]:
+    """按权限模式过滤工具列表（读时过滤 + 执行时拦截双保险）。"""
+    if access == "full" or access not in ACCESS_LEVELS:
+        return tools
+    out = []
+    for t in tools:
+        name = t.get("function", {}).get("name", "")
+        if access == "read_only" and name in READ_ONLY_TOOLS:
+            out.append(t)
+        elif access == "workspace" and name not in WORKSPACE_BLOCKED:
+            out.append(t)
+    return out or [t for t in tools if t.get("function", {}).get("name") in READ_ONLY_TOOLS] if access == "read_only" else out
+
+
+def _check_access(tool_name: str, access: str) -> str | None:
+    """执行时权限拦截：返回拒绝原因或 None（放行）。"""
+    if access == "full" or access not in ACCESS_LEVELS:
+        return None
+    if access == "read_only" and tool_name not in READ_ONLY_TOOLS:
+        return f"⛔ 当前为只读模式，工具 {tool_name} 不可用。若要使用请切换为工作区读写或全部权限。"
+    if access == "workspace" and tool_name in WORKSPACE_BLOCKED:
+        return f"⛔ 当前为工作区模式，系统级工具 {tool_name} 不可用。若要使用请切换为全部权限。"
+    return None
+
+
 def _filter_tools(user_text: str, all_tools: list[dict]) -> list[dict]:
     """Return a filtered tool list based on user intent. Falls back to all tools if uncertain."""
     if not user_text or len(user_text) < 3:
@@ -1036,11 +1068,16 @@ def _check_pre_hooks(tool_name: str, args: dict) -> tuple[bool, list[dict], str]
 
 
 async def _handle_tool_execution(tc: dict, current_msgs: list, session_id: str,
-                                  agent_id: str) -> tuple[bool, list[dict]]:
+                                  agent_id: str, access_mode: str = "full") -> tuple[bool, list[dict]]:
     """Execute a single tool call within the agent loop. Returns (verify_failed, events)."""
     call_id = tc.get("id") or str(uuid.uuid4())
     func = tc.get("function", {})
     tool_name = func.get("name", "unknown")
+    # 权限模式拦截：read_only/workspace 下越权工具直接拒绝（不执行）
+    denied = _check_access(tool_name, access_mode)
+    if denied:
+        current_msgs.append({"role": "tool", "tool_call_id": call_id, "content": denied})
+        return True, [{"event": "tool_end", "call_id": call_id, "tool": tool_name, "result": denied}]
     try:
         args = json.loads(func.get("arguments", "{}"))
     except json.JSONDecodeError:
@@ -1250,7 +1287,7 @@ def _append_loop_log(line: str):
         pass  # 调试日志写失败不影响主流程
 
 
-async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: dict, session_id: str = "", agent_id: str = "latiao", reflection_mode: str = "off"):
+async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: dict, session_id: str = "", agent_id: str = "latiao", reflection_mode: str = "off", access_mode: str = "full"):
     """Agent loop: call LLM with tools. If tool_calls → execute → loop. If text → yield & done."""
     current_msgs = [dict(m) for m in messages]
     # Two-level compression: keep head + tail, prune middle (MUSE-Autoskill style)
@@ -1298,6 +1335,7 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
     # ── Dynamic Tool Filtering + Agent restrictions ──
     agent_tools = _get_agent_tools(agent_id, TOOLS)
     active_tools = _filter_tools(last_user_text, agent_tools) if last_user_text else agent_tools
+    active_tools = _filter_tools_by_access(active_tools, access_mode)
     # Cap tools to prevent overflowing model context
     if len(active_tools) > 5:
         active_tools = _cap_tools(active_tools, 5)
@@ -1461,7 +1499,7 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                         recent_tool_calls.add(sig)
                         any_new = True
                     verify_failed, events = await _handle_tool_execution(
-                        tc, current_msgs, session_id, agent_id)
+                        tc, current_msgs, session_id, agent_id, access_mode)
                     logger.info(f"[LOCAL-AGENT] Iteration {iteration}: tool={tc.get('function',{}).get('name','')} executed, result_len={len(current_msgs[-1].get('content','')) if current_msgs else 0}")
                     for evt in events:
                         yield evt
@@ -1796,7 +1834,7 @@ def _build_local_tools_prompt(active_tools: list[dict]) -> str:
 
 
 async def _local_agent_loop_stream(messages: list, model: str, api_url: str, headers: dict,
-                                    session_id: str = "", agent_id: str = "latiao", reflection_mode: str = "off"):
+                                    session_id: str = "", agent_id: str = "latiao", reflection_mode: str = "off", access_mode: str = "full"):
     """Local model agent loop: inject tools as prompt, parse tool calls from text."""
     current_msgs = [dict(m) for m in messages]
     # Truncate long history to prevent context overflow.
@@ -1857,6 +1895,7 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
     last_user_text = _extract_last_user_text(current_msgs)
     agent_tools = _get_agent_tools(agent_id, TOOLS)
     active_tools = _filter_tools(last_user_text, agent_tools) if last_user_text else agent_tools
+    active_tools = _filter_tools_by_access(active_tools, access_mode)
     if len(active_tools) > 8:
         active_tools = _cap_tools(active_tools, 8)
     tools_prompt = _build_local_tools_prompt(active_tools)
@@ -2012,7 +2051,7 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                         recent_tool_calls.add(sig)
                         any_new = True
                     verify_failed, events = await _handle_tool_execution(
-                        tc, current_msgs, session_id, agent_id)
+                        tc, current_msgs, session_id, agent_id, access_mode)
                     for evt in events:
                         yield evt
                     if verify_failed:
