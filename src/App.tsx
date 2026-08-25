@@ -1136,7 +1136,6 @@ const [timeFilter, setTimeFilter] = useState("all");
             <option value="">{t("sidebar.auto_detect")}</option>
             {cloudModels.map((m) => (<option key={m.name} value={m.name}>☁️ {m.name}</option>))}
           </select>
-          <button className="sidebar-settings-btn" title={t("nav.settings")} onClick={() => setActiveView("settings")}>⚙</button>
         </div>
       </aside>
 
