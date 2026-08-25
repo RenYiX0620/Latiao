@@ -1133,7 +1133,7 @@ const [timeFilter, setTimeFilter] = useState("all");
       </aside>
 
       {/* ═══ Main ═══ */}
-      <main className="main">
+      <main className="main" style={{ position: "relative" }}>
         <div className="topbar">
           <span className="topbar-title">{session.name}</span>
           <span style={{ fontSize: 10, color: "var(--text-muted)", padding: "2px 6px", borderRadius: "var(--radius-sm)", background: "var(--accent-soft)", marginRight: 8 }}>
@@ -1153,6 +1153,17 @@ const [timeFilter, setTimeFilter] = useState("all");
 
 
         {/* ═══ Chat View ═══ */}
+        {sidecarStatus !== "online" && (
+          <div className="view-panel active" id="view-recovery" style={{ position: "absolute", inset: 0, background: "var(--bg)", zIndex: 90 }}>
+            <RecoveryView
+              sidecarStatus={sidecarStatus}
+              restartingSidecar={restartingSidecar}
+              onRestartSidecar={handleRestartSidecar}
+              gatewayLogs={gatewayLogs}
+              fetchLogs={() => void fetchGatewayLogs()}
+            />
+          </div>
+        )}
         <div className={`view-panel${activeView === "chat" ? " active" : ""}`} id="view-chat">
           <ChatView
             messages={messages} isProcessing={isProcessing}
@@ -1260,18 +1271,6 @@ const [timeFilter, setTimeFilter] = useState("all");
             <AgentView key={lang} activeAgent={activeAgent} setActiveAgent={setActiveAgent} showToast={showToast} />
           </div>
         </div>
-        {/* sidecar 完全不可用 → 恢复面板（诊断/重启/日志），替代空白界面 */}
-        {sidecarStatus !== "online" && (
-          <div className="view-panel active" id="view-recovery" style={{ zIndex: 100, position: "absolute", inset: 0, background: "var(--bg)" }}>
-            <RecoveryView
-              sidecarStatus={sidecarStatus}
-              restartingSidecar={restartingSidecar}
-              onRestartSidecar={handleRestartSidecar}
-              gatewayLogs={gatewayLogs}
-              fetchLogs={() => void fetchGatewayLogs()}
-            />
-          </div>
-        )}
         <div className={`view-panel${activeView === "settings" ? " active" : ""}`} id="view-settings">
           <div className="page-header">
             <div><div className="page-title">{t("page.settings")}</div><div className="page-desc">{t("page.settings_desc")}</div></div>
