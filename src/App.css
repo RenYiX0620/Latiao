@@ -423,27 +423,26 @@ body {
 
 /* ── Tool Call ── */
 .tool-call {
-  display: inline-block; max-width: 68%; margin-bottom: 6px;
-  border-radius: var(--radius-md); border: 1px solid var(--border-default);
-  background: var(--bg-tool-call); overflow: hidden; font-size: 11px;
+  display: block; width: 100%; margin-bottom: 4px;
+  border-radius: var(--radius-sm); border-left: 3px solid var(--border-default);
+  background: transparent; overflow: hidden; font-size: 11px;
 }
-.tool-call.running { border-left: 2px solid var(--accent); }
-.tool-call.done { border-left: 2px solid var(--success); opacity: 0.95; }
-.tool-call.error { border-left: 2px solid var(--danger); }
-.tool-call.confirming { border-left: 2px solid var(--warning); }
+.tool-call.running { border-left-color: var(--accent); }
+.tool-call.done { border-left-color: var(--success); }
+.tool-call.error { border-left-color: var(--danger); }
+.tool-call.confirming { border-left-color: var(--warning); }
 .tool-call-header {
-  display: flex; align-items: center; gap: 7px;
-  padding: 7px 12px; cursor: pointer; user-select: none;
+  display: flex; align-items: center; gap: 6px;
+  padding: 4px 8px; cursor: pointer; user-select: none;
 }
-.tool-call-header:hover { background: rgba(255,255,255,0.03); }
+.tool-call-header:hover { background: var(--bg-input); border-radius: var(--radius-sm); }
 .tool-call-name { font-weight: 600; color: var(--text-primary); }
 .tool-call-args { color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
 .tool-call-chevron { font-size: 9px; color: var(--text-muted); }
 .tool-call-spinner { font-size: 10px; color: var(--accent); animation: blink 1s infinite; }
 .tool-call-preview {
-  font-size: 11px; color: var(--text-primary);
-  padding: 2px 12px 8px; display: flex; align-items: center; gap: 6px;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  font-size: 10.5px; color: var(--text-muted);
+  padding: 0 8px 4px; display: flex; align-items: center; gap: 4px;
 }
 .tool-call-more { color: var(--accent); opacity: 0.9; flex-shrink: 0; }
 .tool-call-preview-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 1; }
