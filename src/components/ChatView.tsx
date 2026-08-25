@@ -1,4 +1,4 @@
-import { memo, lazy, Suspense, useCallback } from "react";
+import { memo, lazy, Suspense, useCallback, useState } from "react";
 import type { Message, PendingFile } from "../types";
 import { useTranslation } from "../i18n";
 import ToolCallBubble from "./ToolCallBubble";
@@ -51,6 +51,7 @@ interface ChatViewProps {
   accessMode: "read_only" | "confirm" | "auto_edit" | "plan" | "full";
   setAccessMode: (m: "read_only" | "confirm" | "auto_edit" | "plan" | "full") => void;
   contextEstimate?: { max_context: number; recommended_context: number } | null;
+  showToast: (msg: string, type?: string) => void;
 }
 
 export default memo(function ChatView({
@@ -60,7 +61,7 @@ export default memo(function ChatView({
   sendMessage, onStop, handleFileSelect, startRecording, confirmTool,
   chatEndRef, handleDrop, onPasteImage,
   cloudModels, selectedModel, onSelectModel,
-  accessMode, setAccessMode, contextEstimate,
+  accessMode, setAccessMode, contextEstimate, showToast,
 }: ChatViewProps) {
   const { t } = useTranslation();
   const handleEditableKeyDown = useCallback((e: React.KeyboardEvent) => {
@@ -73,6 +74,20 @@ export default memo(function ChatView({
   const handleSend = useCallback(() => {
     sendMessage();
   }, [sendMessage]);
+
+  // 点赞/点踩本地反馈状态（localStorage 持久化，可扩展为反馈学习数据）
+  const [msgFeedback, setMsgFeedback] = useState<Record<string, "up" | "down">>(() => {
+    try { return JSON.parse(localStorage.getItem("latiao_msg_feedback") || "{}"); } catch { return {}; }
+  });
+  const toggleFeedback = (msgId: string, kind: "up" | "down") => {
+    const cur = msgFeedback[msgId];
+    const next = cur === kind ? undefined : kind;
+    const m = { ...msgFeedback };
+    if (next) m[msgId] = next; else delete m[msgId];
+    setMsgFeedback(m);
+    try { localStorage.setItem("latiao_msg_feedback", JSON.stringify(m)); } catch { /* ignore */ }
+  };
+  const fmtTime = (ts?: number) => ts ? new Date(ts).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false }) : "";
 
   // 状态栏数据：轮数（user 消息数）、工具调用数、消息数、token 估算
   const userTurns = messages.filter(m => m.role === "user").length || 0;
@@ -104,6 +119,16 @@ export default memo(function ChatView({
                       {msg.content}
                     </ReactMarkdown>
                   </div>
+                  <div className="msg-actions">
+                    <button className="btn-icon" title={t("chat.copy")} onClick={() => {
+                      navigator.clipboard?.writeText(msg.content).then(() => showToast(t("chat.copied"))).catch(() => showToast(t("chat.copy_fail"), "warn"));
+                    }}>⧉</button>
+                    <button className={`btn-icon${msgFeedback[msg.id || ""] === "up" ? " active" : ""}`} title={t("chat.like")}
+                      onClick={() => msg.id && toggleFeedback(msg.id, "up")}>👍</button>
+                    <button className={`btn-icon${msgFeedback[msg.id || ""] === "down" ? " active" : ""}`} title={t("chat.dislike")}
+                      onClick={() => msg.id && toggleFeedback(msg.id, "down")}>👎</button>
+                    {fmtTime(msg.ts) && <span className="msg-time">{fmtTime(msg.ts)}</span>}
+                  </div>
                 </div>
               </div>
             );
@@ -130,6 +155,12 @@ export default memo(function ChatView({
               <div className="avatar-small">🧑</div>
               <div className="msg-content">
                 <div className="msg-bubble">{msg.content}</div>
+                <div className="msg-actions">
+                  <button className="btn-icon" title={t("chat.copy")} onClick={() => {
+                    navigator.clipboard?.writeText(msg.content).then(() => showToast(t("chat.copied"))).catch(() => showToast(t("chat.copy_fail"), "warn"));
+                  }}>⧉</button>
+                  {fmtTime(msg.ts) && <span className="msg-time">{fmtTime(msg.ts)}</span>}
+                </div>
               </div>
             </div>
           );
