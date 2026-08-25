@@ -114,10 +114,14 @@ const [timeFilter, setTimeFilter] = useState("all");
   );
   useEffect(() => { localStorage.setItem("latiao_reflection", reflectionMode); }, [reflectionMode]);
 
-  // 权限模式：read_only | workspace | full（对应参考 UI 三档）
-  const [accessMode, setAccessMode] = useState<"read_only" | "workspace" | "full">(
-    () => (localStorage.getItem("latiao_access") as "read_only" | "workspace" | "full") || "full"
-  );
+  // 权限模式五档（从保守到放手）：read_only / confirm / auto_edit / plan / full
+  const [accessMode, setAccessMode] = useState<"read_only" | "confirm" | "auto_edit" | "plan" | "full">(() => {
+    const saved = localStorage.getItem("latiao_access");
+    if (!saved) return "full";
+    // 旧版本值迁移：workspace → auto_edit
+    if (saved === "workspace") return "auto_edit";
+    return (["read_only", "confirm", "auto_edit", "plan", "full"].includes(saved) ? saved : "full") as "read_only" | "confirm" | "auto_edit" | "plan" | "full";
+  });
   useEffect(() => { localStorage.setItem("latiao_access", accessMode); }, [accessMode]);
 
   const [planMode, setPlanMode] = useState<boolean>(() => {
@@ -866,7 +870,7 @@ const [timeFilter, setTimeFilter] = useState("all");
     setMessages((prev) => [...prev, assistantPlaceholder]);
 
     try {
-      const apiMessages = buildApiMessages(session, userMsg, planMode, lang);
+      const apiMessages = buildApiMessages(session, userMsg, planMode || accessMode === "plan", lang);
       const opts: Record<string, unknown> = { agent: activeAgent };
       if (session.selectedModel) opts.model = session.selectedModel;
       if (cloudCfgPre) opts.cloudConfig = { key: cloudCfgPre.key, endpoint: cloudCfgPre.endpoint, protocol: cloudCfgPre.protocol || "openai" };

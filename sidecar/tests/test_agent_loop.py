@@ -183,22 +183,23 @@ class TestAccessMode(unittest.TestCase):
         self.assertIsNotNone(_check_access("run_cmd", "read_only"))
         self.assertIsNone(_check_access("read_file", "read_only"))
 
-    def test_workspace_blocks_system(self):
+    def test_confirm_and_full_allow_all(self):
         from agent_loop import _check_access, _filter_tools_by_access
         tools = self._tools()
-        ws = _filter_tools_by_access(tools, "workspace")
-        names = {t.get("function", {}).get("name") for t in ws}
-        self.assertIn("write_file", names)   # 工作区可写
-        self.assertNotIn("run_cmd", names)   # 系统级禁用
-        self.assertNotIn("open_app", names)
-        self.assertIsNotNone(_check_access("run_cmd", "workspace"))
-        self.assertIsNone(_check_access("write_file", "workspace"))
+        for mode in ("confirm", "plan", "full"):
+            self.assertEqual(len(_filter_tools_by_access(tools, mode)), len(tools), mode)
+            self.assertIsNone(_check_access("run_cmd", mode), mode)
 
-    def test_full_allows_all(self):
-        from agent_loop import _check_access, _filter_tools_by_access
-        tools = self._tools()
-        self.assertEqual(len(_filter_tools_by_access(tools, "full")), len(tools))
-        self.assertIsNone(_check_access("run_cmd", "full"))
+    def test_legacy_workspace_maps_to_auto_edit(self):
+        from agent_loop import _normalize_access
+        self.assertEqual(_normalize_access("workspace"), "auto_edit")
+        self.assertEqual(_normalize_access("full"), "full")
+        self.assertEqual(_normalize_access("bogus"), "full")
+
+    def test_auto_edit_tools_defined(self):
+        from agent_loop import AUTO_EDIT_TOOLS
+        self.assertIn("write_file", AUTO_EDIT_TOOLS)
+        self.assertIn("open_folder", AUTO_EDIT_TOOLS)
 
 
 if __name__ == "__main__":

@@ -598,35 +598,37 @@ INTENT_PATTERNS = [
 ]
 
 
-# 权限模式：read_only | workspace | full（用户会话级选择，与参考 UI 三档对应）
+# 权限模式五档（自主权从低到高）：
+#   read_only  只读 —— 只能查询，改不了任何东西
+#   confirm    变更前确认 —— 高风险操作每次确认（= 默认行为）
+#   auto_edit  自动编辑 —— 文件类工具免确认（write_file/open_folder）
+#   plan       计划模式 —— 动工前先出方案确认 + 高危确认
+#   full       完全访问 —— 仅高危确认，其余自动
 READ_ONLY_TOOLS = {"read_file", "list_dir", "search_files", "tavily_search", "web_search", "bing_search"}
-# 工作区模式下禁用的系统级工具（仍可在 full 模式使用，confirm 规则照常）
-WORKSPACE_BLOCKED = {"run_cmd", "open_app", "open_folder", "write_file.sh", "delete_file", "move_file"}
-ACCESS_LEVELS = {"read_only", "workspace", "full"}
+AUTO_EDIT_TOOLS = {"write_file", "open_folder"}
+ACCESS_LEVELS = {"read_only", "confirm", "auto_edit", "plan", "full"}
+# 旧版本 workspace 档位迁移到 auto_edit（语义对应）
+_LEGACY_ACCESS_MAP = {"workspace": "auto_edit"}
+
+
+def _normalize_access(mode: str) -> str:
+    return _LEGACY_ACCESS_MAP.get(mode, mode) if mode in _LEGACY_ACCESS_MAP or mode in ACCESS_LEVELS else "full"
 
 
 def _filter_tools_by_access(tools: list[dict], access: str) -> list[dict]:
     """按权限模式过滤工具列表（读时过滤 + 执行时拦截双保险）。"""
-    if access == "full" or access not in ACCESS_LEVELS:
+    access = _normalize_access(access)
+    if access != "read_only":
         return tools
-    out = []
-    for t in tools:
-        name = t.get("function", {}).get("name", "")
-        if access == "read_only" and name in READ_ONLY_TOOLS:
-            out.append(t)
-        elif access == "workspace" and name not in WORKSPACE_BLOCKED:
-            out.append(t)
-    return out or [t for t in tools if t.get("function", {}).get("name") in READ_ONLY_TOOLS] if access == "read_only" else out
+    out = [t for t in tools if t.get("function", {}).get("name", "") in READ_ONLY_TOOLS]
+    return out or [t for t in tools if t.get("function", {}).get("name") in READ_ONLY_TOOLS]
 
 
 def _check_access(tool_name: str, access: str) -> str | None:
-    """执行时权限拦截：返回拒绝原因或 None（放行）。"""
-    if access == "full" or access not in ACCESS_LEVELS:
-        return None
+    """执行时权限拦截：返回拒绝原因或 None（放行）。read_only 档强制只读，其余档不拦截。"""
+    access = _normalize_access(access)
     if access == "read_only" and tool_name not in READ_ONLY_TOOLS:
-        return f"⛔ 当前为只读模式，工具 {tool_name} 不可用。若要使用请切换为工作区读写或全部权限。"
-    if access == "workspace" and tool_name in WORKSPACE_BLOCKED:
-        return f"⛔ 当前为工作区模式，系统级工具 {tool_name} 不可用。若要使用请切换为全部权限。"
+        return f"⛔ 当前为只读模式，工具 {tool_name} 不可用。请切换到自动编辑/计划模式/完全访问后重试。"
     return None
 
 
@@ -1093,7 +1095,17 @@ async def _handle_tool_execution(tc: dict, current_msgs: list, session_id: str,
         return True, [{"event": "tool_end", "call_id": call_id, "tool": tool_name, "result": result}]
 
     # ── User confirmation ──
-    if _resolve_permission(tool_name, args) == "confirm":
+    _access = _normalize_access(access_mode)
+    _auto_edit_bypass = False
+    if _access == "auto_edit" and tool_name in AUTO_EDIT_TOOLS:
+        # 自动编辑档：文件类免确认，除非 permissions.json 有显式规则（规则优先）
+        try:
+            from main import _custom_permissions
+            _has_rule = any(r.get("tool") == tool_name for r in _custom_permissions)
+        except Exception:
+            _has_rule = False
+        _auto_edit_bypass = not _has_rule
+    if _resolve_permission(tool_name, args) == "confirm" and not _auto_edit_bypass:
         approved, events = await _await_tool_confirmation(call_id, tool_name, args)
         if not approved:
             result = f"⛔ User denied this operation: {tool_name}"
