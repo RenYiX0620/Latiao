@@ -17,6 +17,7 @@ export function useSessions() {
     } catch { /* ignore */ }
     return [newSession()];
   });
+  
   const [currentIdx, setCurrentIdx] = useState(0);
 
   // Clamp into a valid range — an out-of-range currentIdx must not produce a
