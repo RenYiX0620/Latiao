@@ -1,4 +1,4 @@
-import { memo, lazy, Suspense, useCallback, useState } from "react";
+import { memo, lazy, Suspense, useCallback, useState, useMemo } from "react";
 import type { Message, PendingFile } from "../types";
 import { useTranslation } from "../i18n";
 import ToolCallBubble from "./ToolCallBubble";
@@ -90,6 +90,24 @@ export default memo(function ChatView({
   };
   const fmtTime = (ts?: number) => ts ? new Date(ts).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false }) : "";
 
+  // 连续工具调用分组折叠（ZCode 式）：组首索引 → 组内工具数量
+  const toolGroups = useMemo(() => {
+    const groups = new Map<number, number>();
+    let i = 0;
+    while (i < messages.length) {
+      const isTool = messages[i].role === "tool" || messages[i].type === "tool_call";
+      if (isTool) {
+        let j = i;
+        while (j < messages.length && (messages[j].role === "tool" || messages[j].type === "tool_call")) j++;
+        groups.set(i, j - i);
+        i = j;
+      } else i++;
+    }
+    return groups;
+  }, [messages]);
+  const [collapsedGroups, setCollapsedGroups] = useState<Record<string, boolean>>({});
+  const groupCollapsed = (gkey: string) => collapsedGroups[gkey] !== false;  // 默认折叠
+
   // 状态栏数据：轮数（user 消息数）、工具调用数、消息数、token 估算
   const userTurns = messages.filter(m => m.role === "user").length || 0;
   const toolCalls = messages.filter(m => m.role === "tool" || m.type === "tool_call").length || 0;
@@ -107,6 +125,35 @@ export default memo(function ChatView({
       <div className="chat-scroll" onDrop={handleDrop} onDragOver={(e) => { if (handleDrop) e.preventDefault(); }}>
         {messages.map((msg, i) => {
           if (msg.role === "tool" || msg.type === "tool_call") {
+            const gcount = toolGroups.get(i);
+            if (gcount === undefined) return null;  // 组内非首成员：由组首统一渲染
+            const gkey = `g${i}`;
+            if (gcount > 1 && groupCollapsed(gkey)) {
+              // 折叠态：组首卡片 + 折叠条
+              return (
+                <div key={gkey} className="tool-group">
+                  <ToolCallBubble msg={msg} onConfirm={confirmTool} />
+                  <div className="tool-group-collapsed" onClick={() => setCollapsedGroups(prev => ({ ...prev, [gkey]: false }))}>
+                    <span className="tool-group-chevron">▸</span>
+                    <span>{t("chat.more_tools", { count: gcount - 1 })}</span>
+                  </div>
+                </div>
+              );
+            }
+            if (gcount > 1) {
+              // 展开态：全部卡片 + 收起条
+              return (
+                <div key={gkey} className="tool-group">
+                  {messages.slice(i, i + gcount).map((tm, k) => (
+                    <ToolCallBubble key={tm.id || `t${i}_${k}`} msg={tm} onConfirm={confirmTool} />
+                  ))}
+                  <div className="tool-group-collapsed" onClick={() => setCollapsedGroups(prev => ({ ...prev, [gkey]: true }))}>
+                    <span className="tool-group-chevron">▾</span>
+                    <span>{t("chat.collapse_tools")}</span>
+                  </div>
+                </div>
+              );
+            }
             return <ToolCallBubble key={msg.id || i} msg={msg} onConfirm={confirmTool} />;
           }
           if (msg.role === "assistant") {
