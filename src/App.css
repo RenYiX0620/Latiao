@@ -446,7 +446,7 @@ body {
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .tool-call-more { color: var(--accent); opacity: 0.9; flex-shrink: 0; }
-.tool-call-preview > span:not(.tool-call-more) { overflow: hidden; text-overflow: ellipsis; }
+.tool-call-preview-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 1; }
 .tool-call-result {
   padding: 7px 12px; border-top: 1px solid rgba(255,255,255,0.04);
   background: var(--bg-tool-result); max-height: 180px; overflow-y: auto;
