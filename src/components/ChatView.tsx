@@ -1,4 +1,4 @@
-import { memo, lazy, Suspense, useRef, useCallback, useEffect } from "react";
+import { memo, lazy, Suspense, useCallback } from "react";
 import type { Message, PendingFile } from "../types";
 import { useTranslation } from "../i18n";
 import ToolCallBubble from "./ToolCallBubble";
@@ -61,31 +61,16 @@ export default memo(function ChatView({
   cloudModels, selectedModel, onSelectModel, onOpenSettings, contextEstimate,
 }: ChatViewProps) {
   const { t } = useTranslation();
-  const editableRef = useRef<HTMLDivElement>(null);
-
-  const handleEditableInput = useCallback(() => {
-    if (editableRef.current) setPrompt(editableRef.current.innerText);
-  }, [setPrompt]);
-
   const handleEditableKeyDown = useCallback((e: React.KeyboardEvent) => {
     if (e.key === "Enter" && !e.shiftKey && !isProcessing) {
       e.preventDefault();
       sendMessage();
-      // Clear the editable div after send (state handled by sendMessage's setPrompt(""))
-      if (editableRef.current) editableRef.current.innerText = "";
     }
   }, [sendMessage, isProcessing]);
 
   const handleSend = useCallback(() => {
     sendMessage();
-    if (editableRef.current) editableRef.current.innerText = "";
   }, [sendMessage]);
-
-  useEffect(() => {
-    if (!prompt && editableRef.current?.innerText !== "") {
-      editableRef.current!.innerText = "";
-    }
-  }, [prompt]);
 
   // 状态栏数据：轮数（user 消息数）、工具调用数、消息数、token 估算
   const userTurns = messages.filter(m => m.role === "user").length || 0;
@@ -161,11 +146,10 @@ export default memo(function ChatView({
           </div>
         )}
         <div className="input-row">
-          <div
-            ref={editableRef}
+          <textarea
             className={`chat-input${prompt ? "" : " is-empty"}`}
-            contentEditable={!isProcessing}
-            onInput={handleEditableInput}
+            value={prompt}
+            onChange={(e) => setPrompt(e.target.value)}
             onKeyDown={handleEditableKeyDown}
             onPaste={async (e) => {
               if (!onPasteImage) return;
@@ -180,9 +164,10 @@ export default memo(function ChatView({
                 }
               }
             }}
-            data-placeholder={t("chat.placeholder")}
-            role="textbox"
-            aria-multiline="true"
+            placeholder={t("chat.placeholder")}
+            disabled={isProcessing}
+            rows={1}
+            style={{ resize: "none", minHeight: 52, maxHeight: 150 }}
           />
           <input type="file" ref={fileInputRef} style={{ display: "none" }} onChange={handleFileSelect} />
           {/* 底部工具栏：左（附件/语音/模式）右（模型/设置/发送） */}
