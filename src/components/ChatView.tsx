@@ -48,8 +48,8 @@ interface ChatViewProps {
   cloudModels: { name: string }[];
   selectedModel: string;
   onSelectModel: (m: string) => void;
-  accessMode: "read_only" | "workspace" | "full";
-  setAccessMode: (m: "read_only" | "workspace" | "full") => void;
+  accessMode: "read_only" | "confirm" | "auto_edit" | "plan" | "full";
+  setAccessMode: (m: "read_only" | "confirm" | "auto_edit" | "plan" | "full") => void;
   contextEstimate?: { max_context: number; recommended_context: number } | null;
 }
 
@@ -184,13 +184,15 @@ export default memo(function ChatView({
                 📋 {planMode ? t("chat.plan_mode_on") : t("chat.plan_mode_btn")}
               </button>
               <select className="form-input" style={{
-                fontSize: 10, padding: "2px 6px", margin: 0, width: "auto", maxWidth: 150,
+                fontSize: 10, padding: "2px 6px", margin: 0, width: "auto", maxWidth: 130,
                 background: "transparent", border: "0", color: "var(--text-secondary)",
                 cursor: "pointer", outline: "none",
-              }} value={accessMode} onChange={(e) => setAccessMode(e.target.value as "read_only" | "workspace" | "full")}
+              }} value={accessMode} onChange={(e) => setAccessMode(e.target.value as "read_only" | "confirm" | "auto_edit" | "plan" | "full")}
                 title={t("chat.access_title")}>
                 <option value="read_only">🛡 {t("chat.access_readonly")}</option>
-                <option value="workspace">📝 {t("chat.access_workspace")}</option>
+                <option value="confirm">✋ {t("chat.access_confirm")}</option>
+                <option value="auto_edit">✅ {t("chat.access_auto_edit")}</option>
+                <option value="plan">📋 {t("chat.access_plan")}</option>
                 <option value="full">⚡ {t("chat.access_full")}</option>
               </select>
             </div>
