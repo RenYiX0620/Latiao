@@ -153,6 +153,9 @@ const [timeFilter, setTimeFilter] = useState("all");
 
 
   const [sidecarStatus, setSidecarStatus] = useState<"checking" | "online" | "offline">("checking");
+  // 连续心跳失败计数：sidecar 冷启动需 1-2 分钟，单次失败不判离线，
+  // 连续 12 次(≈60s)才显示恢复面板，避免启动竞态误报
+  const offlineStreakRef = useRef(0);
   const [restartingSidecar, setRestartingSidecar] = useState(false);
   const [testingModel, setTestingModel] = useState<string | null>(null);
   const [testResult, setTestResult] = useState("");
@@ -357,6 +360,7 @@ const [timeFilter, setTimeFilter] = useState("all");
         const resp = await authFetch("/v1/heartbeat", { signal: AbortSignal.timeout(5000) });
         const data = await resp.json();
         if (data.status === "ok") {
+          offlineStreakRef.current = 0;
           setSidecarStatus("online");
           // Guard: never overwrite a good status with an undefined payload field
           if (data.local_llm != null) setLocalLLMStatus(data.local_llm);
@@ -389,9 +393,13 @@ const [timeFilter, setTimeFilter] = useState("all");
             }
           }
         } else {
-          setSidecarStatus("offline");
+          offlineStreakRef.current += 1;
+          if (offlineStreakRef.current >= 12) setSidecarStatus("offline");
         }
-      } catch { setSidecarStatus("offline"); }
+      } catch {
+        offlineStreakRef.current += 1;
+        if (offlineStreakRef.current >= 12) setSidecarStatus("offline");
+      }
 
       // Fetch recent logs (always, cheap ring-buffer read)
       await fetchGatewayLogs();
@@ -1153,7 +1161,7 @@ const [timeFilter, setTimeFilter] = useState("all");
 
 
         {/* ═══ Chat View ═══ */}
-        {sidecarStatus !== "online" && (
+        {sidecarStatus === "offline" && (
           <div className="view-panel active" id="view-recovery" style={{ position: "absolute", inset: 0, background: "var(--bg)", zIndex: 90 }}>
             <RecoveryView
               sidecarStatus={sidecarStatus}
