@@ -28,7 +28,7 @@ const ToolCallBubble = memo(function ToolCallBubble({ msg, onConfirm }: {
   const chevron = expanded ? "▾" : "▸";
 
   // Derived: whether result needs truncation
-  const { truncated, displayContent, isMarkdown, previewContent, hasMore } = useMemo(() => {
+  const { truncated, displayContent, isMarkdown, previewContent } = useMemo(() => {
     if (!msg.toolResult) return { truncated: false, displayContent: "", isMarkdown: false };
     const long = msg.toolResult.length > MAX_PREVIEW_CHARS;
     const isMd = msg.toolResult.includes("## 🔍") || msg.toolResult.includes("⚠️") || msg.toolResult.includes("✅")
@@ -42,7 +42,6 @@ const ToolCallBubble = memo(function ToolCallBubble({ msg, onConfirm }: {
         : msg.toolResult,
       isMarkdown: isMd,
       previewContent: preview,
-      hasMore: cleaned.length > 220,
       isError: msg.toolResult.startsWith("Error") || msg.toolResult.startsWith("⛔"),
     };
   }, [msg.toolResult, fullExpanded]);
