@@ -365,6 +365,21 @@ body {
 .msg-actions .btn-icon.active { color: var(--accent); background: var(--accent-soft); border-radius: 4px; }
 .msg-time { font-size: 10px; color: var(--text-disabled); margin-left: 6px; }
 
+/* 思考过程块（灰色可折叠） */
+.thinking-block { margin-bottom: 8px; border-left: 3px solid var(--border-accent); background: var(--bg-input); border-radius: var(--radius-sm); padding: 6px 10px; }
+.thinking-block summary { cursor: pointer; font-size: 11px; color: var(--accent); user-select: none; }
+.thinking-block div { font-size: 11px; color: var(--text-muted); line-height: 1.5; margin-top: 4px; max-height: 160px; overflow-y: auto; white-space: pre-wrap; }
+
+/* 任务执行状态条（top of chat） */
+.task-statusbar {
+  display: flex; align-items: center; gap: 6px; padding: 5px 24px;
+  font-size: 11px; color: var(--text-secondary); background: var(--bg-input);
+  border-bottom: 1px solid var(--border-default); flex-shrink: 0;
+}
+.task-statusbar-dot { animation: blink 1.2s infinite; }
+.task-statusbar-label { font-family: var(--font-mono); opacity: 0.85; }
+@keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+
 /* Placeholder */
 .chat-input.is-empty::before {
   content: attr(data-placeholder);
@@ -424,6 +439,7 @@ body {
 .tool-call-name { font-weight: 600; color: var(--text-primary); }
 .tool-call-args { color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
 .tool-call-chevron { font-size: 9px; color: var(--text-muted); }
+.tool-call-spinner { font-size: 10px; color: var(--accent); animation: blink 1s infinite; }
 .tool-call-result {
   padding: 7px 12px; border-top: 1px solid rgba(255,255,255,0.04);
   background: var(--bg-tool-result); max-height: 180px; overflow-y: auto;

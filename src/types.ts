@@ -5,6 +5,7 @@ export interface Message {
   role: "user" | "assistant" | "tool";
   content: string;
   ts?: number;
+  thinking?: string;
   type?: "file" | "text" | "image" | "audio" | "translation" | "tool_call";
   filename?: string;
   imagePreview?: string;
