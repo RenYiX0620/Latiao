@@ -440,6 +440,13 @@ body {
 .tool-call-args { color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
 .tool-call-chevron { font-size: 9px; color: var(--text-muted); }
 .tool-call-spinner { font-size: 10px; color: var(--accent); animation: blink 1s infinite; }
+.tool-group-collapsed {
+  display: flex; align-items: center; gap: 6px; padding: 3px 8px;
+  font-size: 10.5px; color: var(--text-muted); cursor: pointer;
+  border-radius: var(--radius-sm); user-select: none;
+}
+.tool-group-collapsed:hover { background: var(--bg-input); color: var(--accent); }
+.tool-group-chevron { font-size: 9px; }
 .tool-call-result-hint {
   font-size: 10px; color: var(--success, #34d399); overflow: hidden;
   text-overflow: ellipsis; white-space: nowrap; max-width: 220px; flex-shrink: 1;

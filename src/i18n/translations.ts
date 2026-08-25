@@ -51,6 +51,8 @@ const T: Record<string, Record<Lang, string>> = {
   "chat.like": { zh: "赞", en: "Like", ja: "いいね", ru: "Нравится" },
   "chat.dislike": { zh: "踩", en: "Dislike", ja: "残念", ru: "Не нравится" },
   "chat.task_running": { zh: "执行中", en: "Running", ja: "実行中", ru: "Выполняется" },
+  "chat.more_tools": { zh: "还有 {count} 个工具调用（点击展开）", en: "{count} more tool calls (click to expand)", ja: "他{count}件のツール", ru: "Ещё {count} вызовов" },
+  "chat.collapse_tools": { zh: "收起工具列表", en: "Collapse tools", ja: "折りたたむ", ru: "Свернуть" },
 
   "chat.access_full": { zh: "全部权限", en: "Full access", ja: "フル", ru: "Полный" },
   "chat.send": { zh: "发送", en: "Send", ja: "送信", ru: "Отправить" },
