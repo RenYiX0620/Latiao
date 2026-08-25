@@ -48,7 +48,6 @@ interface ChatViewProps {
   cloudModels: { name: string }[];
   selectedModel: string;
   onSelectModel: (m: string) => void;
-  onOpenSettings: () => void;
   contextEstimate?: { max_context: number; recommended_context: number } | null;
 }
 
@@ -58,7 +57,7 @@ export default memo(function ChatView({
   fileInputRef, mediaRecorderRef, isRecording,
   sendMessage, onStop, handleFileSelect, startRecording, confirmTool,
   chatEndRef, handleDrop, onPasteImage,
-  cloudModels, selectedModel, onSelectModel, onOpenSettings, contextEstimate,
+  cloudModels, selectedModel, onSelectModel, contextEstimate,
 }: ChatViewProps) {
   const { t } = useTranslation();
   const handleEditableKeyDown = useCallback((e: React.KeyboardEvent) => {
@@ -195,7 +194,6 @@ export default memo(function ChatView({
                   <option key={m.name} value={m.name}>☁️ {m.name}</option>
                 ))}
               </select>
-              <button className="btn-icon" onClick={onOpenSettings} title={t("chat.settings")}>⚙</button>
               {isProcessing ? (
                 <button className="btn-send btn-circle" onClick={onStop} title={t("chat.stop")}>⏹</button>
               ) : (

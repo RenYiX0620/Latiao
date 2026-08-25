@@ -394,11 +394,11 @@ const [timeFilter, setTimeFilter] = useState("all");
           }
         } else {
           offlineStreakRef.current += 1;
-          if (offlineStreakRef.current >= 12) setSidecarStatus("offline");
+          if (offlineStreakRef.current >= 18) setSidecarStatus("offline");
         }
       } catch {
         offlineStreakRef.current += 1;
-        if (offlineStreakRef.current >= 12) setSidecarStatus("offline");
+        if (offlineStreakRef.current >= 18) setSidecarStatus("offline");
       }
 
       // Fetch recent logs (always, cheap ring-buffer read)
@@ -1161,7 +1161,7 @@ const [timeFilter, setTimeFilter] = useState("all");
 
         {/* ═══ Chat View ═══ */}
         {sidecarStatus === "offline" && (
-          <div className="view-panel active" id="view-recovery" style={{ position: "absolute", inset: 0, background: "var(--bg)", zIndex: 90 }}>
+          <div className="view-panel active" id="view-recovery" style={{ flex: 1 }}>
             <RecoveryView
               sidecarStatus={sidecarStatus}
               restartingSidecar={restartingSidecar}
@@ -1171,7 +1171,7 @@ const [timeFilter, setTimeFilter] = useState("all");
             />
           </div>
         )}
-        <div className={`view-panel${activeView === "chat" ? " active" : ""}`} id="view-chat">
+        <div className={`view-panel${activeView === "chat" ? " active" : ""}`} id="view-chat" style={sidecarStatus === "offline" ? { display: "none" } : undefined}>
           <ChatView
             messages={messages} isProcessing={isProcessing}
             pendingFile={pendingFile} setPendingFile={setPendingFile}
@@ -1186,13 +1186,12 @@ const [timeFilter, setTimeFilter] = useState("all");
             cloudModels={cloudModels}
             selectedModel={session.selectedModel}
             onSelectModel={setSelectedModel}
-            onOpenSettings={() => setActiveView("settings")}
             contextEstimate={contextEstimate}
           />
         </div>
 
         {/* ═══ Models View ═══ */}
-        <div className={`view-panel${activeView === "models" ? " active" : ""}`} id="view-models">
+        <div className={`view-panel${activeView === "models" ? " active" : ""}`} id="view-models" style={sidecarStatus === "offline" ? { display: "none" } : undefined}>
           <div className="page-header">
             <div><div className="page-title">{t("page.models")}</div><div className="page-desc">{t("page.models_desc", { model: session.selectedModel || t("sidebar.auto_detect") })}</div></div>
           </div>
@@ -1226,7 +1225,7 @@ const [timeFilter, setTimeFilter] = useState("all");
         </div>
 
         {/* ═══ Tools View ═══ */}
-        <div className={`view-panel${activeView === "tools" ? " active" : ""}`} id="view-tools">
+        <div className={`view-panel${activeView === "tools" ? " active" : ""}`} id="view-tools" style={sidecarStatus === "offline" ? { display: "none" } : undefined}>
           <div className="page-header">
             <div><div className="page-title">{t("page.tools")}</div><div className="page-desc">{t("page.tools_desc", { count: tools.length })}</div></div>
           </div>
@@ -1235,7 +1234,7 @@ const [timeFilter, setTimeFilter] = useState("all");
             <ToolsView tools={tools} setTools={setTools} showToast={showToast} />
           </div>
         </div>
-        <div className={`view-panel${activeView === "skills" ? " active" : ""}`} id="view-skills">
+        <div className={`view-panel${activeView === "skills" ? " active" : ""}`} id="view-skills" style={sidecarStatus === "offline" ? { display: "none" } : undefined}>
           <div className="page-header">
             <div><div className="page-title">{t("page.skills")}</div><div className="page-desc">{t("page.skills_desc", { enabled: skills.filter(s => s.enabled).length, total: skills.length })}</div></div>
           </div>
@@ -1248,7 +1247,7 @@ const [timeFilter, setTimeFilter] = useState("all");
 
 
         {/* ═══ Cron View ═══ */}
-        <div className={`view-panel${activeView === "cron" ? " active" : ""}`} id="view-cron">
+        <div className={`view-panel${activeView === "cron" ? " active" : ""}`} id="view-cron" style={sidecarStatus === "offline" ? { display: "none" } : undefined}>
           <div className="page-header">
             <div><div className="page-title">{t("page.cron")}</div><div className="page-desc">{t("page.cron_desc", { count: cronJobs.filter(j => j.enabled).length })}</div></div>
           </div>
@@ -1258,7 +1257,7 @@ const [timeFilter, setTimeFilter] = useState("all");
           </div>
         </div>
         {/* ═══ Channels View ═══ */}
-        <div className={`view-panel${activeView === "channels" ? " active" : ""}`} id="view-channels">
+        <div className={`view-panel${activeView === "channels" ? " active" : ""}`} id="view-channels" style={sidecarStatus === "offline" ? { display: "none" } : undefined}>
           <div className="page-header">
             <div><div className="page-title">{t("page.channels")}</div><div className="page-desc">{t("page.channels_desc")}</div></div>
           </div>
@@ -1269,7 +1268,7 @@ const [timeFilter, setTimeFilter] = useState("all");
 
 
         {/* ═══ Agent View ═══ */}
-        <div className={`view-panel${activeView === "agents" ? " active" : ""}`} id="view-agents">
+        <div className={`view-panel${activeView === "agents" ? " active" : ""}`} id="view-agents" style={sidecarStatus === "offline" ? { display: "none" } : undefined}>
           <div className="page-header">
             <div><div className="page-title">{t("page.agents")}</div><div className="page-desc">{t("page.agents_desc")}</div></div>
             <button className="btn btn-md btn-primary" style={{ marginLeft: "auto" }} onClick={() => showToast(t("agent.created_simple"))}>{t("agent.new_btn")}</button>
@@ -1278,7 +1277,7 @@ const [timeFilter, setTimeFilter] = useState("all");
             <AgentView key={lang} activeAgent={activeAgent} setActiveAgent={setActiveAgent} showToast={showToast} />
           </div>
         </div>
-        <div className={`view-panel${activeView === "settings" ? " active" : ""}`} id="view-settings">
+        <div className={`view-panel${activeView === "settings" ? " active" : ""}`} id="view-settings" style={sidecarStatus === "offline" ? { display: "none" } : undefined}>
           <div className="page-header">
             <div><div className="page-title">{t("page.settings")}</div><div className="page-desc">{t("page.settings_desc")}</div></div>
           </div>
@@ -1301,7 +1300,7 @@ const [timeFilter, setTimeFilter] = useState("all");
         </div>
 
         {/* ═══ Logs View ═══ */}
-        <div className={`view-panel${activeView === "logs" ? " active" : ""}`} id="view-logs">
+        <div className={`view-panel${activeView === "logs" ? " active" : ""}`} id="view-logs" style={sidecarStatus === "offline" ? { display: "none" } : undefined}>
           <div className="page-header">
             <div>
               <div className="page-title">{t("page.logs")}</div>
