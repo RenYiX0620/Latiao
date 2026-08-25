@@ -167,5 +167,39 @@ class TestReflectionTrigger(unittest.TestCase):
         self.assertFalse(_should_reflect("deep", "x" * 100, False))
 
 
+class TestAccessMode(unittest.TestCase):
+    def _tools(self):
+        from agent_loop import TOOLS
+        return list(TOOLS)
+
+    def test_read_only_filters(self):
+        from agent_loop import _check_access, _filter_tools_by_access
+        tools = self._tools()
+        ro = _filter_tools_by_access(tools, "read_only")
+        names = {t.get("function", {}).get("name") for t in ro}
+        self.assertIn("read_file", names)
+        self.assertNotIn("run_cmd", names)
+        self.assertNotIn("write_file", names)
+        self.assertIsNotNone(_check_access("run_cmd", "read_only"))
+        self.assertIsNone(_check_access("read_file", "read_only"))
+
+    def test_workspace_blocks_system(self):
+        from agent_loop import _check_access, _filter_tools_by_access
+        tools = self._tools()
+        ws = _filter_tools_by_access(tools, "workspace")
+        names = {t.get("function", {}).get("name") for t in ws}
+        self.assertIn("write_file", names)   # 工作区可写
+        self.assertNotIn("run_cmd", names)   # 系统级禁用
+        self.assertNotIn("open_app", names)
+        self.assertIsNotNone(_check_access("run_cmd", "workspace"))
+        self.assertIsNone(_check_access("write_file", "workspace"))
+
+    def test_full_allows_all(self):
+        from agent_loop import _check_access, _filter_tools_by_access
+        tools = self._tools()
+        self.assertEqual(len(_filter_tools_by_access(tools, "full")), len(tools))
+        self.assertIsNone(_check_access("run_cmd", "full"))
+
+
 if __name__ == "__main__":
     unittest.main()

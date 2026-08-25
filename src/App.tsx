@@ -114,6 +114,12 @@ const [timeFilter, setTimeFilter] = useState("all");
   );
   useEffect(() => { localStorage.setItem("latiao_reflection", reflectionMode); }, [reflectionMode]);
 
+  // 权限模式：read_only | workspace | full（对应参考 UI 三档）
+  const [accessMode, setAccessMode] = useState<"read_only" | "workspace" | "full">(
+    () => (localStorage.getItem("latiao_access") as "read_only" | "workspace" | "full") || "full"
+  );
+  useEffect(() => { localStorage.setItem("latiao_access", accessMode); }, [accessMode]);
+
   const [planMode, setPlanMode] = useState<boolean>(() => {
     try { const saved = localStorage.getItem("local_ai_os_plan_mode"); return saved ? JSON.parse(saved) : false; }
     catch (e) { console.error(e); return false; }
@@ -644,7 +650,7 @@ const [timeFilter, setTimeFilter] = useState("all");
     opts?: { model?: string; agent?: string; cloudConfig?: Record<string, unknown>; skipTools?: boolean },
     signal?: AbortSignal,
   ): Promise<string> => {
-    const body: Record<string, unknown> = { messages, stream: true, reflection_mode: reflectionMode };
+    const body: Record<string, unknown> = { messages, stream: true, reflection_mode: reflectionMode, access_mode: accessMode };
     if (opts?.model) body.model = opts.model;
     if (opts?.agent) body.agent = opts.agent;
     if (opts?.cloudConfig) body.cloud_config = opts.cloudConfig;
@@ -1186,6 +1192,7 @@ const [timeFilter, setTimeFilter] = useState("all");
             cloudModels={cloudModels}
             selectedModel={session.selectedModel}
             onSelectModel={setSelectedModel}
+            accessMode={accessMode} setAccessMode={setAccessMode}
             contextEstimate={contextEstimate}
           />
         </div>

@@ -178,13 +178,14 @@ async def chat_completion(request: Request):
             async def agent_loop_wrapper():
                 try:
                     _reflection_mode = body.get("reflection_mode", "off")
+                    _access_mode = body.get("access_mode", "full")
                     if is_local:
                         # 本地模型：用 prompt-based tool calling（不依赖 OpenAI function calling API）
-                        async for event in _local_agent_loop_stream(messages, model, api_url, headers, session_id, agent_id, _reflection_mode):
+                        async for event in _local_agent_loop_stream(messages, model, api_url, headers, session_id, agent_id, _reflection_mode, _access_mode):
                             yield f"data: {json.dumps(event)}\n\n"
                     else:
                         # 云端模型：原生 OpenAI function calling
-                        async for event in _agent_loop_stream(messages, model, api_url, headers, session_id, agent_id, _reflection_mode):
+                        async for event in _agent_loop_stream(messages, model, api_url, headers, session_id, agent_id, _reflection_mode, _access_mode):
                             yield f"data: {json.dumps(event)}\n\n"
                     yield "data: [DONE]\n\n"
                 except (httpx.ConnectError, httpx.RemoteProtocolError) as e:
