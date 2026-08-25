@@ -51,11 +51,12 @@ const ToolCallBubble = memo(function ToolCallBubble({ msg, onConfirm }: {
   const renderedResult = useMemo(() => {
     if (!msg.toolResult) return null;
     if (!expanded) {
-      // 默认显示结果预览（前 220 字符），点击头部展开完整内容
+      // 默认显示结果预览（前 120 字符），点击头部展开完整内容
       return (
-        <div className="tool-call-result tool-call-preview">
-          <span>{previewContent || "✅ 已完成"}{isMarkdown ? " · 点击展开" : ""}</span>
-          {hasMore && <span className="tool-call-more">… (点击展开)</span>}
+        <div className="tool-call-preview">
+          {isMarkdown && <span className="tool-call-more">📊 </span>}
+          <span>{previewContent || "✅ 已完成"}</span>
+          <span className="tool-call-more"> · 点击展开</span>
         </div>
       );
     }
