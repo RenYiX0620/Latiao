@@ -1427,7 +1427,15 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                         err_body = "<read failed>"
                     logger.error("Agent stream HTTP %d body: %s", r.status_code, err_body)
                 r.raise_for_status()  # httpx 不自动抛 4xx/5xx，必须显式检查
-                async for line in r.aiter_lines():
+                # 流式停顿检测：连续 180s 无数据视为僵死（大模型可能缓慢滴灌，120s 超时永不触发）
+                aiter = r.aiter_lines()
+                while True:
+                    try:
+                        line = await asyncio.wait_for(anext(aiter), timeout=180)
+                    except asyncio.TimeoutError:
+                        raise TimeoutError(f"模型输出停滞超 180 秒（模型可能过大或未加载完）：{model[:60]}")
+                    except StopAsyncIteration:
+                        break
                     if line and line.startswith("data: "):
                         data_str = line[6:]
                         if data_str == "[DONE]":
@@ -2011,8 +2019,19 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
             _raw_delta_count = 0  # 诊断: 统计收到的 delta 数(空响应时判断是模型真空还是解析丢了)
             logger.info(f"[LOCAL-AGENT] Iteration {iteration}: calling LLM, msgs={len(loop_msgs)}, first_user_content_len={len(loop_msgs[-1].get('content','')) if loop_msgs else 0}")
             # 本地 llama.cpp 并发流式请求会崩溃 → _local_llm_stream 内部串行化
+            # 流式停顿检测：模型过大/未加载完时可能极慢滴灌（120s 超时永不触发），
+            # 连续 180s 无任何数据视为僵死，中止不再无限挂起
             async with _local_llm_stream(client, api_url, body, headers) as r:
-                async for line in r.aiter_lines():
+                aiter = r.aiter_lines()
+                while True:
+                    try:
+                        line = await asyncio.wait_for(anext(aiter), timeout=180)
+                    except asyncio.TimeoutError:
+                        raise TimeoutError(
+                            f"本地模型输出停滞超 180 秒（模型可能过大或未加载完）：{model[:60]}"
+                        )
+                    except StopAsyncIteration:
+                        break
                     if line and line.startswith("data: "):
                         data_str = line[6:]
                         if data_str == "[DONE]":
