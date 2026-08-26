@@ -877,6 +877,15 @@ class LocalLLMEngine:
             self._kill_port(self.server_port)
             self.server_status = "stopped"
             self.status_message = ""
+            # 引擎崩溃/被杀（如系统内存压力）：有当前模型则后台自动重载，
+            # 下一条消息直接可用（重载需要时间，等待期间显示提示）
+            model_id = self.current_model_id
+            if model_id:
+                self.status_message = "引擎异常，正在自动重新加载模型..."
+                threading.Thread(
+                    target=lambda mid=model_id: self.start_model(mid),
+                    daemon=True,
+                ).start()
         return ok
 
     # ── Start / Stop ──
@@ -1389,7 +1398,19 @@ class LocalLLMEngine:
                 except Exception:
                     pass
 
-    def stop_model(self) -> dict:
+    def detach_engine(self):
+        """sidecar 重启/部署前调用：放弃对模型子进程的所有权，使其独立存活。
+
+        模型加载耗时巨大（35B MLX 冷启动可达数十分钟），sidecar 重启后
+        get_status 的 reconnect 探测会重新接管端口上幸存的模型服务，
+        避免"部署一次模型就没了"。"""
+        with self._proc_lock:
+            if self._process and self._process.poll() is None:
+                logger.info("Detaching engine pid=%s (model=%s)", self._process.pid, self.current_model_id)
+            self._process = None
+            self._active_backend = ""
+
+
         with self._proc_lock:
             # External engine mode: the model runs inside LM Studio/Ollama —
             # never kill their process or their port, just drop our state.

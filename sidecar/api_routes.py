@@ -1535,6 +1535,16 @@ async def local_llm_stop():
     return local_llm.stop_model()
 
 
+@app.post("/v1/engine/detach")
+async def engine_detach():
+    """sidecar 重启/部署前调用：放弃引擎子进程所有权，令其独立存活。
+
+    模型加载耗时巨大（数十 GB 冷启动），sidecar 重启后 get_status 的
+    reconnect 探测会接管幸存的引擎服务，避免"部署一次模型就没了"。"""
+    local_llm.detach_engine()
+    return {"status": "ok"}
+
+
 @app.post("/v1/local-llm/delete-model")
 async def local_llm_delete_model(request: Request):
     """Delete a local model file from ~/Models/ or download cache."""
