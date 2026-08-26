@@ -341,7 +341,7 @@ body {
 .btn-circle.btn-stop { background: var(--danger, #f87171); }
 .chat-statusbar {
   display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
-  font-size: 10px; color: var(--text-muted); padding: 6px 6px 0;
+  font-size: 11px; color: var(--text-muted); padding: 6px 6px 0;
   opacity: 0.85;
 }
 .statusbar-sep { opacity: 0.5; }
