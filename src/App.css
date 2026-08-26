@@ -297,9 +297,11 @@ body {
   color: var(--text-primary);
 }
 .msg-bubble.user {
-  background: linear-gradient(135deg, rgba(56,189,248,0.2), rgba(99,102,241,0.12));
-  border: 1px solid var(--border-accent); color: var(--text-primary);
+  /* ZCode 式：用户问题也直接铺开，仅以颜色区分（不再套聊天气泡框） */
+  background: transparent; border: none; padding: 2px 0;
+  color: var(--text-primary);
 }
+.msg-row.user .msg-bubble { font-weight: 550; }
 .msg-bubble.assistant {
   /* ZCode 式：回答正文直接铺在卡片里，不套气泡框 */
   background: transparent; border: none; padding: 2px 0;
