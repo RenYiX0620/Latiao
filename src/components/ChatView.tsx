@@ -33,26 +33,42 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import remarkGfm from "remark-gfm";
 
 const SyntaxHighlighter = lazy(async () => {
-  const [{ Prism }, { oneDark }] = await Promise.all([
+  const [{ Prism }, themes] = await Promise.all([
     import("react-syntax-highlighter"),
     import("react-syntax-highlighter/dist/esm/styles/prism"),
   ]);
-  // ZCode 式代码块：去掉 oneDark 的深色面板背景/圆角/内边距，
-  // 语法配色保留，融入卡片背景（无框）
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const flatTheme: Record<string, any> = Object.fromEntries(
-    Object.entries(oneDark).map(([k, v]) => [k, { ...(v as object), background: "transparent" }])
-  );
-  flatTheme['pre[class*="language-"]'] = {
-    ...flatTheme['pre[class*="language-"]'],
-    background: "transparent", margin: 0, padding: 0, boxShadow: "none",
+  // 主题按 <html data-theme> 切换：深色用 oneDark、浅色用 oneLight，
+  // 统一做扁平化（去面板背景/圆角/内边距，仅保留语法颜色）
+  const flatten = (src: Record<string, any>): Record<string, any> => {
+    const out = Object.fromEntries(
+      Object.entries(src).map(([k, v]) => [k, { ...(v as object), background: "transparent" }])
+    );
+    out['pre[class*="language-"]'] = {
+      ...(out['pre[class*="language-"]'] as object),
+      background: "transparent", margin: 0, padding: 0, boxShadow: "none",
+    } as any;
+    out['code[class*="language-"]'] = {
+      ...(out['code[class*="language-"]'] as object),
+      background: "transparent", boxShadow: "none", textShadow: "none",
+    } as any;
+    return out;
   };
-  flatTheme['code[class*="language-"]'] = {
-    ...flatTheme['code[class*="language-"]'],
-    background: "transparent", boxShadow: "none", textShadow: "none",
-  };
+  const darkFlat = flatten(themes.oneDark);
+  const lightFlat = flatten(themes.oneLight);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  return { default: (props: any) => <Prism style={flatTheme} {...props} /> };
+  return { default: (props: any) => {
+    const [theme, setTheme] = useState<string>(
+      () => document.documentElement.getAttribute("data-theme") || "dark"
+    );
+    useEffect(() => {
+      const el = document.documentElement;
+      const apply = () => setTheme(el.getAttribute("data-theme") || "dark");
+      const mo = new MutationObserver(apply);
+      mo.observe(el, { attributes: true, attributeFilter: ["data-theme"] });
+      return () => mo.disconnect();
+    }, []);
+    return <Prism style={theme === "light" ? lightFlat : darkFlat} {...props} />;
+  } };
 });
 
 function CodeBlock({ language, children }: { language: string; children: string }) {
