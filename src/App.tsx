@@ -830,11 +830,16 @@ const [timeFilter, setTimeFilter] = useState("all");
                   const msgs = [...prev];
                   const last = msgs[msgs.length - 1];
                   if (last?.role === "assistant") {
-                    // 正文开始输出 = 思考结束，结算思考耗时
-                    const updated = last.thinkingDuration === undefined && last.thinking
-                      ? { ...last, content: full, thinkingDuration: Math.max(0, Date.now() - (last.ts || Date.now())) }
-                      : { ...last, content: full };
-                    msgs[msgs.length - 1] = updated;
+                    if (last.content && !full.startsWith(last.content)) {
+                      // 已有内容的 assistant（如 📋 执行计划）：正文另起新消息，不覆盖
+                      msgs.push({ id: msgId(), role: "assistant", content: full, ts: Date.now() });
+                    } else {
+                      // 正文开始输出 = 思考结束，结算思考耗时
+                      const updated = last.thinkingDuration === undefined && last.thinking
+                        ? { ...last, content: full, thinkingDuration: Math.max(0, Date.now() - (last.ts || Date.now())) }
+                        : { ...last, content: full };
+                      msgs[msgs.length - 1] = updated;
+                    }
                   }
                   return msgs;
                 });
@@ -874,6 +879,9 @@ const [timeFilter, setTimeFilter] = useState("all");
       abortControllerRef.current.abort();
       abortControllerRef.current = null;
     }
+    activeTaskStackRef.current = [];
+    setActiveTask(null);
+    setTaskStartAt(null);
     setIsProcessing(false);
     setPendingFile(null);
     setAgentPhase("");
@@ -907,6 +915,8 @@ const [timeFilter, setTimeFilter] = useState("all");
     setPrompt("");
     setIsProcessing(true);
     setAgentPhase(t("agent.phase_analyze"));
+    activeTaskStackRef.current = []; // 清残留工具栈（上次中断/未正常结束）
+    setActiveTask(null);
     setTaskStartAt(Date.now()); // 任务头部"已工作"计时起点
 
     const userMsg: Message = { id: msgId(), role: "user", content: text || "Analyze this file", ts: Date.now() };
@@ -1393,8 +1403,8 @@ const [timeFilter, setTimeFilter] = useState("all");
           position: "fixed", bottom: 24, right: 24, zIndex: 9999,
           padding: "10px 18px", borderRadius: "var(--radius-md)",
           background: "var(--bg-elevated)",
-          border: `1px solid ${toastType === "warning" ? "var(--warning)" : toastType === "success" ? "var(--success)" : "var(--border-strong)"}`,
-          borderLeft: `3px solid ${toastType === "warning" ? "var(--warning)" : toastType === "success" ? "var(--success)" : "var(--accent)"}`,
+          border: `1px solid ${(toastType === "warning" || toastType === "warn") ? "var(--warning)" : toastType === "success" ? "var(--success)" : "var(--border-strong)"}`,
+          borderLeft: `3px solid ${(toastType === "warning" || toastType === "warn") ? "var(--warning)" : toastType === "success" ? "var(--success)" : "var(--accent)"}`,
           color: "var(--text-primary)", fontSize: 12, fontFamily: "var(--font-sans)",
           backdropFilter: "blur(14px)", WebkitBackdropFilter: "blur(14px)",
           animation: "fadeInMsg 0.25s ease", boxShadow: "0 8px 32px rgba(0,0,0,0.4)",

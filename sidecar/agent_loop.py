@@ -903,6 +903,9 @@ def _sanitize_tool_messages(msgs: list[dict]) -> list[dict]:
     for msg in msgs:
         role = msg.get("role")
         if role == "assistant" and msg.get("tool_calls"):
+            if pending_ids:  # 上一条 assistant 的 tool_calls 未响应，先补空
+                for tid in pending_ids:
+                    out.append({"role": "tool", "tool_call_id": tid, "content": "[工具结果缺失，已自动补空]"})
             pending_ids = {tc.get("id") for tc in msg["tool_calls"] if tc.get("id")}
             out.append(msg)
             continue
@@ -1375,7 +1378,8 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
             iteration += 1
             # Re-evaluate tool set every 3 iterations for multi-step tasks
             if iteration > 1 and iteration % 3 == 0:
-                active_tools = agent_tools  # Full tool access for follow-up steps
+                # 恢复全量工具，但仍须套用权限过滤（read_only 等模式不可绕过）
+                active_tools = _cap_tools(_filter_tools_by_access(agent_tools, access_mode), 5) if not is_local else agent_tools
             # ── Auto-Fix: if last verify failed, include error context ──
             if last_verify_failed and retry_count < max_retries:
                 current_msgs.append({
@@ -1525,7 +1529,10 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                     logger.info(f"[LOCAL-AGENT] Iteration {iteration}: tool={tc.get('function',{}).get('name','')} executed, result_len={len(current_msgs[-1].get('content','')) if current_msgs else 0}")
                     for evt in events:
                         yield evt
-                    if verify_failed:
+                    denied = any(
+                        isinstance(e, dict) and str(e.get("result", "")).startswith("⛔ User denied")
+                        for e in events)
+                    if verify_failed and not denied:
                         round_failed = True
                         last_verify_failed = True
                 # 新的调用签名，或本轮有工具失败（模型正在尝试修复）都算实质推进，不计停滞
@@ -1760,7 +1767,7 @@ def _parse_prompt_tool_calls(text: str) -> tuple[str, list[dict]]:
                 args = {"path": cat_match.group(1)}
             elif find_match:
                 tool_name = "search_files"
-                args = {"path": find_match.group(1), "pattern": find_match.group(2).strip()}
+                args = {"directory": find_match.group(1), "pattern": find_match.group(2).strip()}
             else:
                 tool_name = "run_cmd"
                 args = {"command": cmd_text}

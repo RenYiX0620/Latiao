@@ -399,19 +399,6 @@ body {
 .msg-actions .btn-icon.active { color: var(--accent); background: var(--accent-soft); border-radius: 4px; }
 .msg-time { font-size: 10px; color: var(--text-disabled); margin-left: 6px; }
 
-/* 思考过程块（灰色可折叠摘要行：图标 + 标题 · 耗时，点开展开全文） */
-.thinking-block { margin-bottom: 4px; border-radius: var(--radius-sm); }
-.thinking-block summary {
-  cursor: pointer; font-size: 11px; color: var(--text-muted); user-select: none;
-  display: inline-flex; align-items: center; gap: 5px; padding: 2px 4px;
-  border-radius: var(--radius-sm);
-}
-.thinking-block summary:hover { color: var(--text-secondary); background: var(--bg-input); }
-.thinking-meta { color: var(--text-disabled); }
-.thinking-block div {
-  font-size: 11px; color: var(--text-muted); line-height: 1.5; margin-top: 4px; max-height: 160px; overflow-y: auto; white-space: pre-wrap;
-  background: transparent; border-left: 2px solid var(--border-default); padding: 4px 0 4px 10px;
-}
 
 /* ZCode 式活动行：思考过程 / 工具聚合（summary 行内灰字，点开展开） */
 .thinking-row, .tool-group-row { margin: 2px 0; }
@@ -472,15 +459,6 @@ body {
 .mini-preview-line.current { color: var(--text-primary); font-weight: 550; }
 .mini-preview-icon { flex-shrink: 0; font-size: 10px; }
 
-/* 任务头部：已工作计时（ZCode 式：任务执行期间显示） */
-.task-statusbar {
-  display: flex; align-items: center; gap: 6px; padding: 5px 24px;
-  font-size: 11px; color: var(--text-secondary); background: var(--bg-input);
-  border-bottom: 1px solid var(--border-default); flex-shrink: 0;
-}
-.task-statusbar-dot { animation: blink 1.2s infinite; }
-.task-statusbar-label { font-family: var(--font-mono); opacity: 0.85; }
-.task-statusbar-sub { color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* ── 对话卡片（ZCode 式：一次对话 = 一张卡片，头部显示耗时） ── */
 /* ZCode 式：对话段无卡片底/无边框，内容直接铺在主背景上，
    仅以左侧细线和段间距区分 */
@@ -498,7 +476,6 @@ body {
 }
 .chat-segment-head:hover { background: var(--bg-input); color: var(--text-secondary); }
 .chat-segment.collapsed .chat-segment-head { border-bottom: none; }
-.chat-segment-dot { animation: blink 1.2s infinite; }
 .chat-segment-label { font-family: var(--font-mono); opacity: 0.85; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chat-segment-chevron { margin-left: auto; display: inline-flex; opacity: 0.6; }
 .chat-segment .msg-row { padding: 4px 0; }
@@ -514,15 +491,9 @@ body {
 }
 .avatar-user { background: var(--accent-soft); color: var(--accent); }
 .avatar-bot { background: var(--success-soft, rgba(52,211,153,0.15)); color: var(--success); }
-.task-statusbar-label { font-family: var(--font-mono); opacity: 0.85; }
 @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
 
 /* Placeholder */
-.chat-input.is-empty::before {
-  content: attr(data-placeholder);
-  color: var(--text-disabled);
-  pointer-events: none;
-}
 .chat-input::placeholder { color: var(--text-disabled); }
 
 /* ── Buttons ── */
@@ -575,23 +546,6 @@ body {
 .tool-call-duration { color: var(--text-disabled); flex-shrink: 0; font-size: 10.5px; }
 .tool-call-chevron { display: inline-flex; align-items: center; color: var(--text-muted); }
 .tool-call-spinner { display: inline-flex; color: var(--accent); animation: spin 1s linear infinite; }
-.tool-group-collapsed {
-  display: flex; align-items: center; gap: 6px; padding: 3px 8px;
-  font-size: 10.5px; color: var(--text-muted); cursor: pointer;
-  border-radius: var(--radius-sm); user-select: none;
-}
-.tool-group-collapsed:hover { background: var(--bg-input); color: var(--accent); }
-.tool-group-chevron { display: inline-flex; align-items: center; }
-.tool-call-result-hint {
-  font-size: 10px; color: var(--success, #34d399); overflow: hidden;
-  text-overflow: ellipsis; white-space: nowrap; max-width: 220px; flex-shrink: 1;
-}
-.tool-call-preview {
-  font-size: 10.5px; color: var(--text-muted);
-  padding: 0 8px 4px; display: flex; align-items: center; gap: 4px;
-}
-.tool-call-more { color: var(--accent); opacity: 0.9; flex-shrink: 0; }
-.tool-call-preview-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 1; }
 .tool-call-result {
   padding: 6px 12px 6px 14px; border-left: 2px solid var(--border-default);
   background: transparent; max-height: 180px; overflow-y: auto; margin: 2px 0 2px 22px;
