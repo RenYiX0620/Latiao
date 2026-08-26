@@ -316,6 +316,8 @@ body {
   background: rgba(0,0,0,0.25); padding: 10px 14px; border-radius: var(--radius-md);
   margin: 4px 0; overflow-x: auto; border: none;
 }
+/* 浅色主题下代码块底调淡（oneLight 深色语法字需要浅底） */
+[data-theme="light"] .msg-bubble pre { background: rgba(15, 15, 25, 0.05); }
 .msg-bubble pre code { background: none; padding: 0; }
 .msg-bubble p { margin: 0; }
 .msg-bubble ul, .msg-bubble ol { padding-left: 18px; margin: 2px 0; }
