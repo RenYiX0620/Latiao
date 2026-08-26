@@ -135,7 +135,7 @@ export default memo(function ChatView({
   }, [messages]);
   const [collapsedGroups, setCollapsedGroups] = useState<Record<string, boolean>>({});
   // minimap 悬停预览：hoverRatio + 对应消息预览
-  const [minimapHover, setMinimapHover] = useState<{ ratio: number; msg: Message | null } | null>(null);
+  const [minimapHover, setMinimapHover] = useState<{ ratio: number; idx: number } | null>(null);
   const groupCollapsed = (gkey: string) => collapsedGroups[gkey] !== false;  // 默认折叠
 
   // 状态栏数据：轮数（user 消息数）、工具调用数、消息数、token 估算
@@ -163,7 +163,7 @@ export default memo(function ChatView({
           const ratio = Math.min(1, Math.max(0, (e.clientY - rect.top) / rect.height));
           // 均匀块：索引 = ratio * 消息数
           const idx = Math.min(miniBlocks.length - 1, Math.floor(ratio * miniBlocks.length));
-          setMinimapHover({ ratio, msg: messages[idx] || null });
+          setMinimapHover({ ratio, idx });
         }} onMouseLeave={() => setMinimapHover(null)}>
           {miniBlocks.map(b => (
             <div key={b.key} className={`mini-block${minimapHover && minimapHover.msg?.id === b.key ? " hover" : ""}`}
@@ -174,16 +174,24 @@ export default memo(function ChatView({
             height: `${(scrollInfo.viewH / scrollInfo.totalH) * 100}%`,
           }} />
         </div>
-        {/* 悬停预览浮层（ZCode 式：显示该位置内容摘要） */}
-        {minimapHover?.msg && (
+        {/* 悬停预览浮层（ZCode 式：显示该位置附近的消息上下文） */}
+        {minimapHover && messages[minimapHover.idx] && (
           <div className="mini-preview">
-            <div className="mini-preview-role">
-              {minimapHover.msg.role === "user" ? "🧑 你" :
-               minimapHover.msg.role === "tool" ? `◆ ${minimapHover.msg.toolName || "工具"}` : "🤖 辣条"}
-            </div>
-            <div className="mini-preview-text">
-              {(minimapHover.msg.content || minimapHover.msg.toolResult || "(无内容)").replace(/[#*|`>-]/g, "").replace(/\s+/g, " ").slice(0, 100)}
-            </div>
+            {[minimapHover.idx - 1, minimapHover.idx, minimapHover.idx + 1]
+              .filter(i => i >= 0 && i < messages.length)
+              .map(i => {
+                const m = messages[i];
+                const text = (m.role === "tool"
+                  ? `${m.toolName || "工具"} · ${m.toolResult || m.content || ""}`
+                  : m.content || m.thinking || "") .replace(/[#*|`>-]/g, "").replace(/\s+/g, " ").slice(0, 90);
+                const icon = m.role === "user" ? "🧑" : m.role === "tool" ? "◆" : "🤖";
+                return (
+                  <div key={m.id || i} className={`mini-preview-line${i === minimapHover.idx ? " current" : ""}`}>
+                    <span className="mini-preview-icon">{icon}</span>
+                    <span>{text || "(无内容)"}</span>
+                  </div>
+                );
+              })}
           </div>
         )}
         </>
