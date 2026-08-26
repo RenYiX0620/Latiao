@@ -154,6 +154,7 @@ class LocalLLMEngine:
         # 下一次请求前强制发 mini 请求验证，失败则杀掉引擎进程避免继续带病运行。
         self._health_ok = True
         self._health_verified_at = 0.0
+        self._health_fail_count = 0
         # User explicitly requested a stop — get_status() must NOT flip back to
         # "running" via the reconnect probe while the port is still draining.
         self._explicit_stop = False
@@ -867,29 +868,43 @@ class LocalLLMEngine:
             return False
 
     def ensure_engine_healthy(self, force: bool = False) -> bool:
-        """TTL 缓存的健康检查。引擎异常时直接杀掉进程并复位状态，
-        让 UI 显示"未加载"而不是继续向损坏的引擎发请求。"""
+        """TTL 缓存的健康检查。
+
+        重要：mlx_lm/llama server 串行处理请求——长生成（35B 可达数分钟）期间
+        健康探测会排队超时，单次失败不能判定引擎死亡，否则会误杀运行中的模型
+        并触发 26GB 重载（旧新两份权重同时驻留 → 内存 98%）。
+        连续两次失败才判死并处置。"""
         now = time.time()
         if not force and self._health_ok and now - self._health_verified_at < 30:
             return True
         ok = self.verify_engine_health()
         self._health_ok = ok
         self._health_verified_at = now
-        if not ok:
-            logger.warning("本地模型引擎健康检查失败，停止引擎进程")
-            self._kill_port(self.server_port)
-            self.server_status = "stopped"
-            self.status_message = ""
-            # 引擎崩溃/被杀（如系统内存压力）：有当前模型则后台自动重载，
-            # 下一条消息直接可用（重载需要时间，等待期间显示提示）
-            model_id = self.current_model_id
-            if model_id:
-                self.status_message = "引擎异常，正在自动重新加载模型..."
-                threading.Thread(
-                    target=lambda mid=model_id: self.start_model(mid),
-                    daemon=True,
-                ).start()
-        return ok
+        if ok:
+            self._health_fail_count = 0
+            return True
+        self._health_fail_count += 1
+        if self._health_fail_count < 2:
+            logger.info(
+                "引擎健康检查失败（第 %d 次，可能正忙于长生成），暂不处置",
+                self._health_fail_count,
+            )
+            return True
+        logger.warning("本地模型引擎健康检查连续失败，停止引擎进程")
+        self._kill_port(self.server_port)
+        self.server_status = "stopped"
+        self.status_message = ""
+        self._health_fail_count = 0
+        # 引擎崩溃/被杀（如系统内存压力）：有当前模型则后台自动重载，
+        # 下一条消息直接可用（重载需要时间，等待期间显示提示）
+        model_id = self.current_model_id
+        if model_id:
+            self.status_message = "引擎异常，正在自动重新加载模型..."
+            threading.Thread(
+                target=lambda mid=model_id: self.start_model(mid),
+                daemon=True,
+            ).start()
+        return False
 
     # ── Start / Stop ──
 
