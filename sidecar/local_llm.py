@@ -157,6 +157,9 @@ class LocalLLMEngine:
         # User explicitly requested a stop — get_status() must NOT flip back to
         # "running" via the reconnect probe while the port is still draining.
         self._explicit_stop = False
+        # 加载取消事件：stop_model 置位后，正在轮询等待的 _wait_for_http
+        # 立即中止（否则加载期 start_model 持锁，Stop 会被阻塞最长 300s）
+        self._cancel_load = threading.Event()
         # External engine mode (LM Studio / Ollama): when an external
         # OpenAI-compatible server is running, Latiao forwards local-model
         # requests to it instead of launching its own llama.cpp process.
@@ -891,11 +894,16 @@ class LocalLLMEngine:
     # ── Start / Stop ──
 
     @staticmethod
-    def _wait_for_http(port: int, timeout_sec: float = 120, process: subprocess.Popen | None = None) -> bool:
-        """Poll the model server's /v1/models endpoint until it responds, times out, or the process dies."""
+    def _wait_for_http(port: int, timeout_sec: float = 120, process: subprocess.Popen | None = None,
+                      cancel: "threading.Event | None" = None) -> bool:
+        """Poll the model server's /v1/models endpoint until it responds, times out, or the process dies.
+
+        cancel 置位时立即返回 False（用户点停止 / 要取消加载）。"""
         import urllib.request
         deadline = time.time() + timeout_sec
         while time.time() < deadline:
+            if cancel is not None and cancel.is_set():
+                return False
             if process is not None and process.poll() is not None:
                 return False  # Process died — caller will read stderr
             try:
@@ -1112,7 +1120,7 @@ class LocalLLMEngine:
             t.start()
 
             # Poll HTTP immediately — returns as soon as model is ready (no dead-wait)
-            if not self._wait_for_http(port, timeout_sec=300, process=proc):
+            if not self._wait_for_http(port, timeout_sec=300, process=proc, cancel=self._cancel_load):
                 t.join(timeout=1)
                 err_lines = list(stderr_lines)[-50:] if stderr_lines else []
                 err_text = "".join(err_lines)
@@ -1201,7 +1209,7 @@ class LocalLLMEngine:
         t = threading.Thread(target=_drain, daemon=True)
         t.start()
 
-        if not self._wait_for_http(port, timeout_sec=300, process=proc):
+        if not self._wait_for_http(port, timeout_sec=300, process=proc, cancel=self._cancel_load):
             t.join(timeout=1)
             err_lines = list(stderr_lines)[-50:] if stderr_lines else []
             err_summary = ""
@@ -1274,7 +1282,7 @@ class LocalLLMEngine:
             t.start()
 
             # Poll HTTP immediately — returns as soon as model is ready (no dead-wait)
-            if not self._wait_for_http(port, timeout_sec=300, process=proc):
+            if not self._wait_for_http(port, timeout_sec=300, process=proc, cancel=self._cancel_load):
                 t.join(timeout=1)
                 err_lines = list(stderr_lines)[-50:] if stderr_lines else []
                 err_text = "".join(err_lines)
@@ -1314,6 +1322,7 @@ class LocalLLMEngine:
         # （RLock：内部错误路径会再调 stop_model）
         with self._proc_lock:
             self._explicit_stop = False
+            self._cancel_load.clear()
 
             # ── External engine mode (LM Studio / Ollama) ──
             # 默认关闭：辣条自启引擎加载模型。仅当环境变量
@@ -1410,7 +1419,10 @@ class LocalLLMEngine:
             self._process = None
             self._active_backend = ""
 
-
+    def stop_model(self) -> dict:
+        # 先置取消事件：让加载期持锁的 start_model 尽快释放锁，
+        # 否则 Stop 会被阻塞到加载完成（最长 300s）
+        self._cancel_load.set()
         with self._proc_lock:
             # External engine mode: the model runs inside LM Studio/Ollama —
             # never kill their process or their port, just drop our state.
