@@ -294,6 +294,7 @@ body {
   display: inline-block; padding: 8px 14px; border-radius: var(--radius-lg);
   max-width: 68%; white-space: pre-line; word-break: break-word;
   font-size: 13px; line-height: 1.35; text-align: left;
+  color: var(--text-primary);
 }
 .msg-bubble.user {
   background: linear-gradient(135deg, rgba(56,189,248,0.2), rgba(99,102,241,0.12));
@@ -458,7 +459,7 @@ body {
 /* ── 对话卡片（ZCode 式：一次对话 = 一张卡片，头部显示耗时） ── */
 .chat-segment {
   background: var(--bg-card); border: 1px solid var(--border-default);
-  border-radius: var(--radius-lg); margin: 8px 0; overflow: hidden;
+  border-radius: var(--radius-lg); margin: 8px 0; overflow: visible;
   box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08);
 }
 .chat-segment-head {
@@ -751,3 +752,4 @@ body {
   .msg-bubble { max-width: 88%; }
   .tool-call { max-width: 88%; }
 }
+

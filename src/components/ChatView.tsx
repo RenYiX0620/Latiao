@@ -215,7 +215,7 @@ export default memo(function ChatView({
               <div key={msg.id || i} className={`msg-row assistant${msg.type === "file" ? " file" : ""}`}>
                 <div className="avatar-small avatar-bot"><Bot size={19} strokeWidth={2} /></div>
                 <div className="msg-content">
-                  <div className="msg-bubble">
+                  <div className="msg-bubble assistant">
                     {(() => {
                       // 思考内容显示：后端 reasoning 字段（推理模型）或本地 <think> 标签
                       const localThink = msg.content.match(/^<think>([\s\S]*?)<\/think>\s*/);
@@ -287,7 +287,7 @@ export default memo(function ChatView({
             <div key={msg.id || i} className={`msg-row user${msg.type === "image" ? " file" : ""}`}>
               <div className="avatar-small avatar-user"><User size={19} strokeWidth={2} /></div>
               <div className="msg-content">
-                <div className="msg-bubble">{msg.content}</div>
+                <div className="msg-bubble user">{msg.content}</div>
                 <div className="msg-actions">
                   <button className="btn-icon" title={t("chat.copy")} onClick={() => {
                     navigator.clipboard?.writeText(msg.content).then(() => showToast(t("chat.copied"))).catch(() => showToast(t("chat.copy_fail"), "warn"));

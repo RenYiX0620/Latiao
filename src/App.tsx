@@ -261,13 +261,21 @@ const [timeFilter, setTimeFilter] = useState("all");
     }
   }, [sessions, isProcessing, stripForStorage, saveSessions]);
 
-  // Auto-scroll chat to bottom (throttled to avoid jank during SSE streaming)
+  // Auto-scroll chat to bottom（instant，内容高度未定时 smooth 会滚错位）
   useEffect(() => {
     const timer = setTimeout(() => {
-      chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
-    }, 150);
+      chatEndRef.current?.scrollIntoView({ behavior: "auto", block: "end" });
+    }, 120);
     return () => clearTimeout(timer);
   }, [messages]);
+  // 会话切换/首次加载：立即滚到底（不含历史消息变化时的 smooth 竞态）
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      chatEndRef.current?.scrollIntoView({ behavior: "auto", block: "end" });
+    }, 60);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentIdx, session.id]);
   // Persist cloud models to OS keychain (debounced to avoid writes on every keystroke)
   useEffect(() => {
     if (!cloudModelsLoaded) return;
