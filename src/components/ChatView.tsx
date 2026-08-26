@@ -13,8 +13,22 @@ const SyntaxHighlighter = lazy(async () => {
     import("react-syntax-highlighter"),
     import("react-syntax-highlighter/dist/esm/styles/prism"),
   ]);
+  // ZCode 式代码块：去掉 oneDark 的深色面板背景/圆角/内边距，
+  // 语法配色保留，融入卡片背景（无框）
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  return { default: (props: any) => <Prism style={oneDark} {...props} /> };
+  const flatTheme: Record<string, any> = Object.fromEntries(
+    Object.entries(oneDark).map(([k, v]) => [k, { ...(v as object), background: "transparent" }])
+  );
+  flatTheme['pre[class*="language-"]'] = {
+    ...flatTheme['pre[class*="language-"]'],
+    background: "transparent", margin: 0, padding: 0, boxShadow: "none",
+  };
+  flatTheme['code[class*="language-"]'] = {
+    ...flatTheme['code[class*="language-"]'],
+    background: "transparent", boxShadow: "none", textShadow: "none",
+  };
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return { default: (props: any) => <Prism style={flatTheme} {...props} /> };
 });
 
 function CodeBlock({ language, children }: { language: string; children: string }) {
