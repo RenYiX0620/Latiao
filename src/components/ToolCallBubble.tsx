@@ -13,7 +13,7 @@ import type { Message } from "../types";
 const MAX_PREVIEW_CHARS = 2000;
 
 // 每个工具一个语义图标（lucide 线性风格），未知工具回退到扳手
-const TOOL_ICONS: Record<string, LucideIcon> = {
+export const TOOL_ICONS: Record<string, LucideIcon> = {
   bing_search: Search, web_search: Search, tavily_search: Search,
   mx_query: Database, ak_finance: LineChart,
   write_file: FilePen, read_file: FileText,
@@ -49,30 +49,17 @@ const ToolCallBubble = memo(function ToolCallBubble({ msg, onConfirm }: {
   const ToolIcon = TOOL_ICONS[msg.toolName || ""] || Wrench;
 
   // Derived: whether result needs truncation
-  const { truncated, displayContent, isMarkdown, previewContent } = useMemo(() => {
+  const { truncated, displayContent, isMarkdown } = useMemo(() => {
     if (!msg.toolResult) return { truncated: false, displayContent: "", isMarkdown: false };
     const long = msg.toolResult.length > MAX_PREVIEW_CHARS;
     const isMd = msg.toolResult.includes("## 🔍") || msg.toolResult.includes("⚠️") || msg.toolResult.includes("✅")
       || /[|]/.test(msg.toolResult) || msg.toolResult.startsWith("|");  // markdown 表格
-    const cleaned = msg.toolResult.replace(/\s+/g, " ").trim();
-    // 智能摘要：优先提取"查询证券/查询结果"这类标题行，跳过表格行（|...）
-    const titleMatch = msg.toolResult.match(/\*\*(查询[^\n]*|执行[^\n]*)\**/);
-    const summaryMatch = msg.toolResult.match(/(\d+\s*个表.*?数据|退出码[^，\n]+)/);
-    let preview = "";
-    if (msg.toolResult.startsWith("Error") || msg.toolResult.startsWith("⛔")) {
-      preview = cleaned.slice(0, 80);
-    } else if (titleMatch) {
-      preview = titleMatch[0] + (summaryMatch ? " · " + summaryMatch[0] : "");
-    } else {
-      preview = cleaned.slice(0, 80);
-    }
     return {
       truncated: long,
       displayContent: long && !fullExpanded
         ? msg.toolResult.slice(0, MAX_PREVIEW_CHARS)
         : msg.toolResult,
       isMarkdown: isMd,
-      previewContent: preview,
       isError: msg.toolResult.startsWith("Error") || msg.toolResult.startsWith("⛔"),
     };
   }, [msg.toolResult, fullExpanded]);
@@ -141,9 +128,6 @@ const ToolCallBubble = memo(function ToolCallBubble({ msg, onConfirm }: {
           <span className="tool-call-duration">· {fmtDur(msg.duration)}</span>
         )}
         {msg.toolStatus === "running" && <Loader2 size={13} className="tool-call-spinner" />}
-        {!expanded && msg.toolStatus === "done" && previewContent && (
-          <span className="tool-call-result-hint">✓ {previewContent.slice(0, 30)}{previewContent.length > 30 ? "…" : ""}</span>
-        )}
         <span className="tool-call-chevron">{expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}</span>
       </div>
       {msg.toolStatus === "confirming" && onConfirm && (
