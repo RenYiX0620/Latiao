@@ -1,9 +1,33 @@
 import { memo, lazy, Suspense, useCallback, useState, useMemo, useRef, useEffect } from "react";
 import type { Message, PendingFile } from "../types";
 import { useTranslation } from "../i18n";
-import ToolCallBubble, { TOOL_ICONS } from "./ToolCallBubble";
+import ToolCallBubble from "./ToolCallBubble";
 import ToolbarSelect from "./ToolbarSelect";
-import { Eye, ShieldCheck, PencilRuler, ListChecks, Zap, CircleOff, Brain, BrainCircuit, Bot, User, ChevronRight, ChevronDown, Wrench } from "lucide-react";
+import {
+  Eye, ShieldCheck, PencilRuler, ListChecks, Zap, CircleOff, Brain, BrainCircuit,
+  Bot, User, ChevronRight, ChevronDown, Wrench, Search, Database, FileText,
+  FolderOpen, FilePen, Terminal, AppWindow, Users, Clock,
+} from "lucide-react";
+import type { LucideIcon } from "lucide-react";
+
+// ZCode 式活动类别：工具名 → (动词, 名词, 图标)，聚合行显示 "探索 · N 搜索"
+const TOOL_CATEGORIES: Record<string, { verb: string; noun: string; icon: LucideIcon }> = {
+  bing_search: { verb: "探索", noun: "搜索", icon: Search },
+  web_search: { verb: "探索", noun: "搜索", icon: Search },
+  tavily_search: { verb: "探索", noun: "搜索", icon: Search },
+  search_files: { verb: "探索", noun: "搜索", icon: Search },
+  mx_query: { verb: "查询", noun: "查询", icon: Database },
+  ak_finance: { verb: "查询", noun: "查询", icon: Database },
+  read_file: { verb: "读取", noun: "文件", icon: FileText },
+  list_dir: { verb: "读取", noun: "目录", icon: FolderOpen },
+  write_file: { verb: "写入", noun: "文件", icon: FilePen },
+  run_cmd: { verb: "执行", noun: "命令", icon: Terminal },
+  open_folder: { verb: "打开", noun: "目录", icon: FolderOpen },
+  open_app: { verb: "打开", noun: "应用", icon: AppWindow },
+  delegate_task: { verb: "委派", noun: "任务", icon: Users },
+  create_cron: { verb: "定时", noun: "任务", icon: Clock },
+};
+const TOOL_CATEGORY_FALLBACK = { verb: "工具", noun: "调用", icon: Wrench };
 import ReactMarkdown from "react-markdown";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import remarkGfm from "remark-gfm";
@@ -385,12 +409,13 @@ export default memo(function ChatView({
           }
           const planMsgs = asstMsgs.filter((m) => m.content.startsWith("📋"));
           const answerMsgs = asstMsgs.filter((m) => !m.content.startsWith("📋"));
-          const toolGroups: { name: string; msgs: Message[] }[] = [];
+          // ZCode 式类别聚合：同类别工具折叠为一行 "探索 · N 搜索"（保持首次出现顺序）
+          const catGroups: { verb: string; noun: string; icon: LucideIcon; msgs: Message[] }[] = [];
           for (const m of toolMsgs) {
-            const name = m.toolName || "工具";
-            const last = toolGroups[toolGroups.length - 1];
-            if (last && last.name === name) last.msgs.push(m);
-            else toolGroups.push({ name, msgs: [m] });
+            const cat = TOOL_CATEGORIES[m.toolName || ""] || TOOL_CATEGORY_FALLBACK;
+            const last = catGroups[catGroups.length - 1];
+            if (last && last.verb === cat.verb) last.msgs.push(m);
+            else catGroups.push({ verb: cat.verb, noun: cat.noun, icon: cat.icon, msgs: [m] });
           }
           return (
             <div key={segKey} className={`chat-segment${collapsed ? " collapsed" : ""}`}>
@@ -410,20 +435,23 @@ export default memo(function ChatView({
                 </details>
               ))}
               {!collapsed && planMsgs.map((m, i) => renderMsg(m, i))}
-              {!collapsed && toolGroups.map((g, gi) => {
-                const ToolIcon = TOOL_ICONS[g.name] || Wrench;
-                const totalDur = g.msgs.reduce((s, m) => s + (m.duration || 0), 0);
-                const hasRunning = g.msgs.some((m) => m.toolStatus === "running");
-                if (g.msgs.length === 1) {
-                  return <ToolCallBubble key={g.msgs[0].id || `t${gi}`} msg={g.msgs[0]} onConfirm={confirmTool} />;
+              {!collapsed && catGroups.map((g, gi) => {
+                const Icon = g.icon;
+                // 执行中/待确认的调用必须直接露出卡片（旋转指示/确认按钮），不折叠
+                const needsDirect = g.msgs.some((m) => m.toolStatus === "running" || m.toolStatus === "confirming");
+                if (needsDirect) {
+                  return (
+                    <div key={`cg${gi}`} style={{ margin: "2px 0" }}>
+                      {g.msgs.map((m) => <ToolCallBubble key={m.id} msg={m} onConfirm={confirmTool} />)}
+                    </div>
+                  );
                 }
                 return (
-                  <details key={`tg${g.name}${gi}`} className="tool-group-row">
+                  <details key={`cg${gi}`} className="tool-group-row">
                     <summary className="tool-group-row-head">
-                      <span className="tool-call-icon" style={{ color: hasRunning ? "var(--accent)" : "var(--text-muted)" }}><ToolIcon size={14} /></span>
-                      <span className="tool-call-name">{g.name}</span>
-                      <span className="tool-group-row-meta">· {g.msgs.length} 次调用</span>
-                      {totalDur > 0 && <span className="tool-call-duration">· {fmtDur(totalDur)}</span>}
+                      <span className="tool-call-icon"><Icon size={14} /></span>
+                      <span className="tool-call-name">{g.verb}</span>
+                      <span className="tool-group-row-meta">· {g.msgs.length} {g.noun}</span>
                       <span className="tool-group-row-chevron"><ChevronDown size={12} /></span>
                     </summary>
                     <div className="tool-group-row-body">
