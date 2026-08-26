@@ -174,12 +174,12 @@ export default memo(function ChatView({
             height: `${(scrollInfo.viewH / scrollInfo.totalH) * 100}%`,
           }} />
         </div>
-        {/* 悬停预览浮层（ZCode 式：以悬停位置为起点的连续对话流） */}
+        {/* 悬停预览浮层（ZCode 式：以悬停位置为中心的滑动窗口对话流） */}
         {minimapHover && messages[minimapHover.idx] && (() => {
-          // 向上回溯到最近的用户提问
-          let start = minimapHover.idx;
-          while (start > 0 && messages[start].role !== "user") start--;
-          // 收集预览条目：连续工具合并为一行"执行了 N 个工具调用"，对话消息占主要篇幅
+          // 以悬停消息为中心：前 2 条 + 当前 + 后若干条（跟随悬停滑动）
+          const cur = minimapHover.idx;
+          const lo = Math.max(0, cur - 2);
+          const hi = Math.min(messages.length - 1, cur + 9);
           const entries: { icon: string; text: string; isCurrent: boolean; key: string }[] = [];
           let toolRun = 0;
           const flushTools = () => {
@@ -188,15 +188,14 @@ export default memo(function ChatView({
               toolRun = 0;
             }
           };
-          for (let i = start; i < messages.length && entries.length < 10; i++) {
+          for (let i = lo; i <= hi && entries.length < 10; i++) {
             const m = messages[i];
-            const isCur = i === minimapHover.idx;
+            const isCur = i === cur;
             if (m.role === "tool") {
               toolRun++;
-              // 悬停在工具上时，该工具单独显示（当前行高亮）
               if (isCur) {
                 flushTools();
-                entries.push({ icon: "◆", text: `${m.toolName || "工具"} · 执行中/完成`, isCurrent: true, key: m.id || `t${i}` });
+                entries.push({ icon: "◆", text: `${m.toolName || "工具"}`, isCurrent: true, key: m.id || `t${i}` });
               }
             } else if ((m.content || "").trim()) {
               flushTools();
