@@ -903,13 +903,16 @@ class LocalLLMEngine:
         if ok:
             self._health_fail_count = 0
             return True
-        self._health_fail_count += 1
-        if self._health_fail_count < 2:
-            logger.info(
-                "引擎健康检查失败（第 %d 次，可能正忙于长生成），暂不处置",
-                self._health_fail_count,
-            )
+        # 两连败之间要求最小时间窗 60s：连续探测间隔过近（cron+用户消息并发），
+        # 引擎忙于长生成时两次都会超时 → 判死。间隔不足视为同一次事件。
+        prev_fail_at = getattr(self, "_health_first_fail_at", 0.0)
+        if prev_fail_at == 0.0 or now - prev_fail_at < 60:
+            self._health_first_fail_at = now
+            logger.info("引擎健康检查首次失败（可能正忙于长生成），暂不处置")
             return True
+        # 第二次失败且间隔 ≥60s → 进入处置
+        self._health_fail_count = 0
+        self._health_first_fail_at = 0.0
         logger.warning("本地模型引擎健康检查连续失败，停止引擎进程")
         self._kill_port(self.server_port)
         self.server_status = "stopped"
