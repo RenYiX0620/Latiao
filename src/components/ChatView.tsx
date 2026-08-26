@@ -105,17 +105,12 @@ export default memo(function ChatView({
     return () => { el.removeEventListener("scroll", onScroll); ro.disconnect(); };
   }, [messages.length]);
 
-  // 每条消息 → 色块（高度按内容占比）
-  const miniBlocks = useMemo(() => {
-    const lens = messages.map(m => Math.max(1, (m.content || "").length + (m.thinking || "").length + 40));
-    const total = lens.reduce((a, b) => a + b, 1);
-    return messages.map((m, i) => ({
-      index: i,
-      h: Math.max(3, Math.round((lens[i] / total) * 100)),   // 百分比
-      color: m.role === "user" ? "var(--accent)" : m.role === "tool" ? "var(--text-disabled)" : "var(--success)",
-      key: m.id || `m${i}`,
-    }));
-  }, [messages]);
+  // 每条消息 → 色块（均匀等高，ZCode 风格；仅颜色区分角色）
+  const miniBlocks = useMemo(() => messages.map((m, i) => ({
+    index: i,
+    color: m.role === "user" ? "var(--accent)" : m.role === "tool" ? "var(--text-disabled)" : "var(--success)",
+    key: m.id || `m${i}`,
+  })), [messages]);
 
   const jumpTo = (ratio: number) => {
     const el = scrollRef.current;
@@ -166,20 +161,13 @@ export default memo(function ChatView({
         }} onMouseMove={(e) => {
           const rect = e.currentTarget.getBoundingClientRect();
           const ratio = Math.min(1, Math.max(0, (e.clientY - rect.top) / rect.height));
-          // 定位到消息：总长度比例 → 消息索引
-          const totalL = Math.max(1, miniBlocks.reduce((a, c) => a + c.h, 0));
-          let acc = 0, idx = 0;
-          for (const b of miniBlocks) {
-            acc += b.h;
-            if (acc / totalL >= ratio) { idx = b.index; break; }
-          }
+          // 均匀块：索引 = ratio * 消息数
+          const idx = Math.min(miniBlocks.length - 1, Math.floor(ratio * miniBlocks.length));
           setMinimapHover({ ratio, msg: messages[idx] || null });
         }} onMouseLeave={() => setMinimapHover(null)}>
           {miniBlocks.map(b => (
-            <div key={b.key} className={`mini-block${minimapHover && minimapHover.msg?.id === b.key ? " hover" : ""}`} style={{
-              height: `${b.h / miniBlocks.reduce((a, c) => a + c.h, 0) * 100}%`,
-              background: b.color,
-            }} />
+            <div key={b.key} className={`mini-block${minimapHover && minimapHover.msg?.id === b.key ? " hover" : ""}`}
+              style={{ background: b.color }} />
           ))}
           <div className="mini-viewport" style={{
             top: `${(scrollInfo.top / Math.max(1, scrollInfo.totalH - scrollInfo.viewH)) * 100}%`,
