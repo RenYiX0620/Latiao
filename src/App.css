@@ -301,7 +301,8 @@ body {
   border: 1px solid var(--border-accent); color: var(--text-primary);
 }
 .msg-bubble.assistant {
-  background: var(--bg-card); border: 1px solid var(--border-default);
+  /* ZCode 式：回答正文直接铺在卡片里，不套气泡框 */
+  background: transparent; border: none; padding: 2px 0;
   color: var(--text-primary);
 }
 .msg-bubble h1, .msg-bubble h2, .msg-bubble h3 { font-size: 15px; font-weight: 600; margin: 4px 0 2px; }
