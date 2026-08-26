@@ -726,7 +726,10 @@ const [timeFilter, setTimeFilter] = useState("all");
                 disarmWatchdog();
                 setMessages((prev) => {
                   const msgs = [...prev];
-                  msgs.splice(msgs.length - 1, 0, {
+                  // 工具消息插到用户问题之后、思考/回答之前（保持 [user, tool, assistant] 顺序）
+                  const last = msgs[msgs.length - 1];
+                  const idx = last?.role === "assistant" ? msgs.length - 1 : msgs.length;
+                  msgs.splice(idx, 0, {
                     id: msgId(), role: "tool", type: "tool_call", content: "",
                     callId: parsed.call_id, toolName: parsed.tool, toolArgs: parsed.args, toolStatus: "confirming",
                   });
@@ -765,7 +768,9 @@ const [timeFilter, setTimeFilter] = useState("all");
                   const idx = msgs.findIndex((m) => m.callId === parsed.call_id && m.toolStatus === "confirming");
                   if (idx !== -1) { msgs[idx] = { ...msgs[idx], toolStatus: "running", ts: startTs }; }
                   else {
-                    msgs.splice(msgs.length - 1, 0, {
+                    const last = msgs[msgs.length - 1];
+                    const pos = last?.role === "assistant" ? msgs.length - 1 : msgs.length;
+                    msgs.splice(pos, 0, {
                       id: msgId(), role: "tool", type: "tool_call", content: "",
                       callId: parsed.call_id, toolName: parsed.tool, toolArgs: parsed.args, toolStatus: "running",
                       ts: startTs,

@@ -143,31 +143,63 @@ export default memo(function ChatView({
   };
 
   // ── 对话分段（ZCode 式：一次对话 = 一张卡片，头部显示耗时）──
-  // 消息数组真实顺序：[…上轮回答, 本轮工具, 本轮问题, 本轮工具, 本轮回答, …]
-  // （工具消息用 splice 插到末尾前，可能落在用户消息之前）
-  // 因此段边界 = assistant 消息之后紧跟 user/tool 消息
+  // 每轮顺序固定为 [user, tool…, assistant]（App.tsx 已保证插入位置）；
+  // 兼容历史坏数据：段首工具挪到问题之后；无 user 的孤儿工具段并入下一段
   const segments = useMemo(() => {
-    const segs: { startTs?: number; endTs?: number; msgs: Message[] }[] = [];
+    const raw: { msgs: Message[] }[] = [];
     let cur: Message[] = [];
     const push = () => {
       if (cur.length === 0) return;
-      let st = cur[0].ts, en = 0;
-      for (const m of cur) {
+      raw.push({ msgs: cur });
+      cur = [];
+    };
+    for (const m of messages) {
+      if (m.role === "user" && cur.length > 0) { push(); cur = [m]; }
+      else cur.push(m);
+    }
+    push();
+    // 孤儿段（历史坏顺序的纯工具段）并入相邻段：前面有段并入其末尾，否则挂起并入下一段
+    const merged: { msgs: Message[] }[] = [];
+    let pending: Message[] = [];
+    for (const seg of raw) {
+      const hasUser = seg.msgs.some((m) => m.role === "user");
+      if (!hasUser) {
+        if (merged.length > 0) {
+          const last = merged[merged.length - 1];
+          last.msgs = [...last.msgs, ...seg.msgs];
+        } else {
+          pending = [...pending, ...seg.msgs];
+        }
+      } else {
+        if (pending.length > 0) { seg.msgs = [...pending, ...seg.msgs]; pending = []; }
+        merged.push(seg);
+      }
+    }
+    if (pending.length > 0) {
+      if (merged.length > 0) {
+        const last = merged[merged.length - 1];
+        last.msgs = [...last.msgs, ...pending];
+      } else {
+        merged.push({ msgs: pending });
+      }
+    }
+    // normalize：段首连续工具消息挪到该段 user 消息之后
+    const segs: { startTs?: number; endTs?: number; msgs: Message[] }[] = [];
+    for (const seg of merged) {
+      let msgs = seg.msgs;
+      if (msgs[0]?.role === "tool" || msgs[0]?.type === "tool_call") {
+        let k = 0;
+        while (k < msgs.length && (msgs[k].role === "tool" || msgs[k].type === "tool_call")) k++;
+        if (k < msgs.length) msgs = [msgs[k], ...msgs.slice(0, k), ...msgs.slice(k + 1)];
+      }
+      let st = msgs[0].ts, en = 0;
+      for (const m of msgs) {
         const t = (m.ts || 0) + (m.duration || 0) + (m.thinkingDuration || 0);
         if (t > en) en = t;
         if (m.ts && (!st || m.ts < st)) st = m.ts;
       }
-      segs.push({ startTs: st, endTs: en, msgs: cur });
-      cur = [];
-    };
-    for (let i = 0; i < messages.length; i++) {
-      const m = messages[i];
-      const prev = messages[i - 1];
-      const startsNew = cur.length > 0 && prev?.role === "assistant" && (m.role === "user" || m.role === "tool");
-      if (startsNew) push();
-      cur.push(m);
+      segs.push({ startTs: st, endTs: en, msgs });
     }
-    push();
     return segs;
   }, [messages]);
   const [collapsedSegs, setCollapsedSegs] = useState<Record<string, boolean>>({});
