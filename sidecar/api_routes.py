@@ -179,9 +179,10 @@ async def chat_completion(request: Request):
                 try:
                     _reflection_mode = body.get("reflection_mode", "off")
                     _access_mode = body.get("access_mode", "full")
+                    _thinking_level = body.get("thinking_level", "high")
                     if is_local:
                         # 本地模型：用 prompt-based tool calling（不依赖 OpenAI function calling API）
-                        async for event in _local_agent_loop_stream(messages, model, api_url, headers, session_id, agent_id, _reflection_mode, _access_mode):
+                        async for event in _local_agent_loop_stream(messages, model, api_url, headers, session_id, agent_id, _reflection_mode, _access_mode, _thinking_level):
                             yield f"data: {json.dumps(event)}\n\n"
                     else:
                         # 云端模型：原生 OpenAI function calling

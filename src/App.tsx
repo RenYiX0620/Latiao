@@ -115,6 +115,12 @@ const [timeFilter, setTimeFilter] = useState("all");
   useEffect(() => { localStorage.setItem("latiao_reflection", reflectionMode); }, [reflectionMode]);
 
   // 权限模式五档（从保守到放手）：read_only / confirm / auto_edit / plan / full
+  // 思考强度三档（🧠 选择器）：off / high(默认) / max
+  const [thinkingLevel, setThinkingLevel] = useState<"off" | "high" | "max">(
+    () => (localStorage.getItem("latiao_thinking") as "off" | "high" | "max") || "high"
+  );
+  useEffect(() => { localStorage.setItem("latiao_thinking", thinkingLevel); }, [thinkingLevel]);
+
   const [accessMode, setAccessMode] = useState<"read_only" | "confirm" | "auto_edit" | "plan" | "full">(() => {
     const saved = localStorage.getItem("latiao_access");
     if (!saved) {
@@ -656,7 +662,7 @@ const [timeFilter, setTimeFilter] = useState("all");
     opts?: { model?: string; agent?: string; cloudConfig?: Record<string, unknown>; skipTools?: boolean },
     signal?: AbortSignal,
   ): Promise<string> => {
-    const body: Record<string, unknown> = { messages, stream: true, reflection_mode: reflectionMode, access_mode: accessMode };
+    const body: Record<string, unknown> = { messages, stream: true, reflection_mode: reflectionMode, access_mode: accessMode, thinking_level: thinkingLevel };
     if (opts?.model) body.model = opts.model;
     if (opts?.agent) body.agent = opts.agent;
     if (opts?.cloudConfig) body.cloud_config = opts.cloudConfig;
@@ -1214,6 +1220,7 @@ const [timeFilter, setTimeFilter] = useState("all");
             selectedModel={session.selectedModel}
             onSelectModel={setSelectedModel}
             accessMode={accessMode} setAccessMode={setAccessMode}
+            thinkingLevel={thinkingLevel} setThinkingLevel={setThinkingLevel}
             contextEstimate={contextEstimate}
             showToast={showToast}
             activeTask={activeTask}

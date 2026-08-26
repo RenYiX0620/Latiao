@@ -48,6 +48,8 @@ interface ChatViewProps {
   onSelectModel: (m: string) => void;
   accessMode: "read_only" | "confirm" | "auto_edit" | "plan" | "full";
   setAccessMode: (m: "read_only" | "confirm" | "auto_edit" | "plan" | "full") => void;
+  thinkingLevel: "off" | "high" | "max";
+  setThinkingLevel: (l: "off" | "high" | "max") => void;
   contextEstimate?: { max_context: number; recommended_context: number } | null;
   showToast: (msg: string, type?: string) => void;
   activeTask: string | null;
@@ -60,7 +62,8 @@ export default memo(function ChatView({
   sendMessage, onStop, handleFileSelect, startRecording, confirmTool,
   chatEndRef, handleDrop, onPasteImage,
   cloudModels, selectedModel, onSelectModel,
-  accessMode, setAccessMode, contextEstimate, showToast, activeTask,
+  accessMode, setAccessMode, thinkingLevel, setThinkingLevel,
+  contextEstimate, showToast, activeTask,
 }: ChatViewProps) {
   const { t } = useTranslation();
   const handleEditableKeyDown = useCallback((e: React.KeyboardEvent) => {
@@ -369,6 +372,16 @@ export default memo(function ChatView({
                 <option value="auto_edit">✅ {t("chat.access_auto_edit")}</option>
                 <option value="plan">📋 {t("chat.access_plan")}</option>
                 <option value="full">⚡ {t("chat.access_full")}</option>
+              </select>
+              <select className="form-input" style={{
+                fontSize: 10, padding: "2px 6px", margin: 0, width: "auto", maxWidth: 110,
+                background: "transparent", border: "0", color: "var(--text-secondary)",
+                cursor: "pointer", outline: "none",
+              }} value={thinkingLevel} onChange={(e) => setThinkingLevel(e.target.value as "off" | "high" | "max")}
+                title={t("chat.thinking_title")}>
+                <option value="off">🧠 {t("chat.thinking_off")}</option>
+                <option value="high">🧠 {t("chat.thinking_high")}</option>
+                <option value="max">🧠 {t("chat.thinking_max")}</option>
               </select>
             </div>
             <div className="toolbar-right">
