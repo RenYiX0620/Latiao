@@ -416,8 +416,39 @@ fn setup_tray(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Error>> 
 }
 
 
+/// 每次启动清空 WKWebView 网络缓存（不碰 LocalStorage 会话数据）。
+/// index.html 及其引用的 hashed JS 不带缓存头，WKWebView 会启发式缓存，
+/// 导致重新部署后界面仍是旧构建——启动时清缓存保证永远加载本次构建资源。
+#[cfg(target_os = "macos")]
+fn clear_webview_cache() {
+    let Ok(home) = std::env::var("HOME") else { return };
+    let root = std::path::Path::new(&home);
+    let webkit = root.join("Library/WebKit/com.latiao.desktop/WebsiteData");
+    if let Ok(entries) = std::fs::read_dir(&webkit) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                let _ = std::fs::remove_dir_all(p.join("NetworkCache"));
+                let _ = std::fs::remove_dir_all(p.join("Cache"));
+            }
+        }
+    }
+    let caches = root.join("Library/Caches/com.latiao.desktop");
+    if let Ok(entries) = std::fs::read_dir(&caches) {
+        for e in entries.flatten() {
+            let p = e.path();
+            let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            if p.is_dir() && name.contains("WebKit") {
+                let _ = std::fs::remove_dir_all(&p);
+            }
+        }
+    }
+}
+
 fn main() {
     eprintln!("[Latiao] App starting...");
+    #[cfg(target_os = "macos")]
+    clear_webview_cache();
     let _ = AUTH_TOKEN.set(generate_auth_token());
     let sidecar = start_sidecar();
     let sidecar_ok = sidecar.is_some();
