@@ -3,7 +3,7 @@ import type { Message, PendingFile } from "../types";
 import { useTranslation } from "../i18n";
 import ToolCallBubble from "./ToolCallBubble";
 import ToolbarSelect from "./ToolbarSelect";
-import { Eye, ShieldCheck, PencilRuler, ListChecks, Zap, CircleOff, Brain, BrainCircuit, ChevronRight, ChevronDown } from "lucide-react";
+import { Eye, ShieldCheck, PencilRuler, ListChecks, Zap, CircleOff, Brain, BrainCircuit, ChevronRight, ChevronDown, Bot, User } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import remarkGfm from "remark-gfm";
@@ -259,7 +259,7 @@ export default memo(function ChatView({
           if (msg.role === "assistant") {
             return (
               <div key={msg.id || i} className={`msg-row assistant${msg.type === "file" ? " file" : ""}`}>
-                <div className="avatar-small">🤖</div>
+                <div className="avatar-small avatar-bot"><Bot size={19} strokeWidth={2} /></div>
                 <div className="msg-content">
                   <div className="msg-bubble">
                     {(() => {
@@ -309,7 +309,7 @@ export default memo(function ChatView({
           if (msg.type === "file") {
             return (
               <div key={msg.id || i} className={`msg-row user file`}>
-                <div className="avatar-small">🧑</div>
+                <div className="avatar-small avatar-user"><User size={19} strokeWidth={2} /></div>
                 <div className="msg-content">
                   <div className="msg-bubble">
                     {msg.imagePreview ? (
@@ -325,7 +325,7 @@ export default memo(function ChatView({
           }
           return (
             <div key={msg.id || i} className={`msg-row user${msg.type === "image" ? " file" : ""}`}>
-              <div className="avatar-small">🧑</div>
+              <div className="avatar-small avatar-user"><User size={19} strokeWidth={2} /></div>
               <div className="msg-content">
                 <div className="msg-bubble">{msg.content}</div>
                 <div className="msg-actions">

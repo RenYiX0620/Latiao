@@ -440,6 +440,14 @@ body {
   border-bottom: 1px solid var(--border-default); flex-shrink: 0;
 }
 .task-statusbar-dot { animation: blink 1.2s infinite; }
+/* 对话头像：圆形彩色底 + lucide 图标 */
+.avatar-small {
+  width: 26px; height: 26px; border-radius: 50%; flex-shrink: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  margin-top: 2px;
+}
+.avatar-user { background: var(--accent-soft); color: var(--accent); }
+.avatar-bot { background: var(--success-soft, rgba(52,211,153,0.15)); color: var(--success); }
 .task-statusbar-label { font-family: var(--font-mono); opacity: 0.85; }
 @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
 
