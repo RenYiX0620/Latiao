@@ -501,15 +501,16 @@ body {
 .tool-call-header:hover { background: var(--bg-input); border-radius: var(--radius-sm); }
 .tool-call-name { font-weight: 600; color: var(--text-primary); }
 .tool-call-args { color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
-.tool-call-chevron { font-size: 9px; color: var(--text-muted); }
-.tool-call-spinner { font-size: 10px; color: var(--accent); animation: blink 1s infinite; }
+.tool-call-icon { display: inline-flex; align-items: center; flex-shrink: 0; }
+.tool-call-chevron { display: inline-flex; align-items: center; color: var(--text-muted); }
+.tool-call-spinner { display: inline-flex; color: var(--accent); animation: spin 1s linear infinite; }
 .tool-group-collapsed {
   display: flex; align-items: center; gap: 6px; padding: 3px 8px;
   font-size: 10.5px; color: var(--text-muted); cursor: pointer;
   border-radius: var(--radius-sm); user-select: none;
 }
 .tool-group-collapsed:hover { background: var(--bg-input); color: var(--accent); }
-.tool-group-chevron { font-size: 9px; }
+.tool-group-chevron { display: inline-flex; align-items: center; }
 .tool-call-result-hint {
   font-size: 10px; color: var(--success, #34d399); overflow: hidden;
   text-overflow: ellipsis; white-space: nowrap; max-width: 220px; flex-shrink: 1;
