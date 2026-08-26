@@ -182,7 +182,7 @@ export default memo(function ChatView({
                minimapHover.msg.role === "tool" ? `◆ ${minimapHover.msg.toolName || "工具"}` : "🤖 辣条"}
             </div>
             <div className="mini-preview-text">
-              {(minimapHover.msg.content || minimapHover.msg.toolResult || "(无内容)").replace(/[#*|`>-]/g, "").slice(0, 140)}
+              {(minimapHover.msg.content || minimapHover.msg.toolResult || "(无内容)").replace(/[#*|`>-]/g, "").replace(/\s+/g, " ").slice(0, 100)}
             </div>
           </div>
         )}
