@@ -385,26 +385,26 @@ export default memo(function ChatView({
                 style={isRecording ? { color: "var(--danger)" } : undefined} title={t("chat.voice")}>{isRecording ? "⏹" : "🎙"}</button>
               <ToolbarSelect value={accessMode}
                 options={[
-                  { value: "read_only", label: t("chat.access_readonly"), icon: <Eye size={13} /> },
-                  { value: "confirm", label: t("chat.access_confirm"), icon: <ShieldCheck size={13} /> },
-                  { value: "auto_edit", label: t("chat.access_auto_edit"), icon: <PencilRuler size={13} /> },
-                  { value: "plan", label: t("chat.access_plan"), icon: <ListChecks size={13} /> },
-                  { value: "full", label: t("chat.access_full"), icon: <Zap size={13} /> },
+                  { value: "read_only", label: t("chat.access_readonly"), icon: <Eye size={15} /> },
+                  { value: "confirm", label: t("chat.access_confirm"), icon: <ShieldCheck size={15} /> },
+                  { value: "auto_edit", label: t("chat.access_auto_edit"), icon: <PencilRuler size={15} /> },
+                  { value: "plan", label: t("chat.access_plan"), icon: <ListChecks size={15} /> },
+                  { value: "full", label: t("chat.access_full"), icon: <Zap size={15} /> },
                 ]}
                 onChange={(v) => setAccessMode(v as "read_only" | "confirm" | "auto_edit" | "plan" | "full")}
                 title={t("chat.access_title")} />
               <ToolbarSelect value={thinkingLevel}
                 options={[
-                  { value: "off", label: t("chat.thinking_off"), icon: <CircleOff size={13} /> },
-                  { value: "high", label: t("chat.thinking_high"), icon: <Brain size={13} /> },
-                  { value: "max", label: t("chat.thinking_max"), icon: <BrainCircuit size={13} /> },
+                  { value: "off", label: t("chat.thinking_off"), icon: <CircleOff size={15} /> },
+                  { value: "high", label: t("chat.thinking_high"), icon: <Brain size={15} /> },
+                  { value: "max", label: t("chat.thinking_max"), icon: <BrainCircuit size={15} /> },
                 ]}
                 onChange={(v) => setThinkingLevel(v as "off" | "high" | "max")}
                 title={t("chat.thinking_title")} />
             </div>
             <div className="toolbar-right">
               <select className="form-input" style={{
-                fontSize: 12, padding: "2px 6px", margin: 0, width: "auto", maxWidth: 180,
+                fontSize: 13, padding: "2px 6px", margin: 0, width: "auto", maxWidth: 180,
                 background: "transparent", border: "0", color: "var(--text-secondary)",
                 cursor: "pointer", outline: "none",
               }}

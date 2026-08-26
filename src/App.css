@@ -337,7 +337,7 @@ body {
 .toolbar-select { position: relative; }
 .toolbar-select-btn {
   display: inline-flex; align-items: center; gap: 5px;
-  font-size: 12px; font-family: var(--font-sans); color: var(--text-secondary);
+  font-size: 14px; font-family: var(--font-sans); color: var(--text-secondary);
   background: transparent; border: 0; padding: 2px 6px; border-radius: 6px;
   cursor: pointer; transition: all 0.15s ease;
 }
@@ -355,7 +355,7 @@ body {
 }
 .toolbar-select-option {
   display: flex; align-items: center; gap: 8px;
-  font-size: 12px; font-family: var(--font-sans); text-align: left;
+  font-size: 13.5px; font-family: var(--font-sans); text-align: left;
   color: var(--text-secondary); background: transparent; border: 0;
   padding: 7px 10px; border-radius: 7px; cursor: pointer;
   transition: background 0.12s ease; white-space: nowrap;
@@ -371,7 +371,7 @@ body {
 .btn-circle.btn-stop { background: var(--danger, #f87171); }
 .chat-statusbar {
   display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
-  font-size: 11px; color: var(--text-muted); padding: 6px 6px 0;
+  font-size: 12px; color: var(--text-muted); padding: 6px 6px 0;
   opacity: 0.85;
 }
 .statusbar-sep { opacity: 0.5; }
