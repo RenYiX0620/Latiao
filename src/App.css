@@ -455,6 +455,27 @@ body {
 .task-statusbar-dot { animation: blink 1.2s infinite; }
 .task-statusbar-label { font-family: var(--font-mono); opacity: 0.85; }
 .task-statusbar-sub { color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* ── 对话卡片（ZCode 式：一次对话 = 一张卡片，头部显示耗时） ── */
+.chat-segment {
+  background: var(--bg-card); border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg); margin: 8px 0; overflow: hidden;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08);
+}
+.chat-segment-head {
+  display: flex; align-items: center; gap: 7px; width: 100%;
+  padding: 7px 14px; background: var(--bg-input);
+  border: none; border-bottom: 1px solid var(--border-default);
+  font-size: 11px; color: var(--text-secondary); font-family: var(--font-sans);
+  text-align: left; cursor: pointer; user-select: none;
+}
+.chat-segment-head:hover { background: var(--bg-surface-hover); color: var(--text-primary); }
+.chat-segment.collapsed .chat-segment-head { border-bottom: none; }
+.chat-segment-dot { animation: blink 1.2s infinite; }
+.chat-segment-label { font-family: var(--font-mono); opacity: 0.85; }
+.chat-segment-chevron { margin-left: auto; display: inline-flex; opacity: 0.6; }
+.chat-segment .msg-row { padding: 4px 14px; }
+.chat-segment .tool-call { padding: 0 8px; }
+
 /* 对话头像：圆形彩色底 + lucide 图标（与消息内容同行） */
 .msg-row { display: flex; align-items: flex-start; gap: 10px; padding: 4px 0; }
 .msg-content { flex: 1; min-width: 0; }

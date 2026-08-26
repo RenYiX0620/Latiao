@@ -3,7 +3,7 @@ import type { Message, PendingFile } from "../types";
 import { useTranslation } from "../i18n";
 import ToolCallBubble from "./ToolCallBubble";
 import ToolbarSelect from "./ToolbarSelect";
-import { Eye, ShieldCheck, PencilRuler, ListChecks, Zap, CircleOff, Brain, BrainCircuit, Bot, User } from "lucide-react";
+import { Eye, ShieldCheck, PencilRuler, ListChecks, Zap, CircleOff, Brain, BrainCircuit, Bot, User, ChevronRight, ChevronDown } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import remarkGfm from "remark-gfm";
@@ -142,91 +142,32 @@ export default memo(function ChatView({
     return `${Math.floor(s / 60)} 分 ${s % 60} 秒`;
   };
 
-  // 状态栏数据：轮数（user 消息数）、工具调用数、消息数、token 估算
-  const userTurns = messages.filter(m => m.role === "user").length || 0;
-  const toolCalls = messages.filter(m => m.role === "tool" || m.type === "tool_call").length || 0;
-  const estTokens = Math.round(messages.reduce((s, m) => s + m.content.length, 0) * 0.55); // 中文近似
+  // ── 对话分段（ZCode 式：一次对话 = 一张卡片，头部显示耗时）──
+  const segments = useMemo(() => {
+    const segs: { startTs?: number; endTs?: number; msgs: Message[] }[] = [];
+    let cur: Message[] = [];
+    const push = () => {
+      if (cur.length === 0) return;
+      let st = cur[0].ts, en = 0;
+      for (const m of cur) {
+        const t = (m.ts || 0) + (m.duration || 0) + (m.thinkingDuration || 0);
+        if (t > en) en = t;
+        if (m.ts && (!st || m.ts < st)) st = m.ts;
+      }
+      segs.push({ startTs: st, endTs: en, msgs: cur });
+      cur = [];
+    };
+    for (const m of messages) {
+      if (m.role === "user" && cur.length > 0) { push(); cur = [m]; }
+      else cur.push(m);
+    }
+    push();
+    return segs;
+  }, [messages]);
+  const [collapsedSegs, setCollapsedSegs] = useState<Record<string, boolean>>({});
 
-  return (
-    <>
-      <div className="chat-wrap">
-      {/* 任务头部：已工作计时（工具执行 / 回复生成期间显示） */}
-      {taskStartAt && (activeTask || isProcessing) && (
-        <div className="task-statusbar">
-          <span className="task-statusbar-dot">▣</span>
-          <span className="task-statusbar-label">已工作 {fmtDur(elapsed)}</span>
-          {activeTask && <span className="task-statusbar-sub">{activeTask.slice(0, 60)}</span>}
-        </div>
-      )}
-      {messages.length > 8 && (
-        <>
-        <div className="chat-minimap" onClick={(e) => {
-          const rect = e.currentTarget.getBoundingClientRect();
-          jumpTo((e.clientY - rect.top) / rect.height);
-        }} onMouseMove={(e) => {
-          const rect = e.currentTarget.getBoundingClientRect();
-          const ratio = Math.min(1, Math.max(0, (e.clientY - rect.top) / rect.height));
-          // 均匀块：索引 = ratio * 消息数
-          const idx = Math.min(miniBlocks.length - 1, Math.floor(ratio * miniBlocks.length));
-          setMinimapHover({ ratio, idx });
-        }} onMouseLeave={() => setMinimapHover(null)}>
-          {miniBlocks.map(b => (
-            <div key={b.key} className={`mini-block${minimapHover && minimapHover.idx === b.index ? " hover" : ""}`}
-              style={{ background: b.color }} />
-          ))}
-          <div className="mini-viewport" style={{
-            top: `${(scrollInfo.top / Math.max(1, scrollInfo.totalH - scrollInfo.viewH)) * 100}%`,
-            height: `${(scrollInfo.viewH / scrollInfo.totalH) * 100}%`,
-          }} />
-        </div>
-        {/* 悬停预览浮层（ZCode 式：以悬停消息为中心的滑动窗口对话流） */}
-        {minimapHover && messages[minimapHover.idx] && (() => {
-          // 以悬停消息为中心：上下各 4 条；工具逐条展开（不折叠），保证滑过每张卡片内容都不同
-          const cur = minimapHover.idx;
-          const lo = Math.max(0, cur - 4);
-          const hi = Math.min(messages.length - 1, cur + 4);
-          const entries: { icon: string; text: string; isCurrent: boolean; key: string }[] = [];
-          for (let i = lo; i <= hi; i++) {
-            const m = messages[i];
-            const isCur = i === cur;
-            if (m.role === "tool") {
-              let args = "";
-              try {
-                args = m.toolArgs
-                  ? JSON.stringify(m.toolArgs).replace(/[{}"]/g, "").replace(/[:,]/g, " ").replace(/\s+/g, " ").trim()
-                  : "";
-              } catch { /* 参数不可序列化时忽略 */ }
-              entries.push({
-                icon: "◆",
-                text: `${m.toolName || "工具"}${args ? " · " + args.slice(0, 48) : ""}`.slice(0, 80),
-                isCurrent: isCur, key: m.id || `t${i}`,
-              });
-            } else if ((m.content || "").trim()) {
-              const text = (m.content || "").replace(/[#*|`>-]/g, "").replace(/\s+/g, " ").slice(0, 110);
-              entries.push({
-                icon: m.role === "user" ? "🧑" : "🤖",
-                text, isCurrent: isCur, key: m.id || `m${i}`,
-              });
-            }
-          }
-          if (entries.length === 0) return null;
-          // 预览跟随悬停位置上下滑动（clamp 到可视范围内）
-          const follow = Math.max(0, Math.min(scrollInfo.viewH - 320, minimapHover.ratio * Math.max(0, scrollInfo.viewH - 320)));
-          return (
-            <div className="mini-preview" style={{ top: 34 + follow }}>
-              {entries.map(e => (
-                <div key={e.key} className={`mini-preview-line${e.isCurrent ? " current" : ""}`}>
-                  <span className="mini-preview-icon">{e.icon}</span>
-                  <span>{e.text}</span>
-                </div>
-              ))}
-            </div>
-          );
-        })()}
-        </>
-      )}
-      <div className="chat-scroll" ref={scrollRef} onDrop={handleDrop} onDragOver={(e) => { if (handleDrop) e.preventDefault(); }}>
-        {messages.map((msg, i) => {
+  // 单条消息渲染（段内复用）
+  const renderMsg = (msg: Message, i: number) => {
           if (msg.role === "tool" || msg.type === "tool_call") {
             // 活动摘要行（ZCode 式）：每个工具调用独立一行，点击展开结果
             return <ToolCallBubble key={msg.id || i} msg={msg} onConfirm={confirmTool} />;
@@ -316,6 +257,108 @@ export default memo(function ChatView({
                   {fmtTime(msg.ts) && <span className="msg-time">{fmtTime(msg.ts)}</span>}
                 </div>
               </div>
+            </div>
+          );
+  };
+
+  // 状态栏数据：轮数（user 消息数）、工具调用数、消息数、token 估算
+  const userTurns = messages.filter(m => m.role === "user").length || 0;
+  const toolCalls = messages.filter(m => m.role === "tool" || m.type === "tool_call").length || 0;
+  const estTokens = Math.round(messages.reduce((s, m) => s + m.content.length, 0) * 0.55); // 中文近似
+
+  return (
+    <>
+      <div className="chat-wrap">
+      {/* 任务头部：已工作计时（工具执行 / 回复生成期间显示） */}
+      {taskStartAt && (activeTask || isProcessing) && (
+        <div className="task-statusbar">
+          <span className="task-statusbar-dot">▣</span>
+          <span className="task-statusbar-label">已工作 {fmtDur(elapsed)}</span>
+          {activeTask && <span className="task-statusbar-sub">{activeTask.slice(0, 60)}</span>}
+        </div>
+      )}
+      {messages.length > 8 && (
+        <>
+        <div className="chat-minimap" onClick={(e) => {
+          const rect = e.currentTarget.getBoundingClientRect();
+          jumpTo((e.clientY - rect.top) / rect.height);
+        }} onMouseMove={(e) => {
+          const rect = e.currentTarget.getBoundingClientRect();
+          const ratio = Math.min(1, Math.max(0, (e.clientY - rect.top) / rect.height));
+          // 均匀块：索引 = ratio * 消息数
+          const idx = Math.min(miniBlocks.length - 1, Math.floor(ratio * miniBlocks.length));
+          setMinimapHover({ ratio, idx });
+        }} onMouseLeave={() => setMinimapHover(null)}>
+          {miniBlocks.map(b => (
+            <div key={b.key} className={`mini-block${minimapHover && minimapHover.idx === b.index ? " hover" : ""}`}
+              style={{ background: b.color }} />
+          ))}
+          <div className="mini-viewport" style={{
+            top: `${(scrollInfo.top / Math.max(1, scrollInfo.totalH - scrollInfo.viewH)) * 100}%`,
+            height: `${(scrollInfo.viewH / scrollInfo.totalH) * 100}%`,
+          }} />
+        </div>
+        {/* 悬停预览浮层（ZCode 式：以悬停消息为中心的滑动窗口对话流） */}
+        {minimapHover && messages[minimapHover.idx] && (() => {
+          // 以悬停消息为中心：上下各 4 条；工具逐条展开（不折叠），保证滑过每张卡片内容都不同
+          const cur = minimapHover.idx;
+          const lo = Math.max(0, cur - 4);
+          const hi = Math.min(messages.length - 1, cur + 4);
+          const entries: { icon: string; text: string; isCurrent: boolean; key: string }[] = [];
+          for (let i = lo; i <= hi; i++) {
+            const m = messages[i];
+            const isCur = i === cur;
+            if (m.role === "tool") {
+              let args = "";
+              try {
+                args = m.toolArgs
+                  ? JSON.stringify(m.toolArgs).replace(/[{}"]/g, "").replace(/[:,]/g, " ").replace(/\s+/g, " ").trim()
+                  : "";
+              } catch { /* 参数不可序列化时忽略 */ }
+              entries.push({
+                icon: "◆",
+                text: `${m.toolName || "工具"}${args ? " · " + args.slice(0, 48) : ""}`.slice(0, 80),
+                isCurrent: isCur, key: m.id || `t${i}`,
+              });
+            } else if ((m.content || "").trim()) {
+              const text = (m.content || "").replace(/[#*|`>-]/g, "").replace(/\s+/g, " ").slice(0, 110);
+              entries.push({
+                icon: m.role === "user" ? "🧑" : "🤖",
+                text, isCurrent: isCur, key: m.id || `m${i}`,
+              });
+            }
+          }
+          if (entries.length === 0) return null;
+          // 预览跟随悬停位置上下滑动（clamp 到可视范围内）
+          const follow = Math.max(0, Math.min(scrollInfo.viewH - 320, minimapHover.ratio * Math.max(0, scrollInfo.viewH - 320)));
+          return (
+            <div className="mini-preview" style={{ top: 34 + follow }}>
+              {entries.map(e => (
+                <div key={e.key} className={`mini-preview-line${e.isCurrent ? " current" : ""}`}>
+                  <span className="mini-preview-icon">{e.icon}</span>
+                  <span>{e.text}</span>
+                </div>
+              ))}
+            </div>
+          );
+        })()}
+        </>
+      )}
+      <div className="chat-scroll" ref={scrollRef} onDrop={handleDrop} onDragOver={(e) => { if (handleDrop) e.preventDefault(); }}>
+        {segments.map((seg, si) => {
+          const segKey = seg.msgs[0]?.id || `seg${si}`;
+          const collapsed = collapsedSegs[segKey] === true;
+          const segDur = seg.startTs && seg.endTs ? Math.max(0, seg.endTs - seg.startTs) : 0;
+          // 进行中的对话段（最后一段）：实时计时
+          const live = si === segments.length - 1 && taskStartAt !== null && (isProcessing || activeTask !== null);
+          return (
+            <div key={segKey} className={`chat-segment${collapsed ? " collapsed" : ""}`}>
+              <button className="chat-segment-head" onClick={() => setCollapsedSegs(p => ({ ...p, [segKey]: !collapsed }))}>
+                <span className="chat-segment-dot">▣</span>
+                <span className="chat-segment-label">{live ? `已工作 ${fmtDur(elapsed)}` : segDur > 0 ? `已工作 ${fmtDur(segDur)}` : "对话"}</span>
+                <span className="chat-segment-chevron">{collapsed ? <ChevronRight size={13} /> : <ChevronDown size={13} />}</span>
+              </button>
+              {!collapsed && seg.msgs.map((m, i) => renderMsg(m, i))}
             </div>
           );
         })}
