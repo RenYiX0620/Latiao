@@ -155,6 +155,7 @@ class LocalLLMEngine:
         self._health_ok = True
         self._health_verified_at = 0.0
         self._health_fail_count = 0
+        self._auto_reloading = False
         # User explicitly requested a stop — get_status() must NOT flip back to
         # "running" via the reconnect probe while the port is still draining.
         self._explicit_stop = False
@@ -788,7 +789,26 @@ class LocalLLMEngine:
             if not self._active_backend:
                 self._active_backend = self.backend  # best guess: platform default
             return f"http://127.0.0.1:{self.server_port}/v1"
-        return ""
+        # 端口也没了（引擎进程彻底退出）：有当前模型则后台自动重载，
+        # 返回 URL 让 agent 层在重载窗口内排队等待（6 分钟重试窗口覆盖加载）
+        model_id = self.current_model_id
+        process_dead = self._process is None or self._process.poll() is not None
+        if model_id and process_dead and not getattr(self, "_auto_reloading", False):
+            self._auto_reloading = True
+            self._process = None  # 丢弃僵尸句柄，让 start_model 能重新 Popen
+            logger.info("引擎进程已退出，自动重载模型: %s", model_id)
+            threading.Thread(
+                target=lambda mid=model_id: self._auto_reload(mid),
+                daemon=True,
+            ).start()
+        return f"http://127.0.0.1:{self.server_port}/v1"
+
+    def _auto_reload(self, model_id: str):
+        """后台自动重载：加载完成后复位 _auto_reloading 标记。"""
+        try:
+            self.start_model(model_id)
+        finally:
+            self._auto_reloading = False
 
     def _probe_external_engine(self) -> tuple[str, str, str] | None:
         """Detect an external OpenAI-compatible local server (LM Studio 1234,

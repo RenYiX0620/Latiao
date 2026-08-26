@@ -146,7 +146,9 @@ async def _local_llm_stream(client, api_url: str, body: dict, headers: dict):
         # 生成器语义：yield 之后消费者持有 r 直到读完，无法重试；
         # 只对"连接建立即失败"（还没 yield 过）的情况重试。
         last_err: Exception | None = None
-        for _attempt in range(4):
+        # 引擎闪断/自动重载期间 404/503：等待恢复（35B 重载窗口 3-5 分钟），
+        # 每 5s 重试一次、最长 5 分钟——用户消息自然排队到引擎就绪，不再秒败
+        for _attempt in range(72):
             try:
                 async with client.stream("POST", api_url, json=body, headers=headers) as r:
                     r.raise_for_status()  # httpx 不自动抛 4xx/5xx，必须显式检查
@@ -160,9 +162,9 @@ async def _local_llm_stream(client, api_url: str, body: dict, headers: dict):
                         raise
                     return
             except httpx.HTTPStatusError as e:
-                if e.response.status_code in (404, 503) and _attempt < 3:
+                if e.response.status_code in (404, 503) and _attempt < 71:
                     last_err = e
-                    await asyncio.sleep(3 + 3 * _attempt)  # 3s/6s/9s 递增退避
+                    await asyncio.sleep(5)  # 5s × 72 = 最大约 6 分钟等待
                     continue
                 raise
         if last_err is not None:
