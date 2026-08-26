@@ -32,8 +32,6 @@ interface ChatViewProps {
   setPendingFile: (f: PendingFile | null) => void;
   prompt: string;
   setPrompt: (p: string) => void;
-  planMode: boolean;
-  setPlanMode: (v: boolean) => void;
   fileInputRef: React.RefObject<HTMLInputElement | null>;
   mediaRecorderRef: React.MutableRefObject<MediaRecorder | null>;
   isRecording: boolean;
@@ -57,7 +55,7 @@ interface ChatViewProps {
 
 export default memo(function ChatView({
   messages, isProcessing, pendingFile, setPendingFile,
-  prompt, setPrompt, planMode, setPlanMode,
+  prompt, setPrompt,
   fileInputRef, mediaRecorderRef, isRecording,
   sendMessage, onStop, handleFileSelect, startRecording, confirmTool,
   chatEndRef, handleDrop, onPasteImage,
@@ -282,11 +280,6 @@ export default memo(function ChatView({
               <button className="btn-icon" onClick={() => fileInputRef.current?.click()} title={t("chat.attach")}>＋</button>
               <button className="btn-icon" onClick={isRecording ? () => mediaRecorderRef.current?.stop() : startRecording}
                 style={isRecording ? { color: "var(--danger)" } : undefined} title={t("chat.voice")}>{isRecording ? "⏹" : "🎙"}</button>
-              <button className="btn btn-sm btn-ghost"
-                style={{ padding: "3px 10px", fontSize: 10, background: planMode ? "var(--accent-soft)" : "transparent", borderColor: planMode ? "var(--border-accent)" : undefined, color: planMode ? "var(--accent)" : undefined }}
-                onClick={() => setPlanMode(!planMode)} title={t("chat.plan_mode")}>
-                📋 {planMode ? t("chat.plan_mode_on") : t("chat.plan_mode_btn")}
-              </button>
               <select className="form-input" style={{
                 fontSize: 10, padding: "2px 6px", margin: 0, width: "auto", maxWidth: 130,
                 background: "transparent", border: "0", color: "var(--text-secondary)",
