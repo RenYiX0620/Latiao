@@ -174,31 +174,29 @@ export default memo(function ChatView({
             height: `${(scrollInfo.viewH / scrollInfo.totalH) * 100}%`,
           }} />
         </div>
-        {/* 悬停预览浮层（ZCode 式：以悬停位置为中心的滑动窗口对话流） */}
+        {/* 悬停预览浮层（ZCode 式：以悬停消息为中心的滑动窗口对话流） */}
         {minimapHover && messages[minimapHover.idx] && (() => {
-          // 以悬停消息为中心：前 2 条 + 当前 + 后若干条（跟随悬停滑动）
+          // 以悬停消息为中心：上下各 4 条；工具逐条展开（不折叠），保证滑过每张卡片内容都不同
           const cur = minimapHover.idx;
-          const lo = Math.max(0, cur - 2);
-          const hi = Math.min(messages.length - 1, cur + 9);
+          const lo = Math.max(0, cur - 4);
+          const hi = Math.min(messages.length - 1, cur + 4);
           const entries: { icon: string; text: string; isCurrent: boolean; key: string }[] = [];
-          let toolRun = 0;
-          const flushTools = () => {
-            if (toolRun > 0) {
-              entries.push({ icon: "🔧", text: `执行了 ${toolRun} 个工具调用`, isCurrent: false, key: `tools${entries.length}` });
-              toolRun = 0;
-            }
-          };
-          for (let i = lo; i <= hi && entries.length < 10; i++) {
+          for (let i = lo; i <= hi; i++) {
             const m = messages[i];
             const isCur = i === cur;
             if (m.role === "tool") {
-              toolRun++;
-              if (isCur) {
-                flushTools();
-                entries.push({ icon: "◆", text: `${m.toolName || "工具"}`, isCurrent: true, key: m.id || `t${i}` });
-              }
+              let args = "";
+              try {
+                args = m.toolArgs
+                  ? JSON.stringify(m.toolArgs).replace(/[{}"]/g, "").replace(/[:,]/g, " ").replace(/\s+/g, " ").trim()
+                  : "";
+              } catch { /* 参数不可序列化时忽略 */ }
+              entries.push({
+                icon: "◆",
+                text: `${m.toolName || "工具"}${args ? " · " + args : ""}`.slice(0, 90),
+                isCurrent: isCur, key: m.id || `t${i}`,
+              });
             } else if ((m.content || "").trim()) {
-              flushTools();
               const text = (m.content || "").replace(/[#*|`>-]/g, "").replace(/\s+/g, " ").slice(0, 110);
               entries.push({
                 icon: m.role === "user" ? "🧑" : "🤖",
@@ -206,10 +204,11 @@ export default memo(function ChatView({
               });
             }
           }
-          flushTools();
           if (entries.length === 0) return null;
+          // 预览跟随悬停位置上下滑动（clamp 到可视范围内）
+          const follow = Math.max(0, Math.min(scrollInfo.viewH - 320, minimapHover.ratio * Math.max(0, scrollInfo.viewH - 320)));
           return (
-            <div className="mini-preview">
+            <div className="mini-preview" style={{ top: 34 + follow }}>
               {entries.map(e => (
                 <div key={e.key} className={`mini-preview-line${e.isCurrent ? " current" : ""}`}>
                   <span className="mini-preview-icon">{e.icon}</span>
