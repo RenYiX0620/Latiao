@@ -795,9 +795,12 @@ const [timeFilter, setTimeFilter] = useState("all");
                 }
               } else if (parsed.event === "reflection_revised") {
                 flushStream();
-                // 输出反思修正：把最后一条 assistant 消息替换为修正版
+                // 输出反思修正：把最后一条 assistant 消息替换为修正版。
+                // 同步 full = revised，防止 [DONE] 时最终 flush 把修正前原文
+                // 又以新气泡重复显示（M1 复盘 bug）。
                 const revised = String(parsed.content ?? "");
                 if (revised.trim()) {
+                  full = revised;
                   setMessages((prev) => {
                     const msgs = [...prev];
                     for (let i = msgs.length - 1; i >= 0; i--) {

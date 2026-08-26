@@ -86,8 +86,10 @@ def _is_local_llm_url(api_url: str | None) -> bool:
 
 async def _verify_llm_health(api_url: str) -> bool:
     """锁内健康验证：发一个最小生成请求，确认引擎能正常产出文本。
-    失败时直接杀掉引擎进程并复位状态，让 UI 提示重新加载模型。"""
-    ok = False
+
+    注意：mlx_lm/llama server 串行处理请求——长生成期间健康请求排队超时
+    是"忙"不是"死"。之前单次超时就 SIGKILL 引擎（误杀运行中的 35B 并触发
+    26GB 重载→内存翻倍），现在只有端口确实死亡（连接被拒）才判死。"""
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(25)) as c:
             resp = await c.post(api_url, json={
@@ -97,22 +99,18 @@ async def _verify_llm_health(api_url: str) -> bool:
             resp.raise_for_status()
             data = resp.json()
             content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
-            ok = bool(content.strip())
+            if not content.strip():
+                logger.warning("引擎返回空响应（%s），标记存疑", api_url)
+                return False  # 空响应=引擎异常（端口活但产出坏了）
+            return True
+    except httpx.ConnectError:
+        # 端口确实死亡（进程退出）→ 判死，由调用方处置
+        logger.warning("本地模型引擎连接被拒（%s），判定引擎死亡", api_url)
+        return False
     except Exception:
-        ok = False
-    if not ok:
-        try:
-            from urllib.parse import urlparse
-            engine = local_llm._engine
-            port = urlparse(api_url).port or engine.server_port
-            engine._kill_port(port)
-            if port == engine.server_port:
-                engine.server_status = "stopped"
-                engine.status_message = ""
-        except Exception:
-            pass
-        logger.warning("本地模型引擎健康检查失败（%s），已停止引擎进程", api_url)
-    return ok
+        # 超时/排队/临时错误：引擎活着但忙——不误杀
+        logger.info("健康探测超时但连接可达（%s），引擎忙，视为存活", api_url)
+        return True
 
 
 @asynccontextmanager
@@ -137,6 +135,16 @@ async def _local_llm_stream(client, api_url: str, body: dict, headers: dict):
         if _is_local_llm_url(api_url) and _llm_suspect_since is not None:
             ok = await _verify_llm_health(api_url)
             if not ok:
+                # 端口确实死亡或引擎产出异常——先杀残留，自动重载由 get_api_url 触发
+                try:
+                    from urllib.parse import urlparse
+                    engine = local_llm._engine
+                    port = urlparse(api_url).port or engine.server_port
+                    engine._kill_port(port)
+                    if port == engine.server_port:
+                        engine.server_status = "stopped"
+                except Exception:
+                    pass
                 raise httpx.ConnectError(
                     "本地模型引擎状态异常，已自动停止。请重新加载本地模型。"
                 )
@@ -165,6 +173,14 @@ async def _local_llm_stream(client, api_url: str, body: dict, headers: dict):
                 if e.response.status_code in (404, 503) and _attempt < 71:
                     last_err = e
                     await asyncio.sleep(5)  # 5s × 72 = 最大约 6 分钟等待
+                    continue
+                raise
+            except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError) as e:
+                # 重载窗口期端口无进程（连接被拒）或读超时/连接重置：
+                # 同样等待重试（自动重载完成即恢复）
+                if _attempt < 71:
+                    last_err = e
+                    await asyncio.sleep(5)
                     continue
                 raise
         if last_err is not None:
@@ -1703,7 +1719,7 @@ def _parse_prompt_tool_calls(text: str) -> tuple[str, list[dict]]:
         search_text = text  # fallback if everything was think
 
     # Priority 1: Fenced format ```tool name\n{json}\n```
-    for idx, m in enumerate(_PROMPT_TOOL_FENCE_RE.finditer(text)):
+    for idx, m in enumerate(_PROMPT_TOOL_FENCE_RE.finditer(search_text)):
         name = m.group(1)
         args_str = m.group(2).strip()
         try:
@@ -1719,7 +1735,7 @@ def _parse_prompt_tool_calls(text: str) -> tuple[str, list[dict]]:
 
     # Priority 2: Inline format [TOOL:name key=value ...] or <tool>name{json}</tool> or FUNC:name key=value
     if not tool_calls:
-        for idx, m in enumerate(_PROMPT_TOOL_RE.finditer(text)):
+        for idx, m in enumerate(_PROMPT_TOOL_RE.finditer(search_text)):
             name = m.group(1)
             json_str = m.group(2)
             quoted = m.group(3)
@@ -1746,7 +1762,7 @@ def _parse_prompt_tool_calls(text: str) -> tuple[str, list[dict]]:
 
     # Priority 3: Natural language fallback — "web_search \"query\"" etc.
     if not tool_calls:
-        for idx, m in enumerate(_NL_TOOL_RE.finditer(text)):
+        for idx, m in enumerate(_NL_TOOL_RE.finditer(search_text)):
             name = m.group(1).lower()
             # Normalize tool name
             if name == "search":
@@ -1777,7 +1793,7 @@ def _parse_prompt_tool_calls(text: str) -> tuple[str, list[dict]]:
     # Priority 4: Bash/shell code block fallback — models often output ```bash
     # instead of the taught ```tool format; parse ls/cat/find into our tools
     if not tool_calls:
-        for idx, m in enumerate(_BASH_BLOCK_RE.finditer(text)):
+        for idx, m in enumerate(_BASH_BLOCK_RE.finditer(search_text)):
             cmd_text = m.group(1).strip()
             if not cmd_text:
                 continue
@@ -1892,6 +1908,7 @@ def _build_local_tools_prompt(active_tools: list[dict]) -> str:
 async def _local_agent_loop_stream(messages: list, model: str, api_url: str, headers: dict,
                                     session_id: str = "", agent_id: str = "latiao", reflection_mode: str = "off", access_mode: str = "full", thinking_level: str = "high"):
     """Local model agent loop: inject tools as prompt, parse tool calls from text."""
+    global _llm_suspect_since  # 引擎存疑标记（本函数内多处置位/清除）
     current_msgs = [dict(m) for m in messages]
     # Truncate long history to prevent context overflow.
     # Keeps system messages + last 20 user/assistant pairs.
@@ -2045,6 +2062,7 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                     try:
                         line = await asyncio.wait_for(anext(aiter), timeout=180)
                     except asyncio.TimeoutError:
+                        _llm_suspect_since = _llm_suspect_since or time.monotonic()
                         raise TimeoutError(
                             f"本地模型输出停滞超 180 秒（模型可能过大或未加载完）：{model[:60]}"
                         )
@@ -2196,7 +2214,6 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                 if _raw_delta_count <= 1 and _is_local_llm_url(api_url):
                     # 流正常结束却只收到 role 空块 → 引擎疑似损坏（残留线程竞争）。
                     # 标记后下一次请求会在锁内先验证健康，坏引擎会被杀掉。
-                    global _llm_suspect_since
                     _llm_suspect_since = _llm_suspect_since or time.monotonic()
                 nudge_text = _get_localized_text(_detect_user_language(_extract_last_user_text(current_msgs)), {
                     "zh": "⚠️ 你上一轮的回复是空的。请直接回复用户，或者使用工具完成任务。如果需要调用工具，使用 ```tool 格式。",

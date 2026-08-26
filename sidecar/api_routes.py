@@ -1471,13 +1471,13 @@ async def local_llm_open_path(request: Request):
 
 
 @app.get("/v1/local-llm/status")
-async def local_llm_status():
+def local_llm_status():
     """Get local LLM engine status."""
     return local_llm.get_status()
 
 
 @app.get("/v1/local-llm/models")
-async def local_llm_models():
+def local_llm_models():
     """List downloaded local models."""
     return {"status": "ok", "models": local_llm.list_local_models()}
 
@@ -1519,9 +1519,9 @@ async def local_llm_get_context():
 
 
 @app.post("/v1/local-llm/start")
-async def local_llm_start(request: Request):
+def local_llm_start(request: Request):
     """Start a local model."""
-    body = await _json_body(request)
+    body = json.loads(request.body()) if request.body() else {}
     model_id = body.get("model_id", "")
     port = body.get("port", 1235)
     if not model_id:
@@ -1531,13 +1531,13 @@ async def local_llm_start(request: Request):
 
 
 @app.post("/v1/local-llm/stop")
-async def local_llm_stop():
+def local_llm_stop():
     """Stop the running local model."""
     return local_llm.stop_model()
 
 
 @app.post("/v1/engine/detach")
-async def engine_detach():
+def engine_detach():
     """sidecar 重启/部署前调用：放弃引擎子进程所有权，令其独立存活。
 
     模型加载耗时巨大（数十 GB 冷启动），sidecar 重启后 get_status 的
