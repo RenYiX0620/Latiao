@@ -108,6 +108,8 @@ export default memo(function ChatView({
 }: ChatViewProps) {
   const { t } = useTranslation();
   const handleEditableKeyDown = useCallback((e: React.KeyboardEvent) => {
+    // 输入法组词中按 Enter 是确认候选，不是发送（中文输入法高频误发送）
+    if (e.nativeEvent.isComposing) return;
     if (e.key === "Enter" && !e.shiftKey && !isProcessing) {
       e.preventDefault();
       sendMessage();

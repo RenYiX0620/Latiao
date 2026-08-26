@@ -335,7 +335,7 @@ def _match_skill_keywords(user_query: str) -> str | None:
             overlap += 5
         if overlap > best_score:
             best_score = overlap
-            best_match = skill.get("content", "")
+            best_match = name
     return best_match if best_score >= 1 else None
 
 async def _match_skill(user_query: str) -> str | None:
