@@ -3,9 +3,24 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { useTranslation } from "../i18n";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import {
+  Search, Database, LineChart, FilePen, FileText, FolderOpen, AppWindow,
+  Terminal, FileSearch, Users, Clock, Wrench, ChevronRight, ChevronDown, Loader2,
+} from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 import type { Message } from "../types";
 
 const MAX_PREVIEW_CHARS = 2000;
+
+// 每个工具一个语义图标（lucide 线性风格），未知工具回退到扳手
+const TOOL_ICONS: Record<string, LucideIcon> = {
+  bing_search: Search, web_search: Search, tavily_search: Search,
+  mx_query: Database, ak_finance: LineChart,
+  write_file: FilePen, read_file: FileText,
+  list_dir: FolderOpen, open_folder: FolderOpen,
+  open_app: AppWindow, run_cmd: Terminal, search_files: FileSearch,
+  delegate_task: Users, create_cron: Clock,
+};
 
 function formatToolArgs(args?: Record<string, unknown>): string {
   if (!args) return "";
@@ -25,7 +40,7 @@ const ToolCallBubble = memo(function ToolCallBubble({ msg, onConfirm }: {
   const [fullExpanded, setFullExpanded] = useState(false);
   const statusClass = msg.toolStatus === "confirming" ? "confirming" : msg.toolStatus === "running" ? "running" : msg.toolStatus === "error" ? "error" : "done";
   const iconColor = msg.toolStatus === "confirming" ? "var(--warning)" : msg.toolStatus === "running" ? "var(--accent)" : msg.toolStatus === "error" ? "var(--danger)" : "var(--success)";
-  const chevron = expanded ? "▾" : "▸";
+  const ToolIcon = TOOL_ICONS[msg.toolName || ""] || Wrench;
 
   // Derived: whether result needs truncation
   const { truncated, displayContent, isMarkdown, previewContent } = useMemo(() => {
@@ -113,14 +128,14 @@ const ToolCallBubble = memo(function ToolCallBubble({ msg, onConfirm }: {
   return (
     <div className={`tool-call ${statusClass}`}>
       <div className="tool-call-header" onClick={() => setExpanded(!expanded)}>
-        <span style={{ color: iconColor }}>{msg.toolName === "run_cmd" ? "▣" : "◆"}</span>
+        <span className="tool-call-icon" style={{ color: iconColor }}><ToolIcon size={14} /></span>
         <span className="tool-call-name">{msg.toolName}</span>
         <span className="tool-call-args">{formatToolArgs(msg.toolArgs)}</span>
-        {msg.toolStatus === "running" && <span className="tool-call-spinner">…</span>}
+        {msg.toolStatus === "running" && <Loader2 size={13} className="tool-call-spinner" />}
         {!expanded && msg.toolStatus === "done" && previewContent && (
           <span className="tool-call-result-hint">✓ {previewContent.slice(0, 30)}{previewContent.length > 30 ? "…" : ""}</span>
         )}
-        <span className="tool-call-chevron">{chevron}</span>
+        <span className="tool-call-chevron">{expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}</span>
       </div>
       {msg.toolStatus === "confirming" && onConfirm && (
         <div className="tool-call-confirm">

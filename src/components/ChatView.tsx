@@ -3,7 +3,7 @@ import type { Message, PendingFile } from "../types";
 import { useTranslation } from "../i18n";
 import ToolCallBubble from "./ToolCallBubble";
 import ToolbarSelect from "./ToolbarSelect";
-import { Eye, ShieldCheck, PencilRuler, ListChecks, Zap, CircleOff, Brain, BrainCircuit } from "lucide-react";
+import { Eye, ShieldCheck, PencilRuler, ListChecks, Zap, CircleOff, Brain, BrainCircuit, ChevronRight, ChevronDown } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import remarkGfm from "remark-gfm";
@@ -234,7 +234,7 @@ export default memo(function ChatView({
                 <div key={gkey} className="tool-group">
                   <ToolCallBubble msg={msg} onConfirm={confirmTool} />
                   <div className="tool-group-collapsed" onClick={() => setCollapsedGroups(prev => ({ ...prev, [gkey]: false }))}>
-                    <span className="tool-group-chevron">▸</span>
+                    <span className="tool-group-chevron"><ChevronRight size={12} /></span>
                     <span>{t("chat.more_tools", { count: gcount - 1 })}</span>
                   </div>
                 </div>
@@ -248,7 +248,7 @@ export default memo(function ChatView({
                     <ToolCallBubble key={tm.id || `t${i}_${k}`} msg={tm} onConfirm={confirmTool} />
                   ))}
                   <div className="tool-group-collapsed" onClick={() => setCollapsedGroups(prev => ({ ...prev, [gkey]: true }))}>
-                    <span className="tool-group-chevron">▾</span>
+                    <span className="tool-group-chevron"><ChevronDown size={12} /></span>
                     <span>{t("chat.collapse_tools")}</span>
                   </div>
                 </div>
