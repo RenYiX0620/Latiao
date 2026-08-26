@@ -204,9 +204,10 @@ export default memo(function ChatView({
   }, [messages]);
   const [collapsedSegs, setCollapsedSegs] = useState<Record<string, boolean>>({});
 
-  // 单条消息渲染（段内复用）
-  const renderMsg = (msg: Message, i: number) => {
+  // 单条消息渲染（段内复用；hideActivities=头部折叠时隐藏思考/工具，正文常驻）
+  const renderMsg = (msg: Message, i: number, hideActivities: boolean) => {
           if (msg.role === "tool" || msg.type === "tool_call") {
+            if (hideActivities) return null;
             // 活动摘要行（ZCode 式）：每个工具调用独立一行，点击展开结果
             return <ToolCallBubble key={msg.id || i} msg={msg} onConfirm={confirmTool} />;
           }
@@ -223,7 +224,7 @@ export default memo(function ChatView({
                       const bodyText = localThink ? msg.content.slice(localThink[0].length) : msg.content;
                       return (
                         <>
-                          {thinkText && (
+                          {thinkText && !hideActivities && (
                             <details className="thinking-block">
                               <summary className="thinking-summary">
                                 <Brain size={13} />
@@ -403,7 +404,7 @@ export default memo(function ChatView({
                 <span className="chat-segment-label">{label}</span>
                 <span className="chat-segment-chevron">{collapsed ? <ChevronRight size={13} /> : <ChevronDown size={13} />}</span>
               </button>
-              {!collapsed && seg.msgs.map((m, i) => renderMsg(m, i))}
+              {seg.msgs.map((m, i) => renderMsg(m, i, collapsed))}
             </div>
           );
         })}
