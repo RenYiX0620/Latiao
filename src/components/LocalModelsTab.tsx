@@ -245,7 +245,7 @@ export default function LocalModelsTab(props: Props) {
                         <div style={{ fontSize: 11, fontWeight: 500, color: "var(--text-primary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{m.name}</div>
                         <div style={{ fontSize: 9, color: "var(--text-muted)" }}>{m.size}</div>
                       </div>
-                      <button className="btn btn-sm btn-primary" style={{ padding: "4px 12px", fontSize: 10, flexShrink: 0 }} onClick={() => startLocalLLM(m.name + (m.format === "gguf" ? ".gguf" : ".mlx"))} disabled={isStarting}>🚀 {t("local.load")}</button>
+                      <button className="btn btn-sm btn-primary" style={{ padding: "4px 12px", fontSize: 10, flexShrink: 0 }} onClick={() => startLocalLLM(m.id)} disabled={isStarting}>🚀 {t("local.load")}</button>
                     </div>
                   ))}
                 </div>

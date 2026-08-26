@@ -57,6 +57,42 @@ def _detect_model_bits(model_path: str) -> int:
     # Default: assume 4-bit (most common download)
     return 4
 
+
+def _resolve_mlx_path(model_id: str, models_dir: Path = MODELS_DIR, hf_hub: Path | None = None) -> str:
+    """把模型 id 解析成 mlx_lm 可加载的本地 MLX 目录/路径。
+
+    优先级：直接路径 → ~/Models 下的 MLX 目录（含 config.json + 权重）
+    → HF hub 缓存 snapshots → 原样返回（当作 HF repo id，由 mlx_lm 下载）。
+    MLX 模型是目录结构（config.json + model.safetensors/weights.npz），
+    没有通用的"单个 .mlx 文件"，因此不能只按文件名匹配。
+    """
+    try:
+        p = Path(model_id)
+        if p.exists():
+            return str(p)
+    except (OSError, ValueError):
+        pass
+    # ~/Models 下的目录（模型名 或 repo 名替换 -- 形式）
+    for cand in (models_dir / model_id, models_dir / model_id.replace("/", "--")):
+        try:
+            if cand.is_dir() and (cand / "config.json").exists():
+                return str(cand)
+        except OSError:
+            continue
+    # HF hub 缓存（models--owner--name/snapshots/<hash>/config.json）
+    hub = hf_hub if hf_hub is not None else (Path.home() / ".cache" / "huggingface" / "hub")
+    try:
+        repo_dir = hub / f"models--{model_id.replace('/', '--')}"
+        if repo_dir.is_dir():
+            for snap in sorted(repo_dir.glob("snapshots/*")):
+                if (snap / "config.json").exists():
+                    return str(snap)
+    except OSError:
+        pass
+    return model_id
+
+
+
 def _auto_cache_type(model_path: str) -> tuple[int, int]:
     """Return (type_k, type_v) as ggml_type ints based on model quantization level.
     KV cache precision should never exceed model precision.
@@ -523,13 +559,16 @@ class LocalLLMEngine:
                 # Full repo: use huggingface_hub for repo-level operations
                 from huggingface_hub import snapshot_download
 
+                os.environ.setdefault("HF_ENDPOINT", self._get_hf_endpoint())
+                # XetHub CAS 存储需鉴权（镜像/匿名会 401），禁用后走传统 LFS 流
+                os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
                 dl_info["message"] = "正在准备下载模型仓库..."
                 self._save_download_state()
                 local_path = snapshot_download(
                     repo_id=model_id,
                     cache_dir=cache_root,
                     resume_download=True,
-                    allow_patterns=["*.gguf", "*.safetensors", "*.json", "*.md", "*.txt"],
+                    allow_patterns=["*.gguf", "*.safetensors", "*.npz", "*.json", "*.md", "*.txt"],
                 )
                 path = local_path
 
@@ -1042,7 +1081,8 @@ class LocalLLMEngine:
             if chat_fmt:
                 cmd += ["--chat_format", chat_fmt]
             env = os.environ.copy()
-            env.pop("HF_ENDPOINT", None)
+            env["HF_ENDPOINT"] = self._get_hf_endpoint()  # 镜像优先（国内 huggingface.co 常不可达）
+            env["HF_HUB_DISABLE_XET"] = "1"
             # stdout 无人读取，必须 DEVNULL，否则管道缓冲满后子进程死锁
             proc = subprocess.Popen(
                 cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, env=env
@@ -1177,7 +1217,6 @@ class LocalLLMEngine:
         self._active_backend = "llama-cpp-native"
         return self.get_status()
 
-
     def _start_mlx(self, model_id: str, port: int) -> dict:
         self.current_model_id = model_id
         self.current_model_name = model_id.split("/")[-1] if "/" in model_id else model_id
@@ -1185,9 +1224,22 @@ class LocalLLMEngine:
         self.status_message = f"正在加载 {self.current_model_name} (首次需下载)..."
 
         try:
+            model_path = _resolve_mlx_path(model_id)
+            if model_path != model_id and Path(model_path).is_dir():
+                # 本地 MLX 目录：权重缺失时提前给出明确错误
+                has_w = (Path(model_path) / "model.safetensors").exists() \
+                    or (Path(model_path) / "weights.npz").exists() \
+                    or any(Path(model_path).glob("weights*.npz"))
+                if not has_w:
+                    self.stop_model()
+                    self.server_status = "error"
+                    self.status_message = f"MLX 模型目录缺少权重文件（model.safetensors / weights.npz）: {model_path}"
+                    self.current_model_id = ""
+                    self.current_model_name = ""
+                    return self.get_status()
             cmd = [
                 sys.executable, "-m", "mlx_lm.server",
-                "--model", model_id,
+                "--model", model_path,
                 "--port", str(port),
                 "--host", "127.0.0.1",
             ]
@@ -1830,15 +1882,38 @@ def list_local_models() -> list[dict]:
                 "size": f"{size_gb:.1f}GB", "format": f.suffix[1:],
             })
 
-    # 1. Built-in model dir (~/Models/)
-    _scan_dir(MODELS_DIR)
-    # 2. Third-party model managers (reuse models downloaded via LM Studio / Ollama)
-    _scan_dir(Path.home() / ".lmstudio" / "models")
-    _scan_dir(Path.home() / ".ollama" / "models")
-    # 3. HuggingFace cache
-    hf = Path.home() / ".cache" / "huggingface" / "hub"
-    if hf.exists():
-        for dl_info in hf.glob("models--*"):
+    def _dir_size_gb(d: Path) -> float:
+        total = 0
+        for f in d.rglob("*"):
+            if f.is_file():
+                total += f.stat().st_size
+        return total / (1024**3)
+
+    def _scan_mlx_dirs(root: Path):
+        """MLX 模型以目录形式存在（config.json + 权重），扫描首层目录。"""
+        if not root or not root.exists():
+            return
+        for d in sorted(root.iterdir()):
+            if not d.is_dir() or str(d) in seen_paths:
+                continue
+            if not (d / "config.json").exists():
+                continue
+            has_w = (d / "model.safetensors").exists() \
+                or (d / "weights.npz").exists() \
+                or any(d.glob("weights*.npz"))
+            if not has_w:
+                continue
+            seen_paths.add(str(d))
+            models.append({
+                "id": d.name, "name": d.name, "path": str(d),
+                "size": f"{_dir_size_gb(d):.1f}GB", "format": "mlx",
+            })
+
+    # MLX 目录扫描：~/Models 首层 + HF hub 快照（repo id 为模型 id）
+    _scan_mlx_dirs(MODELS_DIR)
+    hf_scan = Path.home() / ".cache" / "huggingface" / "hub"
+    if hf_scan.exists():
+        for dl_info in hf_scan.glob("models--*"):
             snaps = dl_info / "snapshots"
             if snaps.exists():
                 mid = dl_info.name.replace("models--", "").replace("--", "/")
@@ -1847,6 +1922,12 @@ def list_local_models() -> list[dict]:
                         "id": mid, "name": mid.split("/")[-1],
                         "path": str(dl_info), "size": "cached", "format": "mlx",
                     })
+
+    # 1. Built-in model dir (~/Models/)
+    _scan_dir(MODELS_DIR)
+    # 2. Third-party model managers (reuse models downloaded via LM Studio / Ollama)
+    _scan_dir(Path.home() / ".lmstudio" / "models")
+    _scan_dir(Path.home() / ".ollama" / "models")
     return models
 
 def get_recommended_models() -> list[dict]:
