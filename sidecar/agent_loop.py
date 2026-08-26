@@ -1379,7 +1379,8 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
             # Re-evaluate tool set every 3 iterations for multi-step tasks
             if iteration > 1 and iteration % 3 == 0:
                 # 恢复全量工具，但仍须套用权限过滤（read_only 等模式不可绕过）
-                active_tools = _cap_tools(_filter_tools_by_access(agent_tools, access_mode), 5) if not is_local else agent_tools
+                # （本函数为云端循环，无 is_local 变量；本地循环独立实现）
+                active_tools = _cap_tools(_filter_tools_by_access(agent_tools, access_mode), 5)
             # ── Auto-Fix: if last verify failed, include error context ──
             if last_verify_failed and retry_count < max_retries:
                 current_msgs.append({
