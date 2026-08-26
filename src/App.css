@@ -471,7 +471,7 @@ body {
 .chat-segment-head:hover { background: var(--bg-surface-hover); color: var(--text-primary); }
 .chat-segment.collapsed .chat-segment-head { border-bottom: none; }
 .chat-segment-dot { animation: blink 1.2s infinite; }
-.chat-segment-label { font-family: var(--font-mono); opacity: 0.85; }
+.chat-segment-label { font-family: var(--font-mono); opacity: 0.85; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chat-segment-chevron { margin-left: auto; display: inline-flex; opacity: 0.6; }
 .chat-segment .msg-row { padding: 4px 14px; }
 .chat-segment .tool-call { padding: 0 8px; }

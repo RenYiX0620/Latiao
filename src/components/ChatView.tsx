@@ -143,6 +143,9 @@ export default memo(function ChatView({
   };
 
   // ── 对话分段（ZCode 式：一次对话 = 一张卡片，头部显示耗时）──
+  // 消息数组真实顺序：[…上轮回答, 本轮工具, 本轮问题, 本轮工具, 本轮回答, …]
+  // （工具消息用 splice 插到末尾前，可能落在用户消息之前）
+  // 因此段边界 = assistant 消息之后紧跟 user/tool 消息
   const segments = useMemo(() => {
     const segs: { startTs?: number; endTs?: number; msgs: Message[] }[] = [];
     let cur: Message[] = [];
@@ -157,9 +160,12 @@ export default memo(function ChatView({
       segs.push({ startTs: st, endTs: en, msgs: cur });
       cur = [];
     };
-    for (const m of messages) {
-      if (m.role === "user" && cur.length > 0) { push(); cur = [m]; }
-      else cur.push(m);
+    for (let i = 0; i < messages.length; i++) {
+      const m = messages[i];
+      const prev = messages[i - 1];
+      const startsNew = cur.length > 0 && prev?.role === "assistant" && (m.role === "user" || m.role === "tool");
+      if (startsNew) push();
+      cur.push(m);
     }
     push();
     return segs;
@@ -349,13 +355,20 @@ export default memo(function ChatView({
           const segKey = seg.msgs[0]?.id || `seg${si}`;
           const collapsed = collapsedSegs[segKey] === true;
           const segDur = seg.startTs && seg.endTs ? Math.max(0, seg.endTs - seg.startTs) : 0;
+          const qMsg = seg.msgs.find((m) => m.role === "user");
+          const qText = (qMsg?.content || "").replace(/\s+/g, " ").slice(0, 24);
           // 进行中的对话段（最后一段）：实时计时
           const live = si === segments.length - 1 && taskStartAt !== null && (isProcessing || activeTask !== null);
+          const label = live
+            ? `${qText ? qText + " · " : ""}已工作 ${fmtDur(elapsed)}`
+            : segDur > 0
+              ? `${qText ? qText + " · " : ""}已工作 ${fmtDur(segDur)}`
+              : qText || "对话";
           return (
             <div key={segKey} className={`chat-segment${collapsed ? " collapsed" : ""}`}>
               <button className="chat-segment-head" onClick={() => setCollapsedSegs(p => ({ ...p, [segKey]: !collapsed }))}>
                 <span className="chat-segment-dot">▣</span>
-                <span className="chat-segment-label">{live ? `已工作 ${fmtDur(elapsed)}` : segDur > 0 ? `已工作 ${fmtDur(segDur)}` : "对话"}</span>
+                <span className="chat-segment-label">{label}</span>
                 <span className="chat-segment-chevron">{collapsed ? <ChevronRight size={13} /> : <ChevronDown size={13} />}</span>
               </button>
               {!collapsed && seg.msgs.map((m, i) => renderMsg(m, i))}
