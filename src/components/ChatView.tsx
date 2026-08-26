@@ -181,14 +181,16 @@ export default memo(function ChatView({
               .filter(i => i >= 0 && i < messages.length)
               .map(i => {
                 const m = messages[i];
-                const text = (m.role === "tool"
-                  ? `${m.toolName || "工具"} · ${m.toolResult || m.content || ""}`
-                  : m.content || m.thinking || "") .replace(/[#*|`>-]/g, "").replace(/\s+/g, " ").slice(0, 90);
+                // 工具消息只显示工具名（不显示原始结果——含 emoji/URL/乱码）；
+                // 对话消息显示原文，保持 ZCode 式流畅会话预览
+                const text = m.role === "tool"
+                  ? `◆ ${m.toolName || "工具"} · 执行完成`
+                  : (m.content || m.thinking || "(无内容)").replace(/[#*|`>-]/g, "").replace(/\s+/g, " ").slice(0, 90);
                 const icon = m.role === "user" ? "🧑" : m.role === "tool" ? "◆" : "🤖";
                 return (
                   <div key={m.id || i} className={`mini-preview-line${i === minimapHover.idx ? " current" : ""}`}>
                     <span className="mini-preview-icon">{icon}</span>
-                    <span>{text || "(无内容)"}</span>
+                    <span>{text}</span>
                   </div>
                 );
               })}
