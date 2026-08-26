@@ -693,6 +693,45 @@ const [timeFilter, setTimeFilter] = useState("all");
     const decoder = new TextDecoder();
     let buffer = "", full = "";
 
+    // 流式渲染节流：内容/思考按 120ms 批量落盘。每条 token 都 setMessages 会
+    // 让长会话（大量 ReactMarkdown）全量重渲染占满主线程——停止按钮点击排队
+    // 等不到主线程，"停止没反应"的根因。
+    let flushTimer: ReturnType<typeof setTimeout> | null = null;
+    let pendingThinking = "";
+    const flushStream = () => {
+      if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+      const text = full;
+      const th = pendingThinking;
+      pendingThinking = "";
+      if (!text && !th) return;
+      setMessages((prev) => {
+        const msgs = [...prev];
+        const last = msgs[msgs.length - 1];
+        if (last?.role === "assistant") {
+          if (text && last.content && !text.startsWith(last.content)) {
+            // 已有内容的 assistant（如 📋 执行计划）：正文另起新消息，不覆盖
+            msgs.push({ id: msgId(), role: "assistant", content: text, ts: Date.now() });
+          } else {
+            const updated: Message = { ...last };
+            if (th) updated.thinking = (last.thinking || "") + th;
+            if (text) updated.content = text;
+            // 正文开始输出 = 思考结束，结算思考耗时
+            if (text && updated.thinkingDuration === undefined && updated.thinking) {
+              updated.thinkingDuration = Math.max(0, Date.now() - (updated.ts || Date.now()));
+            }
+            msgs[msgs.length - 1] = updated;
+          }
+        } else if (text || th) {
+          msgs.push({ id: msgId(), role: "assistant", content: text, thinking: th || undefined, ts: Date.now() });
+        }
+        return msgs;
+      });
+    };
+    const scheduleFlush = () => {
+      if (!flushTimer) flushTimer = setTimeout(flushStream, 120);
+    };
+
+
     // Inactivity watchdog: if the stream goes silent for too long (e.g. the
     // local model server hangs on an unsupported request, or a tool call blocks
     // without emitting events), abort so isProcessing always resets instead of
@@ -719,7 +758,7 @@ const [timeFilter, setTimeFilter] = useState("all");
       for (const line of lines) {
         if (line.startsWith("data: ")) {
           const data = line.substring(6).trim();
-          if (data === "[DONE]") return full;
+          if (data === "[DONE]") { flushStream(); return full; }
           try {
             const parsed = JSON.parse(data);
             // Error events must reach the outer catch (and finally sendMessage's
@@ -727,6 +766,7 @@ const [timeFilter, setTimeFilter] = useState("all");
             if (parsed.error) throw new Error(parsed.error);
             try {
               if (parsed.event === "tool_confirm") {
+                flushStream();
                 setAgentPhase(t("agent.phase_confirm", { tool: parsed.tool || "" }));
                 showToast(t("tool.confirm_toast", { tool: parsed.tool || "" }), "warn");
                 // 等待用户确认可能超过看门狗时限——确认期间暂停看门狗，
@@ -744,6 +784,7 @@ const [timeFilter, setTimeFilter] = useState("all");
                   return msgs;
                 });
               } else if (parsed.event === "agent_plan") {
+                flushStream();
                 // 规划模式：执行计划显示为一条消息
                 const plan = String(parsed.content ?? "");
                 if (plan.trim()) {
@@ -753,6 +794,7 @@ const [timeFilter, setTimeFilter] = useState("all");
                   }]);
                 }
               } else if (parsed.event === "reflection_revised") {
+                flushStream();
                 // 输出反思修正：把最后一条 assistant 消息替换为修正版
                 const revised = String(parsed.content ?? "");
                 if (revised.trim()) {
@@ -768,6 +810,7 @@ const [timeFilter, setTimeFilter] = useState("all");
                   });
                 }
               } else if (parsed.event === "tool_start") {
+                flushStream();
                 activeTaskStackRef.current.push(`${parsed.tool || ""} ${JSON.stringify(parsed.args || {}).slice(0, 60)}`);
                 setActiveTask(activeTaskStackRef.current[activeTaskStackRef.current.length - 1] || null);
                 const startTs = Number(parsed.ts) || Date.now();
@@ -787,6 +830,7 @@ const [timeFilter, setTimeFilter] = useState("all");
                   return msgs;
                 });
               } else if (parsed.event === "tool_end") {
+                flushStream();
                 activeTaskStackRef.current.pop();
                 setActiveTask(activeTaskStackRef.current[activeTaskStackRef.current.length - 1] || null);
                 const rawResult = String(parsed.result ?? "");
@@ -808,41 +852,12 @@ const [timeFilter, setTimeFilter] = useState("all");
                   return msgs;
                 });
               } else if (parsed.reasoning) {
-                // 思考内容：累积到最后一条 assistant 消息的 thinking 字段（摘要行展示，不入正文）
-                const rTs = Number(parsed.ts) || Date.now();
-                setMessages((prev) => {
-                  const msgs = [...prev];
-                  const last = msgs[msgs.length - 1];
-                  if (last?.role === "assistant") {
-                    msgs[msgs.length - 1] = {
-                      ...last,
-                      thinking: (last.thinking || "") + parsed.reasoning,
-                      ts: last.ts ?? rTs, // 思考起点；thinkingDuration 在正文开始输出时结算
-                    };
-                  } else {
-                    msgs.push({ id: msgId(), role: "assistant", content: "", thinking: String(parsed.reasoning), ts: rTs });
-                  }
-                  return msgs;
-                });
+                // 思考内容：批量累积（flush 时写入最后一条 assistant 的 thinking 字段）
+                pendingThinking += String(parsed.reasoning);
+                scheduleFlush();
               } else if (parsed.content) {
                 full += parsed.content;
-                setMessages((prev) => {
-                  const msgs = [...prev];
-                  const last = msgs[msgs.length - 1];
-                  if (last?.role === "assistant") {
-                    if (last.content && !full.startsWith(last.content)) {
-                      // 已有内容的 assistant（如 📋 执行计划）：正文另起新消息，不覆盖
-                      msgs.push({ id: msgId(), role: "assistant", content: full, ts: Date.now() });
-                    } else {
-                      // 正文开始输出 = 思考结束，结算思考耗时
-                      const updated = last.thinkingDuration === undefined && last.thinking
-                        ? { ...last, content: full, thinkingDuration: Math.max(0, Date.now() - (last.ts || Date.now())) }
-                        : { ...last, content: full };
-                      msgs[msgs.length - 1] = updated;
-                    }
-                  }
-                  return msgs;
-                });
+                scheduleFlush();
               }
             } catch (e) { console.warn("Skipping malformed stream event", e); }
           } catch (e) { if (e instanceof SyntaxError) continue; throw e; }
@@ -851,6 +866,7 @@ const [timeFilter, setTimeFilter] = useState("all");
     }
     return full;
     } finally {
+      flushStream();
       disarmWatchdog();
       // Proactively release the stream: plugin-http holds the response body as a
       // Tauri resource (rid). If we just walk away, the plugin's later teardown
