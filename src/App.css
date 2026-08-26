@@ -372,19 +372,32 @@ body {
 
 .chat-wrap { position: relative; flex: 1; min-height: 0; display: flex; flex-direction: column; }
 
-/* 消息导航缩略图 minimap */
+/* 消息导航缩略图 minimap（ZCode 式：悬停显示内容预览） */
 .chat-minimap {
-  position: absolute; right: 10px; top: 34px; bottom: 14px; width: 14px;
-  border-radius: 7px; background: var(--bg-input); opacity: 0.85;
+  position: absolute; right: 10px; top: 34px; bottom: 14px; width: 16px;
+  border-radius: 8px; background: var(--border-default);
   cursor: pointer; overflow: hidden; display: flex; flex-direction: column;
+  padding: 2px 0;
 }
-.chat-minimap:hover { opacity: 1; }
-.mini-block { width: 6px; margin: 1px auto; border-radius: 3px; flex-shrink: 0; }
+.mini-block {
+  width: 10px; margin: 0.5px auto; border-radius: 3px; flex-shrink: 0;
+  opacity: 0.75; transition: opacity 0.1s;
+}
+.mini-block.hover { opacity: 1; outline: 1px solid var(--text-primary); }
 .mini-viewport {
-  position: absolute; left: 1px; right: 1px; border-radius: 6px;
-  background: rgba(255,255,255,0.35); border: 1px solid rgba(255,255,255,0.5);
-  pointer-events: none;
+  position: absolute; left: 2px; right: 2px; border-radius: 6px;
+  background: rgba(255,255,255,0.5); border: 1px solid rgba(255,255,255,0.8);
+  pointer-events: none; min-height: 14px;
 }
+.mini-preview {
+  position: absolute; right: 32px; top: 34px; bottom: auto;
+  width: 280px; max-height: 180px; overflow: hidden;
+  background: var(--bg-card); border: 1px solid var(--border-default);
+  border-radius: 10px; padding: 10px 12px; box-shadow: 0 8px 32px rgba(0,0,0,0.25);
+  pointer-events: none; z-index: 60;
+}
+.mini-preview-role { font-size: 11px; font-weight: 650; color: var(--text-primary); margin-bottom: 4px; }
+.mini-preview-text { font-size: 11px; color: var(--text-secondary); line-height: 1.5; white-space: pre-wrap; }
 
 /* 任务执行状态条（top of chat） */
 .task-statusbar {
