@@ -2,6 +2,8 @@ import { memo, lazy, Suspense, useCallback, useState, useMemo, useRef, useEffect
 import type { Message, PendingFile } from "../types";
 import { useTranslation } from "../i18n";
 import ToolCallBubble from "./ToolCallBubble";
+import ToolbarSelect from "./ToolbarSelect";
+import { Eye, ShieldCheck, PencilRuler, ListChecks, Zap, CircleOff, Brain, BrainCircuit } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import remarkGfm from "remark-gfm";
@@ -381,28 +383,24 @@ export default memo(function ChatView({
               <button className="btn-icon" onClick={() => fileInputRef.current?.click()} title={t("chat.attach")}>＋</button>
               <button className="btn-icon" onClick={isRecording ? () => mediaRecorderRef.current?.stop() : startRecording}
                 style={isRecording ? { color: "var(--danger)" } : undefined} title={t("chat.voice")}>{isRecording ? "⏹" : "🎙"}</button>
-              <select className="form-input" style={{
-                fontSize: 12, padding: "2px 6px", margin: 0, width: "auto", maxWidth: 130,
-                background: "transparent", border: "0", color: "var(--text-secondary)",
-                cursor: "pointer", outline: "none",
-              }} value={accessMode} onChange={(e) => setAccessMode(e.target.value as "read_only" | "confirm" | "auto_edit" | "plan" | "full")}
-                title={t("chat.access_title")}>
-                <option value="read_only">🛡 {t("chat.access_readonly")}</option>
-                <option value="confirm">✋ {t("chat.access_confirm")}</option>
-                <option value="auto_edit">✅ {t("chat.access_auto_edit")}</option>
-                <option value="plan">📋 {t("chat.access_plan")}</option>
-                <option value="full">⚡ {t("chat.access_full")}</option>
-              </select>
-              <select className="form-input" style={{
-                fontSize: 12, padding: "2px 6px", margin: 0, width: "auto", maxWidth: 110,
-                background: "transparent", border: "0", color: "var(--text-secondary)",
-                cursor: "pointer", outline: "none",
-              }} value={thinkingLevel} onChange={(e) => setThinkingLevel(e.target.value as "off" | "high" | "max")}
-                title={t("chat.thinking_title")}>
-                <option value="off">🧠 {t("chat.thinking_off")}</option>
-                <option value="high">🧠 {t("chat.thinking_high")}</option>
-                <option value="max">🧠 {t("chat.thinking_max")}</option>
-              </select>
+              <ToolbarSelect value={accessMode}
+                options={[
+                  { value: "read_only", label: t("chat.access_readonly"), icon: <Eye size={13} /> },
+                  { value: "confirm", label: t("chat.access_confirm"), icon: <ShieldCheck size={13} /> },
+                  { value: "auto_edit", label: t("chat.access_auto_edit"), icon: <PencilRuler size={13} /> },
+                  { value: "plan", label: t("chat.access_plan"), icon: <ListChecks size={13} /> },
+                  { value: "full", label: t("chat.access_full"), icon: <Zap size={13} /> },
+                ]}
+                onChange={(v) => setAccessMode(v as "read_only" | "confirm" | "auto_edit" | "plan" | "full")}
+                title={t("chat.access_title")} />
+              <ToolbarSelect value={thinkingLevel}
+                options={[
+                  { value: "off", label: t("chat.thinking_off"), icon: <CircleOff size={13} /> },
+                  { value: "high", label: t("chat.thinking_high"), icon: <Brain size={13} /> },
+                  { value: "max", label: t("chat.thinking_max"), icon: <BrainCircuit size={13} /> },
+                ]}
+                onChange={(v) => setThinkingLevel(v as "off" | "high" | "max")}
+                title={t("chat.thinking_title")} />
             </div>
             <div className="toolbar-right">
               <select className="form-input" style={{

@@ -168,7 +168,7 @@ body {
 }
 .nav-item:hover { background: rgba(255,255,255,0.04); color: var(--text-primary); }
 .nav-item.active { background: var(--accent-soft); color: var(--accent); }
-.nav-icon { font-size: 15px; width: 20px; text-align: center; opacity: 0.65; flex-shrink: 0; }
+.nav-icon { font-size: 15px; width: 20px; display: inline-flex; align-items: center; justify-content: center; opacity: 0.65; flex-shrink: 0; }
 .nav-item.active .nav-icon { opacity: 1; }
 
 /* Sessions */
@@ -333,6 +333,36 @@ body {
 .input-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .toolbar-left { display: flex; align-items: center; gap: 4px; }
 .toolbar-right { display: flex; align-items: center; gap: 6px; }
+/* ── 工具栏自定义下拉（lucide 图标，菜单向上弹出） ── */
+.toolbar-select { position: relative; }
+.toolbar-select-btn {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-size: 12px; font-family: var(--font-sans); color: var(--text-secondary);
+  background: transparent; border: 0; padding: 2px 6px; border-radius: 6px;
+  cursor: pointer; transition: all 0.15s ease;
+}
+.toolbar-select-btn:hover { background: var(--bg-input); color: var(--text-primary); }
+.toolbar-select-icon { display: inline-flex; align-items: center; opacity: 0.75; }
+.toolbar-select-btn:hover .toolbar-select-icon { opacity: 1; }
+.toolbar-select-caret { opacity: 0.55; transition: transform 0.15s ease; }
+.toolbar-select-caret.open { transform: rotate(180deg); }
+.toolbar-select-menu {
+  position: absolute; bottom: calc(100% + 6px); left: 0; z-index: 80;
+  min-width: 168px; padding: 4px; background: var(--bg-card);
+  border: 1px solid var(--border-default); border-radius: 10px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.25);
+  display: flex; flex-direction: column;
+}
+.toolbar-select-option {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 12px; font-family: var(--font-sans); text-align: left;
+  color: var(--text-secondary); background: transparent; border: 0;
+  padding: 7px 10px; border-radius: 7px; cursor: pointer;
+  transition: background 0.12s ease; white-space: nowrap;
+}
+.toolbar-select-option:hover { background: var(--bg-input); color: var(--text-primary); }
+.toolbar-select-option.active { color: var(--accent); background: var(--accent-soft); }
+.toolbar-select-option.active .toolbar-select-icon { opacity: 1; }
 .btn-circle {
   width: 30px; height: 30px; padding: 0; border-radius: 50%;
   display: inline-flex; align-items: center; justify-content: center;

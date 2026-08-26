@@ -18,6 +18,8 @@ import AgentView from "./components/AgentView";
 import SettingsView from "./components/SettingsView";
 import RecoveryView from "./components/RecoveryView";
 import LogsView from "./components/LogsView";
+import { MessageSquare, Brain, Wrench, Puzzle, Clock, Radio, Bot, Settings, ScrollText } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 import "./App.css";
 
 /* ═══════════ Constants ═══════════ */
@@ -53,16 +55,16 @@ const AGENT_NAME_KEYS: Record<string, string> = {
   translator: "agent.translator",
 };
 
-const NAV_ITEMS: { id: ViewId; icon: string; key: string }[] = [
-  { id: "chat", icon: "💬", key: "nav.chat" },
-  { id: "models", icon: "🧠", key: "nav.models" },
-  { id: "tools", icon: "🔧", key: "nav.tools" },
-  { id: "skills", icon: "🧩", key: "nav.skills" },
-  { id: "cron", icon: "⏰", key: "nav.cron" },
-  { id: "channels", icon: "🔗", key: "nav.channels" },
-  { id: "agents", icon: "🎭", key: "nav.agents" },
-  { id: "settings", icon: "⚙", key: "nav.settings" },
-  { id: "logs", icon: "📋", key: "nav.logs" },
+const NAV_ITEMS: { id: ViewId; icon: LucideIcon; key: string }[] = [
+  { id: "chat", icon: MessageSquare, key: "nav.chat" },
+  { id: "models", icon: Brain, key: "nav.models" },
+  { id: "tools", icon: Wrench, key: "nav.tools" },
+  { id: "skills", icon: Puzzle, key: "nav.skills" },
+  { id: "cron", icon: Clock, key: "nav.cron" },
+  { id: "channels", icon: Radio, key: "nav.channels" },
+  { id: "agents", icon: Bot, key: "nav.agents" },
+  { id: "settings", icon: Settings, key: "nav.settings" },
+  { id: "logs", icon: ScrollText, key: "nav.logs" },
 ];
 
 function buildApiMessages(session: SessionInfo, extraUser?: Message, planMode?: boolean, lang?: string): Record<string, unknown>[] {
@@ -1160,7 +1162,7 @@ const [timeFilter, setTimeFilter] = useState("all");
           {NAV_ITEMS.map((item) => (
             <button key={item.id} className={`nav-item${activeView === item.id ? " active" : ""}`}
               onClick={() => setActiveView(item.id)}>
-              <span className="nav-icon">{item.icon}</span> {!sidebarCollapsed && t(item.key)}
+              <span className="nav-icon"><item.icon size={17} strokeWidth={1.8} /></span> {!sidebarCollapsed && t(item.key)}
             </button>
           ))}
         </nav>
