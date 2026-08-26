@@ -234,6 +234,21 @@ fn delete_secret(_key: String) -> Result<(), String> {
 fn restart_sidecar(state: tauri::State<'_, SidecarProcess>) -> Result<String, String> {
     let mut guard = state.0.lock().map_err(|e| format!("Lock failed: {}", e))?;
     if let Some(ref mut child) = *guard {
+        // 先通知 sidecar detach 模型引擎（Python 子进程），使其在 sidecar
+        // 重启后继续存活（模型加载耗时巨大，重新加载会中断用户任务）
+        // 用系统自带 curl 通知 sidecar detach 模型引擎（Python 子进程），
+        // 使其在 sidecar 重启后继续存活（模型加载耗时巨大，重新加载会中断用户任务）
+        let _ = Command::new("curl")
+            .args([
+                "-s", "-m", "1", "-X", "POST",
+                "-H",
+                &format!("X-Latiao-Token: {}", AUTH_TOKEN.get().map(|s| s.as_str()).unwrap_or("")),
+                "http://127.0.0.1:8765/v1/engine/detach",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+
         // Give sidecar a moment to flush, then force-kill
         let _ = child.kill();
         let _ = child.wait();
