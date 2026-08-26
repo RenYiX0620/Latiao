@@ -31,6 +31,12 @@ function formatToolArgs(args?: Record<string, unknown>): string {
   return `${key}: ${valStr.length > 50 ? valStr.slice(0, 50) + "..." : valStr}`;
 }
 
+function fmtDur(ms: number): string {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 60) return `${s} 秒`;
+  return `${Math.floor(s / 60)} 分 ${s % 60} 秒`;
+}
+
 const ToolCallBubble = memo(function ToolCallBubble({ msg, onConfirm }: {
   msg: Message;
   onConfirm?: (callId: string, approved: boolean) => void;
@@ -131,6 +137,9 @@ const ToolCallBubble = memo(function ToolCallBubble({ msg, onConfirm }: {
         <span className="tool-call-icon" style={{ color: iconColor }}><ToolIcon size={14} /></span>
         <span className="tool-call-name">{msg.toolName}</span>
         <span className="tool-call-args">{formatToolArgs(msg.toolArgs)}</span>
+        {msg.duration !== undefined && msg.toolStatus === "done" && (
+          <span className="tool-call-duration">· {fmtDur(msg.duration)}</span>
+        )}
         {msg.toolStatus === "running" && <Loader2 size={13} className="tool-call-spinner" />}
         {!expanded && msg.toolStatus === "done" && previewContent && (
           <span className="tool-call-result-hint">✓ {previewContent.slice(0, 30)}{previewContent.length > 30 ? "…" : ""}</span>

@@ -1089,7 +1089,7 @@ async def _handle_tool_execution(tc: dict, current_msgs: list, session_id: str,
     denied = _check_access(tool_name, access_mode)
     if denied:
         current_msgs.append({"role": "tool", "tool_call_id": call_id, "content": denied})
-        return True, [{"event": "tool_end", "call_id": call_id, "tool": tool_name, "result": denied}]
+        return True, [{"event": "tool_end", "call_id": call_id, "tool": tool_name, "result": denied, "ts": int(time.time() * 1000)}]
     try:
         args = json.loads(func.get("arguments", "{}"))
     except json.JSONDecodeError:
@@ -1102,7 +1102,7 @@ async def _handle_tool_execution(tc: dict, current_msgs: list, session_id: str,
             "通常因回复达到 max_tokens 被截断。请重新调用该工具，保证参数 JSON 完整闭合。"
         )
         current_msgs.append({"role": "tool", "tool_call_id": call_id, "content": result})
-        return True, [{"event": "tool_end", "call_id": call_id, "tool": tool_name, "result": result}]
+        return True, [{"event": "tool_end", "call_id": call_id, "tool": tool_name, "result": result, "ts": int(time.time() * 1000)}]
 
     # ── User confirmation ──
     _access = _normalize_access(access_mode)
@@ -1119,7 +1119,7 @@ async def _handle_tool_execution(tc: dict, current_msgs: list, session_id: str,
         approved, events = await _await_tool_confirmation(call_id, tool_name, args)
         if not approved:
             result = f"⛔ User denied this operation: {tool_name}"
-            events.append({"event": "tool_end", "call_id": call_id, "tool": tool_name, "result": result})
+            events.append({"event": "tool_end", "call_id": call_id, "tool": tool_name, "result": result, "ts": int(time.time() * 1000)})
             current_msgs.append({"role": "tool", "tool_call_id": call_id, "content": result})
             return True, events
     else:
@@ -1129,12 +1129,12 @@ async def _handle_tool_execution(tc: dict, current_msgs: list, session_id: str,
     vetoed, hook_events, veto_msg = _check_pre_hooks(tool_name, args)
     events.extend(hook_events)
     if vetoed:
-        events.append({"event": "tool_end", "call_id": call_id, "tool": tool_name, "result": veto_msg})
+        events.append({"event": "tool_end", "call_id": call_id, "tool": tool_name, "result": veto_msg, "ts": int(time.time() * 1000)})
         current_msgs.append({"role": "tool", "tool_call_id": call_id, "content": veto_msg})
         return True, events
 
     # ── Execute + Post-hooks ──
-    events.append({"event": "tool_start", "call_id": call_id, "tool": tool_name, "args": args})
+    events.append({"event": "tool_start", "call_id": call_id, "tool": tool_name, "args": args, "ts": int(time.time() * 1000)})
     logger.info("Tool executing: %s %s", tool_name, json.dumps(args, ensure_ascii=False)[:120])
     result = await execute_tool(tool_name, args)
     logger.info("Tool result: %s → %s", tool_name, result[:80].replace("\n", " "))
@@ -1146,7 +1146,7 @@ async def _handle_tool_execution(tc: dict, current_msgs: list, session_id: str,
         except Exception:
             logger.warning("Post-tool hook failed", exc_info=True)
 
-    events.append({"event": "tool_end", "call_id": call_id, "tool": tool_name, "result": result})
+    events.append({"event": "tool_end", "call_id": call_id, "tool": tool_name, "result": result, "ts": int(time.time() * 1000)})
 
     # ── State tracking + Verification + Reflection ──
     _record_progress(f"**{tool_name}**\nArgs: `{json.dumps(args)}`\nResult: {result[:200]}")
@@ -1460,7 +1460,7 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                                     continue
                                 if text_output_delivered:
                                     continue
-                                yield {"reasoning": reasoning}
+                                yield {"reasoning": reasoning, "ts": int(time.time() * 1000)}
 
                             for tc_delta in delta.get("tool_calls", []):
                                 idx = tc_delta.get("index", 0)
@@ -2034,7 +2034,7 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                                     continue
                                 if text_output_delivered:
                                     continue
-                                yield {"reasoning": reasoning}
+                                yield {"reasoning": reasoning, "ts": int(time.time() * 1000)}
                         except (json.JSONDecodeError, KeyError, TypeError, IndexError):
                             pass
                         except Exception:

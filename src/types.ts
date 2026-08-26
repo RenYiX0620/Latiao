@@ -19,6 +19,8 @@ export interface Message {
   toolArgs?: Record<string, unknown>;
   toolResult?: string;
   toolStatus?: "running" | "done" | "error" | "confirming";
+  duration?: number;        // 工具耗时（毫秒）
+  thinkingDuration?: number; // 思考耗时（毫秒）
 }
 
 export interface PendingFile {
