@@ -185,6 +185,7 @@ const T: Record<string, Record<Lang, string>> = {
   "local.tap_to_download": { zh: "点击下载", en: "Tap to DL", ja: "タップでDL", ru: "Нажмите" },
   "local.open_folder": { zh: "打开", en: "Open", ja: "開く", ru: "Открыть" },
   "local.select_file": { zh: "选择模型文件", en: "Select Model File", ja: "モデルファイル選択", ru: "Выбрать файл" },
+  "local.select_dir": { zh: "选择模型目录 (MLX)", en: "Select Model Dir (MLX)", ja: "モデルディレクトリ選択", ru: "Выбрать каталог (MLX)" },
   "local.pause": { zh: "暂停", en: "Pause", ja: "一時停止", ru: "Пауза" },
   "local.cancel": { zh: "取消", en: "Cancel", ja: "取消", ru: "Отмена" },
   "local.clear_dl": { zh: "清除", en: "Clear", ja: "クリア", ru: "Очистить" },
