@@ -23,7 +23,7 @@
   --accent-soft: rgba(56, 189, 248, 0.12);
   --accent-glow: rgba(56, 189, 248, 0.2);
   --success: #34d399;
-  --success-soft: rgba(52, 211, 153, 0.1);
+  --success-soft: rgba(52, 211, 153, 0.12);
   --warning: #f59e0b;
   --warning-soft: rgba(245, 158, 11, 0.1);
   --danger: #f87171;
@@ -442,7 +442,7 @@ body {
 .task-statusbar-dot { animation: blink 1.2s infinite; }
 /* 对话头像：圆形彩色底 + lucide 图标 */
 .avatar-small {
-  width: 26px; height: 26px; border-radius: 50%; flex-shrink: 0;
+  width: 36px; height: 36px; border-radius: 50%; flex-shrink: 0;
   display: inline-flex; align-items: center; justify-content: center;
   margin-top: 2px;
 }
