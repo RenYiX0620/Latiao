@@ -382,7 +382,7 @@ export default memo(function ChatView({
               <button className="btn-icon" onClick={isRecording ? () => mediaRecorderRef.current?.stop() : startRecording}
                 style={isRecording ? { color: "var(--danger)" } : undefined} title={t("chat.voice")}>{isRecording ? "⏹" : "🎙"}</button>
               <select className="form-input" style={{
-                fontSize: 10, padding: "2px 6px", margin: 0, width: "auto", maxWidth: 130,
+                fontSize: 12, padding: "2px 6px", margin: 0, width: "auto", maxWidth: 130,
                 background: "transparent", border: "0", color: "var(--text-secondary)",
                 cursor: "pointer", outline: "none",
               }} value={accessMode} onChange={(e) => setAccessMode(e.target.value as "read_only" | "confirm" | "auto_edit" | "plan" | "full")}
@@ -394,7 +394,7 @@ export default memo(function ChatView({
                 <option value="full">⚡ {t("chat.access_full")}</option>
               </select>
               <select className="form-input" style={{
-                fontSize: 10, padding: "2px 6px", margin: 0, width: "auto", maxWidth: 110,
+                fontSize: 12, padding: "2px 6px", margin: 0, width: "auto", maxWidth: 110,
                 background: "transparent", border: "0", color: "var(--text-secondary)",
                 cursor: "pointer", outline: "none",
               }} value={thinkingLevel} onChange={(e) => setThinkingLevel(e.target.value as "off" | "high" | "max")}
@@ -406,7 +406,7 @@ export default memo(function ChatView({
             </div>
             <div className="toolbar-right">
               <select className="form-input" style={{
-                fontSize: 11, padding: "2px 6px", margin: 0, width: "auto", maxWidth: 180,
+                fontSize: 12, padding: "2px 6px", margin: 0, width: "auto", maxWidth: 180,
                 background: "transparent", border: "0", color: "var(--text-secondary)",
                 cursor: "pointer", outline: "none",
               }}
