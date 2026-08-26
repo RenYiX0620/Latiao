@@ -166,7 +166,7 @@ export default memo(function ChatView({
           setMinimapHover({ ratio, idx });
         }} onMouseLeave={() => setMinimapHover(null)}>
           {miniBlocks.map(b => (
-            <div key={b.key} className={`mini-block${minimapHover && minimapHover.msg?.id === b.key ? " hover" : ""}`}
+            <div key={b.key} className={`mini-block${minimapHover && minimapHover.idx === b.index ? " hover" : ""}`}
               style={{ background: b.color }} />
           ))}
           <div className="mini-viewport" style={{
