@@ -141,16 +141,32 @@ async def _local_llm_stream(client, api_url: str, body: dict, headers: dict):
                     "本地模型引擎状态异常，已自动停止。请重新加载本地模型。"
                 )
             _llm_suspect_since = None
-        try:
-            async with client.stream("POST", api_url, json=body, headers=headers) as r:
-                r.raise_for_status()  # httpx 不自动抛 4xx/5xx，必须显式检查
-                yield r
-        except asyncio.CancelledError:
-            if _is_local_llm_url(api_url):
-                # 流被取消（用户点停止/发了新消息）→ 引擎生成线程可能残留
-                # 并继续跑 llama.cpp，下次请求前必须验证健康
-                _llm_suspect_since = _llm_suspect_since or time.monotonic()
-            raise
+        # 引擎短暂闪断（404/503，如 mlx_lm 高负载重启窗口）自动重试，
+        # 避免整轮任务因一次瞬时不可用被判死。
+        # 生成器语义：yield 之后消费者持有 r 直到读完，无法重试；
+        # 只对"连接建立即失败"（还没 yield 过）的情况重试。
+        last_err: Exception | None = None
+        for _attempt in range(4):
+            try:
+                async with client.stream("POST", api_url, json=body, headers=headers) as r:
+                    r.raise_for_status()  # httpx 不自动抛 4xx/5xx，必须显式检查
+                    try:
+                        yield r
+                    except asyncio.CancelledError:
+                        if _is_local_llm_url(api_url):
+                            # 流被取消（用户点停止/发了新消息）-> 引擎生成线程可能残留
+                            # 并继续跑 llama.cpp，下次请求前必须验证健康
+                            _llm_suspect_since = _llm_suspect_since or time.monotonic()
+                        raise
+                    return
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code in (404, 503) and _attempt < 3:
+                    last_err = e
+                    await asyncio.sleep(3 + 3 * _attempt)  # 3s/6s/9s 递增退避
+                    continue
+                raise
+        if last_err is not None:
+            raise last_err
 
 # ═══════════════════════════════════════════════════════
 #  Multi-Agent System: LaTiao orchestrator + specialists
