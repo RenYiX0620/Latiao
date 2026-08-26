@@ -176,29 +176,47 @@ export default memo(function ChatView({
         </div>
         {/* 悬停预览浮层（ZCode 式：以悬停位置为起点的连续对话流） */}
         {minimapHover && messages[minimapHover.idx] && (() => {
-          // 向上回溯到最近的用户提问（对话从提问开始最自然）
+          // 向上回溯到最近的用户提问
           let start = minimapHover.idx;
           while (start > 0 && messages[start].role !== "user") start--;
-          const previewMsgs: { m: Message; i: number }[] = [];
-          for (let i = start; i < messages.length && previewMsgs.length < 10; i++) {
+          // 收集预览条目：连续工具合并为一行"执行了 N 个工具调用"，对话消息占主要篇幅
+          const entries: { icon: string; text: string; isCurrent: boolean; key: string }[] = [];
+          let toolRun = 0;
+          const flushTools = () => {
+            if (toolRun > 0) {
+              entries.push({ icon: "🔧", text: `执行了 ${toolRun} 个工具调用`, isCurrent: false, key: `tools${entries.length}` });
+              toolRun = 0;
+            }
+          };
+          for (let i = start; i < messages.length && entries.length < 10; i++) {
             const m = messages[i];
-            if (m.role === "tool" || (m.content || "").trim()) previewMsgs.push({ m, i });
+            const isCur = i === minimapHover.idx;
+            if (m.role === "tool") {
+              toolRun++;
+              // 悬停在工具上时，该工具单独显示（当前行高亮）
+              if (isCur) {
+                flushTools();
+                entries.push({ icon: "◆", text: `${m.toolName || "工具"} · 执行中/完成`, isCurrent: true, key: m.id || `t${i}` });
+              }
+            } else if ((m.content || "").trim()) {
+              flushTools();
+              const text = (m.content || "").replace(/[#*|`>-]/g, "").replace(/\s+/g, " ").slice(0, 110);
+              entries.push({
+                icon: m.role === "user" ? "🧑" : "🤖",
+                text, isCurrent: isCur, key: m.id || `m${i}`,
+              });
+            }
           }
-          if (previewMsgs.length === 0) return null;
+          flushTools();
+          if (entries.length === 0) return null;
           return (
             <div className="mini-preview">
-              {previewMsgs.map(({ m, i }) => {
-                const text = m.role === "tool"
-                  ? `${m.toolName || "工具"} · 执行完成`
-                  : (m.content || "").replace(/[#*|`>-]/g, "").replace(/\s+/g, " ").slice(0, 110);
-                const icon = m.role === "user" ? "🧑" : m.role === "tool" ? "◆" : "🤖";
-                return (
-                  <div key={m.id || i} className={`mini-preview-line${i === minimapHover.idx ? " current" : ""}`}>
-                    <span className="mini-preview-icon">{icon}</span>
-                    <span>{text}</span>
-                  </div>
-                );
-              })}
+              {entries.map(e => (
+                <div key={e.key} className={`mini-preview-line${e.isCurrent ? " current" : ""}`}>
+                  <span className="mini-preview-icon">{e.icon}</span>
+                  <span>{e.text}</span>
+                </div>
+              ))}
             </div>
           );
         })()}
