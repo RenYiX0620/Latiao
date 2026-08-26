@@ -270,11 +270,11 @@ body {
 .view-panel { display: none; flex: 1; flex-direction: column; overflow: hidden; }
 .view-panel.active { display: flex; }
 
-#view-chat.view-panel.active { display: grid; grid-template-rows: 1fr auto; }
+#view-chat.view-panel.active { display: grid; grid-template-rows: 1fr auto; min-width: 0; }
 
 /* ── Chat Area ── */
 .chat-area { flex: 1; overflow-y: auto; padding: 28px 40px; display: flex; flex-direction: column; min-height: 0; }
-.chat-scroll { flex: 1; overflow-y: auto; padding: 24px 32px 12px; display: flex; flex-direction: column; min-height: 0; }
+.chat-scroll { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 24px 32px 12px; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
 .chat-empty {
   display: flex; flex-direction: column; align-items: center; justify-content: center;
   flex: 1; color: var(--text-muted); gap: 8px;
@@ -307,6 +307,7 @@ body {
   background: transparent; border: none; padding: 2px 0;
   color: var(--text-primary);
 }
+.msg-bubble table { display: block; max-width: 100%; overflow-x: auto; border-collapse: collapse; }
 .msg-bubble h1, .msg-bubble h2, .msg-bubble h3 { font-size: 15px; font-weight: 600; margin: 4px 0 2px; }
 .msg-bubble code {
   font-family: var(--font-mono); font-size: 11.5px;
@@ -424,7 +425,7 @@ body {
 .tool-group-row-meta { color: var(--text-disabled); font-size: 10.5px; }
 .tool-group-row-chevron { display: inline-flex; align-items: center; color: var(--text-muted); }
 
-.chat-wrap { position: relative; flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.chat-wrap { position: relative; flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
 
 /* 消息导航缩略图 minimap（ZCode 式：悬停显示内容预览） */
 .chat-minimap {
