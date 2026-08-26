@@ -136,6 +136,8 @@ export default memo(function ChatView({
     return groups;
   }, [messages]);
   const [collapsedGroups, setCollapsedGroups] = useState<Record<string, boolean>>({});
+  // minimap 悬停预览：hoverRatio + 对应消息预览
+  const [minimapHover, setMinimapHover] = useState<{ ratio: number; msg: Message | null } | null>(null);
   const groupCollapsed = (gkey: string) => collapsedGroups[gkey] !== false;  // 默认折叠
 
   // 状态栏数据：轮数（user 消息数）、工具调用数、消息数、token 估算
@@ -154,14 +156,26 @@ export default memo(function ChatView({
         </div>
       )}
       {messages.length > 8 && (
+        <>
         <div className="chat-minimap" onClick={(e) => {
           const rect = e.currentTarget.getBoundingClientRect();
           jumpTo((e.clientY - rect.top) / rect.height);
-        }}>
+        }} onMouseMove={(e) => {
+          const rect = e.currentTarget.getBoundingClientRect();
+          const ratio = Math.min(1, Math.max(0, (e.clientY - rect.top) / rect.height));
+          // 定位到消息：总长度比例 → 消息索引
+          const totalL = Math.max(1, miniBlocks.reduce((a, c) => a + c.h, 0));
+          let acc = 0, idx = 0;
+          for (const b of miniBlocks) {
+            acc += b.h;
+            if (acc / totalL >= ratio) { idx = b.index; break; }
+          }
+          setMinimapHover({ ratio, msg: messages[idx] || null });
+        }} onMouseLeave={() => setMinimapHover(null)}>
           {miniBlocks.map(b => (
-            <div key={b.key} className="mini-block" style={{
+            <div key={b.key} className={`mini-block${minimapHover && minimapHover.msg?.id === b.key ? " hover" : ""}`} style={{
               height: `${b.h / miniBlocks.reduce((a, c) => a + c.h, 0) * 100}%`,
-              background: b.color, opacity: 0.55,
+              background: b.color,
             }} />
           ))}
           <div className="mini-viewport" style={{
@@ -169,6 +183,19 @@ export default memo(function ChatView({
             height: `${(scrollInfo.viewH / scrollInfo.totalH) * 100}%`,
           }} />
         </div>
+        {/* 悬停预览浮层（ZCode 式：显示该位置内容摘要） */}
+        {minimapHover?.msg && (
+          <div className="mini-preview">
+            <div className="mini-preview-role">
+              {minimapHover.msg.role === "user" ? "🧑 你" :
+               minimapHover.msg.role === "tool" ? `◆ ${minimapHover.msg.toolName || "工具"}` : "🤖 辣条"}
+            </div>
+            <div className="mini-preview-text">
+              {(minimapHover.msg.content || minimapHover.msg.toolResult || "(无内容)").replace(/[#*|`>-]/g, "").slice(0, 140)}
+            </div>
+          </div>
+        )}
+        </>
       )}
       <div className="chat-scroll" ref={scrollRef} onDrop={handleDrop} onDragOver={(e) => { if (handleDrop) e.preventDefault(); }}>
         {messages.map((msg, i) => {
