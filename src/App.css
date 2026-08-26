@@ -440,7 +440,9 @@ body {
   border-bottom: 1px solid var(--border-default); flex-shrink: 0;
 }
 .task-statusbar-dot { animation: blink 1.2s infinite; }
-/* 对话头像：圆形彩色底 + lucide 图标 */
+/* 对话头像：圆形彩色底 + lucide 图标（与消息内容同行） */
+.msg-row { display: flex; align-items: flex-start; gap: 10px; padding: 4px 0; }
+.msg-content { flex: 1; min-width: 0; }
 .avatar-small {
   width: 36px; height: 36px; border-radius: 50%; flex-shrink: 0;
   display: inline-flex; align-items: center; justify-content: center;
