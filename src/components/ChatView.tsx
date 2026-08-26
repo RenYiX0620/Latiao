@@ -198,7 +198,7 @@ export default memo(function ChatView({
               } catch { /* 参数不可序列化时忽略 */ }
               entries.push({
                 icon: "◆",
-                text: `${m.toolName || "工具"}${args ? " · " + args : ""}`.slice(0, 90),
+                text: `${m.toolName || "工具"}${args ? " · " + args.slice(0, 48) : ""}`.slice(0, 80),
                 isCurrent: isCur, key: m.id || `t${i}`,
               });
             } else if ((m.content || "").trim()) {
