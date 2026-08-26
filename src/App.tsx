@@ -1183,7 +1183,7 @@ const [timeFilter, setTimeFilter] = useState("all");
             <button key={s.id} className={`session-item${idx === currentIdx ? " active" : ""}`} onClick={() => switchSession(idx)}>
               <span className="session-info">
                 <div className="session-name">{s.name.startsWith("session.") ? t(s.name) : s.name}</div>
-                <div className="session-preview">{s.messages.length > 0 ? (s.messages[s.messages.length - 1].content || "").slice(0, 30) + "..." : t("session.default")}</div>
+                <div className="session-preview">{s.messages.length > 0 ? (s.messages[s.messages.length - 1].content || "").replace(/[#*|`>-]/g, " ").replace(/\s+/g, " ").slice(0, 30) + "..." : t("session.default")}</div>
               </span>
               <span className="session-delete-btn" style={idx === currentIdx ? { opacity: 1 } : undefined}
                 onClick={(e) => { e.stopPropagation(); deleteSession(idx); }}>×</span>

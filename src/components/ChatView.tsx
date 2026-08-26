@@ -1,9 +1,9 @@
 import { memo, lazy, Suspense, useCallback, useState, useMemo, useRef, useEffect } from "react";
 import type { Message, PendingFile } from "../types";
 import { useTranslation } from "../i18n";
-import ToolCallBubble from "./ToolCallBubble";
+import ToolCallBubble, { TOOL_ICONS } from "./ToolCallBubble";
 import ToolbarSelect from "./ToolbarSelect";
-import { Eye, ShieldCheck, PencilRuler, ListChecks, Zap, CircleOff, Brain, BrainCircuit, Bot, User, ChevronRight, ChevronDown } from "lucide-react";
+import { Eye, ShieldCheck, PencilRuler, ListChecks, Zap, CircleOff, Brain, BrainCircuit, Bot, User, ChevronRight, ChevronDown, Wrench } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import remarkGfm from "remark-gfm";
@@ -218,55 +218,30 @@ export default memo(function ChatView({
   }, [messages]);
   const [collapsedSegs, setCollapsedSegs] = useState<Record<string, boolean>>({});
 
-  // 单条消息渲染（段内复用；hideActivities=头部折叠时隐藏思考/工具，正文常驻）
-  const renderMsg = (msg: Message, i: number, hideActivities: boolean) => {
-          if (msg.role === "tool" || msg.type === "tool_call") {
-            if (hideActivities) return null;
-            // 活动摘要行（ZCode 式）：每个工具调用独立一行，点击展开结果
-            return <ToolCallBubble key={msg.id || i} msg={msg} onConfirm={confirmTool} />;
-          }
+  // 单条消息渲染（段内复用；思考内容由段渲染器提前提取为独立活动行，此处只渲染正文）
+  const renderMsg = (msg: Message, i: number) => {
           if (msg.role === "assistant") {
+            const localThink = msg.content.match(/^<think>([\s\S]*?)<\/think>\s*/);
+            const bodyText = localThink ? msg.content.slice(localThink[0].length) : msg.content;
             return (
               <div key={msg.id || i} className={`msg-row assistant${msg.type === "file" ? " file" : ""}`}>
                 <div className="avatar-small avatar-bot"><Bot size={19} strokeWidth={2} /></div>
                 <div className="msg-content">
-                  <div className="msg-bubble assistant">
-                    {(() => {
-                      // 思考内容显示：后端 reasoning 字段（推理模型）或本地 <think> 标签
-                      const localThink = msg.content.match(/^<think>([\s\S]*?)<\/think>\s*/);
-                      const thinkText = msg.thinking || (localThink ? localThink[1] : null);
-                      const bodyText = localThink ? msg.content.slice(localThink[0].length) : msg.content;
-                      return (
-                        <>
-                          {thinkText && !hideActivities && (
-                            <details className="thinking-block">
-                              <summary className="thinking-summary">
-                                <Brain size={13} />
-                                <span>思考过程</span>
-                                {msg.thinkingDuration !== undefined && (
-                                  <span className="thinking-meta">· 持续了 {fmtDur(msg.thinkingDuration)}</span>
-                                )}
-                              </summary>
-                              <div>{thinkText}</div>
-                            </details>
-                          )}
-                          {bodyText && (
-                            <ReactMarkdown remarkPlugins={[remarkGfm]} components={
-                              {
-                                code: ({ inline, className, children, ...props }: { inline?: boolean; className?: string; children?: React.ReactNode }) =>
-                                  inline
-                                    ? <code className={className} {...props}>{children}</code>
-                                    : <CodeBlock language={(className || "").replace("language-", "")}>{String(children)}</CodeBlock>,
-                                a: ({ href, children }: { href?: string; children?: React.ReactNode }) => (
-                                  <a href={href} onClick={(e) => { e.preventDefault(); if (href) openUrl(href); }}>{children}</a>
-                                ),
-                              }
-                            }>{bodyText}</ReactMarkdown>
-                          )}
-                        </>
-                      );
-                    })()}
-                  </div>
+                  {bodyText && (
+                    <div className="msg-bubble assistant">
+                      <ReactMarkdown remarkPlugins={[remarkGfm]} components={
+                        {
+                          code: ({ inline, className, children, ...props }: { inline?: boolean; className?: string; children?: React.ReactNode }) =>
+                            inline
+                              ? <code className={className} {...props}>{children}</code>
+                              : <CodeBlock language={(className || "").replace("language-", "")}>{String(children)}</CodeBlock>,
+                          a: ({ href, children }: { href?: string; children?: React.ReactNode }) => (
+                            <a href={href} onClick={(e) => { e.preventDefault(); if (href) openUrl(href); }}>{children}</a>
+                          ),
+                        }
+                      }>{bodyText}</ReactMarkdown>
+                    </div>
+                  )}
                   <div className="msg-actions">
                     <button className="btn-icon" title={t("chat.copy")} onClick={() => {
                       navigator.clipboard?.writeText(msg.content).then(() => showToast(t("chat.copied"))).catch(() => showToast(t("chat.copy_fail"), "warn"));
@@ -322,14 +297,6 @@ export default memo(function ChatView({
   return (
     <>
       <div className="chat-wrap">
-      {/* 任务头部：已工作计时（工具执行 / 回复生成期间显示） */}
-      {taskStartAt && (activeTask || isProcessing) && (
-        <div className="task-statusbar">
-          <span className="task-statusbar-dot">▣</span>
-          <span className="task-statusbar-label">已工作 {fmtDur(elapsed)}</span>
-          {activeTask && <span className="task-statusbar-sub">{activeTask.slice(0, 60)}</span>}
-        </div>
-      )}
       {messages.length > 8 && (
         <>
         <div className="chat-minimap" onClick={(e) => {
@@ -338,7 +305,6 @@ export default memo(function ChatView({
         }} onMouseMove={(e) => {
           const rect = e.currentTarget.getBoundingClientRect();
           const ratio = Math.min(1, Math.max(0, (e.clientY - rect.top) / rect.height));
-          // 均匀块：索引 = ratio * 消息数
           const idx = Math.min(miniBlocks.length - 1, Math.floor(ratio * miniBlocks.length));
           setMinimapHover({ ratio, idx });
         }} onMouseLeave={() => setMinimapHover(null)}>
@@ -353,7 +319,6 @@ export default memo(function ChatView({
         </div>
         {/* 悬停预览浮层（ZCode 式：以悬停消息为中心的滑动窗口对话流） */}
         {minimapHover && messages[minimapHover.idx] && (() => {
-          // 以悬停消息为中心：上下各 4 条；工具逐条展开（不折叠），保证滑过每张卡片内容都不同
           const cur = minimapHover.idx;
           const lo = Math.max(0, cur - 4);
           const hi = Math.min(messages.length - 1, cur + 4);
@@ -382,7 +347,6 @@ export default memo(function ChatView({
             }
           }
           if (entries.length === 0) return null;
-          // 预览跟随悬停位置上下滑动（clamp 到可视范围内）
           const follow = Math.max(0, Math.min(scrollInfo.viewH - 320, minimapHover.ratio * Math.max(0, scrollInfo.viewH - 320)));
           return (
             <div className="mini-preview" style={{ top: 34 + follow }}>
@@ -404,21 +368,71 @@ export default memo(function ChatView({
           const segDur = seg.startTs && seg.endTs ? Math.max(0, seg.endTs - seg.startTs) : 0;
           const qMsg = seg.msgs.find((m) => m.role === "user");
           const qText = (qMsg?.content || "").replace(/\s+/g, " ").slice(0, 24);
-          // 进行中的对话段（最后一段）：实时计时
+          // 进行中的对话段（最后一段）：实时计时 + 当前工具
           const live = si === segments.length - 1 && taskStartAt !== null && (isProcessing || activeTask !== null);
           const label = live
-            ? `${qText ? qText + " · " : ""}已工作 ${fmtDur(elapsed)}`
-            : segDur > 0
-              ? `${qText ? qText + " · " : ""}已工作 ${fmtDur(segDur)}`
-              : qText || "对话";
+            ? `已工作 ${fmtDur(elapsed)}${activeTask ? " · " + activeTask.slice(0, 40) : ""}`
+            : segDur > 0 ? `已工作 ${fmtDur(segDur)}` : qText || "对话";
+          // ZCode 分区渲染：用户消息 → 思考活动行 → 计划 → 工具聚合行 → 回答正文
+          const userMsgs = seg.msgs.filter((m) => m.role === "user");
+          const asstMsgs = seg.msgs.filter((m) => m.role === "assistant");
+          const toolMsgs = seg.msgs.filter((m) => m.role === "tool" || m.type === "tool_call");
+          const thinkRows: { key: string; text: string; dur?: number }[] = [];
+          for (const m of asstMsgs) {
+            const localThink = m.content.match(/^<think>([\s\S]*?)<\/think>\s*/);
+            const thinkText = m.thinking || (localThink ? localThink[1] : null);
+            if (thinkText) thinkRows.push({ key: m.id || `thk${thinkRows.length}`, text: thinkText, dur: m.thinkingDuration });
+          }
+          const planMsgs = asstMsgs.filter((m) => m.content.startsWith("📋"));
+          const answerMsgs = asstMsgs.filter((m) => !m.content.startsWith("📋"));
+          const toolGroups: { name: string; msgs: Message[] }[] = [];
+          for (const m of toolMsgs) {
+            const name = m.toolName || "工具";
+            const last = toolGroups[toolGroups.length - 1];
+            if (last && last.name === name) last.msgs.push(m);
+            else toolGroups.push({ name, msgs: [m] });
+          }
           return (
             <div key={segKey} className={`chat-segment${collapsed ? " collapsed" : ""}`}>
               <button className="chat-segment-head" onClick={() => setCollapsedSegs(p => ({ ...p, [segKey]: !collapsed }))}>
-                <span className="chat-segment-dot">▣</span>
                 <span className="chat-segment-label">{label}</span>
                 <span className="chat-segment-chevron">{collapsed ? <ChevronRight size={13} /> : <ChevronDown size={13} />}</span>
               </button>
-              {seg.msgs.map((m, i) => renderMsg(m, i, collapsed))}
+              {userMsgs.map((m, i) => renderMsg(m, i))}
+              {!collapsed && thinkRows.map((r) => (
+                <details key={`thk${r.key}`} className="thinking-row">
+                  <summary className="thinking-row-head">
+                    <Brain size={13} />
+                    <span>思考过程</span>
+                    {r.dur !== undefined && <span className="thinking-meta">· 持续了 {fmtDur(r.dur)}</span>}
+                  </summary>
+                  <div className="thinking-row-body">{r.text}</div>
+                </details>
+              ))}
+              {!collapsed && planMsgs.map((m, i) => renderMsg(m, i))}
+              {!collapsed && toolGroups.map((g, gi) => {
+                const ToolIcon = TOOL_ICONS[g.name] || Wrench;
+                const totalDur = g.msgs.reduce((s, m) => s + (m.duration || 0), 0);
+                const hasRunning = g.msgs.some((m) => m.toolStatus === "running");
+                if (g.msgs.length === 1) {
+                  return <ToolCallBubble key={g.msgs[0].id || `t${gi}`} msg={g.msgs[0]} onConfirm={confirmTool} />;
+                }
+                return (
+                  <details key={`tg${g.name}${gi}`} className="tool-group-row">
+                    <summary className="tool-group-row-head">
+                      <span className="tool-call-icon" style={{ color: hasRunning ? "var(--accent)" : "var(--text-muted)" }}><ToolIcon size={14} /></span>
+                      <span className="tool-call-name">{g.name}</span>
+                      <span className="tool-group-row-meta">· {g.msgs.length} 次调用</span>
+                      {totalDur > 0 && <span className="tool-call-duration">· {fmtDur(totalDur)}</span>}
+                      <span className="tool-group-row-chevron"><ChevronDown size={12} /></span>
+                    </summary>
+                    <div className="tool-group-row-body">
+                      {g.msgs.map((m) => <ToolCallBubble key={m.id} msg={m} onConfirm={confirmTool} />)}
+                    </div>
+                  </details>
+                );
+              })}
+              {!collapsed && answerMsgs.map((m, i) => renderMsg(m, i))}
             </div>
           );
         })}
