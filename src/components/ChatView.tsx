@@ -1,4 +1,4 @@
-import { memo, lazy, Suspense, useCallback, useState, useMemo } from "react";
+import { memo, lazy, Suspense, useCallback, useState, useMemo, useRef, useEffect } from "react";
 import type { Message, PendingFile } from "../types";
 import { useTranslation } from "../i18n";
 import ToolCallBubble from "./ToolCallBubble";
@@ -88,6 +88,38 @@ export default memo(function ChatView({
   };
   const fmtTime = (ts?: number) => ts ? new Date(ts).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false }) : "";
 
+  // ── 消息导航缩略图（minimap）：长会话右侧迷你图，点击/拖动跳转 ──
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const [scrollInfo, setScrollInfo] = useState({ top: 0, viewH: 0, totalH: 1 });
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const onScroll = () => setScrollInfo({ top: el.scrollTop, viewH: el.clientHeight, totalH: el.scrollHeight || 1 });
+    onScroll();
+    el.addEventListener("scroll", onScroll, { passive: true });
+    const ro = new ResizeObserver(onScroll);
+    ro.observe(el);
+    return () => { el.removeEventListener("scroll", onScroll); ro.disconnect(); };
+  }, [messages.length]);
+
+  // 每条消息 → 色块（高度按内容占比）
+  const miniBlocks = useMemo(() => {
+    const lens = messages.map(m => Math.max(1, (m.content || "").length + (m.thinking || "").length + 40));
+    const total = lens.reduce((a, b) => a + b, 1);
+    return messages.map((m, i) => ({
+      index: i,
+      h: Math.max(3, Math.round((lens[i] / total) * 100)),   // 百分比
+      color: m.role === "user" ? "var(--accent)" : m.role === "tool" ? "var(--text-disabled)" : "var(--success)",
+      key: m.id || `m${i}`,
+    }));
+  }, [messages]);
+
+  const jumpTo = (ratio: number) => {
+    const el = scrollRef.current;
+    if (!el) return;
+    el.scrollTop = ratio * (el.scrollHeight - el.clientHeight);
+  };
+
   // 连续工具调用分组折叠（ZCode 式）：组首索引 → 组内工具数量
   const toolGroups = useMemo(() => {
     const groups = new Map<number, number>();
@@ -113,6 +145,7 @@ export default memo(function ChatView({
 
   return (
     <>
+      <div className="chat-wrap">
       {/* 任务执行状态条（工具执行中显示，完成后消失） */}
       {activeTask && (
         <div className="task-statusbar">
@@ -120,7 +153,24 @@ export default memo(function ChatView({
           <span className="task-statusbar-label">{t("chat.task_running")} · {activeTask}</span>
         </div>
       )}
-      <div className="chat-scroll" onDrop={handleDrop} onDragOver={(e) => { if (handleDrop) e.preventDefault(); }}>
+      {messages.length > 8 && (
+        <div className="chat-minimap" onClick={(e) => {
+          const rect = e.currentTarget.getBoundingClientRect();
+          jumpTo((e.clientY - rect.top) / rect.height);
+        }}>
+          {miniBlocks.map(b => (
+            <div key={b.key} className="mini-block" style={{
+              height: `${b.h / miniBlocks.reduce((a, c) => a + c.h, 0) * 100}%`,
+              background: b.color, opacity: 0.55,
+            }} />
+          ))}
+          <div className="mini-viewport" style={{
+            top: `${(scrollInfo.top / Math.max(1, scrollInfo.totalH - scrollInfo.viewH)) * 100}%`,
+            height: `${(scrollInfo.viewH / scrollInfo.totalH) * 100}%`,
+          }} />
+        </div>
+      )}
+      <div className="chat-scroll" ref={scrollRef} onDrop={handleDrop} onDragOver={(e) => { if (handleDrop) e.preventDefault(); }}>
         {messages.map((msg, i) => {
           if (msg.role === "tool" || msg.type === "tool_call") {
             const gcount = toolGroups.get(i);
@@ -237,6 +287,7 @@ export default memo(function ChatView({
           );
         })}
         <div ref={chatEndRef}></div>
+      </div>
       </div>
 
       <div className="input-area">

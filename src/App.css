@@ -370,6 +370,22 @@ body {
 .thinking-block summary { cursor: pointer; font-size: 11px; color: var(--accent); user-select: none; }
 .thinking-block div { font-size: 11px; color: var(--text-muted); line-height: 1.5; margin-top: 4px; max-height: 160px; overflow-y: auto; white-space: pre-wrap; }
 
+.chat-wrap { position: relative; flex: 1; min-height: 0; display: flex; flex-direction: column; }
+
+/* 消息导航缩略图 minimap */
+.chat-minimap {
+  position: absolute; right: 10px; top: 34px; bottom: 14px; width: 14px;
+  border-radius: 7px; background: var(--bg-input); opacity: 0.85;
+  cursor: pointer; overflow: hidden; display: flex; flex-direction: column;
+}
+.chat-minimap:hover { opacity: 1; }
+.mini-block { width: 6px; margin: 1px auto; border-radius: 3px; flex-shrink: 0; }
+.mini-viewport {
+  position: absolute; left: 1px; right: 1px; border-radius: 6px;
+  background: rgba(255,255,255,0.35); border: 1px solid rgba(255,255,255,0.5);
+  pointer-events: none;
+}
+
 /* 任务执行状态条（top of chat） */
 .task-statusbar {
   display: flex; align-items: center; gap: 6px; padding: 5px 24px;
