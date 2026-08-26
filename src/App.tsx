@@ -141,6 +141,7 @@ const [timeFilter, setTimeFilter] = useState("all");
   const [isProcessing, setIsProcessing] = useState(false);
   // 当前执行中任务摘要（tool_start/tool_end 驱动，顶部状态条展示）
   const [activeTask, setActiveTask] = useState<string | null>(null);
+  const [taskStartAt, setTaskStartAt] = useState<number | null>(null);
   const activeTaskStackRef = useRef<string[]>([]);
   const abortControllerRef = useRef<AbortController | null>(null);
   // 已提示过的 cron 完成事件（ts+task 键），防止 5s 心跳对同一事件反复弹 toast
@@ -758,14 +759,16 @@ const [timeFilter, setTimeFilter] = useState("all");
               } else if (parsed.event === "tool_start") {
                 activeTaskStackRef.current.push(`${parsed.tool || ""} ${JSON.stringify(parsed.args || {}).slice(0, 60)}`);
                 setActiveTask(activeTaskStackRef.current[activeTaskStackRef.current.length - 1] || null);
+                const startTs = Number(parsed.ts) || Date.now();
                 setMessages((prev) => {
                   const msgs = [...prev];
                   const idx = msgs.findIndex((m) => m.callId === parsed.call_id && m.toolStatus === "confirming");
-                  if (idx !== -1) { msgs[idx] = { ...msgs[idx], toolStatus: "running" }; }
+                  if (idx !== -1) { msgs[idx] = { ...msgs[idx], toolStatus: "running", ts: startTs }; }
                   else {
                     msgs.splice(msgs.length - 1, 0, {
                       id: msgId(), role: "tool", type: "tool_call", content: "",
                       callId: parsed.call_id, toolName: parsed.tool, toolArgs: parsed.args, toolStatus: "running",
+                      ts: startTs,
                     });
                   }
                   return msgs;
@@ -778,23 +781,33 @@ const [timeFilter, setTimeFilter] = useState("all");
                   ? rawResult.slice(0, 10000) + `\n\n...(截断)`
                   : rawResult;
                 const isError = rawResult.startsWith("Error") || rawResult.startsWith("⛔");
+                const endTs = Number(parsed.ts) || Date.now();
                 setMessages((prev) => {
                   const msgs = [...prev];
                   const idx = msgs.findIndex((m) => m.callId === parsed.call_id && (m.toolStatus === "running" || m.toolStatus === "confirming"));
                   if (idx !== -1) {
-                    msgs[idx] = { ...msgs[idx], toolResult, toolStatus: isError ? "error" : "done", content: toolResult };
+                    const base = msgs[idx];
+                    msgs[idx] = {
+                      ...base, toolResult, toolStatus: isError ? "error" : "done", content: toolResult,
+                      duration: base.ts ? Math.max(0, endTs - base.ts) : undefined,
+                    };
                   }
                   return msgs;
                 });
               } else if (parsed.reasoning) {
-                // 思考内容：累积到最后一条 assistant 消息的 thinking 字段（灰块展示，不入正文）
+                // 思考内容：累积到最后一条 assistant 消息的 thinking 字段（摘要行展示，不入正文）
+                const rTs = Number(parsed.ts) || Date.now();
                 setMessages((prev) => {
                   const msgs = [...prev];
                   const last = msgs[msgs.length - 1];
                   if (last?.role === "assistant") {
-                    msgs[msgs.length - 1] = { ...last, thinking: (last.thinking || "") + parsed.reasoning };
+                    msgs[msgs.length - 1] = {
+                      ...last,
+                      thinking: (last.thinking || "") + parsed.reasoning,
+                      ts: last.ts ?? rTs, // 思考起点；thinkingDuration 在正文开始输出时结算
+                    };
                   } else {
-                    msgs.push({ id: msgId(), role: "assistant", content: "", thinking: String(parsed.reasoning), ts: Date.now() });
+                    msgs.push({ id: msgId(), role: "assistant", content: "", thinking: String(parsed.reasoning), ts: rTs });
                   }
                   return msgs;
                 });
@@ -803,7 +816,13 @@ const [timeFilter, setTimeFilter] = useState("all");
                 setMessages((prev) => {
                   const msgs = [...prev];
                   const last = msgs[msgs.length - 1];
-                  if (last?.role === "assistant") msgs[msgs.length - 1] = { ...last, content: full };
+                  if (last?.role === "assistant") {
+                    // 正文开始输出 = 思考结束，结算思考耗时
+                    const updated = last.thinkingDuration === undefined && last.thinking
+                      ? { ...last, content: full, thinkingDuration: Math.max(0, Date.now() - (last.ts || Date.now())) }
+                      : { ...last, content: full };
+                    msgs[msgs.length - 1] = updated;
+                  }
                   return msgs;
                 });
               }
@@ -875,6 +894,7 @@ const [timeFilter, setTimeFilter] = useState("all");
     setPrompt("");
     setIsProcessing(true);
     setAgentPhase(t("agent.phase_analyze"));
+    setTaskStartAt(Date.now()); // 任务头部"已工作"计时起点
 
     const userMsg: Message = { id: msgId(), role: "user", content: text || "Analyze this file", ts: Date.now() };
     if (pendingFile) {
@@ -1226,6 +1246,7 @@ const [timeFilter, setTimeFilter] = useState("all");
             contextEstimate={contextEstimate}
             showToast={showToast}
             activeTask={activeTask}
+            taskStartAt={taskStartAt}
           />
         </div>
 

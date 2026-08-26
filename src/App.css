@@ -395,10 +395,19 @@ body {
 .msg-actions .btn-icon.active { color: var(--accent); background: var(--accent-soft); border-radius: 4px; }
 .msg-time { font-size: 10px; color: var(--text-disabled); margin-left: 6px; }
 
-/* 思考过程块（灰色可折叠） */
-.thinking-block { margin-bottom: 8px; border-left: 3px solid var(--border-accent); background: var(--bg-input); border-radius: var(--radius-sm); padding: 6px 10px; }
-.thinking-block summary { cursor: pointer; font-size: 11px; color: var(--accent); user-select: none; }
-.thinking-block div { font-size: 11px; color: var(--text-muted); line-height: 1.5; margin-top: 4px; max-height: 160px; overflow-y: auto; white-space: pre-wrap; }
+/* 思考过程块（灰色可折叠摘要行：图标 + 标题 · 耗时，点开展开全文） */
+.thinking-block { margin-bottom: 4px; border-radius: var(--radius-sm); }
+.thinking-block summary {
+  cursor: pointer; font-size: 11px; color: var(--text-muted); user-select: none;
+  display: inline-flex; align-items: center; gap: 5px; padding: 2px 4px;
+  border-radius: var(--radius-sm);
+}
+.thinking-block summary:hover { color: var(--text-secondary); background: var(--bg-input); }
+.thinking-meta { color: var(--text-disabled); }
+.thinking-block div {
+  font-size: 11px; color: var(--text-muted); line-height: 1.5; margin-top: 4px; max-height: 160px; overflow-y: auto; white-space: pre-wrap;
+  background: var(--bg-input); border-radius: var(--radius-sm); padding: 6px 10px;
+}
 
 .chat-wrap { position: relative; flex: 1; min-height: 0; display: flex; flex-direction: column; }
 
@@ -433,13 +442,15 @@ body {
 .mini-preview-line.current { color: var(--text-primary); font-weight: 550; }
 .mini-preview-icon { flex-shrink: 0; font-size: 10px; }
 
-/* 任务执行状态条（top of chat） */
+/* 任务头部：已工作计时（ZCode 式：任务执行期间显示） */
 .task-statusbar {
   display: flex; align-items: center; gap: 6px; padding: 5px 24px;
   font-size: 11px; color: var(--text-secondary); background: var(--bg-input);
   border-bottom: 1px solid var(--border-default); flex-shrink: 0;
 }
 .task-statusbar-dot { animation: blink 1.2s infinite; }
+.task-statusbar-label { font-family: var(--font-mono); opacity: 0.85; }
+.task-statusbar-sub { color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* 对话头像：圆形彩色底 + lucide 图标（与消息内容同行） */
 .msg-row { display: flex; align-items: flex-start; gap: 10px; padding: 4px 0; }
 .msg-content { flex: 1; min-width: 0; }
@@ -494,24 +505,21 @@ body {
 .btn-stop:hover { filter: brightness(1.15); transform: translateY(-1px); box-shadow: 0 4px 16px rgba(239,68,68,0.3); }
 .btn-stop:active { transform: translateY(0); }
 
-/* ── Tool Call ── */
+/* ── Tool Call（活动摘要行：紧凑单行，点开展开结果） ── */
 .tool-call {
-  display: block; width: 100%; margin-bottom: 4px;
-  border-radius: var(--radius-sm); border-left: 3px solid var(--border-default);
-  background: transparent; overflow: hidden; font-size: 11px;
+  display: block; width: 100%; margin: 1px 0;
+  background: transparent; overflow: hidden; font-size: 11.5px;
 }
-.tool-call.running { border-left-color: var(--accent); }
-.tool-call.done { border-left-color: var(--success); }
-.tool-call.error { border-left-color: var(--danger); }
-.tool-call.confirming { border-left-color: var(--warning); }
 .tool-call-header {
-  display: flex; align-items: center; gap: 6px;
-  padding: 4px 8px; cursor: pointer; user-select: none;
+  display: flex; align-items: center; gap: 7px;
+  padding: 3px 6px; cursor: pointer; user-select: none;
+  color: var(--text-secondary); border-radius: var(--radius-sm);
 }
-.tool-call-header:hover { background: var(--bg-input); border-radius: var(--radius-sm); }
-.tool-call-name { font-weight: 600; color: var(--text-primary); }
+.tool-call-header:hover { background: var(--bg-input); color: var(--text-primary); }
+.tool-call-name { font-weight: 550; color: inherit; }
 .tool-call-args { color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
 .tool-call-icon { display: inline-flex; align-items: center; flex-shrink: 0; }
+.tool-call-duration { color: var(--text-disabled); flex-shrink: 0; font-size: 10.5px; }
 .tool-call-chevron { display: inline-flex; align-items: center; color: var(--text-muted); }
 .tool-call-spinner { display: inline-flex; color: var(--accent); animation: spin 1s linear infinite; }
 .tool-group-collapsed {

@@ -3,7 +3,7 @@ import type { Message, PendingFile } from "../types";
 import { useTranslation } from "../i18n";
 import ToolCallBubble from "./ToolCallBubble";
 import ToolbarSelect from "./ToolbarSelect";
-import { Eye, ShieldCheck, PencilRuler, ListChecks, Zap, CircleOff, Brain, BrainCircuit, ChevronRight, ChevronDown, Bot, User } from "lucide-react";
+import { Eye, ShieldCheck, PencilRuler, ListChecks, Zap, CircleOff, Brain, BrainCircuit, Bot, User } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import remarkGfm from "remark-gfm";
@@ -55,6 +55,7 @@ interface ChatViewProps {
   contextEstimate?: { max_context: number; recommended_context: number } | null;
   showToast: (msg: string, type?: string) => void;
   activeTask: string | null;
+  taskStartAt: number | null;
 }
 
 export default memo(function ChatView({
@@ -65,7 +66,7 @@ export default memo(function ChatView({
   chatEndRef, handleDrop, onPasteImage,
   cloudModels, selectedModel, onSelectModel,
   accessMode, setAccessMode, thinkingLevel, setThinkingLevel,
-  contextEstimate, showToast, activeTask,
+  contextEstimate, showToast, activeTask, taskStartAt,
 }: ChatViewProps) {
   const { t } = useTranslation();
   const handleEditableKeyDown = useCallback((e: React.KeyboardEvent) => {
@@ -120,25 +121,26 @@ export default memo(function ChatView({
     el.scrollTop = ratio * (el.scrollHeight - el.clientHeight);
   };
 
-  // 连续工具调用分组折叠（ZCode 式）：组首索引 → 组内工具数量
-  const toolGroups = useMemo(() => {
-    const groups = new Map<number, number>();
-    let i = 0;
-    while (i < messages.length) {
-      const isTool = messages[i].role === "tool" || messages[i].type === "tool_call";
-      if (isTool) {
-        let j = i;
-        while (j < messages.length && (messages[j].role === "tool" || messages[j].type === "tool_call")) j++;
-        groups.set(i, j - i);
-        i = j;
-      } else i++;
-    }
-    return groups;
-  }, [messages]);
-  const [collapsedGroups, setCollapsedGroups] = useState<Record<string, boolean>>({});
+  // 每次工具调用独立成行（活动摘要行 ZCode 式），不再分组折叠
   // minimap 悬停预览：hoverRatio + 对应消息预览
   const [minimapHover, setMinimapHover] = useState<{ ratio: number; idx: number } | null>(null);
-  const groupCollapsed = (gkey: string) => collapsedGroups[gkey] !== false;  // 默认折叠
+
+  // 任务头部"已工作 X 分 X 秒"计时（isProcessing / 工具执行期间显示）
+  const [elapsed, setElapsed] = useState(0);
+  useEffect(() => {
+    if (!taskStartAt || (!isProcessing && !activeTask)) { setElapsed(0); return; }
+    const tick = () => setElapsed(Date.now() - taskStartAt);
+    tick();
+    const iv = setInterval(tick, 1000);
+    return () => clearInterval(iv);
+  }, [taskStartAt, isProcessing, activeTask]);
+
+  // 时长格式化：<3s 显示"几秒"，长于 60s 显示"X 分 X 秒"
+  const fmtDur = (ms: number) => {
+    const s = Math.max(0, Math.round(ms / 1000));
+    if (s < 60) return `${s} 秒`;
+    return `${Math.floor(s / 60)} 分 ${s % 60} 秒`;
+  };
 
   // 状态栏数据：轮数（user 消息数）、工具调用数、消息数、token 估算
   const userTurns = messages.filter(m => m.role === "user").length || 0;
@@ -148,11 +150,12 @@ export default memo(function ChatView({
   return (
     <>
       <div className="chat-wrap">
-      {/* 任务执行状态条（工具执行中显示，完成后消失） */}
-      {activeTask && (
+      {/* 任务头部：已工作计时（工具执行 / 回复生成期间显示） */}
+      {taskStartAt && (activeTask || isProcessing) && (
         <div className="task-statusbar">
           <span className="task-statusbar-dot">▣</span>
-          <span className="task-statusbar-label">{t("chat.task_running")} · {activeTask}</span>
+          <span className="task-statusbar-label">已工作 {fmtDur(elapsed)}</span>
+          {activeTask && <span className="task-statusbar-sub">{activeTask.slice(0, 60)}</span>}
         </div>
       )}
       {messages.length > 8 && (
@@ -225,35 +228,7 @@ export default memo(function ChatView({
       <div className="chat-scroll" ref={scrollRef} onDrop={handleDrop} onDragOver={(e) => { if (handleDrop) e.preventDefault(); }}>
         {messages.map((msg, i) => {
           if (msg.role === "tool" || msg.type === "tool_call") {
-            const gcount = toolGroups.get(i);
-            if (gcount === undefined) return null;  // 组内非首成员：由组首统一渲染
-            const gkey = `g${i}`;
-            if (gcount > 1 && groupCollapsed(gkey)) {
-              // 折叠态：组首卡片 + 折叠条
-              return (
-                <div key={gkey} className="tool-group">
-                  <ToolCallBubble msg={msg} onConfirm={confirmTool} />
-                  <div className="tool-group-collapsed" onClick={() => setCollapsedGroups(prev => ({ ...prev, [gkey]: false }))}>
-                    <span className="tool-group-chevron"><ChevronRight size={12} /></span>
-                    <span>{t("chat.more_tools", { count: gcount - 1 })}</span>
-                  </div>
-                </div>
-              );
-            }
-            if (gcount > 1) {
-              // 展开态：全部卡片 + 收起条
-              return (
-                <div key={gkey} className="tool-group">
-                  {messages.slice(i, i + gcount).map((tm, k) => (
-                    <ToolCallBubble key={tm.id || `t${i}_${k}`} msg={tm} onConfirm={confirmTool} />
-                  ))}
-                  <div className="tool-group-collapsed" onClick={() => setCollapsedGroups(prev => ({ ...prev, [gkey]: true }))}>
-                    <span className="tool-group-chevron"><ChevronDown size={12} /></span>
-                    <span>{t("chat.collapse_tools")}</span>
-                  </div>
-                </div>
-              );
-            }
+            // 活动摘要行（ZCode 式）：每个工具调用独立一行，点击展开结果
             return <ToolCallBubble key={msg.id || i} msg={msg} onConfirm={confirmTool} />;
           }
           if (msg.role === "assistant") {
@@ -271,7 +246,13 @@ export default memo(function ChatView({
                         <>
                           {thinkText && (
                             <details className="thinking-block">
-                              <summary>🧠 思考过程</summary>
+                              <summary className="thinking-summary">
+                                <Brain size={13} />
+                                <span>思考过程</span>
+                                {msg.thinkingDuration !== undefined && (
+                                  <span className="thinking-meta">· 持续了 {fmtDur(msg.thinkingDuration)}</span>
+                                )}
+                              </summary>
                               <div>{thinkText}</div>
                             </details>
                           )}
