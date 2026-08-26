@@ -874,12 +874,22 @@ async def _reflect_output(text: str, model: str, api_url: str, headers: dict,
     return current, changed
 
 
-def _inject_thinking_disabled(body: dict, model: str) -> dict:
-    """DeepSeek 思考模式已默认开启（reasoning_content 回传/工具消息补空已处理），
-    保留本钩子以支持将来按需禁用（如设置 LATIAO_DEEPSEEK_THINKING=off）。
-    其它 OpenAI 兼容端点忽略该参数，不受影响。"""
-    if os.environ.get("LATIAO_DEEPSEEK_THINKING", "on") == "off"             and isinstance(model, str) and "deepseek" in model.lower():
+def _inject_thinking_disabled(body: dict, model: str, level: str = "high") -> dict:
+    """思考强度三档（对应前端 🧠 选择器）：off / high(默认) / max。
+    - off: 显式关闭思考（DeepSeek 设 thinking disabled；各 API 兼容）
+    - high: 思考开启（默认，reasoning_content 回传已处理）
+    - max: 思考开启 + 更大 max_tokens（长推理任务不截断）"""
+    m = (model or "").lower()
+    if level == "off":
         body["thinking"] = {"type": "disabled"}
+    elif level == "max":
+        # 长推理预算：高于常规 reasoning 预算（12288）约 1.5 倍
+        body.setdefault("max_tokens", 12288)
+        if isinstance(body.get("max_tokens"), int) and body["max_tokens"] < 18432:
+            body["max_tokens"] = 18432
+        # OpenAI 兼容推理模型支持 reasoning_effort（DeepSeek 不认则该字段忽略）
+        if "deepseek" not in m and "o1" not in m and "o3" not in m:
+            body["reasoning_effort"] = "high"
     return body
 
 
@@ -1299,7 +1309,7 @@ def _append_loop_log(line: str):
         pass  # 调试日志写失败不影响主流程
 
 
-async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: dict, session_id: str = "", agent_id: str = "latiao", reflection_mode: str = "off", access_mode: str = "full"):
+async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: dict, session_id: str = "", agent_id: str = "latiao", reflection_mode: str = "off", access_mode: str = "full", thinking_level: str = "high"):
     """Agent loop: call LLM with tools. If tool_calls → execute → loop. If text → yield & done."""
     current_msgs = [dict(m) for m in messages]
     # Two-level compression: keep head + tail, prune middle (MUSE-Autoskill style)
@@ -1398,7 +1408,7 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                 "frequency_penalty": 0.6,
                 "stop": ["<|im_end|>", "<|endoftext|>", "<end_of_turn>", "<eos>"],
             }
-            _inject_thinking_disabled(body, model)
+            _inject_thinking_disabled(body, model, thinking_level)
 
             streamed_text = ""
             reasoning_text = ""  # 累积 reasoning_content——DeepSeek 推理模型要求传回
@@ -1846,7 +1856,7 @@ def _build_local_tools_prompt(active_tools: list[dict]) -> str:
 
 
 async def _local_agent_loop_stream(messages: list, model: str, api_url: str, headers: dict,
-                                    session_id: str = "", agent_id: str = "latiao", reflection_mode: str = "off", access_mode: str = "full"):
+                                    session_id: str = "", agent_id: str = "latiao", reflection_mode: str = "off", access_mode: str = "full", thinking_level: str = "high"):
     """Local model agent loop: inject tools as prompt, parse tool calls from text."""
     current_msgs = [dict(m) for m in messages]
     # Truncate long history to prevent context overflow.
