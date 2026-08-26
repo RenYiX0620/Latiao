@@ -209,8 +209,9 @@ async def chat_completion(request: Request):
                     # 本地引擎（Latiao/LM Studio）404 = 模型未就绪（启动中/崩溃后未重载），
                     # 云端 404 = 模型名或路径不存在——分别给出可操作的提示
                     req_url = str(e.request.url) if e.request else "?"
-                    is_local = "127.0.0.1" in req_url or "localhost" in req_url
-                    if e.response.status_code == 404 and is_local:
+                    # 注意：不能复用外层 is_local（内层赋值会把外层变量遮蔽为局部 → UnboundLocalError）
+                    req_is_local = "127.0.0.1" in req_url or "localhost" in req_url
+                    if e.response.status_code == 404 and req_is_local:
                         err_msg = "本地模型服务未就绪：模型可能正在加载或已卸载，请到模型页重新加载"
                     elif e.response.status_code == 404:
                         err_msg = "模型服务返回 404：模型名或接口路径不存在，请检查模型名称"
