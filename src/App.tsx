@@ -117,17 +117,17 @@ const [timeFilter, setTimeFilter] = useState("all");
   // 权限模式五档（从保守到放手）：read_only / confirm / auto_edit / plan / full
   const [accessMode, setAccessMode] = useState<"read_only" | "confirm" | "auto_edit" | "plan" | "full">(() => {
     const saved = localStorage.getItem("latiao_access");
-    if (!saved) return "full";
+    if (!saved) {
+      // 迁移旧版独立"计划模式"开关
+      try { if (JSON.parse(localStorage.getItem("local_ai_os_plan_mode") || "false")) return "plan"; } catch { /* ignore */ }
+      return "full";
+    }
     // 旧版本值迁移：workspace → auto_edit
     if (saved === "workspace") return "auto_edit";
     return (["read_only", "confirm", "auto_edit", "plan", "full"].includes(saved) ? saved : "full") as "read_only" | "confirm" | "auto_edit" | "plan" | "full";
   });
   useEffect(() => { localStorage.setItem("latiao_access", accessMode); }, [accessMode]);
 
-  const [planMode, setPlanMode] = useState<boolean>(() => {
-    try { const saved = localStorage.getItem("local_ai_os_plan_mode"); return saved ? JSON.parse(saved) : false; }
-    catch (e) { console.error(e); return false; }
-  });
 
   const [prompt, setPrompt] = useState("");
   const [isProcessing, setIsProcessing] = useState(false);
@@ -259,7 +259,6 @@ const [timeFilter, setTimeFilter] = useState("all");
     }, 150);
     return () => clearTimeout(timer);
   }, [messages]);
-  useEffect(() => { localStorage.setItem("local_ai_os_plan_mode", JSON.stringify(planMode)); }, [planMode]);
   // Persist cloud models to OS keychain (debounced to avoid writes on every keystroke)
   useEffect(() => {
     if (!cloudModelsLoaded) return;
@@ -889,7 +888,7 @@ const [timeFilter, setTimeFilter] = useState("all");
     setMessages((prev) => [...prev, assistantPlaceholder]);
 
     try {
-      const apiMessages = buildApiMessages(session, userMsg, planMode || accessMode === "plan", lang);
+      const apiMessages = buildApiMessages(session, userMsg, accessMode === "plan", lang);
       const opts: Record<string, unknown> = { agent: activeAgent };
       if (session.selectedModel) opts.model = session.selectedModel;
       if (cloudCfgPre) opts.cloudConfig = { key: cloudCfgPre.key, endpoint: cloudCfgPre.endpoint, protocol: cloudCfgPre.protocol || "openai" };
@@ -1205,7 +1204,6 @@ const [timeFilter, setTimeFilter] = useState("all");
             messages={messages} isProcessing={isProcessing}
             pendingFile={pendingFile} setPendingFile={setPendingFile}
             prompt={prompt} setPrompt={setPrompt}
-            planMode={planMode} setPlanMode={setPlanMode}
             fileInputRef={fileInputRef} mediaRecorderRef={mediaRecorderRef}
             isRecording={isRecording}
             sendMessage={sendMessage} onStop={stopGeneration} handleFileSelect={handleFileSelect}
