@@ -429,13 +429,15 @@ body {
 /* 消息导航缩略图 minimap（ZCode 式：悬停显示内容预览） */
 .chat-minimap {
   position: absolute; right: 10px; top: 34px; bottom: 14px; width: 16px;
-  border-radius: 8px; background: var(--border-default);
+  border-radius: 8px; background: rgba(255, 255, 255, 0.09);
+  border: 1px solid rgba(255, 255, 255, 0.12);
   cursor: pointer; overflow: hidden; display: flex; flex-direction: column;
   padding: 2px 0;
 }
+[data-theme="light"] .chat-minimap { background: rgba(0, 0, 0, 0.08); border-color: rgba(0, 0, 0, 0.12); }
 .mini-block {
-  flex: 1; min-height: 3px; width: 10px; margin: 1px auto; border-radius: 3px;
-  opacity: 0.75; transition: opacity 0.1s; flex-shrink: 0;
+  flex: 1; min-height: 3px; width: 12px; margin: 1px auto; border-radius: 3px;
+  opacity: 0.9; transition: opacity 0.1s; flex-shrink: 0;
 }
 .mini-block.hover { opacity: 1; outline: 1px solid var(--text-primary); }
 .mini-viewport {
@@ -465,10 +467,14 @@ body {
 /* ZCode 式：对话段无卡片底/无边框，内容直接铺在主背景上，
    仅以左侧细线和段间距区分 */
 .chat-segment {
-  background: transparent; border: none;
-  border-left: 2px solid var(--border-default);
-  border-radius: 0; margin: 14px 0; overflow: visible; padding-left: 14px;
+  /* ZCode 式分组：可感知的浅浮层底 + 左侧强调线 */
+  background: rgba(30, 32, 48, 0.55);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius-md);
+  margin: 14px 0; overflow: visible; padding: 6px 14px 10px 16px;
 }
+[data-theme="light"] .chat-segment { background: rgba(255, 255, 255, 0.72); border-color: rgba(0, 0, 0, 0.06); }
 .chat-segment-head {
   display: inline-flex; align-items: center; gap: 7px; width: auto;
   padding: 3px 8px; background: transparent; border: none;
