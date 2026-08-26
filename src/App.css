@@ -391,7 +391,7 @@ body {
 }
 .mini-preview {
   position: absolute; right: 30px; top: 34px; bottom: auto;
-  width: min(240px, 36vw); max-height: 140px; overflow: hidden;
+  width: min(280px, 40vw); max-height: 260px; overflow: hidden;
   background: var(--bg-card); border: 1px solid var(--border-default);
   border-radius: 8px; padding: 8px 10px; box-shadow: 0 6px 24px rgba(0,0,0,0.22);
   pointer-events: none; z-index: 60;

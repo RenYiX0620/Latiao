@@ -174,18 +174,23 @@ export default memo(function ChatView({
             height: `${(scrollInfo.viewH / scrollInfo.totalH) * 100}%`,
           }} />
         </div>
-        {/* 悬停预览浮层（ZCode 式：显示该位置附近的消息上下文） */}
-        {minimapHover && messages[minimapHover.idx] && (
-          <div className="mini-preview">
-            {[minimapHover.idx - 1, minimapHover.idx, minimapHover.idx + 1]
-              .filter(i => i >= 0 && i < messages.length)
-              .map(i => {
-                const m = messages[i];
-                // 工具消息只显示工具名（不显示原始结果——含 emoji/URL/乱码）；
-                // 对话消息显示原文，保持 ZCode 式流畅会话预览
+        {/* 悬停预览浮层（ZCode 式：以悬停位置为起点的连续对话流） */}
+        {minimapHover && messages[minimapHover.idx] && (() => {
+          // 向上回溯到最近的用户提问（对话从提问开始最自然）
+          let start = minimapHover.idx;
+          while (start > 0 && messages[start].role !== "user") start--;
+          const previewMsgs: { m: Message; i: number }[] = [];
+          for (let i = start; i < messages.length && previewMsgs.length < 10; i++) {
+            const m = messages[i];
+            if (m.role === "tool" || (m.content || "").trim()) previewMsgs.push({ m, i });
+          }
+          if (previewMsgs.length === 0) return null;
+          return (
+            <div className="mini-preview">
+              {previewMsgs.map(({ m, i }) => {
                 const text = m.role === "tool"
-                  ? `◆ ${m.toolName || "工具"} · 执行完成`
-                  : (m.content || m.thinking || "(无内容)").replace(/[#*|`>-]/g, "").replace(/\s+/g, " ").slice(0, 90);
+                  ? `${m.toolName || "工具"} · 执行完成`
+                  : (m.content || "").replace(/[#*|`>-]/g, "").replace(/\s+/g, " ").slice(0, 110);
                 const icon = m.role === "user" ? "🧑" : m.role === "tool" ? "◆" : "🤖";
                 return (
                   <div key={m.id || i} className={`mini-preview-line${i === minimapHover.idx ? " current" : ""}`}>
@@ -194,8 +199,9 @@ export default memo(function ChatView({
                   </div>
                 );
               })}
-          </div>
-        )}
+            </div>
+          );
+        })()}
         </>
       )}
       <div className="chat-scroll" ref={scrollRef} onDrop={handleDrop} onDragOver={(e) => { if (handleDrop) e.preventDefault(); }}>
