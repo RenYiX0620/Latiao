@@ -124,9 +124,19 @@ export default memo(function ChatView({
   contextEstimate, showToast, activeTask, taskStartAt, subagents,
 }: ChatViewProps) {
   const { t } = useTranslation();
+  // WebKit (WKWebView) 下 compositionend 先于最终 keydown 派发，
+  // 仅靠 e.nativeEvent.isComposing 会在按 Enter 确认候选词时已变 false
+  // → 半句话被发送。用 compositionend 时间戳做缓冲（VSCode 同款方案）。
+  const composingUntilRef = useRef(0);
+  const handleCompositionStart = useCallback(() => {
+    composingUntilRef.current = Number.MAX_SAFE_INTEGER;
+  }, []);
+  const handleCompositionEnd = useCallback(() => {
+    composingUntilRef.current = Date.now() + 300;
+  }, []);
   const handleEditableKeyDown = useCallback((e: React.KeyboardEvent) => {
     // 输入法组词中按 Enter 是确认候选，不是发送（中文输入法高频误发送）
-    if (e.nativeEvent.isComposing) return;
+    if (e.nativeEvent.isComposing || Date.now() < composingUntilRef.current) return;
     if (e.key === "Enter" && !e.shiftKey && !isProcessing) {
       e.preventDefault();
       sendMessage();
@@ -531,6 +541,8 @@ export default memo(function ChatView({
             className={`chat-input${prompt ? "" : " is-empty"}`}
             value={prompt}
             onChange={(e) => setPrompt(e.target.value)}
+            onCompositionStart={handleCompositionStart}
+            onCompositionEnd={handleCompositionEnd}
             onKeyDown={handleEditableKeyDown}
             onPaste={async (e) => {
               if (!onPasteImage) return;

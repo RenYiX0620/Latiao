@@ -406,8 +406,13 @@ async def lifespan(app: FastAPI):
     catchup_task.cancel()
     logger.info("Sidecar 关闭")
 
+# 生产桌面应用：docs/openapi 是 Starlette 原生路由，不走应用级鉴权依赖，
+# 本机任意进程可读完整 API schema → 直接关闭
 app = FastAPI(
     title="Local AI OS Sidecar",
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
     lifespan=lifespan,
     # 应用级依赖：所有 /v1/* 端点都要求本地 token（/health 在 _check_auth 内豁免）
     dependencies=[Depends(_check_auth)],

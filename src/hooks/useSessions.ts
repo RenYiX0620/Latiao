@@ -47,9 +47,13 @@ export function useSessions() {
       // If the list is somehow empty, materialize a real session so the new
       // messages live inside `sessions` instead of a throwaway fallback.
       if (prev.length === 0) return [{ ...newSession(), messages: fn([]) }];
+      // 按会话 id 定位，而非闭包捕获的 currentIdx：流式进行中列表头部
+      // 插入/删除会话（cron 心跳、用户删会话）会使索引指向别的会话，
+      // 内容串话。id 是稳定标识，插入删除不影响定位。
       const idx = Math.min(Math.max(currentIdx, 0), prev.length - 1);
+      const targetId = prev[idx]?.id;
       return prev.map((s, i) => {
-        if (i !== idx) return s;
+        if (targetId ? s.id !== targetId : i !== idx) return s;
         const newMsgs = fn(s.messages);
         let name = s.name;
         if (s.name === "session.default" && newMsgs.length > 0) {

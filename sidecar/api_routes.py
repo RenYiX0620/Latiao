@@ -1142,10 +1142,13 @@ async def get_tavily_key():
     key = ""
     # Try macOS Keychain first
     try:
-        result = subprocess.run(
-            ["security", "find-generic-password", "-s", "com.latiao.desktop", "-a", "tavily_api_key", "-w"],
-            capture_output=True, text=True, timeout=5,
-        )
+        from starlette.concurrency import run_in_threadpool
+        def _sec_read():
+            return subprocess.run(
+                ["security", "find-generic-password", "-s", "com.latiao.desktop", "-a", "tavily_api_key", "-w"],
+                capture_output=True, text=True, timeout=5,
+            )
+        result = await run_in_threadpool(_sec_read)
         if result.returncode == 0 and result.stdout.strip():
             key = result.stdout.strip()
     except Exception:
@@ -1181,10 +1184,16 @@ async def set_tavily_key(request: Request):
         CONFIG_FILE.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
         # Then update macOS Keychain (best-effort)
         try:
-            subprocess.run(
-                ["security", "add-generic-password", "-s", "com.latiao.desktop", "-a", "tavily_api_key", "-w", key, "-U"],
-                capture_output=True, timeout=10,
-            )
+            # 密钥经 stdin 传给 security（-w 不带值时从 stdin 读），
+            # 避免 key 出现在 argv 里被 `ps` 读到；同时线程池化防冻结
+            from starlette.concurrency import run_in_threadpool
+            def _sec_write():
+                return subprocess.run(
+                    ["security", "add-generic-password", "-s", "com.latiao.desktop",
+                     "-a", "tavily_api_key", "-w", "-U"],
+                    input=key.encode(), capture_output=True, timeout=10,
+                )
+            await run_in_threadpool(_sec_write)
         except Exception:
             logger.debug("Failed to write Tavily key to keychain", exc_info=True)
         masked = key[:7] + "••••" + key[-4:] if len(key) > 11 else "••••"
@@ -1266,11 +1275,14 @@ async def get_logs(limit: int = Query(default=100, ge=1, le=500)):
 @app.get("/v1/heartbeat")
 async def heartbeat():
     """Unified polling endpoint: returns downloads, LLM status, and learnings in one call."""
+    from starlette.concurrency import run_in_threadpool
     from tool_executor import _subtask_snapshot
     return {
         "status": "ok",
-        "downloads": list(local_llm._engine._downloads.values()),
-        "local_llm": local_llm.get_status(),
+        "downloads": await run_in_threadpool(local_llm.get_all_downloads),
+        # get_status 内含 TCP/HTTP 探测（引擎忙时可达 10s+），必须线程池化，
+        # 否则心跳冻结整个事件循环——所有聊天/确认全部卡死
+        "local_llm": await run_in_threadpool(local_llm.get_status),
         "learnings": _get_recent_learnings(10),
         "cron_events": cron.get_recent_cron_events(10),
         "subagents": _subtask_snapshot(),
@@ -1425,7 +1437,10 @@ async def local_llm_detect():
 @app.get("/v1/local-llm/search")
 async def local_llm_search(q: str = Query(default=""), library: str = Query(default=""), limit: int = Query(default=20, le=30)):
     """Search HuggingFace for models. Empty q returns trending models."""
-    results = local_llm.search_huggingface(q, limit, library) if q else local_llm.search_huggingface("gguf", limit, library)
+    from starlette.concurrency import run_in_threadpool
+    def _search():
+        return local_llm.search_huggingface(q, limit, library) if q else local_llm.search_huggingface("gguf", limit, library)
+    results = await run_in_threadpool(_search)
     return {"status": "ok", "results": results, "query": q}
 
 
@@ -1435,7 +1450,8 @@ async def local_llm_fix(request: Request):
     body = await _json_body(request)
     fix_type = body.get("fix_type", "")
     fix_pkg = body.get("fix_pkg", "")
-    return local_llm.run_fix(fix_type, fix_pkg)
+    from starlette.concurrency import run_in_threadpool
+    return await run_in_threadpool(local_llm.run_fix, fix_type, fix_pkg)
 
 
 @app.post("/v1/local-llm/download")
@@ -1445,7 +1461,8 @@ async def local_llm_download(request: Request):
     model_id = body.get("model_id", "")
     if not model_id:
         return {"status": "error", "message": "model_id required"}
-    return local_llm.download_model(model_id)
+    from starlette.concurrency import run_in_threadpool
+    return await run_in_threadpool(local_llm.download_model, model_id)
 
 
 @app.get("/v1/local-llm/downloads")
@@ -1490,9 +1507,10 @@ async def local_llm_open_path(request: Request):
 
 
 @app.get("/v1/local-llm/status")
-def local_llm_status():
+async def local_llm_status():
     """Get local LLM engine status."""
-    return local_llm.get_status()
+    from starlette.concurrency import run_in_threadpool
+    return await run_in_threadpool(local_llm.get_status)
 
 
 @app.get("/v1/local-llm/models")
@@ -1504,7 +1522,8 @@ def local_llm_models():
 @app.get("/v1/local-llm/model-detail")
 async def local_llm_model_detail(model_id: str = Query(..., min_length=1)):
     """Fetch HuggingFace model detail: metadata, files, README."""
-    return local_llm.get_model_detail(model_id)
+    from starlette.concurrency import run_in_threadpool
+    return await run_in_threadpool(local_llm.get_model_detail, model_id)
 
 
 @app.get("/v1/local-llm/recommended")

@@ -409,7 +409,24 @@ import time as _time
 
 _SUBTASKS: dict[str, dict] = {}   # task_id -> {agent, task, status, events, result, ...}
 _SUBTASK_EVENTS: list[dict] = []  # 事件流（前端心跳拉取）
+_SUBTASK_TASKS: set = set()       # 后台任务强引用（防 GC 回收）
 _SUBTASK_SEQ = 0
+
+
+def _prune_subtasks(max_keep: int = 50, max_age_sec: float = 3600.0):
+    """清理注册表：已完成/失败的条目超过 1 小时或总量超限时淘汰，防无界增长。"""
+    now = _time.time()
+    for tid in [t for t, s in _SUBTASKS.items()
+                if s.get("status") in ("done", "error")
+                and now - s.get("updated_at", 0) > max_age_sec]:
+        _SUBTASKS.pop(tid, None)
+    if len(_SUBTASKS) > max_keep * 2:
+        done_ids = [t for t, s in _SUBTASKS.items() if s.get("status") in ("done", "error")]
+        done_ids.sort(key=lambda t: _SUBTASKS[t].get("updated_at", 0))
+        for tid in done_ids[:max(len(done_ids) - max_keep, 0)]:
+            _SUBTASKS.pop(tid, None)
+    if len(_SUBTASK_EVENTS) > 200:
+        del _SUBTASK_EVENTS[:-100]
 
 
 def _subtask_snapshot() -> list[dict]:
@@ -451,13 +468,23 @@ async def _delegate_task_bg(agent_type: str, task: str) -> str:
     global _SUBTASK_SEQ
     _SUBTASK_SEQ += 1
     task_id = f"sub_{_time.strftime('%H%M%S')}_{_SUBTASK_SEQ}"
+    # 淘汰已完成超过 1 小时的旧任务 + 事件流截断（长期运行防无界增长）
+    _prune_subtasks()
     _SUBTASKS[task_id] = {
         "agent": agent_type, "task": task, "status": "running",
         "steps": 0, "result": "", "started_at": _time.time(), "updated_at": _time.time(),
     }
     _SUBTASK_EVENTS.append({"id": task_id, "status": "started", "summary": task[:80]})
     import asyncio as _asyncio
-    _asyncio.get_event_loop().create_task(_run_subtask_bg(task_id, agent_type, task))
+    # 必须经 _spawn 保存强引用：asyncio 对 task 只持弱引用，裸 create_task
+    # 可能被 GC 中途回收——子任务消失、注册表永远卡在 running。
+    try:
+        from agent_loop import _spawn
+        _spawn(_run_subtask_bg(task_id, agent_type, task))
+    except ImportError:
+        t = _asyncio.get_running_loop().create_task(_run_subtask_bg(task_id, agent_type, task))
+        _SUBTASK_TASKS.add(t)
+        t.add_done_callback(_SUBTASK_TASKS.discard)
     return f"[Sub-agent {agent_type} 后台任务已启动] task_id={task_id}\n主对话可继续；结果将自动出现在子智能体面板，也可用 task_id 查询。"
 
 
@@ -505,13 +532,21 @@ async def _delegate_task(agent_type: str, task: str, task_id: str | None = None)
     allowed = _SUBAGENT_TOOLS.get(agent_type, ["read_file", "list_dir", "search_files"])
     sub_tools = [t for t in TOOLS if t.get("function", {}).get("name") in allowed]
     # Sub-agents cannot use confirm-level tools (no user confirmation possible)
-    sub_tools = [t for t in sub_tools if TOOL_PERMISSIONS.get(t.get("function", {}).get("name"), "safe") != "confirm"]
+    # 例外：explore/debugger 的 run_cmd 靠只读白名单（_is_readonly_cmd）在执行时
+    # 兜底放行——若在这里把 run_cmd 滤掉，模型永远看不到它，白名单形同虚设
+    sub_tools = [
+        t for t in sub_tools
+        if TOOL_PERMISSIONS.get(t.get("function", {}).get("name"), "safe") != "confirm"
+        or (t.get("function", {}).get("name") == "run_cmd"
+            and agent_type in ("explore", "debugger"))
+    ]
 
     messages = [
-        {"role": "system", "content": cfg.get("identity", "")},
-        {"role": "system", "content": "你是一个子 Agent。独立完成任务后返回简洁结果。最多 3 步，不要问问题，直接执行。"},
+        {"role": "system", "content": (cfg.get("identity", "") + "\n你是一个子 Agent。独立完成任务后返回简洁结果。最多 3 步，不要问问题，直接执行。").strip()},
         {"role": "user", "content": task},
     ]
+    # 注意：单条 system。本地 llama-cpp 对多条 system 消息有静默空响应 bug
+    # （主循环 _build_chat_messages 已修过同一问题），子智能体必须对齐。
 
     protocol, api_url, sub_headers, _is_local = _resolve_api_target(_last_cloud_config.get())
     if not api_url:

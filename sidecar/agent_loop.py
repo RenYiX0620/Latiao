@@ -1682,6 +1682,20 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                 current_msgs.append({"role": "system", "content": nudge_text})
                 text_only_streak += 1
                 continue
+            # ── Empty-response exhaustion：streak 耗尽且模型仍无输出。
+            # 不能静默 completed 返回——用户会看到"执行一半就停了"且零提示。
+            # 与本地循环的诊断分支对齐（同一 bug 只修过一边）。
+            if not streamed_text.strip():
+                logger.warning(f"[AGENT] Iteration {iteration}: {text_only_streak} consecutive empty responses, aborting with diagnostic")
+                yield {"content": (
+                    "\n\n⚠️ **模型连续多次返回空响应，任务已中止。**\n"
+                    "可能原因：\n"
+                    "1. 云端服务限流或降级（如上下文超限被截断）\n"
+                    "2. 模型服务异常\n"
+                    "建议：检查云端配置或稍后重试；若反复出现请缩短对话长度。"
+                )}
+                _track_progress(session_id, "stalled", f"empty_response x{text_only_streak}")
+                return
             # ── 输出反思（可选档位）：修正后前端替换最后一条消息 ──
             if _should_reflect(reflection_mode, streamed_text, _is_local_llm_url(api_url)):
                 _tool_outs = [str(m.get("content") or "") for m in current_msgs if m.get("role") == "tool"]
@@ -1817,7 +1831,7 @@ def _parse_prompt_tool_calls(text: str) -> tuple[str, list[dict]]:
             elif name == "list_dir":
                 args = {"path": raw_query}
             elif name == "run_cmd":
-                args = {"command": raw_query}
+                args = {"cmd": raw_query}
             elif name == "search_files":
                 args = {"pattern": raw_query}
             else:
@@ -1852,7 +1866,7 @@ def _parse_prompt_tool_calls(text: str) -> tuple[str, list[dict]]:
                 args = {"directory": find_match.group(1), "pattern": find_match.group(2).strip()}
             else:
                 tool_name = "run_cmd"
-                args = {"command": cmd_text}
+                args = {"cmd": cmd_text}
             if tool_name:
                 tool_calls.append({
                     "id": f"local_bash_{tool_name}_{idx}",
@@ -1862,7 +1876,10 @@ def _parse_prompt_tool_calls(text: str) -> tuple[str, list[dict]]:
                 used_ranges.append((m.start(), m.end()))
 
     # Clean text by removing parsed tool call regions
-    clean = text
+    # 关键：used_ranges 是在 search_text（去 think 块+strip）上计算的，
+    # 必须对同一坐标系清洗——此前回放到原始 text 上导致偏移错位：
+    # 工具栅栏残留在历史里、think 块被拦腰截断，模型下一轮重复调用。
+    clean = search_text
     if used_ranges:
         # Remove from end to start to preserve offsets
         for start, end in sorted(used_ranges, reverse=True):
@@ -2171,7 +2188,7 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                 any_new = False
                 round_failed = False
                 for tc in tool_calls:
-                    sig = f"{tc.get('function',{}).get('name','')}:{hash(str(tc.get('function',{}).get('arguments','')))} "
+                    sig = f"{tc.get('function',{}).get('name','')}:{hash(str(tc.get('function',{}).get('arguments',''))) } "
                     if sig not in recent_tool_calls:
                         recent_tool_calls.add(sig)
                         any_new = True
@@ -2179,7 +2196,12 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                         tc, current_msgs, session_id, agent_id, access_mode)
                     for evt in events:
                         yield evt
-                    if verify_failed:
+                    # 用户拒绝 ≠ 验证失败：拒绝不应清零停滞预算、诱导模型反复
+                    # 重试同一操作（每次重试都会再弹确认框）。与云端循环对齐。
+                    denied = any(
+                        isinstance(e, dict) and str(e.get("result", "")).startswith("⛔ User denied")
+                        for e in events)
+                    if verify_failed and not denied:
                         round_failed = True
 
                 # 新的调用签名，或本轮有工具失败（模型正在尝试修复）都算实质推进，不计停滞

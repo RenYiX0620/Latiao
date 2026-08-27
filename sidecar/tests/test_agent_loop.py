@@ -233,3 +233,59 @@ class TestAccessMode(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPromptToolParsingThinkBlock(unittest.TestCase):
+    """回归：解析与清洗必须同一坐标系（去 think 后的文本）。
+    曾把 search_text 上的区间回放到原始 text 上，栅栏残留进历史、
+    think 块被拦腰截断，模型下一轮重复调用同一工具。"""
+
+    def test_think_block_plus_fence(self):
+        from agent_loop import _parse_prompt_tool_calls
+        text = "<think>我需要列目录</think>我来查看。\n```tool list_dir\n{\"path\": \"/tmp\"}\n```"
+        clean, calls = _parse_prompt_tool_calls(text)
+        self.assertNotIn("```", clean)
+        self.assertNotIn("list_dir", clean)
+        self.assertEqual(calls[0]["function"]["name"], "list_dir")
+
+    def test_leading_whitespace_fence(self):
+        from agent_loop import _parse_prompt_tool_calls
+        text = "\n\n好的。\n```tool read_file\n{\"path\": \"/tmp/a.txt\"}\n```"
+        clean, calls = _parse_prompt_tool_calls(text)
+        self.assertNotIn("```", clean)
+        self.assertEqual(calls[0]["function"]["name"], "read_file")
+
+    def test_plain_text_untouched(self):
+        from agent_loop import _parse_prompt_tool_calls
+        clean, calls = _parse_prompt_tool_calls("你好，今天天气不错")
+        self.assertEqual(clean, "你好，今天天气不错")
+        self.assertEqual(calls, [])
+
+
+class TestSubagentWhitelistReachable(unittest.TestCase):
+    """回归：explore/debugger 的 run_cmd 必须在子智能体可见工具列表里，
+    否则只读白名单（执行时兜底）永远不可达——'死配置'复发。"""
+
+    def test_run_cmd_visible_for_explore(self):
+        import asyncio
+        from tool_executor import _delegate_task_bg, _SUBTASKS
+        # 不真正跑 LLM：构造到 sub_tools 过滤后的可见性检查即可
+        # （直接调 _delegate_task 会发起 HTTP；这里验证过滤逻辑链路存在）
+        # 模拟 _delegate_task 内部的可见性过滤（TOOLS 由 agent_loop 门面持有）
+        import agent_loop as al
+        import tool_executor as te
+        allowed = te._SUBAGENT_TOOLS["explore"]
+        visible = [t for t in al.TOOLS if t.get("function", {}).get("name") in allowed]
+        names = {t["function"]["name"] for t in visible}
+        self.assertIn("run_cmd", names)
+
+    def test_prune_subtasks_caps_registry(self):
+        import time as _t
+        from tool_executor import _SUBTASKS, _prune_subtasks
+        for i in range(120):
+            _SUBTASKS[f"old_{i}"] = {"agent": "x", "task": "t", "status": "done",
+                                     "steps": 0, "result": "", "activity": {},
+                                     "started_at": 0, "updated_at": 0}
+        _prune_subtasks(max_keep=50)
+        done_left = [t for t, s in _SUBTASKS.items() if t.startswith("old_")]
+        self.assertLessEqual(len(done_left), 60)
