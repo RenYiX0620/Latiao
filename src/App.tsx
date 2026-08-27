@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import { fetch } from "@tauri-apps/plugin-http";
 import { invoke } from "@tauri-apps/api/core";
+import logoUrl from "./assets/logo.png";
 import type { Message, PendingFile, SessionInfo, ViewId, CloudModel, DownloadState, HFModelResult, LLMStatus } from "./types";
 // API keys stored in OS keychain via Rust commands (store_secret/get_secret/delete_secret)
 import { useSessions } from "./hooks/useSessions";
@@ -1171,7 +1172,9 @@ const [timeFilter, setTimeFilter] = useState("all");
       {/* ═══ Sidebar ═══ */}
       <aside className="sidebar">
         <div className="sidebar-brand">
-          {!sidebarCollapsed && <div className="sidebar-logo">辣</div>}
+          {sidebarCollapsed
+            ? <img className="sidebar-logo" src={logoUrl} alt="辣条" />
+            : <div className="sidebar-logo"><img src={logoUrl} alt="辣条" /></div>}
           {!sidebarCollapsed && <div>
             <div className="sidebar-title">辣条</div>
             <div className="sidebar-subtitle">Latiao</div>
