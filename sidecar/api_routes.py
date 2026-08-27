@@ -1266,13 +1266,32 @@ async def get_logs(limit: int = Query(default=100, ge=1, le=500)):
 @app.get("/v1/heartbeat")
 async def heartbeat():
     """Unified polling endpoint: returns downloads, LLM status, and learnings in one call."""
+    from tool_executor import _subtask_snapshot
     return {
         "status": "ok",
         "downloads": list(local_llm._engine._downloads.values()),
         "local_llm": local_llm.get_status(),
         "learnings": _get_recent_learnings(10),
         "cron_events": cron.get_recent_cron_events(10),
+        "subagents": _subtask_snapshot(),
     }
+
+
+@app.get("/v1/subagents")
+def list_subagents():
+    """列出后台子智能体任务（含状态与结果摘要）。"""
+    from tool_executor import _subtask_snapshot
+    return {"status": "ok", "subagents": _subtask_snapshot()}
+
+
+@app.get("/v1/subagents/{task_id}")
+def get_subagent(task_id: str):
+    """查询单个后台子任务详情（含完整结果）。"""
+    from tool_executor import _SUBTASKS
+    s = _SUBTASKS.get(task_id)
+    if not s:
+        return {"status": "error", "message": "task not found"}
+    return {"status": "ok", "subagent": {**s, "id": task_id}}
 
 
 @app.post("/v1/confirm_tool")

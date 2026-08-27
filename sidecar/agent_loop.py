@@ -465,6 +465,7 @@ _delegate_tool_def = {
             "properties": {
                 "agent": {"type": "string", "enum": ["code-reviewer", "doc-generator", "debugger", "translator"], "description": "The specialist agent type."},
                 "task": {"type": "string", "description": "The specific task for the sub-agent. Be clear and concise."},
+                "background": {"type": "boolean", "description": "Run in background without blocking the main conversation. Progress appears in the sub-agent panel. Default false."},
             },
             "required": ["agent", "task"],
         },
@@ -474,8 +475,18 @@ _delegate_tool_def = {
 # 导致 Iteration 3 全量工具时 DeepSeek 报 "Tool names must be unique" 400)
 if not any(t.get("function", {}).get("name") == "delegate_task" for t in TOOLS):
     TOOLS.append(_delegate_tool_def)
-TOOL_DISPATCH["delegate_task"] = lambda args: _delegate_task(args.get("agent", "code-reviewer"), args.get("task", ""))
+def _dispatch_delegate(args: dict):
+    """delegate_task 分发：background=true 时以后台子任务运行（不阻塞主对话）。"""
+    agent = args.get("agent", "code-reviewer")
+    task = args.get("task", "")
+    if args.get("background"):
+        from tool_executor import _delegate_task_bg
+        return _delegate_task_bg(agent, task)
+    return _delegate_task(agent, task)
+
+TOOL_DISPATCH["delegate_task"] = _dispatch_delegate
 TOOL_PERMISSIONS["delegate_task"] = "safe"
+# 描述补充 background 参数（模型需要知道才能用）
 
 _create_cron_def = {
     "type": "function",

@@ -141,6 +141,8 @@ const [timeFilter, setTimeFilter] = useState("all");
   const [isProcessing, setIsProcessing] = useState(false);
   // 当前执行中任务摘要（tool_start/tool_end 驱动，顶部状态条展示）
   const [activeTask, setActiveTask] = useState<string | null>(null);
+  // 后台子智能体任务（ZCode 式活动栏：delegate_task background=true 产生）
+  const [subagents, setSubagents] = useState<{ id: string; agent: string; task: string; status: string; summary?: string }[]>([]);
   const [taskStartAt, setTaskStartAt] = useState<number | null>(null);
   const activeTaskStackRef = useRef<string[]>([]);
   const abortControllerRef = useRef<AbortController | null>(null);
@@ -396,6 +398,8 @@ const [timeFilter, setTimeFilter] = useState("all");
           // Downloads are owned by the 2s poller below (single writer, no flicker)
           // Learnings
           setRecentLearnings(data.learnings || []);
+          // 后台子智能体任务快照
+          setSubagents((data.subagents || []) as typeof subagents);
           // Cron completion toasts (skip "skipped" to avoid spam)
           for (const ev of (data.cron_events || []) as { ts: string; task: string; status: string; summary?: string; full?: string }[]) {
             const key = `${ev.ts}|${ev.task}`;
@@ -1289,6 +1293,7 @@ const [timeFilter, setTimeFilter] = useState("all");
             showToast={showToast}
             activeTask={activeTask}
             taskStartAt={taskStartAt}
+            subagents={subagents}
           />
         </div>
 

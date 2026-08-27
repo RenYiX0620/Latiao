@@ -110,6 +110,7 @@ interface ChatViewProps {
   showToast: (msg: string, type?: string) => void;
   activeTask: string | null;
   taskStartAt: number | null;
+  subagents?: { id: string; agent: string; task: string; status: string; summary?: string }[];
 }
 
 export default memo(function ChatView({
@@ -120,7 +121,7 @@ export default memo(function ChatView({
   chatEndRef, handleDrop, onPasteImage,
   cloudModels, selectedModel, onSelectModel,
   accessMode, setAccessMode, thinkingLevel, setThinkingLevel,
-  contextEstimate, showToast, activeTask, taskStartAt,
+  contextEstimate, showToast, activeTask, taskStartAt, subagents,
 }: ChatViewProps) {
   const { t } = useTranslation();
   const handleEditableKeyDown = useCallback((e: React.KeyboardEvent) => {
@@ -339,6 +340,20 @@ export default memo(function ChatView({
   return (
     <>
       <div className="chat-wrap">
+      {(subagents && subagents.length > 0) && (
+        <div className="subagent-bar">
+          {(subagents as { id: string; agent: string; task: string; status: string; summary?: string }[]).map(sa => (
+            <div key={sa.id} className={`subagent-row${sa.status === "running" ? " running" : sa.status === "error" ? " error" : ""}`}>
+              <span className="subagent-icon"><Bot size={13} /></span>
+              <span className="subagent-name">{sa.agent}</span>
+              <span className="subagent-task">· {sa.task.slice(0, 40)}</span>
+              <span className={`subagent-status${sa.status === "running" ? " running" : ""}`}>
+                {sa.status === "running" ? "●" : sa.status === "done" ? "✓" : "✗"}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
       {messages.length > 8 && (
         <>
         <div className="chat-minimap" onClick={(e) => {
