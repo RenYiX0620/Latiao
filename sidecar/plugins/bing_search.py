@@ -12,7 +12,7 @@ DEFINITION = {
     "type": "function",
     "function": {
         "name": "bing_search",
-        "description": "免费网页搜索（无需 API Key）。搜索中文网络内容、新闻、行情、百科等实时信息。当 tavily_search 未配置 Key 时使用本工具。返回标题、链接和摘要。",
+        "description": "备用免费网页搜索（无需 API Key）。仅当 tavily_search 不可用（未配置 Key 或调用失败）时才使用本工具；若 tavily_search 在工具列表中，请优先调用 tavily_search，不要同时调用两者。搜索中文网络内容、新闻、行情、百科等实时信息。返回标题、链接和摘要。",
         "parameters": {
             "type": "object",
             "properties": {
