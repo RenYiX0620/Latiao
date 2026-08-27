@@ -50,11 +50,11 @@
 }
 
 [data-theme="light"] {
-  --bg-root: #f5f5f7;
-  --bg-surface: rgba(255, 255, 255, 0.85);
-  --bg-surface-hover: rgba(240, 240, 245, 0.9);
-  --bg-elevated: rgba(255, 255, 255, 0.95);
-  --bg-input: rgba(240, 240, 245, 0.8);
+  --bg-root: #ffffff;
+  --bg-surface: #ffffff;
+  --bg-surface-hover: #fafafa;
+  --bg-elevated: #ffffff;
+  --bg-input: #ffffff;
   --border-default: rgba(0, 0, 0, 0.08);
   --border-strong: rgba(0, 0, 0, 0.12);
   --border-subtle: rgba(0, 0, 0, 0.08);
@@ -70,21 +70,21 @@
   --accent-glow: rgba(2, 132, 199, 0.15);
   --glass-saturation: 1;
   /* ── Adaptive backgrounds (light) ── */
-  --bg-main: linear-gradient(180deg, #eaeaef 0%, #f5f5f7 100%);
-  --bg-card: rgba(240, 240, 245, 0.75);
-  --bg-card-hover: rgba(228, 228, 238, 0.85);
-  --bg-log: #f0f0f3;
-  --bg-identity-bar: rgba(240, 240, 245, 0.7);
-  --bg-tool-call: rgba(240, 240, 245, 0.8);
+  --bg-main: #ffffff;
+  --bg-card: #ffffff;
+  --bg-card-hover: #fafafa;
+  --bg-log: #ffffff;
+  --bg-identity-bar: #ffffff;
+  --bg-tool-call: rgba(0, 0, 0, 0.03);
   --bg-tool-result: rgba(0, 0, 0, 0.04);
 }
 
 /* ── Light-theme hard overrides (belt-and-suspenders, in case variable cascade fails) ── */
 [data-theme="light"] .main {
-  background: linear-gradient(180deg, #eaeaef 0%, #f5f5f7 100%);
+  background: #ffffff;
 }
 [data-theme="light"] body {
-  background: #f5f5f7;
+  background: #ffffff;
 }
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -439,7 +439,7 @@ img.sidebar-logo {
   cursor: pointer; overflow: hidden; display: flex; flex-direction: column;
   padding: 2px 0;
 }
-[data-theme="light"] .chat-minimap { background: rgba(0, 0, 0, 0.08); border-color: rgba(0, 0, 0, 0.12); }
+[data-theme="light"] .chat-minimap { background: rgba(0, 0, 0, 0.04); border-color: rgba(0, 0, 0, 0.08); }
 .mini-block {
   flex: 1; min-height: 3px; width: 12px; margin: 1px auto; border-radius: 3px;
   opacity: 0.9; transition: opacity 0.1s; flex-shrink: 0;
@@ -504,7 +504,11 @@ img.sidebar-logo {
   border-radius: var(--radius-md);
   margin: 14px 0; overflow: visible; padding: 6px 14px 10px 16px;
 }
-[data-theme="light"] .chat-segment { background: rgba(255, 255, 255, 0.72); border-color: rgba(0, 0, 0, 0.06); }
+[data-theme="light"] .chat-segment {
+  background: #ffffff;
+  border-color: rgba(0, 0, 0, 0.06);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+}
 .chat-segment-head {
   display: inline-flex; align-items: center; gap: 7px; width: auto;
   padding: 3px 8px; background: transparent; border: none;
