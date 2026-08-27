@@ -236,18 +236,28 @@ fn restart_sidecar(state: tauri::State<'_, SidecarProcess>) -> Result<String, St
     if let Some(ref mut child) = *guard {
         // 先通知 sidecar detach 模型引擎（Python 子进程），使其在 sidecar
         // 重启后继续存活（模型加载耗时巨大，重新加载会中断用户任务）
-        // 用系统自带 curl 通知 sidecar detach 模型引擎（Python 子进程），
-        // 使其在 sidecar 重启后继续存活（模型加载耗时巨大，重新加载会中断用户任务）
-        let _ = Command::new("curl")
+        // token 必须走 stdin 而不是 -H 参数：argv 会出现在 `ps` 输出里泄漏
+        let token = AUTH_TOKEN.get().map(|s| s.as_str()).unwrap_or("").to_string();
+        let mut curl = Command::new("curl")
             .args([
-                "-s", "-m", "1", "-X", "POST",
-                "-H",
-                &format!("X-Latiao-Token: {}", AUTH_TOKEN.get().map(|s| s.as_str()).unwrap_or("")),
+                "-s", "-m", "2", "-X", "POST",
+                "-H", "Content-Type: application/json",
+                "--data-binary", "@-",
                 "http://127.0.0.1:8765/v1/engine/detach",
             ])
+            .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .spawn();
+            .spawn()
+            .ok();
+        if let Some(ref mut c) = curl {
+            use std::io::Write;
+            if let Some(stdin) = c.stdin.as_mut() {
+                let _ = writeln!(stdin, "{{\"token\":\"{}\"}}", token);
+            }
+        }
+        // detach 请求发出后稍候片刻再杀 sidecar（给 Python 处理时间）
+        std::thread::sleep(std::time::Duration::from_millis(300));
 
         // Give sidecar a moment to flush, then force-kill
         let _ = child.kill();
@@ -258,17 +268,23 @@ fn restart_sidecar(state: tauri::State<'_, SidecarProcess>) -> Result<String, St
     if new_child.is_some() {
         println!("[Latiao] Sidecar restarted");
         *guard = new_child;
+        // 同步全局退出清理句柄（RunEvent::Exit 读这里）
+        *APP_SIDECAR.lock().unwrap_or_else(|e| e.into_inner()) = guard.take();
         Ok("ok".to_string())
     } else {
         eprintln!("[Latiao] Failed to restart sidecar");
         *guard = None;
+        *APP_SIDECAR.lock().unwrap_or_else(|e| e.into_inner()) = None;
         Err("Sidecar 启动失败：未找到 main.py 或可用的 Python 运行时。请尝试重启应用。".to_string())
     }
 }
 
 /// Managed state holding the sidecar child process handle.
-/// Dropped on app exit → kills the sidecar automatically.
+/// 注意：Tauri 的 App::run() 以 process::exit 结束、不会 Drop managed state。
+/// 退出清理走 RunEvent::Exit -> kill_sidecar_on_exit()（读 APP_SIDECAR）。
 struct SidecarProcess(Mutex<Option<Child>>);
+
+static APP_SIDECAR: std::sync::Mutex<Option<Child>> = std::sync::Mutex::new(None);
 
 impl Drop for SidecarProcess {
     fn drop(&mut self) {
@@ -470,13 +486,15 @@ fn main() {
     if !sidecar_ok {
         eprintln!("[Latiao] WARNING: sidecar failed to start — AI features will be unavailable");
     }
+    *APP_SIDECAR.lock().unwrap_or_else(|e| e.into_inner()) = sidecar;
+    let managed_sidecar = SidecarProcess(Mutex::new(None));
 
     tauri::Builder::default()
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
-.manage(SidecarProcess(Mutex::new(sidecar)))
+        .manage(managed_sidecar)
         .invoke_handler(tauri::generate_handler![sidecar_proxy, get_auth_token, restart_sidecar, store_secret, get_secret, delete_secret, open_model_dir])
         .on_window_event(|window, event| {
             // 关闭 = 隐藏到托盘（定时任务/sidecar 持续运行），托盘菜单可退出
@@ -493,6 +511,36 @@ fn main() {
             }
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("Failed to start Latiao app");
+        .build(tauri::generate_context!())
+        .expect("Failed to build Latiao app")
+        .run(|_app_handle, event| {
+            // App::run() 不会返回（内部 process::exit，不跑 Drop），
+            // 必须在这里显式清理 sidecar 子进程
+            if let tauri::RunEvent::Exit = event {
+                kill_sidecar_on_exit();
+            }
+        });
+}
+
+/// 应用退出时的进程清理。App::run() 内部以 std::process::exit 结束进程，
+/// 不运行任何 Drop —— 必须在 RunEvent::Exit 显式清理，否则 sidecar 成为
+/// 孤儿：cron 定时任务继续调云端 API（持续烧钱）、模型引擎常驻内存。
+fn kill_sidecar_on_exit() {
+    let mut state = APP_SIDECAR.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(mut child) = state.take() {
+        eprintln!("[Latiao] App exit: stopping sidecar pid={:?}", child.id());
+        // 先优雅终止（sidecar 的 lifespan 会正常关闭），超时再强杀
+        #[cfg(unix)]
+        {
+            use std::process::Command;
+            let pid = child.id();
+            let _ = Command::new("kill").arg("-TERM").arg(pid.to_string()).output();
+            for _ in 0..30 {
+                if let Ok(Some(_)) = child.try_wait() { return; }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+        let _ = child.kill();
+        std::thread::spawn(move || { let _ = child.wait(); });
+    }
 }

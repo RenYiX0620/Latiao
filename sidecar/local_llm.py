@@ -960,8 +960,12 @@ class LocalLLMEngine:
                     ["netstat", "-ano"], capture_output=True, text=True, timeout=10
                 )
                 for line in result.stdout.splitlines():
-                    if f":{port}" in line and "LISTENING" in line:
-                        pid = line.split()[-1]
+                    # 只认 LISTENING 且本地地址列精确匹配 :port —— 否则会命中
+                    # 远端地址列（作为客户端连出去的连接，包括 sidecar 自己）
+                    parts = line.split()
+                    if len(parts) >= 4 and parts[3] == "LISTENING" \
+                            and parts[1].rstrip(":").endswith(f":{port}"):
+                        pid = parts[-1]
                         if pid.isdigit():
                             subprocess.run(["taskkill", "/F", "/PID", pid],
                                            capture_output=True, timeout=10)
@@ -969,12 +973,19 @@ class LocalLLMEngine:
                 pass
             return
         try:
+            # -sTCP:LISTEN 只匹配监听 socket。裸 `lsof -ti :PORT` 会把 sidecar
+            # 自己（作为客户端探测该端口后的 TIME_WAIT 连接）也列出来并 SIGKILL
+            # —— 等于停止/健康检查按钮随机自杀整个 sidecar。
             result = subprocess.run(
-                ["lsof", "-ti", f":{port}"], capture_output=True, text=True, timeout=5,
+                ["lsof", "-ti", f":{port}", "-sTCP:LISTEN"],
+                capture_output=True, text=True, timeout=5,
             )
+            my_pid = os.getpid()
             for pid_str in result.stdout.strip().split("\n"):
                 pid = pid_str.strip()
                 if pid and pid.isdigit():
+                    if int(pid) == my_pid:
+                        continue  # 保险带：绝不能杀自己
                     try:
                         os.kill(int(pid), 9)
                     except OSError:

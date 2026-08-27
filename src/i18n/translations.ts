@@ -328,6 +328,7 @@ const T: Record<string, Record<Lang, string>> = {
   "toast.stopped": { zh: "模型已停止", en: "Model stopped", ja: "モデル停止", ru: "Модель остановлена" },
   "toast.no_mic": { zh: "此环境不支持麦克风访问", en: "Microphone not supported", ja: "マイク非対応", ru: "Микрофон недоступен" },
   "toast.no_vision": { zh: "当前模型不支持图片，请切换到支持视觉的模型（如 Qwen2.5-VL）或云端多模态模型", en: "Current model doesn't support images. Switch to a vision model (e.g. Qwen2.5-VL) or a multimodal cloud model.", ja: "現在のモデルは画像非対応です。視覚モデルに切り替えてください。", ru: "Модель не поддерживает изображения." },
+  "toast.pdf_unsupported": { zh: "暂不支持直接发送 PDF，请先转换为文本或截图后发送", en: "Sending PDFs directly is not supported yet. Convert to text or take a screenshot instead.", ja: "PDFの直接送信には未対応です。テキスト変換またはスクリーンショットをご利用ください。", ru: "Прямая отправка PDF пока не поддерживается. Преобразуйте в текст или сделайте скриншот." },
   "toast.speech_fail": { zh: "语音识别失败", en: "Speech recognition failed", ja: "音声認識失敗", ru: "Ошибка распознавания" },
   "toast.mic_denied": { zh: "麦克风权限被拒绝", en: "Microphone denied", ja: "マイク拒否", ru: "Доступ к микрофону запрещен" },
   "toast.model_switched": { zh: "模型切换为: {model}", en: "Model: {model}", ja: "モデル: {model}", ru: "Модель: {model}" },

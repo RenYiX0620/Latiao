@@ -226,6 +226,9 @@ const [timeFilter, setTimeFilter] = useState("all");
       messages: session.messages.slice(-200).map(m => ({
         ...m,
         imageBase64: undefined,       // don't persist base64 images
+        // imagePreview 也是完整 data URL（~100-300KB/张）——不剥离的话几张截图
+        // 就会撑爆 localStorage 配额，触发回退逻辑丢掉全部旧会话
+        imagePreview: undefined,
         toolResult: m.toolResult ? m.toolResult.slice(0, 5000) : undefined,
       })),
     }));
@@ -703,8 +706,12 @@ const [timeFilter, setTimeFilter] = useState("all");
     // 等不到主线程，"停止没反应"的根因。
     let flushTimer: ReturnType<typeof setTimeout> | null = null;
     let pendingThinking = "";
+    // reflection_revised 已把最终文本写入消息；此后 [DONE]/finally 的 flushStream
+    // 若再跑，prefix 检查不匹配会把 revised 文本重复 push 一条（M1 复发）。
+    let streamFinalized = false;
     const flushStream = () => {
       if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+      if (streamFinalized) return;
       const text = full;
       const th = pendingThinking;
       pendingThinking = "";
@@ -743,9 +750,11 @@ const [timeFilter, setTimeFilter] = useState("all");
     // leaving the red Stop button stuck forever. Reset on every received chunk.
     const WATCHDOG_MS = 180_000;  // 本地模型 prefill 可能 60-100s 无数据，90s 会误断流
     let watchdog: ReturnType<typeof setTimeout> | null = null;
+    let watchdogFired = false;
     const armWatchdog = () => {
       if (watchdog) clearTimeout(watchdog);
       watchdog = setTimeout(() => {
+        watchdogFired = true;
         try { reader.cancel("watchdog-timeout").catch(() => {}); } catch { /* noop */ }
       }, WATCHDOG_MS);
     };
@@ -755,7 +764,12 @@ const [timeFilter, setTimeFilter] = useState("all");
     try {
     while (true) {
       const { done, value } = await reader.read();
-      if (done) break;
+      if (done) {
+        // watchdog 触发的 cancel 会让 read() 以 done:true 正常结束——
+        // 若不当报错，截断的回答看起来像"自然结束"，用户无从分辨
+        if (watchdogFired) throw new Error("⏱ 流式响应超时（180s 无数据），已中断。可重试或检查模型服务状态。");
+        break;
+      }
       armWatchdog();
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split("\n");
@@ -806,6 +820,7 @@ const [timeFilter, setTimeFilter] = useState("all");
                 const revised = String(parsed.content ?? "");
                 if (revised.trim()) {
                   full = revised;
+                  streamFinalized = true; // 后续 [DONE]/finally flush 不再跑（否则 revised 被重复 push）
                   setMessages((prev) => {
                     const msgs = [...prev];
                     for (let i = msgs.length - 1; i >= 0; i--) {
@@ -930,7 +945,7 @@ const [timeFilter, setTimeFilter] = useState("all");
       ? cloudModels.find((m) => m.name === session.selectedModel)
       : undefined;
     const isLocalTarget = !cloudCfgPre;
-    if (pendingFile?.type === "image" && isLocalTarget && !localLLMStatus?.has_image_support) {
+    if (pendingFile?.base64 && pendingFile.type === "image" && isLocalTarget && !localLLMStatus?.has_image_support) {
       showToast(t("toast.no_vision"), "warn");
       setPendingFile(null);
       return;
@@ -954,7 +969,18 @@ const [timeFilter, setTimeFilter] = useState("all");
         // the screenshot history collapses to a "[File: ...]" text line.
         if (pendingFile.type === "image" && pendingFile.preview) userMsg.imagePreview = pendingFile.preview;
       }
-      userMsg.content = text || `[File: ${pendingFile.name}]`;
+      if (pendingFile.type === "image") {
+        userMsg.content = text || `[Image: ${pendingFile.name}]`;
+      } else {
+        // 文本附件必须把内容真正发给模型（此前只发占位符，模型看不到文件）。
+        // 太长截断：上下文有限，128KB 足够覆盖绝大多数源码/文档。
+        const MAX_FILE_CHARS = 128 * 1024;
+        let body = (pendingFile.content || "").slice(0, MAX_FILE_CHARS);
+        if ((pendingFile.content || "").length > MAX_FILE_CHARS) body += "\n\n...(文件过长已截断)";
+        userMsg.content =
+          (text ? text + "\n\n" : "") +
+          `📎 文件「${pendingFile.name}」内容如下：\n\n\`\`\`\n${body}\n\`\`\``;
+      }
     }
 
     setMessages((prev) => [...prev, userMsg]);
@@ -1051,21 +1077,19 @@ const [timeFilter, setTimeFilter] = useState("all");
     if (!file) return;
     if (file.type.startsWith("image/")) {
       await processImageFile(file);
+    } else if (file.type === "application/pdf") {
+      // PDF 无法作为 image_url 发给模型（视觉模型也解不了 PDF），也没有
+      // 内置解析器——直接提示不支持，避免用户等 180s 超时。
+      showToast(t("toast.pdf_unsupported"), "warn");
+      if (fileInputRef.current) fileInputRef.current.value = "";
+      return;
     } else {
       const reader = new FileReader();
       reader.onload = () => {
         const result = reader.result as string;
-        if (file.type === "application/pdf") {
-          setPendingFile({ name: file.name, preview: "📄", type: "pdf", content: result, base64: result.split(",")[1], mimeType: file.type });
-        } else {
-          setPendingFile({ name: file.name, preview: "📄", type: "file", content: result });
-        }
+        setPendingFile({ name: file.name, preview: "📄", type: "file", content: result });
       };
-      if (file.type === "application/pdf") {
-        reader.readAsDataURL(file);
-      } else {
-        reader.readAsText(file);
-      }
+      reader.readAsText(file);
     }
     if (fileInputRef.current) fileInputRef.current.value = "";
   };
