@@ -507,6 +507,20 @@ TOOLS.append(_create_cron_def)
 TOOL_DISPATCH["create_cron"] = lambda a: _create_cron(a.get("schedule", "0 9 * * *"), a.get("task", ""))
 TOOL_PERMISSIONS["create_cron"] = "safe"
 
+# 工具列表顺序 = 模型看到的"优先级"：搜索类模型明显倾向选靠前的工具。
+# 插件按文件名排序加载（bing_search.py < tavily_search.py），导致 tavily 永远排在
+# bing 之后，且 _cap_tools 按原序截断时 tavily_search 总被先切掉——模型根本没机会
+# 看到 tavily。按语义优先级只重排一次，保证 tavily 排在搜索组最前、截断时优先保留。
+_TOOL_PRIORITY = (
+    "read_file", "write_file", "list_dir", "search_files",
+    "tavily_search", "web_search", "bing_search",
+    "mx_query", "ak_finance",
+    "open_app", "open_folder", "run_cmd",
+    "delegate_task", "create_cron",
+)
+_TOOL_RANK = {_name: _rank for _rank, _name in enumerate(_TOOL_PRIORITY)}
+TOOLS.sort(key=lambda _t: _TOOL_RANK.get(_t.get("function", {}).get("name", ""), len(_TOOL_RANK)))
+
 
 async def execute_tool(tool_name: str, arguments: dict) -> str:
     """Execute a tool with feedback verification. Supports both sync and async tool functions."""
@@ -638,7 +652,10 @@ INTENT_PATTERNS = [
      ["file_read", "app"]),
     (re.compile(r"大盘|A股|港股|股票|个股|股价|行情|涨停|跌停|板块|上证|深证|创业板|科创板|沪深|指数|基金|财报|财务|营收|净利润|上市公司|分红|PE|PB|ROE|股息|龙头|K线|成交量|换手率|资金流向|北向资金|龙虎榜|券商研报", re.IGNORECASE),
      ["file_read", "financial"]),
-    (re.compile(r"上网|联网|搜索网络|搜一下|最新的|最新消息|新闻|热搜|汇率|天气|search|web|online|latest|news|weather|trending", re.IGNORECASE),
+    (re.compile(r"上网|联网|搜索网络|搜一下|搜一搜|查一下|查询|查一查|了解一下|最新的|最新消息|新闻|热搜|汇率|天气|资料|search|web|online|latest|news|weather|trending", re.IGNORECASE),
+     ["file_read", "web"]),
+    # 信息询问型问题（“X 是什么/有哪些/对比/评测”）：给出搜索工具，模型按需调用
+    (re.compile(r"是什么|什么是|有哪些|有什么|为什么|如何|怎么|怎么样|怎么回事|介绍一下|介绍下|原理|机制|评测|测评|对比|区别|哪款|哪家|哪个|性价比|值不值得", re.IGNORECASE),
      ["file_read", "web"]),
 ]
 
@@ -1988,7 +2005,8 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
     # responds empty — which looks like the task "stopped halfway". Keep the
     # first-round prompt small: trim tool list before building if needed.
     if len(tools_prompt) > 4500 and len(active_tools) > 4:
-        _core_tools = {"read_file", "write_file", "list_dir", "run_cmd", "search_files"}
+        # tavily_search 必须保住：裁剪后模型还得能联网搜索（否则“查资料”类任务直接废掉）
+        _core_tools = {"read_file", "write_file", "list_dir", "run_cmd", "search_files", "tavily_search"}
         trimmed = [t for t in active_tools if t.get("function", {}).get("name") in _core_tools]
         if len(trimmed) < 2:
             trimmed = active_tools[:4]

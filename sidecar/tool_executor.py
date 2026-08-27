@@ -636,7 +636,7 @@ _FALLBACK_TOOLS = [
         "type": "function",
         "function": {
             "name": "web_search",
-            "description": "搜索互联网获取实时信息。当你需要最新新闻、事实、或超出你训练数据的信息时使用。返回标题、URL和内容摘要。不要用 run_cmd 或手写代码来做网络搜索——直接用这个工具。",
+            "description": "搜索互联网获取实时信息（tavily_search 的旧名别名，二者等价，指向同一个 Tavily 搜索）。优先使用 tavily_search；仅当工具列表中没有 tavily_search 时才用本工具，不要同时调用两者。返回标题、URL和内容摘要。不要用 run_cmd 或手写代码来做网络搜索。",
             "parameters": {
                 "type": "object",
                 "properties": {

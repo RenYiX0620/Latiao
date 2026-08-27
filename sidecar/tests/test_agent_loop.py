@@ -167,6 +167,35 @@ class TestReflectionTrigger(unittest.TestCase):
         self.assertFalse(_should_reflect("deep", "x" * 100, False))
 
 
+class TestToolCappingKeepsTavily(unittest.TestCase):
+    """回归：_cap_tools 截断后 tavily_search 必须仍在列表且排在 bing_search 前。
+    曾因插件按文件名排序（bing < tavily），cap=5/8 时 tavily 被切掉，模型只能
+    调用 bing_search——表现为"怎么一直不调用 tavily"。"""
+
+    def _capped_names(self, cap):
+        from agent_loop import TOOLS, _cap_tools
+        names = [t.get("function", {}).get("name") for t in _cap_tools(TOOLS, cap)]
+        return names
+
+    def test_tavily_visible_after_cap(self):
+        for cap in (5, 8):
+            names = self._capped_names(cap)
+            self.assertIn("tavily_search", names, f"cap={cap} 切掉了 tavily_search: {names}")
+
+    def test_tavily_before_bing(self):
+        for cap in (5, 8):
+            names = self._capped_names(cap)
+            if "bing_search" in names:
+                self.assertLess(
+                    names.index("tavily_search"), names.index("bing_search"),
+                    f"cap={cap} tavily 应排在 bing 前: {names}")
+
+    def test_core_tools_survive(self):
+        names = self._capped_names(8)
+        for core in ("read_file", "write_file", "list_dir"):
+            self.assertIn(core, names)
+
+
 class TestAccessMode(unittest.TestCase):
     def _tools(self):
         from agent_loop import TOOLS

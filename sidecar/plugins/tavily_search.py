@@ -13,7 +13,7 @@ DEFINITION = {
     "type": "function",
     "function": {
         "name": "tavily_search",
-        "description": "Search the web for real-time information using Tavily. Use when you need current events, news, or facts beyond your training data. Returns relevant results with titles, URLs, and content summaries.",
+        "description": "首选网络搜索工具（Tavily API，已配置 Key）。需要实时信息、最新新闻、当前事实、或超出训练数据的内容时优先使用本工具。返回标题、URL、内容摘要和 AI 摘要。同一任务只调用一次搜索即可，不要与 web_search/bing_search 并行调用。",
         "parameters": {
             "type": "object",
             "properties": {
