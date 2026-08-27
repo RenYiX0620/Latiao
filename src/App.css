@@ -479,8 +479,13 @@ body {
   font-size: 11px; color: var(--text-secondary);
 }
 .subagent-row .subagent-icon { display: inline-flex; opacity: 0.8; }
+.subagent-row .subagent-icon.explore { color: var(--accent); }
 .subagent-name { font-weight: 550; color: var(--text-primary); }
 .subagent-task { color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.subagent-activity {
+  margin-left: 4px; color: var(--text-muted); font-size: 10.5px;
+  white-space: nowrap; flex-shrink: 0;
+}
 .subagent-status { margin-left: auto; color: var(--success); }
 .subagent-status.running { color: var(--accent); animation: blink 1.2s infinite; }
 .subagent-row.error .subagent-name { color: var(--danger); }

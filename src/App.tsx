@@ -142,7 +142,7 @@ const [timeFilter, setTimeFilter] = useState("all");
   // 当前执行中任务摘要（tool_start/tool_end 驱动，顶部状态条展示）
   const [activeTask, setActiveTask] = useState<string | null>(null);
   // 后台子智能体任务（ZCode 式活动栏：delegate_task background=true 产生）
-  const [subagents, setSubagents] = useState<{ id: string; agent: string; task: string; status: string; summary?: string }[]>([]);
+  const [subagents, setSubagents] = useState<{ id: string; agent: string; task: string; status: string; steps?: number; activity?: Record<string, number>; last_activity?: string; summary?: string }[]>([]);
   const [taskStartAt, setTaskStartAt] = useState<number | null>(null);
   const activeTaskStackRef = useRef<string[]>([]);
   const abortControllerRef = useRef<AbortController | null>(null);
