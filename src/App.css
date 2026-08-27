@@ -510,7 +510,11 @@ img.sidebar-logo {
 }
 [data-theme="light"] .chat-segment {
   background: #ffffff;
-  border-color: rgba(0, 0, 0, 0.06);
+  /* 只调其余三边；border-color 简写会把左侧 accent 强调线一并盖成灰色，
+     形成用户看到的"框中框"灰色粗线 */
+  border-top-color: rgba(0, 0, 0, 0.06);
+  border-right-color: rgba(0, 0, 0, 0.06);
+  border-bottom-color: rgba(0, 0, 0, 0.06);
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
 }
 .chat-segment-head {
