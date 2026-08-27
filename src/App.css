@@ -498,24 +498,11 @@ img.sidebar-logo {
 .subagent-row.error .subagent-name { color: var(--danger); }
 .subagent-row.error .subagent-status { color: var(--danger); }
 
-/* ZCode 式：对话段无卡片底/无边框，内容直接铺在主背景上，
-   仅以左侧细线和段间距区分 */
+/* 对话段完全无框：内容直接铺在背景上，仅以段间距区分（ZCode 原生样式） */
 .chat-segment {
-  /* ZCode 式分组：可感知的浅浮层底 + 左侧强调线 */
-  background: rgba(30, 32, 48, 0.55);
-  border: 1px solid rgba(255, 255, 255, 0.05);
-  border-left: 3px solid var(--accent);
-  border-radius: var(--radius-md);
-  margin: 14px 0; overflow: visible; padding: 6px 14px 10px 16px;
-}
-[data-theme="light"] .chat-segment {
-  background: #ffffff;
-  /* 只调其余三边；border-color 简写会把左侧 accent 强调线一并盖成灰色，
-     形成用户看到的"框中框"灰色粗线 */
-  border-top-color: rgba(0, 0, 0, 0.06);
-  border-right-color: rgba(0, 0, 0, 0.06);
-  border-bottom-color: rgba(0, 0, 0, 0.06);
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+  background: transparent;
+  border: none;
+  margin: 18px 0; padding: 0;
 }
 .chat-segment-head {
   display: inline-flex; align-items: center; gap: 7px; width: auto;
