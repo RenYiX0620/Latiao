@@ -1538,21 +1538,26 @@ async def local_llm_get_context():
 
 
 @app.post("/v1/local-llm/start")
-def local_llm_start(request: Request):
-    """Start a local model."""
-    body = json.loads(request.body()) if request.body() else {}
+async def local_llm_start(request: Request):
+    """Start a local model.
+
+    async 解析 body，但引擎启动（Popen + 300s 轮询）放线程池执行，
+    不冻结事件循环（否则加载期心跳/停止全部排队）。"""
+    body = await _json_body(request)
     model_id = body.get("model_id", "")
     port = body.get("port", 1235)
     if not model_id:
         return {"status": "error", "message": "model_id required"}
-    result = local_llm.start_model(model_id, port)
-    return result
+    from starlette.concurrency import run_in_threadpool
+    return await run_in_threadpool(local_llm.start_model, model_id, port)
 
 
 @app.post("/v1/local-llm/stop")
-def local_llm_stop():
-    """Stop the running local model."""
-    return local_llm.stop_model()
+async def local_llm_stop():
+    """Stop the running local model. stop_model 内含 lsof/kill 子进程调用，
+    放线程池避免阻塞事件循环（停止必须即时响应）。"""
+    from starlette.concurrency import run_in_threadpool
+    return await run_in_threadpool(local_llm.stop_model)
 
 
 @app.post("/v1/engine/detach")
