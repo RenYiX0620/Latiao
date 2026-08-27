@@ -236,6 +236,15 @@ AGENT_PROFILES: dict[str, dict] = {
             "你是翻译助手，负责多语言翻译与本地化。"),
         "tools": ["read_file", "list_dir", "search_files", "write_file"],
     },
+    "explore": {
+        "name": "探索者",
+        "display": "探索者 · 深度调研",
+        "role": "specialist",
+        "identity": _load_agent_identity("explore",
+            "你是探索者，专注快速摸清代码库/文件结构、定位关键实现，并可联网调研。\n"
+            "你可以运行只读命令（ls/grep/find/cat 等白名单命令）和联网搜索，但不能修改任何东西。\n"
+            "高效优先：一次读大范围信息，避免琐碎小步。返回简洁的发现摘要（含关键路径与结论）。"),
+    },
 }
 
 
@@ -459,11 +468,11 @@ _delegate_tool_def = {
     "type": "function",
     "function": {
         "name": "delegate_task",
-        "description": "Delegate a sub-task to a specialist sub-agent. Sub-agents run independently with limited tools and return results. Use to parallelize work — call multiple times for independent sub-tasks. Available agents: code-reviewer (read-only code review), doc-generator (documentation), debugger (bug analysis), translator (translation).",
+        "description": "Delegate a sub-task to a specialist sub-agent. Sub-agents run independently with limited tools and return results. Use to parallelize work — call multiple times for independent sub-tasks. Available agents: explore (read-only deep exploration: search codebase, run read-only commands like ls/grep, web research), code-reviewer (read-only code review), doc-generator (documentation), debugger (bug analysis), translator (translation).",
         "parameters": {
             "type": "object",
             "properties": {
-                "agent": {"type": "string", "enum": ["code-reviewer", "doc-generator", "debugger", "translator"], "description": "The specialist agent type."},
+                "agent": {"type": "string", "enum": ["explore", "code-reviewer", "doc-generator", "debugger", "translator"], "description": "The specialist agent type."},
                 "task": {"type": "string", "description": "The specific task for the sub-agent. Be clear and concise."},
                 "background": {"type": "boolean", "description": "Run in background without blocking the main conversation. Progress appears in the sub-agent panel. Default false."},
             },
@@ -476,13 +485,15 @@ _delegate_tool_def = {
 if not any(t.get("function", {}).get("name") == "delegate_task" for t in TOOLS):
     TOOLS.append(_delegate_tool_def)
 def _dispatch_delegate(args: dict):
-    """delegate_task 分发：background=true 时以后台子任务运行（不阻塞主对话）。"""
+    """delegate_task 分发：background=true 时以后台子任务运行（不阻塞主对话）。
+    前台模式也进注册表——活动栏实时可见步数/活动摘要，与后台一致。"""
     agent = args.get("agent", "code-reviewer")
     task = args.get("task", "")
     if args.get("background"):
         from tool_executor import _delegate_task_bg
         return _delegate_task_bg(agent, task)
-    return _delegate_task(agent, task)
+    from tool_executor import _delegate_task_fg
+    return _delegate_task_fg(agent, task)
 
 TOOL_DISPATCH["delegate_task"] = _dispatch_delegate
 TOOL_PERMISSIONS["delegate_task"] = "safe"

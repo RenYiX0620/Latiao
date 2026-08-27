@@ -342,16 +342,31 @@ export default memo(function ChatView({
       <div className="chat-wrap">
       {(subagents && subagents.length > 0) && (
         <div className="subagent-bar">
-          {(subagents as { id: string; agent: string; task: string; status: string; summary?: string }[]).map(sa => (
-            <div key={sa.id} className={`subagent-row${sa.status === "running" ? " running" : sa.status === "error" ? " error" : ""}`}>
-              <span className="subagent-icon"><Bot size={13} /></span>
-              <span className="subagent-name">{sa.agent}</span>
-              <span className="subagent-task">· {sa.task.slice(0, 40)}</span>
-              <span className={`subagent-status${sa.status === "running" ? " running" : ""}`}>
-                {sa.status === "running" ? "●" : sa.status === "done" ? "✓" : "✗"}
-              </span>
-            </div>
-          ))}
+          {(subagents as { id: string; agent: string; task: string; status: string; steps?: number; activity?: Record<string, number>; last_activity?: string; summary?: string }[]).map(sa => {
+            const isExplore = sa.agent === "explore";
+            const Icon = isExplore ? Search : Bot;
+            // ZCode 式活动摘要："终端 · 1 个命令""文件 · 3 次读取"
+            const actLabel: Record<string, [string, string]> = {
+              终端: ["个命令", "个命令"], 文件: ["次读写", "次读写"],
+              搜索: ["次搜索", "次搜索"], 委派: ["个子任务", "个子任务"],
+            };
+            const parts = Object.entries(sa.activity || {})
+              .filter(([, n]) => n > 0)
+              .map(([cat, n]) => `${cat} · ${n} ${actLabel[cat]?.[0] ?? "次"}`);
+            return (
+              <div key={sa.id} className={`subagent-row${sa.status === "running" ? " running" : sa.status === "error" ? " error" : ""}`} title={sa.last_activity || sa.summary || ""}>
+                <span className={`subagent-icon${isExplore ? " explore" : ""}`}><Icon size={13} /></span>
+                <span className="subagent-name">{sa.agent}</span>
+                <span className="subagent-task">· {sa.task.slice(0, 40)}</span>
+                {(parts.length > 0 || (sa.steps ?? 0) > 0) && (
+                  <span className="subagent-activity">{parts.join("　") || `· ${sa.steps} 步`}</span>
+                )}
+                <span className={`subagent-status${sa.status === "running" ? " running" : ""}`}>
+                  {sa.status === "running" ? "●" : sa.status === "done" ? "✓" : "✗"}
+                </span>
+              </div>
+            );
+          })}
         </div>
       )}
       {messages.length > 8 && (

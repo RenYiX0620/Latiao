@@ -379,7 +379,29 @@ _SUBAGENT_TOOLS: dict[str, list[str]] = {
     "doc-generator": ["read_file", "list_dir", "search_files", "write_file"],
     "debugger": ["read_file", "list_dir", "search_files", "run_cmd"],
     "translator": ["read_file", "list_dir", "search_files", "write_file"],
+    "explore": ["read_file", "list_dir", "search_files", "run_cmd", "tavily_search"],
 }
+
+# 子智能体可免确认执行的只读命令白名单（ZCode 式 Explore：能跑只读命令探查，
+# 但没有任何写副作用）。run_cmd 本身是 confirm 级且子智能体没有用户确认通道，
+# 此前 debugger 配置里的 run_cmd 实际永远被拦——是死配置。白名单让 explore/
+# debugger 能跑 ls/grep/find 这类纯查询命令，复杂/未列命令仍被拦下。
+_READONLY_CMD_WORDS = {
+    "ls", "cat", "head", "tail", "find", "grep", "rg", "wc", "file",
+    "stat", "du", "df", "ps", "which", "whoami", "uname", "pwd",
+    "echo", "env", "date",
+}
+
+
+def _is_readonly_cmd(cmd: str) -> bool:
+    """判断子智能体请求的命令是否命中只读白名单（仅限单条简单命令）。"""
+    cmd = (cmd or "").strip()
+    if not cmd or re.search(r"[;&|><`$]", cmd):
+        return False
+    if re.match(r"git\s+(log|status|diff|show|branch|remote|tag|blame)\b", cmd):
+        return True
+    first = cmd.split()[0].rsplit("/", 1)[-1]
+    return first in _READONLY_CMD_WORDS
 
 
 # ── 后台子任务注册表（ZCode 式：fire-and-forget + 进度事件 + 结果查询） ──
@@ -397,6 +419,8 @@ def _subtask_snapshot() -> list[dict]:
         out.append({
             "id": tid, "agent": s["agent"], "task": s["task"][:60],
             "status": s["status"], "steps": s["steps"],
+            "activity": dict(s.get("activity") or {}),
+            "last_activity": s.get("last_activity", ""),
             "started_at": s["started_at"], "updated_at": s["updated_at"],
             "summary": (s["result"] or "")[:160],
         })
@@ -410,9 +434,10 @@ async def _run_subtask_bg(task_id: str, agent_type: str, task: str):
         # 复用前台逻辑但拦截进度：为简洁直接跑完整 _delegate_task
         s["status"] = "running"
         s["updated_at"] = _time.time()
-        result = await _delegate_task(agent_type, task)
+        result = await _delegate_task(agent_type, task, task_id=task_id)
         s["result"] = result
-        s["status"] = "done" if not result.startswith("[Sub-agent") or "错误" not in result else "error"
+        failed = "[Sub-agent" in result and ("错误" in result or "HTTP" in result.split("\n")[0])
+        s["status"] = "error" if failed else "done"
         s["updated_at"] = _time.time()
         _SUBTASK_EVENTS.append({"id": task_id, "status": s["status"], "summary": result[:120]})
     except Exception as e:
@@ -436,9 +461,29 @@ async def _delegate_task_bg(agent_type: str, task: str) -> str:
     return f"[Sub-agent {agent_type} 后台任务已启动] task_id={task_id}\n主对话可继续；结果将自动出现在子智能体面板，也可用 task_id 查询。"
 
 
-async def _delegate_task(agent_type: str, task: str) -> str:
+async def _delegate_task_fg(agent_type: str, task: str) -> str:
+    """前台模式（阻塞等待结果），同样进注册表——活动栏实时展示步数/活动摘要。"""
+    global _SUBTASK_SEQ
+    _SUBTASK_SEQ += 1
+    task_id = f"sub_{_time.strftime('%H%M%S')}_{_SUBTASK_SEQ}"
+    _SUBTASKS[task_id] = {
+        "agent": agent_type, "task": task, "status": "running",
+        "steps": 0, "result": "", "started_at": _time.time(), "updated_at": _time.time(),
+    }
+    result = await _delegate_task(agent_type, task, task_id=task_id)
+    s = _SUBTASKS[task_id]
+    failed = "[Sub-agent" in result and ("错误" in result or "HTTP" in result.split("\n")[0])
+    s["result"] = result
+    s["status"] = "error" if failed else "done"
+    s["updated_at"] = _time.time()
+    _SUBTASK_EVENTS.append({"id": task_id, "status": s["status"], "summary": result[:120]})
+    return result
+
+
+async def _delegate_task(agent_type: str, task: str, task_id: str | None = None) -> str:
     """Spawn a specialist sub-agent to handle a delegated task.
-    Uses async httpx to avoid blocking the main event loop."""
+    Uses async httpx to avoid blocking the main event loop.
+    task_id: 后台模式时传入注册表键，实时上报步数与活动摘要（前端活动栏展示）。"""
     if not task.strip():
         return "错误：任务描述不能为空"
 
@@ -510,6 +555,25 @@ async def _delegate_task(agent_type: str, task: str) -> str:
                             logger.warning("Sub-agent received malformed tool arguments", exc_info=True)
                             targs = {}
                         perm = _resolve_permission(tname, targs)
+                        # ZCode 式探索豁免：explore/debugger 的只读白名单命令免确认
+                        # （子智能体无用户确认通道，但白名单命令纯查询、无写副作用）
+                        if perm == "confirm" and tname == "run_cmd" \
+                                and agent_type in ("explore", "debugger") \
+                                and _is_readonly_cmd(targs.get("cmd", "")):
+                            perm = "safe"
+                        if task_id and task_id in _SUBTASKS:
+                            s = _SUBTASKS[task_id]
+                            s["steps"] = s.get("steps", 0) + 1
+                            _cat = ("终端" if tname == "run_cmd"
+                                    else "搜索" if tname in ("tavily_search", "web_search")
+                                    else "委派" if tname == "delegate_task"
+                                    else "文件")
+                            act = s.setdefault("activity", {})
+                            act[_cat] = act.get(_cat, 0) + 1
+                            brief = str(targs.get("query") or targs.get("cmd")
+                                        or targs.get("path") or targs.get("pattern") or "")[:60]
+                            s["last_activity"] = f"{tname}: {brief}" if brief else tname
+                            s["updated_at"] = _time.time()
                         if perm == "deny":
                             tres = "⛔ 工具已被权限系统阻止: " + tname
                             logger.warning("Sub-agent attempted blocked tool: " + tname)
@@ -652,13 +716,13 @@ _FALLBACK_TOOLS = [
         "type": "function",
         "function": {
             "name": "delegate_task",
-            "description": "Delegate a sub-task to a specialist sub-agent. Sub-agents run independently with limited tools and return results. Use this to parallelize work — spawn multiple sub-agents for independent sub-tasks. Available agents: code-reviewer (read-only code review), doc-generator (documentation), debugger (bug analysis), translator (translation).",
+            "description": "Delegate a sub-task to a specialist sub-agent. Sub-agents run independently with limited tools and return results. Use this to parallelize work — spawn multiple sub-agents for independent sub-tasks. Available agents: explore (read-only deep exploration: search codebase, run read-only commands like ls/grep, web research), code-reviewer (read-only code review), doc-generator (documentation), debugger (bug analysis), translator (translation).",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "agent": {
                         "type": "string",
-                        "enum": ["code-reviewer", "doc-generator", "debugger", "translator"],
+                        "enum": ["explore", "code-reviewer", "doc-generator", "debugger", "translator"],
                         "description": "The specialist agent type to delegate to."
                     },
                     "task": {
