@@ -382,6 +382,60 @@ _SUBAGENT_TOOLS: dict[str, list[str]] = {
 }
 
 
+# ── 后台子任务注册表（ZCode 式：fire-and-forget + 进度事件 + 结果查询） ──
+import time as _time
+
+_SUBTASKS: dict[str, dict] = {}   # task_id -> {agent, task, status, events, result, ...}
+_SUBTASK_EVENTS: list[dict] = []  # 事件流（前端心跳拉取）
+_SUBTASK_SEQ = 0
+
+
+def _subtask_snapshot() -> list[dict]:
+    """后台子任务列表快照（heartbeat 附带，前端活动栏渲染）。"""
+    out = []
+    for tid, s in _SUBTASKS.items():
+        out.append({
+            "id": tid, "agent": s["agent"], "task": s["task"][:60],
+            "status": s["status"], "steps": s["steps"],
+            "started_at": s["started_at"], "updated_at": s["updated_at"],
+            "summary": (s["result"] or "")[:160],
+        })
+    return out
+
+
+async def _run_subtask_bg(task_id: str, agent_type: str, task: str):
+    """后台跑子 agent（非阻塞主对话），事件实时进注册表。"""
+    s = _SUBTASKS[task_id]
+    try:
+        # 复用前台逻辑但拦截进度：为简洁直接跑完整 _delegate_task
+        s["status"] = "running"
+        s["updated_at"] = _time.time()
+        result = await _delegate_task(agent_type, task)
+        s["result"] = result
+        s["status"] = "done" if not result.startswith("[Sub-agent") or "错误" not in result else "error"
+        s["updated_at"] = _time.time()
+        _SUBTASK_EVENTS.append({"id": task_id, "status": s["status"], "summary": result[:120]})
+    except Exception as e:
+        s["result"] = f"[Sub-agent: {agent_type}] 错误: {e}"
+        s["status"] = "error"
+        s["updated_at"] = _time.time()
+
+
+async def _delegate_task_bg(agent_type: str, task: str) -> str:
+    """后台模式：立即返回任务 ID，子 agent 异步执行，进度/结果走 heartbeat。"""
+    global _SUBTASK_SEQ
+    _SUBTASK_SEQ += 1
+    task_id = f"sub_{_time.strftime('%H%M%S')}_{_SUBTASK_SEQ}"
+    _SUBTASKS[task_id] = {
+        "agent": agent_type, "task": task, "status": "running",
+        "steps": 0, "result": "", "started_at": _time.time(), "updated_at": _time.time(),
+    }
+    _SUBTASK_EVENTS.append({"id": task_id, "status": "started", "summary": task[:80]})
+    import asyncio as _asyncio
+    _asyncio.get_event_loop().create_task(_run_subtask_bg(task_id, agent_type, task))
+    return f"[Sub-agent {agent_type} 后台任务已启动] task_id={task_id}\n主对话可继续；结果将自动出现在子智能体面板，也可用 task_id 查询。"
+
+
 async def _delegate_task(agent_type: str, task: str) -> str:
     """Spawn a specialist sub-agent to handle a delegated task.
     Uses async httpx to avoid blocking the main event loop."""
