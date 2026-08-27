@@ -49,21 +49,25 @@
   --bg-tool-result: rgba(0, 0, 0, 0.2);
 }
 
+/* hover/active 浮层：深色用白色叠加、浅色用黑色叠加 */
+:root { --hover-overlay: rgba(255, 255, 255, 0.05); }
+[data-theme="light"] { --hover-overlay: rgba(0, 0, 0, 0.03); }
+
 [data-theme="light"] {
   --bg-root: #ffffff;
   --bg-surface: #ffffff;
   --bg-surface-hover: #fafafa;
   --bg-elevated: #ffffff;
   --bg-input: #ffffff;
-  --border-default: rgba(0, 0, 0, 0.08);
-  --border-strong: rgba(0, 0, 0, 0.12);
-  --border-subtle: rgba(0, 0, 0, 0.08);
+  --border-default: rgba(0, 0, 0, 0.05);
+  --border-strong: rgba(0, 0, 0, 0.09);
+  --border-subtle: rgba(0, 0, 0, 0.04);
   --border-accent: rgba(56, 189, 248, 0.25);
   --text-primary: #1a1a2e;
   --text-secondary: #5a5a72;
   --text-muted: #8e8ea0;
   --text-disabled: #c0c0cc;
-  --text-tertiary: #8e8ea0;
+  --text-tertiary: rgba(0, 0, 0, 0.22);
   --accent: #0284c7;
   --accent-hover: #0369a1;
   --accent-soft: rgba(2, 132, 199, 0.1);
@@ -170,7 +174,7 @@ img.sidebar-logo {
   font-size: 12.5px; font-family: var(--font-sans); cursor: pointer; text-align: left;
   transition: all 0.15s ease;
 }
-.nav-item:hover { background: rgba(255,255,255,0.04); color: var(--text-primary); }
+.nav-item:hover { background: var(--hover-overlay); color: var(--text-primary); }
 .nav-item.active { background: var(--accent-soft); color: var(--accent); }
 .nav-icon { font-size: 15px; width: 20px; display: inline-flex; align-items: center; justify-content: center; opacity: 0.65; flex-shrink: 0; }
 .nav-item.active .nav-icon { opacity: 1; }
@@ -182,7 +186,7 @@ img.sidebar-logo {
   border: none; background: transparent; color: var(--text-secondary);
   cursor: pointer; text-align: left; transition: all 0.15s ease; gap: 6px;
 }
-.session-item:hover { background: rgba(255,255,255,0.04); color: var(--text-primary); }
+.session-item:hover { background: var(--hover-overlay); color: var(--text-primary); }
 .session-item.active { background: rgba(56,189,248,0.06); color: var(--text-primary); }
 .session-info { min-width: 0; flex: 1; }
 .session-name { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
