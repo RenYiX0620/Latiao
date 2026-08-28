@@ -118,7 +118,7 @@ body {
 }
 /* ── 折叠态：ZCode 式极简图标栏（黑 #161616 底 + 灰图标 + 悬停圆角浮起） ── */
 .sidebar-collapsed .sidebar {
-  --sidebar-width: 56px;
+  --sidebar-width: 200px;
 }
 .sidebar-collapsed .sidebar-logo {
   width: 28px; height: 28px;
@@ -226,15 +226,20 @@ img.sidebar-logo {
 .sidebar-collapsed .sidebar-title,
 .sidebar-collapsed .sidebar-subtitle,
 .sidebar-collapsed .nav-section-label,
-.sidebar-collapsed .session-name,
 .sidebar-collapsed .session-preview,
 .sidebar-collapsed .session-delete-btn,
 .sidebar-collapsed .sidebar-model-select { display: none; }
+/* 折叠态保留会话名（ZCode 式：图标 + 标题可读） */
+.sidebar-collapsed .session-name {
+  display: inline-block; font-size: 11px; color: #d4d4d4;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 120px;
+}
 .sidebar-collapsed .sidebar-brand { justify-content: center; padding: 18px 8px 14px; }
 .sidebar-collapsed .sidebar-nav { padding: 4px 8px; }
 .sidebar-collapsed .nav-item,
-.sidebar-collapsed .session-item { justify-content: center; padding: 10px 4px; }
+.sidebar-collapsed .session-item { justify-content: flex-start; padding: 8px 10px; }
 .sidebar-collapsed .nav-item .nav-icon { margin: 0; }
+.sidebar-collapsed .nav-item { justify-content: center; }
 .sidebar-collapsed .sidebar-footer { justify-content: center; padding: 12px 8px; }
 
 /* 折叠态配色（对齐 ZCode 截图）：黑底 / 灰图标 / 悬停圆角浮起 */
