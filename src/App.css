@@ -123,6 +123,8 @@ body {
 .sidebar-collapsed .sidebar-logo {
   width: 28px; height: 28px;
   box-shadow: none;
+  outline: 1px solid #2e2e2e;
+  border-radius: 8px;
 }
 
 .sidebar-brand { display: flex; align-items: center; gap: 10px; padding: 18px 18px 14px; flex-shrink: 0; }
@@ -241,10 +243,7 @@ img.sidebar-logo {
   border-right-color: transparent;
   backdrop-filter: none; -webkit-backdrop-filter: none;
 }
-[data-theme="light"] .sidebar-collapsed .sidebar {
-  background: #f7f7f8;
-  border-right-color: rgba(0, 0, 0, 0.05);
-}
+
 .sidebar-collapsed .nav-item,
 .sidebar-collapsed .session-item {
   border-radius: var(--radius-md);
@@ -262,12 +261,7 @@ img.sidebar-logo {
   background: #232323;
   color: #9a9a9a;
 }
-[data-theme="light"] .sidebar-collapsed .nav-item,
-[data-theme="light"] .sidebar-collapsed .session-item { color: #9d9da4; }
-[data-theme="light"] .sidebar-collapsed .nav-item:hover,
-[data-theme="light"] .sidebar-collapsed .session-item:hover { background: #ececee; color: #55555c; }
-[data-theme="light"] .sidebar-collapsed .nav-item.active,
-[data-theme="light"] .sidebar-collapsed .session-item.active { background: #e4e4e7; color: #333338; }
+
 .sidebar-collapsed .sidebar-collapse-btn,
 .sidebar-collapsed .session-add-btn { color: #565656; }
 
