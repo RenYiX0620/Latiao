@@ -172,6 +172,7 @@ class LocalLLMEngine:
         self.has_image_support = False
         # _find_gguf 结果缓存（30s TTL），避免重复全盘 rglob 扫描
         self._gguf_find_cache: dict[str, tuple[float, str | None]] = {}
+        self._restore_engine_state()
 
         # Register exit handler as belt-and-suspenders (once per process)
         if not LocalLLMEngine._atexit_registered:
@@ -733,6 +734,7 @@ class LocalLLMEngine:
         # moment) and the port probe would flip the UI back to "running", making
         # it look like the stop did nothing.
         if (self.server_status == "stopped" and not self._explicit_stop
+                and not self._engine_busy()
                 and self._probe_port(self.server_port)):
             self.server_status = "running"
             self.status_message = "(reconnected after sidecar restart)"
@@ -793,15 +795,51 @@ class LocalLLMEngine:
         # 返回 URL 让 agent 层在重载窗口内排队等待（6 分钟重试窗口覆盖加载）
         model_id = self.current_model_id
         process_dead = self._process is None or self._process.poll() is not None
-        if model_id and process_dead and not getattr(self, "_auto_reloading", False):
-            self._auto_reloading = True
+        if model_id and process_dead:
             self._process = None  # 丢弃僵尸句柄，让 start_model 能重新 Popen
-            logger.info("引擎进程已退出，自动重载模型: %s", model_id)
-            threading.Thread(
-                target=lambda mid=model_id: self._auto_reload(mid),
-                daemon=True,
-            ).start()
+            logger.info("引擎进程已退出，请求自动重载模型: %s", model_id)
+            self._request_reload(model_id)
         return f"http://127.0.0.1:{self.server_port}/v1"
+
+    # ── 引擎状态持久化（B1）──
+    # sidecar 重启会丢失内存里的 current_model_id → get_api_url 的自动重载
+    # 分支条件（model_id 非空）不成立 → 引擎死了不恢复，请求干等 6 分钟报错。
+    _engine_state_file = Path.home() / ".local-ai-os" / ".engine_state.json"
+
+    def _save_engine_state(self):
+        try:
+            self._engine_state_file.parent.mkdir(parents=True, exist_ok=True)
+            data = {
+                "model_id": self.current_model_id,
+                "model_name": self.current_model_name,
+                "backend": self._active_backend,
+                "port": self.server_port,
+                "saved_at": time.time(),
+            }
+            tmp = self._engine_state_file.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+            os.replace(tmp, self._engine_state_file)
+        except Exception:
+            logger.warning("Failed to save engine state", exc_info=True)
+
+    def _clear_engine_state(self):
+        try:
+            self._engine_state_file.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    def _restore_engine_state(self):
+        """sidecar 启动时读回上次加载的模型（仅恢复元数据，不自动拉起进程）。"""
+        try:
+            if self._engine_state_file.exists():
+                data = json.loads(self._engine_state_file.read_text(encoding="utf-8"))
+                if data.get("model_id"):
+                    self.current_model_id = data["model_id"]
+                    self.current_model_name = data.get("model_name", "")
+                    self._active_backend = data.get("backend", "")
+                    logger.info("已恢复引擎状态: %s (backend=%s)", data["model_id"], data.get("backend"))
+        except Exception:
+            logger.warning("Failed to restore engine state", exc_info=True)
 
     def _auto_reload(self, model_id: str):
         """后台自动重载：加载完成后复位 _auto_reloading 标记。"""
@@ -809,6 +847,44 @@ class LocalLLMEngine:
             self.start_model(model_id)
         finally:
             self._auto_reloading = False
+
+    def _request_reload(self, model_id: str) -> bool:
+        """统一的重载请求入口（带防重入守卫）。
+
+        所有自动重载路径（get_api_url / ensure_engine_healthy）必须走这里：
+        已有重载进行中时直接跳过并返回 False。此前 ensure_engine_healthy
+        直接裸起 start_model 线程、不设 _auto_reloading，与 get_api_url 的
+        重载并发时两个 start_model 串行执行——第二个先杀掉刚加载完的引擎
+        再加载一遍，旧新权重同时驻留 = 内存 95% 尖峰。"""
+        if getattr(self, "_auto_reloading", False):
+            logger.info("重载已在进行中，跳过重复重载请求: %s", model_id)
+            return False
+        self._auto_reloading = True
+        logger.info("自动重载已启动: %s (后台加载中，请求将排队等待)", model_id)
+        threading.Thread(
+            target=lambda mid=model_id: self._auto_reload(mid),
+            daemon=True,
+        ).start()
+        return True
+
+    # ── 忙引擎保护（A3）──
+    # 本地流式进行中时，引擎对健康探测的响应必然超时（串行处理），
+    # 不能据此判定引擎死亡。agent_loop 在流开始/结束时调用这两个方法，
+    # 健康检查看到宽限窗口内的忙标志直接视为存活。
+    _engine_busy_until = 0.0
+
+    def mark_engine_busy(self, grace_sec: float = 45.0):
+        """标记引擎正在服务流式请求（宽限期内健康检查跳过）。"""
+        import time as _t
+        type(self)._engine_busy_until = _t.monotonic() + grace_sec
+
+    def mark_engine_idle(self):
+        import time as _t
+        type(self)._engine_busy_until = 0.0
+
+    def _engine_busy(self) -> bool:
+        import time as _t
+        return _t.monotonic() < type(self)._engine_busy_until
 
     def _probe_external_engine(self) -> tuple[str, str, str] | None:
         """Detect an external OpenAI-compatible local server (LM Studio 1234,
@@ -897,6 +973,13 @@ class LocalLLMEngine:
         now = time.time()
         if not force and self._health_ok and now - self._health_verified_at < 30:
             return True
+        # 忙引擎保护：流式进行中（或刚结束的宽限期内）引擎对探测必然响应慢，
+        # 不能据此判死——直接视为存活，避免误杀正在干活的模型触发重载
+        if self._engine_busy():
+            self._health_ok = True
+            self._health_verified_at = now
+            logger.info("引擎忙于流式请求，健康检查跳过（视为存活）")
+            return True
         ok = self.verify_engine_health()
         self._health_ok = ok
         self._health_verified_at = now
@@ -923,10 +1006,7 @@ class LocalLLMEngine:
         model_id = self.current_model_id
         if model_id:
             self.status_message = "引擎异常，正在自动重新加载模型..."
-            threading.Thread(
-                target=lambda mid=model_id: self.start_model(mid),
-                daemon=True,
-            ).start()
+            self._request_reload(model_id)
         return False
 
     # ── Start / Stop ──
@@ -987,6 +1067,7 @@ class LocalLLMEngine:
                     if int(pid) == my_pid:
                         continue  # 保险带：绝不能杀自己
                     try:
+                        logger.warning(" killing pid=%s on port %s", pid, port)
                         os.kill(int(pid), 9)
                     except OSError:
                         pass
@@ -1197,6 +1278,8 @@ class LocalLLMEngine:
             self.server_status = "running"
             self.status_message = f"{self.current_model_name} 运行中"
             self._active_backend = "llama-cpp"
+            self._save_engine_state()
+            logger.info("模型加载完成 (llama-cpp) port=%s model=%s", port, self.current_model_name)
             return self.get_status()
         except Exception as e:
             logger.error("Failed to start llama-cpp server: %s", e)
@@ -1359,6 +1442,8 @@ class LocalLLMEngine:
             self.status_message = f"{self.current_model_name} 运行中 (MLX)"
             self.has_image_support = "vision" in model_id.lower() or "llama-4" in model_id.lower()
             self._active_backend = "mlx"
+            self._save_engine_state()
+            logger.info("模型加载完成 (mlx) port=%s model=%s", port, self.current_model_name)
             return self.get_status()
         except Exception as e:
             logger.error("Failed to start MLX server: %s", e)
@@ -1484,6 +1569,7 @@ class LocalLLMEngine:
                 self.current_model_name = ""
                 self._active_backend = ""
                 self.has_image_support = False
+                self._clear_engine_state()
                 return self.get_status()
             if self._process:
                 try:
@@ -1517,6 +1603,8 @@ class LocalLLMEngine:
             self.current_model_name = ""
             self._active_backend = ""
             self.has_image_support = False
+            self._clear_engine_state()
+            logger.info("模型已停止并卸载 (port=%s)", self.server_port)
             return self.get_status()
 
     def delete_model_file(self, model_id: str) -> dict:
