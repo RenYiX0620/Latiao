@@ -444,17 +444,24 @@ img.sidebar-logo {
 .msg-time { font-size: 10px; color: var(--text-disabled); margin-left: 6px; }
 
 
-/* ZCode 式活动行：思考过程 / 工具聚合（summary 行内灰字，点开展开） */
+/* ZCode 式活动行（对齐参照图逐像素）：常态无背景通栏排版，
+   悬停出现 #2b2b2b 通栏圆角块，文字色不变 */
 .thinking-row, .tool-group-row { margin: 2px 0; }
 .thinking-row-head, .tool-group-row-head {
-  display: inline-flex; align-items: center; gap: 6px;
+  display: flex; align-items: center; gap: 8px;
   font-size: 11px; color: var(--text-muted); cursor: pointer; user-select: none;
-  padding: 2px 6px; border-radius: var(--radius-sm);
+  padding: 6px 10px; border-radius: 8px;
   list-style: none;
 }
 .thinking-row-head::-webkit-details-marker,
 .tool-group-row-head::-webkit-details-marker { display: none; }
-.thinking-row-head:hover, .tool-group-row-head:hover { background: var(--bg-input); color: var(--text-secondary); }
+.thinking-row-head:hover, .tool-group-row-head:hover {
+  background: #2b2b2b;
+}
+[data-theme="light"] .thinking-row-head:hover,
+[data-theme="light"] .tool-group-row-head:hover {
+  background: #ececee;
+}
 .thinking-row-body {
   font-size: 11px; color: var(--text-muted); line-height: 1.5; max-height: 160px; overflow-y: auto;
   white-space: pre-wrap; border-left: 2px solid var(--border-default);
@@ -544,7 +551,9 @@ img.sidebar-logo {
   text-align: left; cursor: pointer; user-select: none;
   border-radius: var(--radius-sm); margin-left: -8px;
 }
-.chat-segment-head:hover { background: var(--bg-input); color: var(--text-secondary); }
+.chat-segment-head { border-radius: 8px; }
+.chat-segment-head:hover { background: #2b2b2b; }
+[data-theme="light"] .chat-segment-head:hover { background: #ececee; }
 .chat-segment.collapsed .chat-segment-head { border-bottom: none; }
 .chat-segment-label { font-family: var(--font-mono); opacity: 0.85; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chat-segment-chevron { margin-left: auto; display: inline-flex; opacity: 0.6; }
