@@ -1633,7 +1633,10 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                 m.get("role") == "tool" or (isinstance(m.get("content"), str) and m["content"].startswith("[工具结果]"))
                 for m in current_msgs[-3:]
             )
-            if has_recent_tool_result and text_only_streak < max_stagnation and streamed_text.strip():
+            # 只补问一次：模型已交付最终文字后，再拖一轮确认“没有未完工具”，
+            # 之后直接结束——此前最多空转 10 轮（每轮 30-60s）→ 用户看到
+            # "答案有了但任务 1 分钟才结束"。
+            if has_recent_tool_result and text_only_streak < 1 and streamed_text.strip():
                 current_msgs.append({
                     "role": "system",
                     "content": (
@@ -2222,7 +2225,7 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                 m.get("role") == "tool" or (isinstance(m.get("content"), str) and m["content"].startswith("[工具结果]"))
                 for m in current_msgs[-3:]
             )
-            if has_recent_tool_result and text_only_streak < max_stagnation and streamed_text.strip():
+            if has_recent_tool_result and text_only_streak < 1 and streamed_text.strip():
                 # Model returned text after a tool result but didn't call another tool.
                 # 推理模型(Muse/Qwen3.5)经常先输出 <think> 思考 + 规划文字,
                 # 下一轮才实际调用工具--这不是停滞,不该 nudge 打断节奏。
