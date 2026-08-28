@@ -489,9 +489,11 @@ img.sidebar-logo {
   cursor: pointer; overflow: hidden; display: flex; flex-direction: column;
   padding: 0;
 }
+/* 每条消息 = 一条固定 2px 高的横线（ZCode 式：一条条横线）。
+   此前 flex:1 均分容器高度，消息少时每块被拉高成"竖柱子"——参数错误 */
 .mini-block {
-  flex: 1; min-height: 2px; width: 10px; margin: 1px auto; border-radius: 1px;
-  opacity: 0.55; transition: opacity 0.1s; flex-shrink: 0;
+  height: 2px; width: 12px; margin: 1px auto; border-radius: 1px;
+  flex: 0 0 auto; opacity: 0.55; transition: opacity 0.1s;
 }
 .mini-block.hover { opacity: 1; }
 [data-theme="light"] .mini-viewport {
