@@ -132,6 +132,8 @@ async def _local_llm_stream(client, api_url: str, body: dict, headers: dict):
     防止并发流式生成导致 server 崩溃（连接被 peer 关闭）。"""
     async with _local_llm_serialized(api_url):
         global _llm_suspect_since
+        if _is_local_llm_url(api_url):
+            local_llm._engine.mark_engine_busy()
         if _is_local_llm_url(api_url) and _llm_suspect_since is not None:
             ok = await _verify_llm_health(api_url)
             if not ok:
@@ -156,35 +158,46 @@ async def _local_llm_stream(client, api_url: str, body: dict, headers: dict):
         last_err: Exception | None = None
         # 引擎闪断/自动重载期间 404/503：等待恢复（35B 重载窗口 3-5 分钟），
         # 每 5s 重试一次、最长 5 分钟——用户消息自然排队到引擎就绪，不再秒败
-        for _attempt in range(72):
-            try:
-                async with client.stream("POST", api_url, json=body, headers=headers) as r:
-                    r.raise_for_status()  # httpx 不自动抛 4xx/5xx，必须显式检查
-                    try:
-                        yield r
-                    except asyncio.CancelledError:
-                        if _is_local_llm_url(api_url):
-                            # 流被取消（用户点停止/发了新消息）-> 引擎生成线程可能残留
-                            # 并继续跑 llama.cpp，下次请求前必须验证健康
-                            _llm_suspect_since = _llm_suspect_since or time.monotonic()
-                        raise
-                    return
-            except httpx.HTTPStatusError as e:
-                if e.response.status_code in (404, 503) and _attempt < 71:
-                    last_err = e
-                    await asyncio.sleep(5)  # 5s × 72 = 最大约 6 分钟等待
-                    continue
-                raise
-            except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError) as e:
-                # 重载窗口期端口无进程（连接被拒）或读超时/连接重置：
-                # 同样等待重试（自动重载完成即恢复）
-                if _attempt < 71:
-                    last_err = e
-                    await asyncio.sleep(5)
-                    continue
-                raise
-        if last_err is not None:
-            raise last_err
+        try:
+            for _attempt in range(72):
+                try:
+                    async with client.stream("POST", api_url, json=body, headers=headers) as r:
+                        r.raise_for_status()  # httpx 不自动抛 4xx/5xx，必须显式检查
+                        try:
+                            yield r
+                        except asyncio.CancelledError:
+                            if _is_local_llm_url(api_url):
+                                # 流被取消（用户点停止/发了新消息）-> 引擎生成线程可能残留
+                                # 并继续跑 llama.cpp，下次请求前必须验证健康
+                                _llm_suspect_since = _llm_suspect_since or time.monotonic()
+                            raise
+                        return
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code in (404, 503) and _attempt < 71:
+                        last_err = e
+                        await asyncio.sleep(5)  # 5s × 72 = 最大约 6 分钟等待
+                        continue
+                    raise
+                except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError) as e:
+                    # 连接被拒：若没有自动重载在进行，等待毫无意义——快速失败
+                    # （此前固定等 6 分钟，用户面对"没反应"的黑盒）
+                    if isinstance(e, httpx.ConnectError) and _is_local_llm_url(api_url):
+                        if not local_llm._engine._auto_reloading and _attempt >= 2:
+                            raise httpx.ConnectError(
+                                "本地模型引擎未运行（端口无监听）。请到模型页加载模型。"
+                            ) from e
+                    # 重载窗口期端口无进程（连接被拒）或读超时/连接重置：
+                    # 等待重试（自动重载完成即恢复）
+                    if _attempt < 71:
+                        last_err = e
+                        await asyncio.sleep(5)
+                        continue
+                    raise
+            if last_err is not None:
+                raise last_err
+        finally:
+            if _is_local_llm_url(api_url):
+                local_llm._engine.mark_engine_idle()
 
 # ═══════════════════════════════════════════════════════
 #  Multi-Agent System: LaTiao orchestrator + specialists
@@ -1425,6 +1438,9 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
     iteration = 0
     text_only_streak = 0   # 与 local loop 对齐，消除空响应分支 (text_only_streak += 1) 的 NameError 崩溃
     text_output_delivered = False  # nudge 重试期间抑制已交付文本的重复流式输出
+    # 总时长看门狗：单次请求硬上限 15 分钟。此前模型服务器偶发 hold 连接
+    # 滴灌字节可绕过单次 read timeout（180s×N），用户面对 18 分钟无响应。
+    loop_deadline = time.monotonic() + 900
 
     # ── Self-Learning: Heuristic extraction + learning_context via _build_chat_messages ──
     if last_user_text:
@@ -1449,6 +1465,11 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
 
         while iteration < 50:  # hard cap at 50, dynamic exit via stagnation
             iteration += 1
+            if time.monotonic() > loop_deadline:
+                logger.error("[AGENT] 总时长超 900s，中止任务")
+                yield {"content": "\n\n⚠️ 任务总时长超过 15 分钟上限，已中止。模型服务可能异常（如响应停滞）。可重试或检查网络。"}
+                _track_progress(session_id, "stalled", "total_duration_limit")
+                return
             # Re-evaluate tool set every 3 iterations for multi-step tasks
             if iteration > 1 and iteration % 3 == 0:
                 # 恢复全量工具，但仍须套用权限过滤（read_only 等模式不可绕过）
