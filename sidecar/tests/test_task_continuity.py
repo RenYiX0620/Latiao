@@ -492,6 +492,30 @@ class TestPermissionDangerBlocked(unittest.TestCase):
             _custom_permissions.pop()
 
 
+class TestMetaWrapupDetection(unittest.TestCase):
+    """元评论式收尾检测：思考模型把分析写在 CoT 里，正文只输出
+    “上面的分析已经覆盖了…任务完成”时，必须继续追问而非当最终答案
+    （19:38 事故回归）。"""
+
+    def test_wrapup_detected(self):
+        from agent_loop import _is_meta_wrapup
+        text = ("上面的分析已经覆盖了这周美股的完整脉络（周四英伟达财报引爆AI行情"
+                "→周五获利了结微跌→标普距历史高点仅0.3%）。数据来自三轮搜索交叉"
+                "验证，结论可靠。\n\n任务完成。")
+        self.assertTrue(_is_meta_wrapup(text))
+
+    def test_real_short_analysis_not_flagged(self):
+        from agent_loop import _is_meta_wrapup
+        # 真实短分析：带数据，无完成声明堆叠
+        text = ("昨夜美股收盘：道指跌0.02%报53559.99点，纳指跌0.52%，标普跌0.25%。"
+                "科技股承压明显，全周三大指数仍收涨。")
+        self.assertFalse(_is_meta_wrapup(text))
+
+    def test_long_analysis_not_flagged(self):
+        from agent_loop import _is_meta_wrapup
+        self.assertFalse(_is_meta_wrapup("任务完成。" + "分析内容。" * 300))
+
+
 class TestGetApiUrlNeverEmpty(unittest.TestCase):
     """修复 1：端口活但引擎不健康时，get_api_url 不得返回空串。"""
 
