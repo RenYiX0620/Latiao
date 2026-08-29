@@ -916,6 +916,27 @@ def _detect_text_loop(text: str) -> bool:
     return False
 
 
+def _is_meta_wrapup(text: str) -> bool:
+    """判断文本是否为“元评论式收尾”而非实质回答。
+
+    思考类模型（Ornith/Qwen3.8）常把完整分析写在 CoT 里，正文只输出
+    “上面的分析已经覆盖了…任务完成”之类的收尾话——用户什么都读不到
+    （19:38 事故）。此类文本特征是：含任务完成声明短语、且长度不够
+    承载真正的分析（<800 字符）。
+    """
+    if not text or len(text.strip()) >= 800:
+        return False
+    lowered = text.lower()
+    markers = (
+        "任务完成", "已完成", "已经完成", "上面的分析", "已经覆盖",
+        "已覆盖", "分析已", "已为你", "任务已", "以上是", "以上内容",
+        "task complete", "task is done", "i've already", "i have already",
+        "the analysis", "already provided", "已经给出", "已给出",
+    )
+    hits = sum(1 for m in markers if m in lowered)
+    return hits >= 2
+
+
 def _record_tool_call_db(session_id: str, tool_name: str, args: dict, result: str):
     """Write a tool call record to SQLite memory."""
     try:
@@ -2764,11 +2785,14 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                     text_only_streak += 1
                     text_output_delivered = True
                     continue
-                if len(streamed_text.strip()) >= 200:
+                if len(streamed_text.strip()) >= 200 and not _is_meta_wrapup(streamed_text):
                     # 模型在工具结果后已给出实质性回答（≥200 字符）——接受为
                     # 最终答案直接收尾，不再追问。此前无差别追问导致模型
                     # 从头再答一遍，UI 里重复堆叠（17:07/17:08 两任务的
                     # "已经查完了👆"式重复）。
+                    # 例外：元评论式收尾（"上面的分析已覆盖…任务完成"）不算
+                    # 实质回答——分析只在模型思考里，正文从未交付（19:38
+                    # 事故），继续走追问轮。
                     current_msgs.append({"role": "assistant", "content": streamed_text.strip()})
                     _track_progress(session_id, "completed", f"text_response ({len(streamed_text)} chars)")
                     logger.info(f"[LOCAL-AGENT] Iteration {iteration}: no tools, returning text ({len(streamed_text)} chars)")
@@ -2777,9 +2801,21 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                 current_msgs.append({
                     "role": "system",
                     "content": _get_localized_text(_detect_user_language(_extract_last_user_text(current_msgs)), {
-                        "zh": "⚠️ 你刚才收到了工具的执行结果，但只回复了文字而没有继续调用工具。\n请检查任务是否完成，未完成请继续调用工具。\n调用工具格式：```tool 工具名\n{\"参数\":\"值\"}\n```",
-                        "en": "⚠️ You received tool results but only replied with text.\nCheck if the task is complete, if not continue calling tools.\nFormat: ```tool tool_name\n{\"param\":\"value\"}\n```",
-                        "ja": "⚠️ ツール実行結果を受け取りましたが、テキストのみ返信しました。\nタスク完了を確認し、未完了の場合はツールを続けて呼び出してください。\n形式：```tool ツール名\n{\"パラメータ\":\"値\"}\n```",
+                        "zh": "⚠️ 你刚才收到了工具的执行结果，但你的回复里没有给出实质内容"
+                               "（只说了“任务完成/上面的分析已覆盖”之类的收尾话，"
+                               "真正的分析还留在你的思考里）。\n"
+                               "请把完整的分析写进回复正文：包含从工具结果中得到的关键"
+                               "数据与结论，让用户直接读到。\n"
+                               "调用工具格式：```tool 工具名\n{\"参数\":\"值\"}\n```",
+                        "en": "⚠️ You received tool results but your reply contained no real content"
+                              " (only meta-commentary like 'task complete').\n"
+                              "Write the FULL analysis into your reply body with key data and"
+                              " conclusions from the tool results.\n"
+                              "Tool format: ```tool tool_name\n{\"param\":\"value\"}\n```",
+                        "ja": "⚠️ ツール実行結果を受け取りましたが、返信に実質的な内容がありません"
+                              "（「タスク完了」等のメタコメントのみ）。\n"
+                              "ツール結果の主要データと結論を本文に書いてください。\n"
+                              "形式：```tool ツール名\n{\"パラメータ\":\"値\"}\n```",
                     }),
                 })
                 text_output_delivered = True  # 文本已交付，nudge 重试不再重复输出
