@@ -1816,10 +1816,13 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                                 # Anti-repetition: skip tokens once the first complete intro is detected
                                 if len(_deduplicate_response(streamed_text)) < len(streamed_text):
                                     continue
-                                # 追问续写轮照常流式输出（此前 text_output_delivered
-                                # 抑制导致死屏）
+                                if text_output_delivered:
+                                    # 追问续写轮：替换上一条而非追加（重复堆叠修复）
+                                    if _raw_delta_count % 40 == 0:
+                                        yield {"event": "content_revised", "content": streamed_text}
+                                    continue
                                 # Filter native control tokens so the UI doesn't show
-                                # raw <|tool_call|> / <|channel> / <channel|> markers
+                                # raw <|tool_call|> / <|channel> / <|channel|> markers
                                 clean = _NATIVE_CONTROL_RE.sub("", content)
                                 if clean:
                                     yield {"content": clean}
@@ -1835,6 +1838,10 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                                     yield {"content": "\n\n⚠️ 检测到输出重复，已自动截断。"}
                                     raise TimeoutError("输出复读循环，已截断")
                                 if len(_deduplicate_response(streamed_text)) < len(streamed_text):
+                                    continue
+                                if text_output_delivered:
+                                    if _raw_delta_count % 40 == 0:
+                                        yield {"event": "content_revised", "content": streamed_text}
                                     continue
                                 yield {"reasoning": reasoning, "ts": int(time.time() * 1000)}
 
@@ -1858,6 +1865,10 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                         except Exception:
                             logger.error("SSE tool_call parse error", exc_info=True)
                             raise  # Real errors (network, memory) must surface
+
+            # 追问续写轮收尾：把本轮完整文本作为最终替换发出去（防节流边界丢失）
+            if text_output_delivered and streamed_text.strip():
+                yield {"event": "content_revised", "content": streamed_text}
 
             if tool_call_bufs:
                 tool_calls = [tool_call_bufs[i] for i in sorted(tool_call_bufs.keys())]
@@ -1927,6 +1938,18 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
             # 之后直接结束——此前最多空转 10 轮（每轮 30-60s）→ 用户看到
             # "答案有了但任务 1 分钟才结束"。
             if has_recent_tool_result and text_only_streak < 1 and streamed_text.strip():
+                if len(streamed_text.strip()) >= 200:
+                    # 工具结果后已给出实质性回答——接受为最终答案直接收尾
+                    # （与 local 循环同口径，防追问后重答堆叠）
+                    current_msgs.append({"role": "assistant", "content": streamed_text.strip()})
+                    if _should_reflect(reflection_mode, streamed_text, _is_local_llm_url(api_url)):
+                        _tool_outs = [str(m.get("content") or "") for m in current_msgs if m.get("role") == "tool"]
+                        _revised, _changed = await _reflect_output(streamed_text, model, api_url, headers, reflection_mode, client, _tool_outs)
+                        if _changed and _revised.strip():
+                            streamed_text = _revised
+                            yield {"event": "reflection_revised", "content": _revised}
+                    _track_progress(session_id, "completed", f"text_response ({len(streamed_text)} chars)")
+                    return
                 current_msgs.append({
                     "role": "system",
                     "content": (
@@ -2489,9 +2512,14 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                                         # Anti-repetition: skip tokens after the first complete intro
                                         if len(_deduplicate_response(streamed_text)) < len(streamed_text):
                                             continue
-                                        # 追问续写轮的输出必须照常流式展示——此前
-                                        # text_output_delivered 抑制导致用户面对几分钟
-                                        # 死屏（16:29 任务"停在尾端没反应"的直接原因）
+                                        if text_output_delivered:
+                                            # 追问续写轮：用替换事件更新上一条消息，
+                                            # 不再追加新气泡（17:07/17:08 重复堆叠的修复）。
+                                            # 节流：每 40 个 delta 发一次全量累积文本，
+                                            # 前端收到后整体替换上一条 assistant 消息。
+                                            if _raw_delta_count % 40 == 0:
+                                                yield {"event": "content_revised", "content": streamed_text}
+                                            continue
                                         yield {"content": content}
                                     elif reasoning:
                                         streamed_text += reasoning
@@ -2500,6 +2528,10 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                                             yield {"content": "\n\n⚠️ 检测到输出重复，已自动截断。"}
                                             raise TimeoutError("输出复读循环，已截断")
                                         if len(_deduplicate_response(streamed_text)) < len(streamed_text):
+                                            continue
+                                        if text_output_delivered:
+                                            if _raw_delta_count % 40 == 0:
+                                                yield {"event": "content_revised", "content": streamed_text}
                                             continue
                                         yield {"reasoning": reasoning, "ts": int(time.time() * 1000)}
                                 except (json.JSONDecodeError, KeyError, TypeError, IndexError):
@@ -2519,6 +2551,11 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                         f"({type(e).__name__})，等待引擎恢复后重发本轮调用 ({_stream_break_retries}/1)")
                     await asyncio.sleep(10)
                     continue
+
+            # 追问续写轮收尾：把本轮完整文本作为最终替换发出去，
+            # 防止最后一段落在 40-delta 节流边界内丢失
+            if text_output_delivered and streamed_text.strip():
+                yield {"event": "content_revised", "content": streamed_text}
 
             # Check for tool calls in the streamed text
             clean_text, tool_calls = _parse_prompt_tool_calls(streamed_text)
@@ -2596,6 +2633,15 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                     text_only_streak += 1
                     text_output_delivered = True
                     continue
+                if len(streamed_text.strip()) >= 200:
+                    # 模型在工具结果后已给出实质性回答（≥200 字符）——接受为
+                    # 最终答案直接收尾，不再追问。此前无差别追问导致模型
+                    # 从头再答一遍，UI 里重复堆叠（17:07/17:08 两任务的
+                    # "已经查完了👆"式重复）。
+                    current_msgs.append({"role": "assistant", "content": streamed_text.strip()})
+                    _track_progress(session_id, "completed", f"text_response ({len(streamed_text)} chars)")
+                    logger.info(f"[LOCAL-AGENT] Iteration {iteration}: no tools, returning text ({len(streamed_text)} chars)")
+                    return
                 logger.info(f"[LOCAL-AGENT] Iteration {iteration}: model returned text after tool result, pushing for continuation")
                 current_msgs.append({
                     "role": "system",
@@ -2677,6 +2723,7 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                     "content": "上一个工具调用失败了。请换一个工具或调整参数重试，"
                                "不要因一次失败就直接给简短结论；若全部工具不可用，再如实告知。",
                 })
+                text_output_delivered = True  # 追问轮替换上一条，不堆叠
                 logger.info(f"[LOCAL-AGENT] Iteration {iteration}: 短回答+工具失败，继续追问一轮")
                 continue
             # 短回答 + 工具成功且有实质资料（如查大盘指数拿到 45 行预览，
@@ -2694,6 +2741,7 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                                "包含关键数字与必要的展开说明，让用户不需要再追问。"
                                "若任务确已完成且无需展开，再如实收尾。",
                 })
+                text_output_delivered = True  # 追问轮替换上一条，不堆叠
                 logger.info(f"[LOCAL-AGENT] Iteration {iteration}: 短回答+有实质资料({_tool_out_total} chars)，追问充分回答一轮")
                 continue
 

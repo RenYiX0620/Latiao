@@ -832,6 +832,25 @@ const [timeFilter, setTimeFilter] = useState("all");
                     return msgs;
                   });
                 }
+              } else if (parsed.event === "content_revised") {
+                // 追问续写轮：把最后一条 assistant 消息替换为当前累积文本。
+                // 与 reflection_revised 的区别：不加"已自查修正"角标。
+                flushStream();
+                const revised = String(parsed.content ?? "");
+                if (revised.trim()) {
+                  full = revised;
+                  streamFinalized = true;
+                  setMessages((prev) => {
+                    const msgs = [...prev];
+                    for (let i = msgs.length - 1; i >= 0; i--) {
+                      if (msgs[i].role === "assistant" && msgs[i].content && msgs[i].content.trim()) {
+                        msgs[i] = { ...msgs[i], content: revised };
+                        break;
+                      }
+                    }
+                    return msgs;
+                  });
+                }
               } else if (parsed.event === "tool_start") {
                 flushStream();
                 activeTaskStackRef.current.push(`${parsed.tool || ""} ${JSON.stringify(parsed.args || {}).slice(0, 60)}`);
@@ -879,6 +898,10 @@ const [timeFilter, setTimeFilter] = useState("all");
                 pendingThinking += String(parsed.reasoning);
                 scheduleFlush();
               } else if (parsed.content) {
+                // 追问轮（content_revised）之后若又出现新一轮正常内容
+                // （如工具调用后的新回答）：重置累积，另起新气泡，
+                // 不再把替换文本与新内容拼在一起
+                if (streamFinalized) { full = ""; streamFinalized = false; }
                 full += parsed.content;
                 scheduleFlush();
               }
