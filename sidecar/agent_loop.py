@@ -151,8 +151,10 @@ async def _local_llm_stream(client, api_url: str, body: dict, headers: dict):
         if _local:
             engine.mark_engine_busy()
             engine.mark_stream_enter()
-        # 入口快照：get_api_url 可能已触发自动重载（_auto_reloading=True）
-        _reload_requested = engine._auto_reloading
+        # 本流内是否已请求过重载（幂等守卫：防重载失败结束后被反复拉起）。
+        # 注意不能拿"入口时 _auto_reloading=True"做初值——那次重载可能中途
+        # 完成或失败，之后引擎再死就没人请求恢复了。
+        _reload_requested = False
 
         def _request_recovery_reload() -> bool:
             nonlocal _reload_requested
@@ -161,7 +163,7 @@ async def _local_llm_stream(client, api_url: str, body: dict, headers: dict):
             if (_own_engine and engine.current_model_id
                     and not getattr(engine, "_explicit_stop", False)
                     and not engine._auto_reloading
-                    and engine.server_status != "starting"):
+                    and engine.server_status not in ("starting", "error")):
                 _reload_requested = True
                 return engine._request_reload(engine.current_model_id)
             return False
@@ -245,12 +247,11 @@ async def _local_llm_stream(client, api_url: str, body: dict, headers: dict):
                                 "本地模型引擎未运行（端口无监听）。请到模型页加载模型。"
                             ) from e
                         # 有恢复资源：确保重载已触发（幂等，防重入）。
-                        # 已请求过重载且其已结束仍连不上（状态 error）= 重载失败，
-                        # 不再无限等待。
+                        # 重载请求被拒且状态是 error = 上一次重载已失败收场，
+                        # 快速失败并给出原因，不再无限等待。
                         if not engine._auto_reloading:
                             _started = _request_recovery_reload()
-                            if (not _started and _reload_requested
-                                    and engine.server_status == "error"):
+                            if not _started and engine.server_status == "error":
                                 raise httpx.ConnectError(
                                     f"本地模型自动重载失败（{(engine.status_message or '未知错误')[:120]}）。"
                                     "请到模型页检查模型。"

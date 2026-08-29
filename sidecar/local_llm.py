@@ -720,12 +720,7 @@ class LocalLLMEngine:
                 self.current_model_name = ""
                 self._active_backend = ""
         if self._process and self._process.poll() is not None:
-            # Only overwrite if not already set to a detailed error by startup
-            if self.server_status != "error":
-                self.server_status = "stopped"
-                self.status_message = f"进程已退出 (code: {self._process.returncode})"
-            self.current_model_id = ""
-            self.current_model_name = ""
+            self._handle_dead_process()
         # If engine thinks we're stopped but a model server is still on our port
         # (e.g. sidecar restarted, model process outlived it), reconnect so the UI
         # shows accurate status without waiting for a chat request.
@@ -1040,6 +1035,22 @@ class LocalLLMEngine:
 
     # 空闲复验前的等待（默认 3s）；类属性便于测试替换成零等待
     _wait_before_recheck = staticmethod(time.sleep)
+
+    def _handle_dead_process(self):
+        """引擎子进程意外退出（崩溃/OOM/被杀）的统一处置。
+
+        保留模型记录并自动重载（与 _dispose_dead_engine 同口径）——此前
+        get_status 轮询在这里直接清空 current_model_id，正在排队等待恢复的
+        请求会因"无模型记录"被秒死，前端也显示已卸载。用户主动停止由
+        _explicit_stop 区分（stop_model 已自行清空状态并置位）。"""
+        if self.server_status != "error":
+            self.server_status = "stopped"
+            self.status_message = (
+                f"进程已退出 (code: {getattr(self._process, 'returncode', '?')})")
+        if (self.current_model_id and not self._explicit_stop
+                and not self._auto_reloading and self.server_status != "error"):
+            self.status_message = "引擎异常，正在自动重新加载模型..."
+            self._request_reload(self.current_model_id)
 
     def _dispose_dead_engine(self):
         """杀掉判定已死的引擎进程并触发后台自动重载（两处判死路径共用）。"""

@@ -229,6 +229,39 @@ class TestConnectErrorRecoveryRace(unittest.TestCase):
         self.assertIn("自动重载失败", str(err))
 
 
+class TestDeadProcessKeepsModel(unittest.TestCase):
+    """get_status 轮询发现引擎子进程死亡：必须保留模型记录并自动重载，
+    不得清空 current_model_id（否则排队中的请求因"无模型"被秒死）。"""
+
+    def _eng(self):
+        from local_llm import LocalLLMEngine
+        eng = LocalLLMEngine.__new__(LocalLLMEngine)
+        eng._process = type("_DeadProc", (), {"returncode": -9, "poll": lambda s: -9})()
+        eng.server_status = "running"
+        eng.current_model_id = "m1"
+        eng._explicit_stop = False
+        eng._auto_reloading = False
+        return eng
+
+    def test_dead_process_keeps_model_and_reloads(self):
+        from local_llm import LocalLLMEngine
+        eng = self._eng()
+        reloads = []
+        eng._request_reload = lambda mid: reloads.append(mid)
+        LocalLLMEngine._handle_dead_process(eng)
+        self.assertEqual(reloads, ["m1"])              # 自动重载已触发
+        self.assertEqual(eng.current_model_id, "m1")   # 模型记录保留
+
+    def test_dead_process_no_model_no_reload(self):
+        from local_llm import LocalLLMEngine
+        eng = self._eng()
+        eng.current_model_id = ""
+        reloads = []
+        eng._request_reload = lambda mid: reloads.append(mid)
+        LocalLLMEngine._handle_dead_process(eng)
+        self.assertEqual(reloads, [])
+
+
 class TestGetApiUrlNeverEmpty(unittest.TestCase):
     """修复 1：端口活但引擎不健康时，get_api_url 不得返回空串。"""
 
