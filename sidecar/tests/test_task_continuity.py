@@ -395,6 +395,21 @@ class TestMergeSystemMessages(unittest.TestCase):
         self.assertEqual(_merge_system_messages(msgs), msgs)
 
 
+class TestLoopDetectNotSkippedByDedup(unittest.TestCase):
+    """复读循环检测必须先于 dedup 过滤执行：模型以自我介绍开头复读时，
+    _deduplicate_response 会截断文本，旧代码在此 continue 跳过循环检测，
+    导致无限复读全程无输出无截断（16:29 任务"停在尾端"帮凶）。"""
+
+    def test_loop_detectable_when_dedup_would_shorten(self):
+        from agent_loop import _deduplicate_response, _detect_text_loop
+        intro = "我是辣条，你的AI助手。今天为您分析美股大盘走势。"
+        raw = intro + intro * 6  # 无换行：检测器只检无空白片段
+        # 旧短路条件成立：dedup 命中会截断文本
+        self.assertLess(len(_deduplicate_response(raw)), len(raw))
+        # 新顺序：循环检测用原始流式文本判定，能触发截断
+        self.assertTrue(_detect_text_loop(raw))
+
+
 class TestGetApiUrlNeverEmpty(unittest.TestCase):
     """修复 1：端口活但引擎不健康时，get_api_url 不得返回空串。"""
 

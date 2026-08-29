@@ -1772,6 +1772,7 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
             streamed_text = ""
             reasoning_text = ""  # 累积 reasoning_content——DeepSeek 推理模型要求传回
             tool_call_bufs: dict[int, dict] = {}
+            _raw_delta_count = 0  # 复读循环检测节流计数（每 40 个 delta 检查一次）
 
             async with client.stream("POST", api_url, json=body, headers=headers) as r:
                 if r.status_code != 200:
@@ -1800,23 +1801,23 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                             if not choices:
                                 continue  # usage-only chunk（仅 token 统计，无 delta）
                             delta = choices[0].get("delta", {})
+                            _raw_delta_count += 1
 
                             content = delta.get("content", "")
                             reasoning = delta.get("reasoning", "")
                             if content:
                                 streamed_text += content
-                                # Anti-repetition: skip tokens once the first complete intro is detected
-                                if len(_deduplicate_response(streamed_text)) < len(streamed_text):
-                                    continue
-                                # 复读循环检测（节流）
-                                _raw_delta_count += 1
+                                # 复读循环检测（节流）——放在 dedup 过滤之前，
+                                # 复读被 dedup 过滤时也要能截断
                                 if _raw_delta_count % 40 == 0 and _detect_text_loop(streamed_text):
                                     logger.warning("[AGENT] 检测到输出复读循环，截断生成")
                                     yield {"content": "\n\n⚠️ 检测到输出重复，已自动截断。"}
                                     raise TimeoutError("输出复读循环，已截断")
-                                # nudge 重试期间不再向用户重复输出已交付的文本
-                                if text_output_delivered:
+                                # Anti-repetition: skip tokens once the first complete intro is detected
+                                if len(_deduplicate_response(streamed_text)) < len(streamed_text):
                                     continue
+                                # 追问续写轮照常流式输出（此前 text_output_delivered
+                                # 抑制导致死屏）
                                 # Filter native control tokens so the UI doesn't show
                                 # raw <|tool_call|> / <|channel> / <channel|> markers
                                 clean = _NATIVE_CONTROL_RE.sub("", content)
@@ -1829,9 +1830,11 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                                 # so the UI doesn't appear frozen during the thinking phase
                                 reasoning_text += reasoning
                                 streamed_text += reasoning
+                                if _raw_delta_count % 40 == 0 and _detect_text_loop(streamed_text):
+                                    logger.warning("[AGENT] 检测到输出复读循环，截断生成")
+                                    yield {"content": "\n\n⚠️ 检测到输出重复，已自动截断。"}
+                                    raise TimeoutError("输出复读循环，已截断")
                                 if len(_deduplicate_response(streamed_text)) < len(streamed_text):
-                                    continue
-                                if text_output_delivered:
                                     continue
                                 yield {"reasoning": reasoning, "ts": int(time.time() * 1000)}
 
@@ -2474,25 +2477,29 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                                     reasoning = delta.get("reasoning") or delta.get("reasoning_content") or ""
                                     if content:
                                         streamed_text += content
-                                        # Anti-repetition: skip tokens after the first complete intro
-                                        if len(_deduplicate_response(streamed_text)) < len(streamed_text):
-                                            continue
-                                        # nudge 重试期间不再向用户重复输出已交付的文本
-                                        if text_output_delivered:
-                                            continue
-                                        yield {"content": content}
-                                        # 复读循环检测（节流：每 ~2KB 一次）：本地小模型长生成
-                                        # 偶发最后两句话无限重复，直 max_tokens 才停
-                                        _raw_delta_count += 1
+                                        # 复读循环检测（节流：每 40 个 delta 一次）：
+                                        # 必须放在 dedup 过滤之前——此前 dedup 命中后
+                                        # continue 会跳过本检查，模型复读时全程无输出
+                                        # 无截断、引擎 100% CPU 转到 max_tokens
+                                        # （16:29 任务"停在尾端没反应"的帮凶之一）
                                         if _raw_delta_count % 40 == 0 and _detect_text_loop(streamed_text):
                                             logger.warning("[LOCAL-AGENT] 检测到输出复读循环，截断生成")
                                             yield {"content": "\n\n⚠️ 检测到输出重复，已自动截断。"}
                                             raise TimeoutError("输出复读循环，已截断")
-                                    elif reasoning:
-                                        streamed_text += reasoning
+                                        # Anti-repetition: skip tokens after the first complete intro
                                         if len(_deduplicate_response(streamed_text)) < len(streamed_text):
                                             continue
-                                        if text_output_delivered:
+                                        # 追问续写轮的输出必须照常流式展示——此前
+                                        # text_output_delivered 抑制导致用户面对几分钟
+                                        # 死屏（16:29 任务"停在尾端没反应"的直接原因）
+                                        yield {"content": content}
+                                    elif reasoning:
+                                        streamed_text += reasoning
+                                        if _raw_delta_count % 40 == 0 and _detect_text_loop(streamed_text):
+                                            logger.warning("[LOCAL-AGENT] 检测到输出复读循环，截断生成")
+                                            yield {"content": "\n\n⚠️ 检测到输出重复，已自动截断。"}
+                                            raise TimeoutError("输出复读循环，已截断")
+                                        if len(_deduplicate_response(streamed_text)) < len(streamed_text):
                                             continue
                                         yield {"reasoning": reasoning, "ts": int(time.time() * 1000)}
                                 except (json.JSONDecodeError, KeyError, TypeError, IndexError):
