@@ -364,6 +364,40 @@ def fetch_marketplace(url: str = "", timeout: float = 20) -> dict:
     return out
 
 
+# ── 市场缓存（启动预热 + 5 分钟 TTL）──
+_MARKET_CACHE: dict = {"": {"ts": 0.0, "data": None}}
+_MARKET_FETCHING = False
+
+
+def get_marketplace_cached(url: str = "") -> dict:
+    """带缓存的 market 读取：命中 TTL 内缓存直接返回；miss 时同步拉取。"""
+    import time as _t
+    global _MARKET_FETCHING
+    key = (url or DEFAULT_MARKETPLACE).strip()
+    entry = _MARKET_CACHE.get(key)
+    if entry and entry["data"] and _t.time() - entry["ts"] < 300:
+        return entry["data"]
+    data = fetch_marketplace(url)
+    if data.get("status") == "ok":
+        _MARKET_CACHE[key] = {"ts": _t.time(), "data": data}
+    return data
+
+
+def warm_market_cache() -> None:
+    """后台预热官方市场（sidecar 启动时调用，不阻塞启动）。"""
+    import threading
+    def _worker():
+        try:
+            data = fetch_marketplace("")
+            if data.get("status") == "ok":
+                import time as _t
+                _MARKET_CACHE[DEFAULT_MARKETPLACE] = {"ts": _t.time(), "data": data}
+                logger.info("市场预热完成: %d 个扩展", len(data.get("plugins", [])))
+        except Exception:
+            logger.warning("市场预热失败", exc_info=True)
+    threading.Thread(target=_worker, daemon=True).start()
+
+
 def uninstall_extension(name: str) -> dict:
     state = _load_installed()
     rec = _find_record(state, name)

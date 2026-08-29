@@ -166,6 +166,20 @@ class TestConnectErrorRecoveryRace(unittest.TestCase):
         self.assertEqual(eng.reload_calls, ["m1"])
         self.assertTrue(eng._auto_reloading)
 
+    def test_read_error_also_queues_reload(self):
+        """kill -9 在预填充期抛 ReadError（非 ConnectError），同样必须触发重载
+        排队而非秒死（E2E 测试 B 回归：TransportError 基类捕获）。"""
+        import httpx
+        eng = _FakeEngine(current_model_id="m1", server_status="running")
+
+        class _ReadErrorClient:
+            def stream(self, *a, **kw):
+                raise httpx.ReadError("connection reset by peer")
+
+        kind, err = self._run_stream_error(eng, client=_ReadErrorClient())
+        self.assertNotIn("内部", str(err))
+        self.assertEqual(eng.reload_calls, ["m1"])
+
     def test_explicit_stop_fails_fast_with_hint(self):
         """用户主动停止：立即失败并给出明确指引。"""
         eng = _FakeEngine(current_model_id="m1", _explicit_stop=True,
