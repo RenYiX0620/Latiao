@@ -56,6 +56,29 @@ class TestEngineStatePersistence(unittest.TestCase):
         return eng
 
     def test_save_and_restore_roundtrip(self):
+        import os
+        from local_llm import LocalLLMEngine
+        eng = self._eng()
+        # 用真实存在的文件路径（restore 会校验路径存在性，防假 id 污染）
+        real = os.path.join(self._tmp.name, "models", "test-35b")
+        os.makedirs(os.path.dirname(real), exist_ok=True)
+        open(real, "w").close()
+        eng.current_model_id = real
+        eng.current_model_name = "test-35b"
+        eng._active_backend = "mlx"
+        LocalLLMEngine._save_engine_state(eng)
+        try:
+            eng2 = self._eng()
+            LocalLLMEngine._restore_engine_state(eng2)
+            self.assertEqual(eng2.current_model_id, real)
+            self.assertEqual(eng2.current_model_name, "test-35b")
+            self.assertEqual(eng2._active_backend, "mlx")
+        finally:
+            LocalLLMEngine._clear_engine_state(eng)
+
+    def test_fake_path_discarded_on_restore(self):
+        """防污染回归：状态文件里的假路径（如测试写入的 /models/test-35b）
+        必须被丢弃，不得恢复——否则 sidecar 对着不存在的模型反复重载。"""
         from local_llm import LocalLLMEngine
         eng = self._eng()
         eng.current_model_id = "/models/test-35b"
@@ -65,9 +88,7 @@ class TestEngineStatePersistence(unittest.TestCase):
         try:
             eng2 = self._eng()
             LocalLLMEngine._restore_engine_state(eng2)
-            self.assertEqual(eng2.current_model_id, "/models/test-35b")
-            self.assertEqual(eng2.current_model_name, "test-35b")
-            self.assertEqual(eng2._active_backend, "mlx")
+            self.assertEqual(eng2.current_model_id, "")
         finally:
             LocalLLMEngine._clear_engine_state(eng)
 

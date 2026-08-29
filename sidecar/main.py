@@ -315,6 +315,34 @@ def _load_skill_index():
                     logger.info(f"Indexed skill: {name}")
         except Exception as e:
             logger.warning(f"Failed to load skill {skill_dir.name}: {e}")
+
+    # ── 扩展包技能（~/.local-ai-os/extensions/<name>/<version>/skills/*.md）──
+    try:
+        from extension_manager import active_extension_dirs
+        for ext_dir in active_extension_dirs():
+            skills_d = ext_dir / "skills"
+            if not skills_d.is_dir():
+                continue
+            for f in sorted(skills_d.rglob("*.md")):
+                try:
+                    content = f.read_text(encoding="utf-8")
+                    if content.startswith("---"):
+                        parts = content.split("---", 2)
+                        if len(parts) >= 3:
+                            fm = yaml.load(parts[1], Loader=yaml.SafeLoader)
+                            name = fm.get("name", f.stem) if isinstance(fm, dict) else f.stem
+                            desc = fm.get("description", "") if isinstance(fm, dict) else ""
+                            body = parts[2].strip()
+                            if name not in SKILL_INDEX:
+                                SKILL_INDEX[name] = {
+                                    "name": name, "description": desc,
+                                    "content": body, "path": f.parent,
+                                }
+                                logger.info(f"Indexed extension skill: {name}")
+                except Exception:
+                    logger.warning("Failed to load extension skill %s", f, exc_info=True)
+    except Exception:
+        logger.warning("Extension skills scan failed", exc_info=True)
     logger.info(f"Loaded {len(SKILL_INDEX)} skills into index")
 
 def _match_skill_keywords(user_query: str) -> str | None:
