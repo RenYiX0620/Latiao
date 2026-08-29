@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { useTranslation } from "../i18n";
 import { authFetch } from "../utils/api";
+import SkillsView from "./SkillsView";
 
 
 interface ExtensionInfo {
@@ -22,6 +23,16 @@ interface ToolsViewProps {
   tools: { name: string; description: string; parameters: Record<string, unknown>; permission: string; usage_count: number }[];
   setTools: React.Dispatch<React.SetStateAction<{ name: string; description: string; parameters: Record<string, unknown>; permission: string; usage_count: number }[]>>;
   showToast: (msg: string, kind?: "warn") => void;
+  // ── 技能（原独立 SkillsView 页并入本页 tab）──
+  skills: { name: string; file: string; key: string; enabled: boolean; builtin?: boolean }[];
+  newSkill: { name: string; content: string };
+  setNewSkill: (s: { name: string; content: string }) => void;
+  toggleSkill: (key: string) => void;
+  deleteSkill: (key: string) => void;
+  addSkill: () => void;
+  tavilyKey: { hasKey: boolean; masked: string | null; loading: boolean };
+  onSaveTavilyKey: (key: string) => void;
+  onDeleteTavilyKey: () => void;
 }
 
 const PERM_LABEL: Record<string, string> = {
@@ -31,9 +42,15 @@ const PERM_LABEL: Record<string, string> = {
   shell: "命令执行",
 };
 
-export default function ToolsView({ tools, setTools, showToast }: ToolsViewProps) {
+export default function ToolsView({ tools, setTools, showToast,
+  skills, newSkill, setNewSkill, toggleSkill, deleteSkill, addSkill,
+  tavilyKey, onSaveTavilyKey, onDeleteTavilyKey,
+}: ToolsViewProps) {
   const { t } = useTranslation();
   const iconMap: Record<string, string> = { read_file: "📄", write_file: "✏️", list_dir: "📁", run_cmd: "⚡", open_folder: "📂", open_app: "🚀", search_files: "🔍" };
+
+  // ── 顶级 tab：扩展 / 工具 / 技能（原"工具"与"技能"两个导航页合并） ──
+  const [mainTab, setMainTab] = useState<"ext" | "tools" | "skills">("ext");
 
   // ── 扩展页（Latiao 扩展市场体系：无缝安装） ──
   const [extensions, setExtensions] = useState<ExtensionInfo[]>([]);
@@ -139,14 +156,19 @@ export default function ToolsView({ tools, setTools, showToast }: ToolsViewProps
 
   return (
     <div>
-      {/* ═══ 扩展市场 ═══ */}
-      <div className="page-header" style={{ marginBottom: 12 }}>
-        <div>
-          <div className="card-title" style={{ fontSize: 15 }}>🧩 扩展</div>
-          <div className="card-desc" style={{ marginTop: 2 }}>
-            无缝安装：拖入 .latiaoext 文件、粘贴 URL 或 GitHub 仓库地址即可安装工具插件、技能与子智能体组合包
-          </div>
-        </div>
+      {/* ═══ 顶级 tab：扩展 / 工具 / 技能（原"工具"与"技能"导航页合并） ═══ */}
+      <div className="tab-bar" style={{ marginBottom: 14 }}>
+        <button className={`tab-btn${mainTab === "ext" ? " active" : ""}`}
+          onClick={() => setMainTab("ext")}>🧩 扩展</button>
+        <button className={`tab-btn${mainTab === "tools" ? " active" : ""}`}
+          onClick={() => setMainTab("tools")}>🔧 工具</button>
+        <button className={`tab-btn${mainTab === "skills" ? " active" : ""}`}
+          onClick={() => setMainTab("skills")}>📗 技能</button>
+      </div>
+
+      {mainTab === "ext" && (<>
+      <div className="card-desc" style={{ marginBottom: 12 }}>
+        无缝安装：拖入 .latiaoext 文件、粘贴 URL 或 GitHub 仓库地址即可安装工具插件、技能与子智能体组合包
       </div>
 
       {/* 市场 / 已装 tab */}
@@ -268,11 +290,10 @@ export default function ToolsView({ tools, setTools, showToast }: ToolsViewProps
       </div>
       </>
       )}
+      </>)}
 
-      {/* ═══ 工具列表（原有内容） ═══ */}
-      <div className="page-header" style={{ margin: "18px 0 12px" }}>
-        <div className="card-title" style={{ fontSize: 15 }}>🔧 工具</div>
-      </div>
+      {/* ═══ 工具 ═══ */}
+      {mainTab === "tools" && (
       <div className="card-grid">
         {tools.map((tool) => {
           const isSafe = tool.permission === "safe";
@@ -309,6 +330,14 @@ export default function ToolsView({ tools, setTools, showToast }: ToolsViewProps
           </div>
         )})}
       </div>
+      )}
+
+      {/* ═══ 技能（原独立导航页，现并入本页 tab） ═══ */}
+      {mainTab === "skills" && (
+        <SkillsView skills={skills} newSkill={newSkill} setNewSkill={setNewSkill}
+          toggleSkill={toggleSkill} deleteSkill={deleteSkill} addSkill={addSkill}
+          tavilyKey={tavilyKey} onSaveTavilyKey={onSaveTavilyKey} onDeleteTavilyKey={onDeleteTavilyKey} />
+      )}
     </div>
   );
 }

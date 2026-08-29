@@ -12,14 +12,13 @@ import { useSkills } from "./hooks/useSkills";
 import ChatView from "./components/ChatView";
 import ModelsView from "./components/ModelsView";
 import ToolsView from "./components/ToolsView";
-import SkillsView from "./components/SkillsView";
 import CronView from "./components/CronView";
 import ChannelsView from "./components/ChannelsView";
 import AgentView from "./components/AgentView";
 import SettingsView from "./components/SettingsView";
 import RecoveryView from "./components/RecoveryView";
 import LogsView from "./components/LogsView";
-import { MessageSquare, Brain, Wrench, Puzzle, Clock, Radio, Bot, Settings, ScrollText } from "lucide-react";
+import { MessageSquare, Brain, Wrench, Clock, Radio, Bot, Settings, ScrollText } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import "./App.css";
 
@@ -60,7 +59,6 @@ const NAV_ITEMS: { id: ViewId; icon: LucideIcon; key: string }[] = [
   { id: "chat", icon: MessageSquare, key: "nav.chat" },
   { id: "models", icon: Brain, key: "nav.models" },
   { id: "tools", icon: Wrench, key: "nav.tools" },
-  { id: "skills", icon: Puzzle, key: "nav.skills" },
   { id: "cron", icon: Clock, key: "nav.cron" },
   { id: "channels", icon: Radio, key: "nav.channels" },
   { id: "agents", icon: Bot, key: "nav.agents" },
@@ -1398,22 +1396,15 @@ const [timeFilter, setTimeFilter] = useState("all");
           />
         </div>
 
-        {/* ═══ Tools View ═══ */}
+        {/* ═══ Tools View（工具 + 技能合并页） ═══ */}
         <div className={`view-panel${activeView === "tools" ? " active" : ""}`} id="view-tools" style={sidecarStatus === "offline" ? { display: "none" } : undefined}>
           <div className="page-header">
-            <div><div className="page-title">{t("page.tools")}</div><div className="page-desc">{t("page.tools_desc", { count: tools.length })}</div></div>
+            <div><div className="page-title">{t("page.tools")}</div><div className="page-desc">{t("page.tools_desc", { count: tools.length, skills_enabled: skills.filter(s => s.enabled).length, skills_total: skills.length })}</div></div>
           </div>
           <div className="page-body">
             {tools.length === 0 && <div style={{padding:20,color:'var(--warning)',fontFamily:'monospace',whiteSpace:'pre-wrap'}}>{fetchDiag}</div>}
-            <ToolsView tools={tools} setTools={setTools} showToast={showToast} />
-          </div>
-        </div>
-        <div className={`view-panel${activeView === "skills" ? " active" : ""}`} id="view-skills" style={sidecarStatus === "offline" ? { display: "none" } : undefined}>
-          <div className="page-header">
-            <div><div className="page-title">{t("page.skills")}</div><div className="page-desc">{t("page.skills_desc", { enabled: skills.filter(s => s.enabled).length, total: skills.length })}</div></div>
-          </div>
-          <div className="page-body">
-            <SkillsView skills={skills} newSkill={newSkill} setNewSkill={setNewSkill}
+            <ToolsView tools={tools} setTools={setTools} showToast={showToast}
+              skills={skills} newSkill={newSkill} setNewSkill={setNewSkill}
               toggleSkill={toggleSkill} deleteSkill={deleteSkill} addSkill={addSkill}
               tavilyKey={tavilyKey} onSaveTavilyKey={saveTavilyKey} onDeleteTavilyKey={deleteTavilyKey} />
           </div>
