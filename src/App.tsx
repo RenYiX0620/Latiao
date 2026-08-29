@@ -8,7 +8,6 @@ import { useSessions } from "./hooks/useSessions";
 import { sidecarFetch, waitForSidecar, authFetch } from "./utils/api";
 import { useTranslation } from "./i18n";
 import { useCronJobs } from "./hooks/useCronJobs";
-import { useSkills } from "./hooks/useSkills";
 import ChatView from "./components/ChatView";
 import ModelsView from "./components/ModelsView";
 import ToolsView from "./components/ToolsView";
@@ -48,6 +47,18 @@ const SIDECAR = "http://127.0.0.1:8765";
 // Unique id for each chat message so list rendering can use a stable key
 // (index keys break when tool messages are spliced into the middle).
 const msgId = () => `msg_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+// 统一能力模型：工具与技能合并的条目（capabilities 表）
+interface Capability {
+  name: string;
+  kind: "tool" | "skill";
+  display_name: string;
+  description: string;
+  permission: string;
+  enabled: boolean;
+  source: string;
+  usage_count: number;
+}
 
 const AGENT_NAME_KEYS: Record<string, string> = {
   latiao: "agent.latiao", "code-reviewer": "agent.code_reviewer",
@@ -209,7 +220,7 @@ const [timeFilter, setTimeFilter] = useState("all");
   const [recentLearnings, setRecentLearnings] = useState<{topic: string; content: string; confidence: number}[]>([]);
   const [agentPhase, setAgentPhase] = useState<string>("");
   const [activeAgent, setActiveAgent] = useState<string>("latiao");
-  const [tools, setTools] = useState<{name: string; description: string; parameters: Record<string, unknown>; permission: string; usage_count: number}[]>([]);
+  const [capabilities, setCapabilities] = useState<Capability[]>([]);
   const [localLLMStatus, setLocalLLMStatus] = useState<LLMStatus>({ backend: "", status: "checking", model_id: "", model_name: "", port: 1235, message: "", has_image_support: false, token_limit: 32768 });
 
   // Sync theme to document.documentElement so CSS variables cascade correctly
@@ -328,8 +339,8 @@ const [timeFilter, setTimeFilter] = useState("all");
   const [fetchDiag, setFetchDiag] = useState("🔍 正在获取...");
 
 
-  // Fetch tools from sidecar (via Rust IPC proxy) with health check + retry
-  const fetchTools = async () => {
+  // Fetch capabilities (统一能力模型：工具+技能) from sidecar (via Rust IPC proxy) with health check + retry
+  const fetchCapabilities = async () => {
     setFetchDiag("🔍 检查 Sidecar 状态...");
     const healthy = await waitForSidecar();
     if (!healthy) {
@@ -341,16 +352,16 @@ const [timeFilter, setTimeFilter] = useState("all");
     for (let attempt = 0; attempt < maxRetries; attempt++) {
       try {
         if (attempt > 0) {
-          setFetchDiag(`⏳ 重试获取工具列表... (${attempt}/${maxRetries})`);
+          setFetchDiag(`⏳ 重试获取能力列表... (${attempt}/${maxRetries})`);
           await new Promise(r => setTimeout(r, 2000));
         } else {
-          setFetchDiag("⏳ 正在获取工具列表...");
+          setFetchDiag("⏳ 正在获取能力列表...");
         }
-        const data = await sidecarFetch("/v1/tools");
-        setFetchDiag(`✅ /v1/tools → status=${data.status}`);
+        const data = await sidecarFetch("/v1/capabilities");
+        setFetchDiag(`✅ /v1/capabilities → status=${data.status}`);
         if (data.status === "ok") {
-          setTools(data.tools || []);
-          setFetchDiag(d => `${d}, tools=${data.tools?.length || 0}`);
+          setCapabilities(data.capabilities || []);
+          setFetchDiag(d => `${d}, capabilities=${data.capabilities?.length || 0}`);
         }
         return; // success
       } catch (e: any) {
@@ -360,7 +371,7 @@ const [timeFilter, setTimeFilter] = useState("all");
       }
     }
   };
-  useEffect(() => { fetchTools(); }, []);
+  useEffect(() => { fetchCapabilities(); }, []);
 
   // Fetch recent logs (supplier for recovery panel)
   const fetchGatewayLogs = async () => {
@@ -681,9 +692,8 @@ const [timeFilter, setTimeFilter] = useState("all");
     toastTimerRef.current = setTimeout(() => setToast(null), 2200);
   }, []);
 
-  // Extracted hooks (cron + skills — depend on showToast)
+  // Extracted hooks (cron — depends on showToast)
   const { cronJobs, newCron, setNewCron, addCronJob, toggleCronJob, deleteCronJob, runCronJob } = useCronJobs(showToast);
-  const { skills, newSkill, setNewSkill, toggleSkill, deleteSkill, addSkill, tavilyKey, saveTavilyKey, deleteTavilyKey } = useSkills(showToast);
 
   /* ── Stream Chat (preserved from original) ── */
   const streamChat = async (
@@ -1396,17 +1406,14 @@ const [timeFilter, setTimeFilter] = useState("all");
           />
         </div>
 
-        {/* ═══ Tools View（工具 + 技能合并页） ═══ */}
+        {/* ═══ Tools View（统一能力模型：工具+技能一套管理） ═══ */}
         <div className={`view-panel${activeView === "tools" ? " active" : ""}`} id="view-tools" style={sidecarStatus === "offline" ? { display: "none" } : undefined}>
           <div className="page-header">
-            <div><div className="page-title">{t("page.tools")}</div><div className="page-desc">{t("page.tools_desc", { count: tools.length, skills_enabled: skills.filter(s => s.enabled).length, skills_total: skills.length })}</div></div>
+            <div><div className="page-title">{t("page.tools")}</div><div className="page-desc">{t("page.tools_desc", { count: capabilities.filter(c => c.kind === "tool").length, skills_enabled: capabilities.filter(c => c.kind === "skill" && c.enabled).length, skills_total: capabilities.filter(c => c.kind === "skill").length })}</div></div>
           </div>
           <div className="page-body">
-            {tools.length === 0 && <div style={{padding:20,color:'var(--warning)',fontFamily:'monospace',whiteSpace:'pre-wrap'}}>{fetchDiag}</div>}
-            <ToolsView tools={tools} setTools={setTools} showToast={showToast}
-              skills={skills} newSkill={newSkill} setNewSkill={setNewSkill}
-              toggleSkill={toggleSkill} deleteSkill={deleteSkill} addSkill={addSkill}
-              tavilyKey={tavilyKey} onSaveTavilyKey={saveTavilyKey} onDeleteTavilyKey={deleteTavilyKey} />
+            {capabilities.length === 0 && <div style={{padding:20,color:'var(--warning)',fontFamily:'monospace',whiteSpace:'pre-wrap'}}>{fetchDiag}</div>}
+            <ToolsView capabilities={capabilities} setCapabilities={setCapabilities} showToast={showToast} />
           </div>
         </div>
 

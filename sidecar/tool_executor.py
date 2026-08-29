@@ -39,9 +39,9 @@ _FALLBACK_PERMISSIONS = {
 def _resolve_permission(tool_name: str, args: dict) -> str:
     """
     Resolve permission level for a tool call.
-    Checks custom rules first (with optional path_pattern matching),
-    then falls back to TOOL_PERMISSIONS default.
-    Rules format: {"tool": "write_file", "path_pattern": "/tmp/*", "permission": "safe"}
+    Priority: path_pattern rules (permissions.json) → capability 表（统一模型）
+    → legacy 无路径规则 → TOOL_PERMISSIONS 插件默认。
+    use_skill 特殊处理：解析目标技能的安全等级（技能权限在 capabilities 表）。
     """
     # 状态由 main.py 门面持有（测试通过 main._custom_permissions 重绑定，
     # 这里必须在调用时读 main 的实时槽位）→ 函数内 lazy import 避免循环依赖
@@ -59,6 +59,19 @@ def _resolve_permission(tool_name: str, args: dict) -> str:
                     return rule.get("permission", "confirm")
         else:
             return rule.get("permission", "confirm")
+    # 统一能力模型：use_skill 的技能安全等级 / 工具的表中权限
+    try:
+        import capability_registry
+        if tool_name == "use_skill":
+            skill_name = str(args.get("skill_name") or "")
+            if skill_name:
+                skill = capability_registry.get_skill_content(skill_name)
+                return skill["permission"] if skill else "safe"
+        table_perm = capability_registry.get_permission(tool_name)
+        if table_perm:
+            return table_perm
+    except Exception:
+        logger.debug("capability registry lookup failed for %s", tool_name, exc_info=True)
     return TOOL_PERMISSIONS.get(tool_name, "safe")
 
 

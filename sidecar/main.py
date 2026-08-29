@@ -110,7 +110,6 @@ from agent_loop import (  # noqa: F401 — 门面 re-export：保持 main.xxx �
     _build_local_tools_prompt,
     _cap_tools,
     _check_pre_hooks,
-    _check_skill_permission,
     _check_stagnation,
     _deduplicate_response,
     _detect_task_intent,
@@ -262,155 +261,8 @@ logger.info("Sidecar 启动")
 # os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
 
-# ═══════════════════════════════════════════════════════
-#  Smart Skill System: Auto-match & load skills on demand
-# ═══════════════════════════════════════════════════════
-
-SKILL_INDEX: dict[str, dict] = {}
 PROJECT_ROOT = Path(__file__).parent  # sidecar/
-SKILLS_DIR = PROJECT_ROOT / "skills"
 
-# TF-IDF cache for learnings (avoid rebuilding every search)
-
-# ╔══════════════════════════════════════════════════════╗
-# ║  SECTION 1: Skills & App Lifecycle                    ║
-# ║  _load_skill_index, _match_skill, lifespan            ║
-# ╚══════════════════════════════════════════════════════╝
-
-def _load_skill_index():
-    """Scan all skills in ./skills/ directory and build index of their metadata."""
-    global SKILL_INDEX
-    SKILL_INDEX.clear()
-    # Pre-import yaml at the top so we don't import inside the loop
-    try:
-        import yaml  # noqa: F811
-    except ImportError:
-        logger.error("PyYAML not installed — skills system disabled. Install: pip install pyyaml")
-        return
-    if not SKILLS_DIR.exists():
-        logger.info("No skills directory found, skill system disabled")
-        return
-    for skill_dir in SKILLS_DIR.iterdir():
-        if not skill_dir.is_dir():
-            continue
-        skill_md = skill_dir / "SKILL.md"
-        if not skill_md.exists():
-            continue
-        try:
-            content = skill_md.read_text(encoding="utf-8")
-            # Parse YAML frontmatter
-            if content.startswith("---"):
-                parts = content.split("---", 2)
-                if len(parts) >= 3:
-                    frontmatter = yaml.load(parts[1], Loader=yaml.SafeLoader)
-                    name = frontmatter.get("name", skill_dir.name)
-                    description = frontmatter.get("description", "")
-                    skill_content = parts[2].strip()
-                    SKILL_INDEX[name] = {
-                        "name": name,
-                        "description": description,
-                        "content": skill_content,
-                        "path": skill_dir,
-                    }
-                    logger.info(f"Indexed skill: {name}")
-        except Exception as e:
-            logger.warning(f"Failed to load skill {skill_dir.name}: {e}")
-
-    # ── 扩展包技能（~/.local-ai-os/extensions/<name>/<version>/skills/*.md）──
-    try:
-        from extension_manager import active_extension_dirs
-        for ext_dir in active_extension_dirs():
-            skills_d = ext_dir / "skills"
-            if not skills_d.is_dir():
-                continue
-            for f in sorted(skills_d.rglob("*.md")):
-                try:
-                    content = f.read_text(encoding="utf-8")
-                    if content.startswith("---"):
-                        parts = content.split("---", 2)
-                        if len(parts) >= 3:
-                            fm = yaml.load(parts[1], Loader=yaml.SafeLoader)
-                            name = fm.get("name", f.stem) if isinstance(fm, dict) else f.stem
-                            desc = fm.get("description", "") if isinstance(fm, dict) else ""
-                            body = parts[2].strip()
-                            if name not in SKILL_INDEX:
-                                SKILL_INDEX[name] = {
-                                    "name": name, "description": desc,
-                                    "content": body, "path": f.parent,
-                                }
-                                logger.info(f"Indexed extension skill: {name}")
-                except Exception:
-                    logger.warning("Failed to load extension skill %s", f, exc_info=True)
-    except Exception:
-        logger.warning("Extension skills scan failed", exc_info=True)
-    logger.info(f"Loaded {len(SKILL_INDEX)} skills into index")
-
-def _match_skill_keywords(user_query: str) -> str | None:
-    """Match user query against skill keywords using overlap scoring."""
-    if not user_query or not SKILL_INDEX:
-        return None
-    query_lower = user_query.lower()
-    q_words = set(query_lower.split())
-    best_match = None
-    best_score = 0
-    for name, skill in SKILL_INDEX.items():
-        if not _is_skill_enabled(name):
-            continue
-        kw_text = (name + " " + skill.get("description", "")).lower()
-        kw_words = set(kw_text.split())
-        overlap = len(q_words & kw_words)
-        if name.lower() in query_lower:
-            overlap += 5
-        if overlap > best_score:
-            best_score = overlap
-            best_match = name
-    return best_match if best_score >= 1 else None
-
-async def _match_skill(user_query: str) -> str | None:
-    """Intelligently match user query to the most appropriate skill."""
-    if not SKILL_INDEX:
-        return None
-    # For local models, use keyword matching to avoid sending user text to external API
-    cfg = _last_cloud_config.get()
-    if not cfg or not cfg.get("key"):
-        return _match_skill_keywords(user_query)
-    # Build skill list for LLM to choose from
-    skill_list = []
-    for name, skill in SKILL_INDEX.items():
-        if not _is_skill_enabled(name):
-            continue
-        skill_list.append(f"- {name}: {skill['description']}")
-    skill_list_str = "\n".join(skill_list)
-    # Lightweight prompt to match skill, no tool calls needed
-    prompt = f"""用户的问题是：{user_query}
-下面是所有可用的技能列表：
-{skill_list_str}
-请判断用户的问题是否需要用到某个技能，如果需要，返回技能的名字，如果不需要，返回NONE。
-只返回一个结果，不需要解释。"""
-    try:
-        protocol, api_url, skill_headers, _is_local = await _resolve_api_target(_last_cloud_config.get())
-        if not api_url:
-            return None
-        async with httpx.AsyncClient(timeout=httpx.Timeout(10)) as client:
-            async with _local_llm_serialized(api_url):
-                r = await client.post(api_url, json={
-                "model": SUBAGENT_MODEL,
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 10,
-                "temperature": 0,
-                "stream": False,
-            }, headers=skill_headers)
-            if r.status_code != 200:
-                return None
-            data = r.json()
-            result = data.get("choices", [{}])[0].get("message", {}).get("content", "NONE").strip()
-            if result in SKILL_INDEX:
-                logger.info(f"Matched skill: {result} for query: {user_query[:50]}...")
-                return result
-            return None
-    except Exception as e:
-        logger.warning(f"Skill matching failed: {e}")
-        return None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -421,7 +273,12 @@ async def lifespan(app: FastAPI):
     from cron import _load_cron_state, run_cron_catchup
     _load_cron_state()  # 恢复跨重启状态（去重表 + seeded 标记），必须先于播种
     _seed_default_cron()
-    _load_skill_index()  # Load skill index at startup
+    # 统一能力模型：工具+技能入能力表（含一次性旧数据迁移），幂等
+    try:
+        import capability_registry
+        capability_registry.initialize(TOOLS, TOOL_PERMISSIONS, TOOL_DISPATCH)
+    except Exception:
+        logger.warning("capability initialize failed", exc_info=True)
     # Write PID file so the Rust process manager can find us (after _init_db creates dir)
     SIDECAR_PID = PROGRESS_DIR / "sidecar.pid"
     SIDECAR_PID.write_text(str(os.getpid()))
@@ -511,58 +368,6 @@ def _save_permissions(rules: list[dict]):
         encoding="utf-8"
     )
 
-# ═══════════════════════════════════════════════════════
-#  Skill Card System: Markdown constraints injected at startup
-# ═══════════════════════════════════════════════════════
-
-SKILLS_DIR = Path(__file__).parent / "skills"
-SKILLS_CONFIG = PROGRESS_DIR / "skills.json"
-_loaded_skills: list[dict] = []
-
-
-def _load_skills_config() -> dict:
-    """Load skills enable/disable config."""
-    try:
-        if SKILLS_CONFIG.exists():
-            return json.loads(SKILLS_CONFIG.read_text(encoding="utf-8"))
-    except Exception:
-        logger.warning("Failed to load skills config", exc_info=True)
-    return {}
-
-
-def _save_skills_config(cfg: dict):
-    """Save skills config."""
-    PROGRESS_DIR.mkdir(parents=True, exist_ok=True)
-    SKILLS_CONFIG.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
-
-
-
-
-def _is_skill_enabled(skill_name: str) -> bool:
-    """Check if a skill is enabled in the loaded skills list."""
-    for s in _loaded_skills:
-        if s.get("key") == skill_name or s.get("name") == skill_name:
-            return s.get("enabled", True)
-    return True  # If not listed, assume enabled
-
-
-def _load_skills() -> list[dict]:
-    """Load all .md skill cards. Returns list of {name, file, content, enabled}."""
-    cfg = _load_skills_config()
-    skills = []
-    if SKILLS_DIR.exists():
-        for f in sorted(SKILLS_DIR.glob("*.md")):
-            try:
-                content = f.read_text(encoding="utf-8").strip()
-                name = f.stem.replace("-", " ").title()
-                # New skills default to enabled
-                enabled = cfg.get(f.stem, {}).get("enabled", True)
-                skills.append({"name": name, "file": f.name, "key": f.stem, "content": content, "enabled": enabled})
-            except Exception:
-                logger.warning(f"Failed to load skill: {f.name if 'f' in dir() else 'unknown'}", exc_info=True)
-    return skills
-
-
 async def _hot_reload_extensions() -> dict:
     """扩展安装/启停后的热重载：重建技能索引 + 原地重载插件注册表 +
     重新注册 MCP 工具——刚装完的扩展立即可用，无需重启（此前只写磁盘
@@ -574,8 +379,11 @@ async def _hot_reload_extensions() -> dict:
         _FALLBACK_TOOLS,
         load_plugins,
     )
-    # 1) 技能索引原地重建
-    _load_skill_index()
+    # 1) 能力表同步：技能三来源 + 工具注册表（prune 清理已卸载扩展的能力行）
+    import capability_registry
+    capability_registry.sync_skills()
+    capability_registry.sync_tools(agent_loop.TOOLS, agent_loop.TOOL_PERMISSIONS,
+                                   agent_loop.TOOL_DISPATCH, prune=True)
     # 2) 插件注册表原地重载。绝不能 rebind agent_loop.TOOLS——各模块
     #    （main/api_routes/cron 等）持有 from agent_loop import TOOLS 的
     #    旧引用，rebind 会让它们全部失效；原地 clear+extend 保持同一对象。
@@ -591,37 +399,11 @@ async def _hot_reload_extensions() -> dict:
     agent_loop.TOOL_HOOKS.update(new_hooks)
     # 3) MCP 远程工具重新注册
     await agent_loop._load_mcp_tools()
+    from capability_registry import skill_catalog
+    n_skills = len(skill_catalog())
     logger.info("扩展热重载完成: %d 工具 / %d 技能",
-                len(agent_loop.TOOLS), len(SKILL_INDEX))
-    return {"status": "ok", "tools": len(agent_loop.TOOLS), "skills": len(SKILL_INDEX)}
-
-
-def _build_skill_prompt() -> str:
-    """Build a lightweight skill directory for system prompt.
-    Only injects name + description (progressive disclosure).
-    Agent loads full SKILL.md via read_file when it needs a specific skill."""
-    global _loaded_skills
-    _loaded_skills = _load_skills()
-    enabled = [s for s in _loaded_skills if s.get("enabled", True)]
-    if not enabled:
-        return ""
-    lines = ["## 可用技能（按需加载）"]
-    lines.append("以下技能可用。需要使用特定技能时，用 read_file 读取对应的 SKILL.md。\n")
-    for s in enabled:
-        # Extract first meaningful line as description
-        desc = s.get("description", "")
-        if not desc:
-            # Fallback: first non-empty line of content
-            for line in s.get("content", "").split("\n"):
-                stripped = line.strip()
-                if stripped and not stripped.startswith("#") and not stripped.startswith("---"):
-                    desc = stripped[:100]
-                    break
-            if not desc:
-                desc = s["name"]
-        lines.append(f"- **{s['name']}** (`{s['key']}`): {desc[:120]}")
-    lines.append(f"\n技能文件路径: {SKILLS_DIR}/*.md")
-    return "\n".join(lines)
+                len(agent_loop.TOOLS), n_skills)
+    return {"status": "ok", "tools": len(agent_loop.TOOLS), "skills": n_skills}
 
 
 # ── 路由注册：api_routes 在文件末尾导入，确保 `from main import app` 拿到完整 app ──

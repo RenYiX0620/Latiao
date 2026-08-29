@@ -14,7 +14,6 @@ import json
 import logging
 import os
 import re
-import sqlite3
 import subprocess
 import uuid
 from datetime import datetime
@@ -68,15 +67,10 @@ from db import MEMORY_DB, _db_write_lock, _get_db
 from identity import IDENTITY_FILES
 from main import (
     MAX_UPLOAD_SIZE,
-    SKILLS_DIR,
     SUBAGENT_MODEL,
     _load_permissions,
-    _load_skills,
-    _load_skills_config,
     _log_buffer,
-    _match_skill,
     _save_permissions,
-    _save_skills_config,
     app,
 )
 from memory import (
@@ -120,11 +114,9 @@ async def chat_completion(request: Request):
     messages = body.get("messages", [])
     last_user_text = _extract_last_user_text(messages)
 
-    # Async match skill (no event loop conflict)
-    matched_skill = await _match_skill(last_user_text)
-
-    # Assemble full message context (identity, env, skills, agent, image)
-    messages = _build_chat_messages(body, messages, matched_skill)
+    # Assemble full message context (identity, env, skill catalog, agent, image)
+    # 技能目录由 capability_registry 在 _build_chat_messages 内注入，模型按需调用 use_skill
+    messages = _build_chat_messages(body, messages)
     # DeepSeek 推理模型(thinking mode)要求: content 为 null 的 assistant
     # 消息(工具调用轮)必须带 reasoning_content,否则下一轮请求 400。
     # 旧会话历史缺失该字段 → 补空值兜底(实测空字符串可接受)。
@@ -782,71 +774,34 @@ async def delete_agent(agent_id: str):
 
 @app.get("/v1/tools")
 async def get_tools():
-    """Return all loaded tools with definitions, permissions, and usage stats."""
+    """工具列表（统一能力模型：kind=tool 读 capabilities 表，保留旧路径兼容）。"""
+    import capability_registry
+    caps = {c["name"]: c for c in capability_registry.list_capabilities("tool")}
     tools_info = []
-    # Get usage stats from memory.db
-    usage: dict[str, int] = {}
-    try:
-        if MEMORY_DB.exists():
-            conn = sqlite3.connect(str(MEMORY_DB), check_same_thread=False)
-            try:
-                rows = conn.execute(
-                    "SELECT tool_name, COUNT(*) as cnt FROM tool_calls GROUP BY tool_name"
-                ).fetchall()
-                for row in rows:
-                    usage[row[0]] = row[1]
-            finally:
-                conn.close()
-    except Exception:
-        logger.warning("Failed to load usage stats", exc_info=True)
-
     for tool in TOOLS:
         fn = tool.get("function", {})
         name = fn.get("name", "unknown")
-        # Check custom permissions first, then fall back to default
-        perm = TOOL_PERMISSIONS.get(name, "safe")
-        for rule in main._custom_permissions:
-            if rule.get("tool") == name and "path_pattern" not in rule:
-                perm = rule.get("permission", perm)
-                break
+        cap = caps.get(name, {})
         tools_info.append({
             "name": name,
             "description": fn.get("description", ""),
             "parameters": fn.get("parameters", {}),
-            "permission": perm,
-            "usage_count": usage.get(name, 0),
+            "permission": cap.get("permission", TOOL_PERMISSIONS.get(name, "safe")),
+            "usage_count": cap.get("usage_count", 0),
         })
     return {"status": "ok", "tools": tools_info}
 
 
 @app.get("/v1/permissions")
 async def get_permissions():
-    """Return current custom permission rules."""
+    """Return current custom permission rules (path 级规则，工具级权限已迁移至 capabilities 表)."""
     return {"status": "ok", "rules": main._custom_permissions}
 
 
 @app.post("/v1/permissions")
 async def set_permissions(request: Request):
-    """Save custom permission rules. Accepts {rules: [...]} or {tool, permission} for single update."""
+    """Save custom permission rules. Accepts {rules: [...]}（含 path_pattern 的路径级规则）。"""
     body = await _json_body(request)
-    if "tool" in body and "permission" in body:
-        # Single tool update — upsert into custom rules
-        tool = body["tool"]
-        perm = body["permission"]
-        if not isinstance(tool, str) or not tool:
-            raise HTTPException(status_code=400, detail="invalid tool")
-        if perm not in ("safe", "confirm", "danger"):
-            raise HTTPException(status_code=400, detail=f"invalid permission: {perm}")
-        found = False
-        for rule in main._custom_permissions:
-            if rule.get("tool") == tool and "path_pattern" not in rule:
-                rule["permission"] = perm
-                found = True
-                break
-        if not found:
-            main._custom_permissions.append({"tool": tool, "permission": perm})
-        _save_permissions(main._custom_permissions)
-        return {"status": "ok", "rules": main._custom_permissions}
     rules = body.get("rules", [])
     if not isinstance(rules, list):
         raise HTTPException(status_code=400, detail="rules must be a list")
@@ -1039,78 +994,68 @@ async def get_reflections(limit: int = Query(default=20, ge=1, le=100)):
         return {"status": "error", "message": str(e)}
 
 
-@app.get("/v1/skills")
-async def get_skills():
-    """Return loaded skill cards with enable/disable state. Injects Tavily as a built-in skill."""
-    main._loaded_skills = _load_skills()
-    skills = [{"name": s["name"], "file": s["file"], "key": s["key"], "enabled": s.get("enabled", True)} for s in main._loaded_skills]
+# ── 统一能力模型（capability registry）：工具与技能一套 API ──
 
-    # Inject Tavily as a built-in skill (not a physical .md file)
-    cfg = _load_skills_config()
-    tavily_enabled = cfg.get("tavily_search", {}).get("enabled", True)
-    # Check if API key is configured
-    has_key = False
-    try:
-        if CONFIG_FILE.exists():
-            config = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-            has_key = bool(config.get("tavily_api_key"))
-    except Exception:
-        logger.warning("Failed to check Tavily key in config", exc_info=True)
-    skills.append({
-        "name": "Web Search (Tavily)",
-        "file": "sidecar/plugins/tavily_search.py",
-        "key": "tavily_search",
-        "enabled": tavily_enabled,
-        "builtin": True,
-        "has_api_key": has_key,
-    })
-    return {"status": "ok", "skills": skills}
+@app.get("/v1/capabilities")
+async def get_capabilities(request: Request):
+    """统一能力列表：kind=tool|skill 过滤（默认全部）。工具与技能合并管理。"""
+    import capability_registry
+    kind = request.query_params.get("kind")
+    kind = kind if kind in ("tool", "skill") else None
+    capabilities = capability_registry.list_capabilities(kind)
+    # tavily 提示：前端在 capabilities 里看到 tavily_search 时展示 key 配置区
+    for c in capabilities:
+        c["has_api_key"] = None
+    return {"status": "ok", "capabilities": capabilities}
 
 
-@app.post("/v1/skills/{key}/toggle")
-async def toggle_skill(key: str):
-    """Toggle a skill enabled/disabled. Works for both physical .md skills and built-in skills (tavily_search)."""
-    cfg = _load_skills_config()
-    if key not in cfg:
-        cfg[key] = {"enabled": True}
-    cfg[key]["enabled"] = not cfg[key].get("enabled", True)
-    _save_skills_config(cfg)
-    # Reload so next request picks up changes
-    main._loaded_skills = _load_skills()
-    return {"status": "ok", "key": key, "enabled": cfg[key]["enabled"]}
+@app.post("/v1/capabilities/{name}/toggle")
+async def toggle_capability(name: str):
+    """启用/禁用任意能力（工具或技能），状态存 capabilities 表。"""
+    import capability_registry
+    row = capability_registry.get_capability(name)
+    if row is None:
+        return {"status": "error", "message": "Capability not found"}
+    updated = capability_registry.set_enabled(name, not row["enabled"])
+    return {"status": "ok", "name": name, "enabled": updated["enabled"] if updated else not row["enabled"]}
 
 
-@app.post("/v1/skills")
-async def create_skill(request: Request):
-    """Create a new skill .md file."""
+@app.post("/v1/capabilities/{name}/permission")
+async def set_capability_permission(name: str, request: Request):
+    """设置能力的权限级别（safe/confirm/danger/deny），覆盖插件默认值。"""
+    import capability_registry
+    body = await _json_body(request)
+    perm = body.get("permission")
+    if perm not in ("safe", "confirm", "danger", "deny"):
+        return {"status": "error", "message": "invalid permission"}
+    updated = capability_registry.set_permission(name, perm)
+    if updated is None:
+        return {"status": "error", "message": "Capability not found"}
+    return {"status": "ok", "name": name, "permission": updated["permission"]}
+
+
+@app.post("/v1/capabilities/skills")
+async def create_capability_skill(request: Request):
+    """新建用户技能（写表 + ~/.local-ai-os/skills/<key>.md 双写）。"""
+    import capability_registry
     body = await _json_body(request)
     name = body.get("name", "").strip()
     content = body.get("content", "").strip()
     if not name or not content:
         return {"status": "error", "message": "Name and content required"}
-    key = re.sub(r'[^a-z0-9-]', '', name.lower().replace(" ", "-"))[:40]
-    filepath = SKILLS_DIR / f"{key}.md"
-    if filepath.exists():
-        return {"status": "error", "message": "Skill already exists"}
-    SKILLS_DIR.mkdir(parents=True, exist_ok=True)
-    filepath.write_text(content, encoding="utf-8")
-    main._loaded_skills = _load_skills()
-    return {"status": "ok", "skill": {"name": name, "file": f"{key}.md", "key": key, "enabled": True}}
+    skill = capability_registry.create_skill(name, content)
+    if skill is None:
+        return {"status": "error", "message": "Skill already exists or invalid name"}
+    return {"status": "ok", "skill": skill}
 
 
-@app.delete("/v1/skills/{key}")
-async def delete_skill(key: str):
-    """Delete a skill .md file. Built-in skills cannot be deleted."""
-    if key == "tavily_search":
-        return {"status": "error", "message": "Built-in skill cannot be deleted"}
-    filepath = SKILLS_DIR / f"{key}.md"
-    if not filepath.exists():
-        return {"status": "error", "message": "Skill not found"}
-    filepath.unlink()
-    cfg = _load_skills_config()
-    cfg.pop(key, None)
-    _save_skills_config(cfg)
-    main._loaded_skills = _load_skills()
+@app.delete("/v1/capabilities/skills/{name}")
+async def delete_capability_skill(name: str):
+    """删除用户自建技能。内置/扩展技能不可删除。"""
+    import capability_registry
+    ok = capability_registry.delete_skill(name)
+    if not ok:
+        return {"status": "error", "message": "Skill not found or not user-created"}
     return {"status": "ok"}
 
 
@@ -1711,6 +1656,12 @@ async def api_extensions_uninstall(request: Request):
     from extension_manager import uninstall_extension
     result = uninstall_extension(name)
     if isinstance(result, dict) and result.get("status") == "ok":
+        try:
+            # 直接移除该扩展的能力行（工具+技能），热重载 prune 作为兜底
+            import capability_registry
+            capability_registry.remove_extension_caps(name)
+        except Exception:
+            logger.warning("扩展能力清理失败", exc_info=True)
         try:
             from main import _hot_reload_extensions
             result["reload"] = await _hot_reload_extensions()
