@@ -1025,7 +1025,7 @@ class LocalLLMEngine:
             # 3s 后立即复验一次，仍失败直接处置--不再让用户面对 60s 黑盒。
             # 忙引擎维持 60s 窗口（复验会排队超时，快速判死有误杀长生成风险）。
             if not self._engine_busy():
-                time.sleep(3)
+                LocalLLMEngine._wait_before_recheck(3)
                 # 复验期间流可能进入（用户发了新消息）-> 退回慢路径
                 if not self._engine_busy() and not self.verify_engine_health():
                     self._health_first_fail_at = 0.0
@@ -1037,6 +1037,9 @@ class LocalLLMEngine:
         # 第二次失败且间隔 ≥60s -> 进入处置
         self._dispose_dead_engine()
         return False
+
+    # 空闲复验前的等待（默认 3s）；类属性便于测试替换成零等待
+    _wait_before_recheck = staticmethod(time.sleep)
 
     def _dispose_dead_engine(self):
         """杀掉判定已死的引擎进程并触发后台自动重载（两处判死路径共用）。"""

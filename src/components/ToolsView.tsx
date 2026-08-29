@@ -40,6 +40,25 @@ export default function ToolsView({ tools, setTools, showToast }: ToolsViewProps
   const [installSrc, setInstallSrc] = useState("");
   const [installing, setInstalling] = useState(false);
   const [confirming, setConfirming] = useState<{ source: string; sha256: string; permissions: string[] } | null>(null);
+  // ── 市场（Phase 2a） ──
+  const [marketTab, setMarketTab] = useState<"market" | "installed">("market");
+  const [marketPlugins, setMarketPlugins] = useState<any[]>([]);
+  const [marketLoading, setMarketLoading] = useState(false);
+  const [marketErr, setMarketErr] = useState("");
+
+  const refreshMarket = useCallback(async () => {
+    setMarketLoading(true);
+    setMarketErr("");
+    try {
+      const resp = await authFetch("/v1/marketplace?url=");
+      const data = await resp.json();
+      if (data.status === "ok") setMarketPlugins(data.plugins || []);
+      else setMarketErr(data.message || "市场加载失败");
+    } catch { setMarketErr("市场加载失败"); }
+    finally { setMarketLoading(false); }
+  }, []);
+
+  useEffect(() => { refreshMarket(); }, [refreshMarket]);
 
   const refreshExtensions = useCallback(async () => {
     try {
@@ -77,6 +96,10 @@ export default function ToolsView({ tools, setTools, showToast }: ToolsViewProps
     // 所以先请求权限预检（后端 install 返回 permissions 后再确认会太晚）。
     // 简化方案：本地/URL 直接询问用户是否信任该来源。
     setConfirming({ source: source.trim(), sha256: "", permissions: [] });
+  };
+
+  const installFromMarket = async (item: any) => {
+    setConfirming({ source: item.source_url || "", sha256: item.sha256 || "", permissions: [] });
   };
 
   const toggleExt = async (ext: ExtensionInfo) => {
@@ -119,6 +142,53 @@ export default function ToolsView({ tools, setTools, showToast }: ToolsViewProps
         </div>
       </div>
 
+      {/* 市场 / 已装 tab */}
+      <div className="tab-bar" style={{ marginBottom: 12 }}>
+        <button className={`tab-btn${marketTab === "market" ? " active" : ""}`}
+          onClick={() => setMarketTab("market")}>市场</button>
+        <button className={`tab-btn${marketTab === "installed" ? " active" : ""}`}
+          onClick={() => setMarketTab("installed")}>已安装</button>
+      </div>
+
+      {marketTab === "market" && (
+        <div className="card" style={{ marginBottom: 14 }}>
+          <div className="card-title" style={{ marginBottom: 8 }}>官方市场</div>
+          {marketLoading && <div className="card-desc">加载中…</div>}
+          {marketErr && <div className="card-desc" style={{ color: "var(--danger)" }}>{marketErr}</div>}
+          {!marketLoading && !marketErr && marketPlugins.length === 0 && (
+            <div className="card-desc">市场为空——等待官方扩展上架。已支持：粘贴 URL/GitHub 仓库/本地文件安装。</div>
+          )}
+          {marketPlugins.map((item) => (
+            <div key={item.name} style={{
+              display: "flex", alignItems: "center", gap: 10, padding: "8px 0",
+              borderBottom: "1px solid var(--border-default)",
+            }}>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <span style={{ fontWeight: 650, fontSize: 13 }}>🧩 {item.name}</span>
+                  <span className="badge badge-safe">v{item.version}</span>
+                  {item.update_available && <span className="badge badge-confirm">有更新</span>}
+                </div>
+                <div className="card-desc" style={{ marginTop: 2 }}>{item.description}</div>
+                <div className="card-meta" style={{ marginTop: 2 }}>
+                  {typeof item.author === "object" && item.author ? item.author.name || "" : ""}
+                  {item.category ? ` · ${item.category}` : ""}
+                </div>
+              </div>
+              <button className={`btn btn-sm ${item.installed ? "btn-ghost" : "btn-primary"}`}
+                disabled={item.installed && !item.update_available}
+                onClick={() => item.installed && item.update_available
+                  ? setConfirming({ source: item.source_url, sha256: item.sha256, permissions: [] })
+                  : installFromMarket(item)}>
+                {item.update_available ? "更新" : item.installed ? "已安装" : "安装"}
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {marketTab === "installed" && (
+      <>
       <div className="card" style={{ marginBottom: 14 }}>
         <div className="card-title" style={{ marginBottom: 8 }}>安装扩展</div>
         <div style={{ display: "flex", gap: 8 }}>
@@ -189,6 +259,8 @@ export default function ToolsView({ tools, setTools, showToast }: ToolsViewProps
           </div>
         )}
       </div>
+      </>
+      )}
 
       {/* ═══ 工具列表（原有内容） ═══ */}
       <div className="page-header" style={{ margin: "18px 0 12px" }}>

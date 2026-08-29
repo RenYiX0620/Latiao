@@ -129,64 +129,129 @@ async def _local_llm_serialized(api_url: str | None):
 @asynccontextmanager
 async def _local_llm_stream(client, api_url: str, body: dict, headers: dict):
     """流式请求本地/云端模型。本地 llama.cpp 时持锁直到流读完，
-    防止并发流式生成导致 server 崩溃（连接被 peer 关闭）。"""
+    防止并发流式生成导致 server 崩溃（连接被 peer 关闭）。
+
+    引擎死亡时的恢复语义（修复"任务执行一半停止"）：
+    - 有可恢复资源（模型记录在、非用户主动停止、是我们自己管理的引擎）：
+      触发防重入自动重载，本函数的 5s×72 等待循环覆盖 35B 重载窗口，
+      请求自然排队恢复--不再因 kill 与 reload 置位之间的竞态窗口秒死；
+    - 无可恢复资源（用户手动停止 / 从未加载模型 / 外部引擎 / 重载已失败）：
+      快速失败并给出明确的下一步指引。
+    """
     async with _local_llm_serialized(api_url):
         global _llm_suspect_since
-        if _is_local_llm_url(api_url):
-            local_llm._engine.mark_engine_busy()
-            local_llm._engine.mark_stream_enter()
-        if _is_local_llm_url(api_url) and _llm_suspect_since is not None:
+        engine = local_llm._engine
+        _local = _is_local_llm_url(api_url)
+        from urllib.parse import urlparse
+        try:
+            _own_engine = (urlparse(api_url).port or engine.server_port) == engine.server_port
+        except Exception:
+            _own_engine = True
+
+        if _local:
+            engine.mark_engine_busy()
+            engine.mark_stream_enter()
+        # 入口快照：get_api_url 可能已触发自动重载（_auto_reloading=True）
+        _reload_requested = engine._auto_reloading
+
+        def _request_recovery_reload() -> bool:
+            nonlocal _reload_requested
+            if _reload_requested:
+                return False
+            if (_own_engine and engine.current_model_id
+                    and not getattr(engine, "_explicit_stop", False)
+                    and not engine._auto_reloading
+                    and engine.server_status != "starting"):
+                _reload_requested = True
+                return engine._request_reload(engine.current_model_id)
+            return False
+
+        if _local and _llm_suspect_since is not None:
             ok = await _verify_llm_health(api_url)
+            _llm_suspect_since = None
             if not ok:
-                # 端口确实死亡或引擎产出异常——先杀残留，自动重载由 get_api_url 触发
+                # 端口确实死亡或引擎产出异常--先杀残留，再触发自动重载；
+                # 下面的等待-重试循环会等到引擎就绪（此前直接秒死）
                 try:
-                    from urllib.parse import urlparse
-                    engine = local_llm._engine
                     port = urlparse(api_url).port or engine.server_port
                     engine._kill_port(port)
                     if port == engine.server_port:
                         engine.server_status = "stopped"
                 except Exception:
                     pass
-                raise httpx.ConnectError(
-                    "本地模型引擎状态异常，已自动停止。请重新加载本地模型。"
-                )
-            _llm_suspect_since = None
+                if not _request_recovery_reload():
+                    raise httpx.ConnectError(
+                        "本地模型引擎状态异常，已自动停止。请到模型页重新加载模型。"
+                    )
         # 引擎短暂闪断（404/503，如 mlx_lm 高负载重启窗口）自动重试，
         # 避免整轮任务因一次瞬时不可用被判死。
-        # 生成器语义：yield 之后消费者持有 r 直到读完，无法重试；
-        # 只对"连接建立即失败"（还没 yield 过）的情况重试。
+        # 生成器语义：yield 之后消费者持有 r 直到读完。流中途断裂（athrow 进来
+        # 的异常）后生成器不能再次 yield（asynccontextmanager 协议会破坏）--
+        # 生成器内只对"连接建立即失败"（还没 yield 过）的情况重试；
+        # 流中途断裂抛出明确异常，由 agent 循环的零交付重试接管。
         last_err: Exception | None = None
+        _yielded = False
         # 引擎闪断/自动重载期间 404/503：等待恢复（35B 重载窗口 3-5 分钟），
-        # 每 5s 重试一次、最长 5 分钟——用户消息自然排队到引擎就绪，不再秒败
+        # 每 5s 重试一次、最长 5 分钟--用户消息自然排队到引擎就绪，不再秒败
         try:
             for _attempt in range(72):
                 try:
                     async with client.stream("POST", api_url, json=body, headers=headers) as r:
                         r.raise_for_status()  # httpx 不自动抛 4xx/5xx，必须显式检查
+                        _yielded = True
                         try:
                             yield r
                         except asyncio.CancelledError:
-                            if _is_local_llm_url(api_url):
+                            if _local:
                                 # 流被取消（用户点停止/发了新消息）-> 引擎生成线程可能残留
                                 # 并继续跑 llama.cpp，下次请求前必须验证健康
                                 _llm_suspect_since = _llm_suspect_since or time.monotonic()
                             raise
                         return
                 except httpx.HTTPStatusError as e:
+                    if _yielded:
+                        raise  # 流中途断裂：生成器内不能重试（见函数注释）
                     if e.response.status_code in (404, 503) and _attempt < 71:
                         last_err = e
                         await asyncio.sleep(5)  # 5s × 72 = 最大约 6 分钟等待
                         continue
                     raise
                 except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError) as e:
-                    # 连接被拒：若没有自动重载在进行，等待毫无意义——快速失败
-                    # （此前固定等 6 分钟，用户面对"没反应"的黑盒）
-                    if isinstance(e, httpx.ConnectError) and _is_local_llm_url(api_url):
-                        if not local_llm._engine._auto_reloading and _attempt >= 2:
+                    if _yielded:
+                        # 流中途断裂（引擎被杀/系统压力/网络断）：生成器内不能重发，
+                        # 抛出明确语义的异常，由 agent 循环的零交付重试接管
+                        raise httpx.RemoteProtocolError(
+                            "本地模型流中断（引擎死亡或连接断开）。"
+                            "若本轮尚无输出，任务将自动等待引擎恢复并重试。"
+                        ) from e
+                    if isinstance(e, httpx.ConnectError) and _local:
+                        # 连接被拒：判断有无恢复资源，决定快速失败还是排队等重载。
+                        # 此前只要 _auto_reloading 未置位就秒死，而引擎几秒后
+                        # 就能自动恢复（kill 与 reload 置位之间的竞态窗口）。
+                        if not _own_engine:
+                            raise httpx.ConnectError(
+                                "外部模型引擎（LM Studio/Ollama）未运行。请启动外部引擎后重试。"
+                            ) from e
+                        if getattr(engine, "_explicit_stop", False):
+                            raise httpx.ConnectError(
+                                "本地模型已被手动停止，任务已中断。请到模型页重新加载模型后重发消息。"
+                            ) from e
+                        _load_in_progress = engine.server_status == "starting"
+                        if not engine.current_model_id and not _load_in_progress:
                             raise httpx.ConnectError(
                                 "本地模型引擎未运行（端口无监听）。请到模型页加载模型。"
                             ) from e
+                        # 有恢复资源：确保重载已触发（幂等，防重入）。
+                        # 已请求过重载且其已结束仍连不上（状态 error）= 重载失败，
+                        # 不再无限等待。
+                        if not engine._auto_reloading:
+                            _started = _request_recovery_reload()
+                            if (not _started and _reload_requested
+                                    and engine.server_status == "error"):
+                                raise httpx.ConnectError(
+                                    f"本地模型自动重载失败（{(engine.status_message or '未知错误')[:120]}）。"
+                                    "请到模型页检查模型。"
+                                ) from e
                     # 重载窗口期端口无进程（连接被拒）或读超时/连接重置：
                     # 等待重试（自动重载完成即恢复）
                     if _attempt < 71:
@@ -197,9 +262,9 @@ async def _local_llm_stream(client, api_url: str, body: dict, headers: dict):
             if last_err is not None:
                 raise last_err
         finally:
-            if _is_local_llm_url(api_url):
-                local_llm._engine.mark_stream_exit()
-                local_llm._engine.mark_engine_idle()
+            if _local:
+                engine.mark_stream_exit()
+                engine.mark_engine_idle()
 
 # ═══════════════════════════════════════════════════════
 #  Multi-Agent System: LaTiao orchestrator + specialists
@@ -546,6 +611,88 @@ _TOOL_PRIORITY = (
 )
 _TOOL_RANK = {_name: _rank for _rank, _name in enumerate(_TOOL_PRIORITY)}
 TOOLS.sort(key=lambda _t: _TOOL_RANK.get(_t.get("function", {}).get("name", ""), len(_TOOL_RANK)))
+
+
+# ── MCP 扩展：启用扩展声明 mcpServers → 动态注册远程工具 ──
+# 工具命名 mcp_<server>_<tool>；dispatch 异步转发，连接失败返回错误文本（不崩整轮）。
+def _mcp_tool_name(server: str, tool: str) -> str:
+    from mcp_client import sanitize_tool_name
+    return sanitize_tool_name(f"mcp_{server}_{tool}")
+
+
+async def _load_mcp_tools() -> None:
+    """扫描启用扩展的 mcpServers 声明，把远程工具并入 TOOLS/DISPATCH。"""
+    try:
+        from extension_manager import active_extension_dirs, _read_manifest
+        from mcp_client import get_mcp_client
+        for ext_dir in active_extension_dirs():
+            manifest = _read_manifest(ext_dir) or {}
+            servers = manifest.get("mcpServers") or {}
+            for srv_name, cfg in servers.items():
+                if not isinstance(cfg, dict):
+                    continue
+                entry = f"{ext_dir.parent.name}/{srv_name}"
+                try:
+                    client = get_mcp_client(entry, cfg)
+                    tools = await client.list_tools()
+                except Exception as e:
+                    logger.warning("MCP 连接失败 %s: %s", entry, e)
+                    continue
+                for t in tools:
+                    tname = t.get("name", "")
+                    if not tname:
+                        continue
+                    fname = _mcp_tool_name(srv_name, tname)
+                    schema = (t.get("inputSchema") or {}).copy()
+                    desc = t.get("description") or f"MCP 工具 {srv_name}:{tname}"
+                    # 已有同名工具时跳过（内置优先）
+                    if any(td.get("function", {}).get("name") == fname for td in TOOLS):
+                        continue
+                    TOOLS.append({
+                        "type": "function",
+                        "function": {"name": fname, "description": desc, "parameters": schema},
+                    })
+                    TOOL_PERMISSIONS[fname] = "safe"
+                    TOOL_DISPATCH[fname] = (
+                        lambda args, _srv=srv_name, _tool=tname, _entry=entry:
+                        _mcp_invoke(_entry, _tool, args)
+                    )
+                    logger.info("MCP 工具注册: %s (%s)", fname, entry)
+    except Exception:
+        logger.warning("MCP 扩展扫描失败", exc_info=True)
+
+
+async def _mcp_invoke(entry: str, tool: str, args: dict) -> str:
+    try:
+        from mcp_client import _MCP_CLIENTS
+        client = _MCP_CLIENTS.get(entry)
+        if client is None:
+            return "⛔ MCP 连接已失效，请重启应用或重新安装扩展"
+        return await client.call_tool(tool, args)
+    except Exception as e:
+        return f"⛔ MCP 工具调用失败: {e}"
+
+
+_MCP_LOADED = False
+
+
+def ensure_mcp_loaded() -> None:
+    """进程内一次性 MCP 注册（幂等）。api_routes 每个请求入口调用。"""
+    global _MCP_LOADED
+    if _MCP_LOADED:
+        return
+    _MCP_LOADED = True
+    try:
+        import asyncio as _asyncio
+        try:
+            _asyncio.get_running_loop()
+        except RuntimeError:
+            _asyncio.run(_load_mcp_tools())
+        else:
+            # 已在事件循环内（理论上 api 层 async 调用前不至此）
+            _asyncio.create_task(_load_mcp_tools())
+    except Exception:
+        logger.warning("MCP 工具注册失败", exc_info=True)
 
 
 async def execute_tool(tool_name: str, arguments: dict) -> str:
@@ -2084,6 +2231,7 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
     text_only_streak = 0
     has_called_tool = False
     text_output_delivered = False  # nudge 重试期间抑制已交付文本的重复流式输出
+    _brief_answer_nudged = False  # "资料充足却短回答"的追问只触发一次，防死循环
     # Build tool prompt
     last_user_text = _extract_last_user_text(current_msgs)
     agent_tools = _get_agent_tools(agent_id, TOOLS)
@@ -2174,63 +2322,82 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
             streamed_text = ""
             _raw_delta_count = 0  # 诊断: 统计收到的 delta 数(空响应时判断是模型真空还是解析丢了)
             logger.info(f"[LOCAL-AGENT] Iteration {iteration}: calling LLM, msgs={len(loop_msgs)}, first_user_content_len={len(loop_msgs[-1].get('content','')) if loop_msgs else 0}")
-            # 本地 llama.cpp 并发流式请求会崩溃 → _local_llm_stream 内部串行化
+            # 本地 llama.cpp 并发流式请求会崩溃 -> _local_llm_stream 内部串行化
             # 流式停顿检测：模型过大/未加载完时可能极慢滴灌（120s 超时永不触发），
             # 连续 180s 无任何数据视为僵死，中止不再无限挂起
-            async with _local_llm_stream(client, api_url, body, headers) as r:
-                aiter = r.aiter_lines()
-                while True:
-                    try:
-                        line = await asyncio.wait_for(anext(aiter), timeout=180)
-                    except asyncio.TimeoutError:
-                        _llm_suspect_since = _llm_suspect_since or time.monotonic()
-                        raise TimeoutError(
-                            f"本地模型输出停滞超 180 秒（模型可能过大或未加载完）：{model[:60]}"
-                        )
-                    except StopAsyncIteration:
-                        break
-                    if line and line.startswith("data: "):
-                        data_str = line[6:]
-                        if data_str == "[DONE]":
-                            break
-                        try:
-                            event = json.loads(data_str)
-                            choices = event.get("choices") or []
-                            if not choices:
-                                continue  # usage-only chunk（仅 token 统计，无 delta）
-                            delta = choices[0].get("delta", {})
-                            _raw_delta_count += 1
-                            content = delta.get("content", "")
-                            # LM Studio/方舟等返回 reasoning_content,OpenAI o 系列返回 reasoning
-                            reasoning = delta.get("reasoning") or delta.get("reasoning_content") or ""
-                            if content:
-                                streamed_text += content
-                                # Anti-repetition: skip tokens after the first complete intro
-                                if len(_deduplicate_response(streamed_text)) < len(streamed_text):
-                                    continue
-                                # nudge 重试期间不再向用户重复输出已交付的文本
-                                if text_output_delivered:
-                                    continue
-                                yield {"content": content}
-                                # 复读循环检测（节流：每 ~2KB 一次）：本地小模型长生成
-                                # 偶发最后两句话无限重复，直 max_tokens 才停
-                                _raw_delta_count += 1
-                                if _raw_delta_count % 40 == 0 and _detect_text_loop(streamed_text):
-                                    logger.warning("[LOCAL-AGENT] 检测到输出复读循环，截断生成")
-                                    yield {"content": "\n\n⚠️ 检测到输出重复，已自动截断。"}
-                                    raise TimeoutError("输出复读循环，已截断")
-                            elif reasoning:
-                                streamed_text += reasoning
-                                if len(_deduplicate_response(streamed_text)) < len(streamed_text):
-                                    continue
-                                if text_output_delivered:
-                                    continue
-                                yield {"reasoning": reasoning, "ts": int(time.time() * 1000)}
-                        except (json.JSONDecodeError, KeyError, TypeError, IndexError):
-                            pass
-                        except Exception:
-                            logger.error("Local agent SSE parse error", exc_info=True)
-                            raise
+            #
+            # 零交付断裂重试：引擎在本轮 LLM 调用中途死亡（健康处置杀进程/
+            # 系统内存压力/OOM）时流会中断。若本轮尚未向用户交付任何内容
+            # （streamed_text 为空 <=> 未 yield 过任何 content/reasoning），
+            # 等待引擎自动重载后重发本轮调用--任务无感继续，不再
+            # "执行一半停止"。已有部分输出时重发会重复，直接抛出。
+            _stream_break_retries = 0
+            while True:
+                try:
+                    async with _local_llm_stream(client, api_url, body, headers) as r:
+                        aiter = r.aiter_lines()
+                        while True:
+                            try:
+                                line = await asyncio.wait_for(anext(aiter), timeout=180)
+                            except asyncio.TimeoutError:
+                                _llm_suspect_since = _llm_suspect_since or time.monotonic()
+                                raise TimeoutError(
+                                    f"本地模型输出停滞超 180 秒（模型可能过大或未加载完）：{model[:60]}"
+                                )
+                            except StopAsyncIteration:
+                                break
+                            if line and line.startswith("data: "):
+                                data_str = line[6:]
+                                if data_str == "[DONE]":
+                                    break
+                                try:
+                                    event = json.loads(data_str)
+                                    choices = event.get("choices") or []
+                                    if not choices:
+                                        continue  # usage-only chunk（仅 token 统计，无 delta）
+                                    delta = choices[0].get("delta", {})
+                                    _raw_delta_count += 1
+                                    content = delta.get("content", "")
+                                    # LM Studio/方舟等返回 reasoning_content,OpenAI o 系列返回 reasoning
+                                    reasoning = delta.get("reasoning") or delta.get("reasoning_content") or ""
+                                    if content:
+                                        streamed_text += content
+                                        # Anti-repetition: skip tokens after the first complete intro
+                                        if len(_deduplicate_response(streamed_text)) < len(streamed_text):
+                                            continue
+                                        # nudge 重试期间不再向用户重复输出已交付的文本
+                                        if text_output_delivered:
+                                            continue
+                                        yield {"content": content}
+                                        # 复读循环检测（节流：每 ~2KB 一次）：本地小模型长生成
+                                        # 偶发最后两句话无限重复，直 max_tokens 才停
+                                        _raw_delta_count += 1
+                                        if _raw_delta_count % 40 == 0 and _detect_text_loop(streamed_text):
+                                            logger.warning("[LOCAL-AGENT] 检测到输出复读循环，截断生成")
+                                            yield {"content": "\n\n⚠️ 检测到输出重复，已自动截断。"}
+                                            raise TimeoutError("输出复读循环，已截断")
+                                    elif reasoning:
+                                        streamed_text += reasoning
+                                        if len(_deduplicate_response(streamed_text)) < len(streamed_text):
+                                            continue
+                                        if text_output_delivered:
+                                            continue
+                                        yield {"reasoning": reasoning, "ts": int(time.time() * 1000)}
+                                except (json.JSONDecodeError, KeyError, TypeError, IndexError):
+                                    pass
+                                except Exception:
+                                    logger.error("Local agent SSE parse error", exc_info=True)
+                                    raise
+                    break
+                except httpx.RemoteProtocolError as e:
+                    if streamed_text.strip() or _stream_break_retries >= 1:
+                        raise
+                    _stream_break_retries += 1
+                    logger.warning(
+                        f"[LOCAL-AGENT] Iteration {iteration}: LLM 流零交付中断"
+                        f"({type(e).__name__})，等待引擎恢复后重发本轮调用 ({_stream_break_retries}/1)")
+                    await asyncio.sleep(10)
+                    continue
 
             # Check for tool calls in the streamed text
             clean_text, tool_calls = _parse_prompt_tool_calls(streamed_text)
@@ -2390,6 +2557,21 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                                "不要因一次失败就直接给简短结论；若全部工具不可用，再如实告知。",
                 })
                 logger.info(f"[LOCAL-AGENT] Iteration {iteration}: 短回答+工具失败，继续追问一轮")
+                continue
+            # 短回答 + 工具成功且资料量充足（如美股任务搜到 6 条结果+指数数据，
+            # 最终却只回 192 字符"草草收场"）：提示模型基于已有资料输出完整报告。
+            # 只追加一次，防止与空响应 nudge 互相触发死循环。
+            _tool_out_total = sum(len(str(m.get("content") or "")) for m in current_msgs if m.get("role") == "tool")
+            if (len(streamed_text.strip()) < 200 and has_called_tool
+                    and _tool_out_total > 2048 and not _brief_answer_nudged):
+                _brief_answer_nudged = True
+                current_msgs.append({
+                    "role": "system",
+                    "content": "你已通过工具收集了充分的资料（见上方工具结果）。"
+                               "请基于这些结果输出完整的分析报告，包含关键数据与结论，"
+                               "不要只给一两句话的简短总结。",
+                })
+                logger.info(f"[LOCAL-AGENT] Iteration {iteration}: 短回答+资料充足({_tool_out_total} chars)，追问完整报告一轮")
                 continue
 
             _track_progress(session_id, "completed", f"text_response ({len(streamed_text)} chars)")
