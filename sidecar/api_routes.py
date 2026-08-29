@@ -222,7 +222,8 @@ async def chat_completion(request: Request):
                 except TimeoutError as e:
                     # 复读循环截断 / 总时长看门狗等主动中止——正常收尾而非报错
                     logger.warning(f"Agent stream 主动中止: {e}")
-                    yield f"data: {json.dumps({'content': f'\n\n⚠️ {e}'})}\n\n"
+                    _note = f"\n\n⚠️ {e}"
+                    yield f"data: {json.dumps({'content': _note})}\n\n"
                     yield "data: [DONE]\n\n"
                 except httpx.TimeoutException as e:
                     logger.error(f"Agent stream 超时: {type(e).__name__}: {e}", exc_info=True)
