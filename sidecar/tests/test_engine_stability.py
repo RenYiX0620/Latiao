@@ -35,6 +35,17 @@ class TestRequestReloadGuard(unittest.TestCase):
 
 
 class TestEngineStatePersistence(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        from local_llm import LocalLLMEngine
+        # 关键：重定向到临时目录。曾发生测试把测试数据写进生产
+        # ~/.local-ai-os/.engine_state.json，被运行中的 sidecar 恢复。
+        self._tmp = tempfile.TemporaryDirectory()
+        LocalLLMEngine._engine_state_file = (
+            __import__("pathlib").Path(self._tmp.name) / ".engine_state.json"
+        )
+        self.addCleanup(self._tmp.cleanup)
+
     def _eng(self):
         from local_llm import LocalLLMEngine
         eng = LocalLLMEngine.__new__(LocalLLMEngine)

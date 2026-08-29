@@ -568,21 +568,29 @@ if __name__ == "__main__":
     # ── 防双实例：已有 sidecar 监听 8765 时直接退出 ──
     # 两个 sidecar 同时管理引擎 = 双份模型加载（内存 95% 尖峰）+ 状态互踩。
     # 应用正常重启由 Rust 端先 kill 旧进程，这里拦的是绕过应用的手动启动。
-    import socket
-    _probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    _probe.settimeout(1.0)
-    _dup = _probe.connect_ex(("127.0.0.1", int(os.environ.get("LATIAO_PORT", "8765"))))
-    _probe.close()
-    if _dup == 0:
-        _other_pid = ""
+    import socket, time as _time
+    _port = int(os.environ.get("LATIAO_PORT", "8765"))
+    _dup = False
+    for _try in range(3):
+        _probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        _probe.settimeout(1.0)
+        _dup = _probe.connect_ex(("127.0.0.1", _port)) == 0
+        _probe.close()
+        if not _dup:
+            break
+        # 端口被占：可能是刚被 kill 的旧实例尚未完全退出，等 2s 重试
+        if _try < 2:
+            _time.sleep(2)
+    if _dup:
+        _other = ""
         try:
             import urllib.request
-            with urllib.request.urlopen("http://127.0.0.1:8765/health", timeout=2) as _r:
-                _other_pid = _r.read().decode("utf-8", errors="replace")[:120]
+            with urllib.request.urlopen(f"http://127.0.0.1:{_port}/health", timeout=2) as _r:
+                _other = _r.read().decode("utf-8", errors="replace")[:120]
         except Exception:
             pass
-        print("⛔ 另一个辣条 sidecar 已在运行（端口 8765 被占用），本次启动取消。", flush=True)
-        print(f"   现存实例响应: {_other_pid}", flush=True)
+        print("⛔ 另一个辣条 sidecar 已在运行（端口被占用），本次启动取消。", flush=True)
+        print(f"   现存实例响应: {_other}", flush=True)
         raise SystemExit(1)
 
     import uvicorn
