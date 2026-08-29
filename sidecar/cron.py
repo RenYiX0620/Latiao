@@ -259,6 +259,7 @@ async def _execute_cron_job(job: dict):
     from agent_loop import (
         _NATIVE_TOOL_RE,
         TOOLS,
+        _build_local_tools_prompt,
         _cap_tools,
         _deduplicate_response,
         _filter_tools,
@@ -266,7 +267,9 @@ async def _execute_cron_job(job: dict):
         _get_agent_tools,
         _get_best_cloud_config,
         _local_llm_serialized,
+        _merge_system_messages,
         _parse_native_tool_calls,
+        _parse_prompt_tool_calls,
         _resolve_api_target,
         _safe_cwd,
         _strip_native_tool_calls,
@@ -300,7 +303,7 @@ async def _execute_cron_job(job: dict):
     # Use non-streaming agent loop to execute the task
     # 优先使用云端模型（支持原生 function calling）；仅在无云端时退回本地模型
     cloud = _get_best_cloud_config()
-    protocol, api_url, headers, is_local = _resolve_api_target(cloud)
+    protocol, api_url, headers, is_local = await _resolve_api_target(cloud)
     if not api_url:
         logger.warning("Cron job skipped: no API target（云端未配置且本地模型未运行）: %s", task[:50])
         _record_cron_result(job, "skipped", "跳过：无可用模型（云端未配置且本地模型未运行）")
@@ -317,8 +320,18 @@ async def _execute_cron_job(job: dict):
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(120)) as client:
             for _ in range(10):  # max 10 iterations for cron
+                # 本地模式：prompt-based 工具（此前本地 cron 无任何工具，P1-9）
+                # 且发送前统一合并 system——重试轮追加的第二个 system 会让
+                # mlx 404（与主循环同款修复）
+                _cron_msgs = _merge_system_messages(current_msgs)
+                if is_local:
+                    _cron_msgs = _cron_msgs + [{
+                        "role": "system",
+                        "content": _build_local_tools_prompt(active_tools),
+                    }]
+                    _cron_msgs = _merge_system_messages(_cron_msgs)
                 req_body = {
-                    "model": model, "messages": current_msgs,
+                    "model": model, "messages": _cron_msgs,
                     "max_tokens": 2048, "stream": False,
                     "temperature": 0.5,
                     "frequency_penalty": 0.6,
@@ -345,9 +358,11 @@ async def _execute_cron_job(job: dict):
                         content = _strip_native_tool_calls(content)
                         tc_data = native_tcs
 
-                if is_local:
-                    # 本地模型：纯文本问答——不发送 tools，也不回灌 role:"tool" 消息
-                    tc_data = []
+                if is_local and not tc_data and content:
+                    # 本地模式：从文本解析 prompt-based 工具调用（P1-9）
+                    _clean, tc_data = _parse_prompt_tool_calls(content)
+                    if tc_data:
+                        content = _clean
 
                 if tc_data:
                     tool_count += 1

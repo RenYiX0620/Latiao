@@ -237,7 +237,10 @@ async def _local_llm_stream(client, api_url: str, body: dict, headers: dict):
                         # 健康引擎对正确路径绝不会 404——连续 2 次后杀+重载，
                         # 而不是空转 71×5s 后报"模型未就绪"。503 保持纯等待语义。
                         if (_status == 404 and _local and _own_engine
-                                and _attempt >= 1 and not engine._auto_reloading):
+                                and _attempt >= 1 and not engine._auto_reloading
+                                and engine.server_status != "starting"):
+                            # 注意 starting 保护：手动加载期间 chat 接口 404 是
+                            # 常态（模型未就绪），绝不能杀正在加载的引擎（P1-7）
                             logger.warning("本地引擎连续 404，判定状态损坏，强制重载")
                             try:
                                 engine._kill_port(engine.server_port)
@@ -845,9 +848,10 @@ def _detect_text_loop(text: str) -> bool:
             pos -= plen
         if count >= 3:
             return True
-    # 兜底：短片段高频重复（如"好的，"×8）
+    # 兜底：短片段高频重复（如"好的，"×8）。注意 \1 是反向引用——
+    # 此前误写成字面 \x01 控制字符，兜底永远不匹配（P1-10）
     import re as _re
-    m = _re.search(r"(.{6,40}?)(?:){4,}$", tail, _re.DOTALL)
+    m = _re.search(r"(.{6,40}?)\1{3,}$", tail, _re.DOTALL)
     if m:
         return True
     return False
@@ -967,6 +971,11 @@ def _filter_tools(user_text: str, all_tools: list[dict]) -> list[dict]:
         allowed_tools.update(TOOL_CATEGORIES.get(cat, []))
     # Always include read_file as fallback
     allowed_tools.add("read_file")
+    # 金融意图同时保留 web 工具：美股/港股等境外市场 mx_query 查不到，
+    # 需要 tavily 联网搜索——此前 financial 只给 mx_query/ak_finance，
+    # 模型想搜行情时工具被白名单过滤、空响应收场（P0-1）
+    if "financial" in allowed_categories:
+        allowed_tools.update(TOOL_CATEGORIES.get("web", []))
     # Only add web/financial tools when relevant (not unconditionally)
     if "financial" not in allowed_categories and "web" not in allowed_categories:
         allowed_tools.add("tavily_search")
@@ -1378,7 +1387,10 @@ async def _enhance_auto_verify(tool_name: str, args: dict, result: str, checks: 
 
 
 async def _await_tool_confirmation(call_id: str, tool_name: str, args: dict) -> tuple[bool, list[dict]]:
-    """Wait for user to approve/deny a confirm-level tool. Returns (approved, events)."""
+    """Wait for user to approve/deny a confirm-level tool. Returns (approved, events).
+
+    超时不再静默当拒绝（P2-14）：保留 pending 状态并给用户明确提示事件，
+    任务暂停而不是以 User denied 收场。"""
     events = [{"event": "tool_confirm", "call_id": call_id, "tool": tool_name, "args": args}]
     event = asyncio.Event()
     async with _pending_lock:
@@ -1389,6 +1401,12 @@ async def _await_tool_confirmation(call_id: str, tool_name: str, args: dict) -> 
             approved = _pending_confirmations.get(call_id, {}).get("approved", False)
     except asyncio.TimeoutError:
         approved = False
+        events.append({
+            "content": (
+                f"\n\n⚠️ 工具 `{tool_name}` 等待确认超时（2 分钟无人操作），"
+                "任务已暂停，未执行该操作。可在界面中重新批准后继续。"
+            ),
+        })
     finally:
         async with _pending_lock:
             _pending_confirmations.pop(call_id, None)
@@ -1539,10 +1557,12 @@ async def _handle_tool_execution(tc: dict, current_msgs: list, session_id: str,
     # 保留前 3000 字符(够模型理解数据结构)+ 提示完整数据已保存。
     MAX_TOOL_RESULT = 3000
     if len(tool_content) > MAX_TOOL_RESULT:
+        # 保留首 2000 + 尾 800：尾部常含关键结论/错误信息（P2-16）
         tool_content = (
-            tool_content[:MAX_TOOL_RESULT]
-            + f"\n\n... (工具结果过长,已截断。完整结果 {len(result)} 字符已记录,"
-            + "如需查看特定部分请用 read_file 分段读取对应文件。)"
+            tool_content[:2000]
+            + f"\n\n... (中间已省略。完整结果 {len(result)} 字符已记录,"
+            + "如需查看特定部分请用 read_file 分段读取对应文件。)\n\n"
+            + tool_content[-800:]
         )
     current_msgs.append({"role": "tool", "tool_call_id": call_id, "content": tool_content})
     return verify_failed, events
@@ -1759,8 +1779,11 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                 if (_m.get("role") == "assistant" and _m.get("tool_calls")
                         and "reasoning_content" not in _m):
                     _m["reasoning_content"] = ""
+            # cloud_config 指向本地引擎（如本地 MLX 代理）时，多个 system
+            # 消息同样会被 mlx 拒绝——发送前统一合并（P2-11）
+            _msgs_for_body = _merge_system_messages(_sanitize_tool_messages(current_msgs))
             body = {
-                "model": model, "messages": _sanitize_tool_messages(current_msgs),
+                "model": model, "messages": _msgs_for_body,
                 "tools": active_tools, "tool_choice": "auto",
                 "max_tokens": _resolve_max_tokens(model), "stream": True,
                 "temperature": 0.5,
@@ -1882,6 +1905,10 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                     tool_calls = []
             else:
                 tool_calls = []
+
+            if not tool_calls:
+                # 纯文本轮计入停滞计数（工具轮/完成轮会复位，P2-12）
+                _track_progress(session_id, "text_round", "text_only")
 
             if tool_calls:
                 _append_loop_log(f"Iteration {iteration}: found {len(tool_calls)} tool(s): {[tc.get('function',{}).get('name') for tc in tool_calls]}\n")
@@ -2443,21 +2470,29 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
             # 等待引擎自动重载后重发本轮调用--任务无感继续，不再
             # "执行一半停止"。已有部分输出时重发会重复，直接抛出。
             _stream_break_retries = 0
+            _any_output = False  # 本轮是否产出过 content/reasoning（role-only 空块不算，P1-6）
             while True:
                 try:
                     async with _local_llm_stream(client, api_url, body, headers) as r:
                         aiter = r.aiter_lines()
+                        _silent_secs = 0  # 连续静默秒数（心跳与停滞判定共用，P0-4）
                         while True:
                             try:
-                                # 自适应停滞超时：本地引擎首 token（预填充）在
-                                # 正常时只需几秒，90s 足够覆盖长上下文；此后按
-                                # 180s 容忍长生成中的停顿。
-                                _stall_timeout = 90 if (not streamed_text.strip()
-                                                        and _raw_delta_count == 0) else 180
-                                line = await asyncio.wait_for(anext(aiter), timeout=_stall_timeout)
+                                # 60s 分片等待：静默超 60s 发一次心跳保活（前端
+                                # 看门狗 180s 无事件会掐连接），累计静默达到
+                                # 自适应停滞阈值（首 token 90s / 之后 180s，
+                                # role-only 空块不算输出，P1-6）才判停滞
+                                _stall_timeout = 90 if (not _any_output) else 180
+                                line = await asyncio.wait_for(anext(aiter), timeout=60)
+                                _silent_secs = 0
                             except asyncio.TimeoutError:
+                                _silent_secs += 60
+                                if _silent_secs < _stall_timeout:
+                                    # 尚未到停滞阈值：发心跳，前端看门狗续命
+                                    yield {"event": "heartbeat"}
+                                    continue
                                 _llm_suspect_since = _llm_suspect_since or time.monotonic()
-                                if not streamed_text.strip() and _is_local_llm_url(api_url):
+                                if not _any_output and _is_local_llm_url(api_url):
                                     # 零交付停滞 = 引擎挂起（接受连接但不出字，
                                     # 15:10 事故同款）。杀掉+重载，并抛传输异常
                                     # 让外层零交付重试接管：引擎恢复后本轮调用
@@ -2499,6 +2534,7 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                                     # LM Studio/方舟等返回 reasoning_content,OpenAI o 系列返回 reasoning
                                     reasoning = delta.get("reasoning") or delta.get("reasoning_content") or ""
                                     if content:
+                                        _any_output = True
                                         streamed_text += content
                                         # 复读循环检测（节流：每 40 个 delta 一次）：
                                         # 必须放在 dedup 过滤之前——此前 dedup 命中后
@@ -2522,6 +2558,7 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                                             continue
                                         yield {"content": content}
                                     elif reasoning:
+                                        _any_output = True
                                         streamed_text += reasoning
                                         if _raw_delta_count % 40 == 0 and _detect_text_loop(streamed_text):
                                             logger.warning("[LOCAL-AGENT] 检测到输出复读循环，截断生成")
@@ -2542,8 +2579,29 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                     break
                 except httpx.TransportError as e:
                     # 与 _local_llm_stream 同口径：任何传输层错误都算流中断。
-                    # 已有部分输出时重发会重复，直接抛出。
-                    if streamed_text.strip() or _stream_break_retries >= 1:
+                    if streamed_text.strip():
+                        # 部分输出已交付且引擎死亡：把已交付文本落为 assistant
+                        # 消息并注入断点续写提示，重发本轮让模型从断点继续，
+                        # 不再让用户拿着半截回答收错误（P0-3，限一次）
+                        if _stream_break_retries >= 1:
+                            raise
+                        logger.warning(
+                            f"[LOCAL-AGENT] Iteration {iteration}: 部分输出中断"
+                            f"({type(e).__name__})，记录已交付文本后重发本轮续写")
+                        current_msgs.append({"role": "assistant", "content": streamed_text.strip()})
+                        current_msgs.append({
+                            "role": "system",
+                            "content": "你刚才的回答被中断了（模型服务异常）。"
+                                       "请从断点继续完成回答，不要从头重复。",
+                        })
+                        body["messages"] = _merge_system_messages(current_msgs)
+                        streamed_text = ""
+                        _raw_delta_count = 0
+                        _any_output = False
+                        _stream_break_retries += 1
+                        await asyncio.sleep(10)
+                        continue
+                    if _stream_break_retries >= 1:
                         raise
                     _stream_break_retries += 1
                     logger.warning(
@@ -2612,6 +2670,8 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                 continue
 
             # No tool calls — pure text response done
+            # 停滞计数：纯文本轮计入 stalled_rounds（工具轮/完成轮会复位，P2-12）
+            _track_progress(session_id, "text_round", "text_only")
             # Check if there are pending tasks: if the last message is a tool result
             # and model didn't call another tool, it might have prematurely stopped
             has_recent_tool_result = any(
@@ -2666,6 +2726,9 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                     return
                 # 任务型请求但模型只回文字不调工具 → nudge 促其行动（不再向用户重复流式输出）
                 logger.info(f"[LOCAL-AGENT] Iteration {iteration}: model planning instead of calling tools, nudging (streak={text_only_streak})")
+                _stag = _check_stagnation(session_id)
+                if _stag:
+                    current_msgs.append({"role": "system", "content": _stag})
                 current_msgs.append({
                     "role": "system",
                     "content": (
@@ -2894,9 +2957,12 @@ def _build_chat_messages(body: dict, messages: list, matched_skill: str|None = N
     return messages
 
 
-def _resolve_api_target(cloud_config: dict | None) -> tuple[str, str, dict, bool]:
+async def _resolve_api_target(cloud_config: dict | None) -> tuple[str, str, dict, bool]:
     """Resolve API URL, protocol, headers, and whether it's a local LLM (no cloud config).
-    Cloud models are detected by having an endpoint (key is optional for local proxies)."""
+    Cloud models are detected by having an endpoint (key is optional for local proxies).
+
+    async：get_api_url 内含同步健康探测（最长 20s + 空闲复验 3s sleep），
+    必须放线程池执行，否则阻塞事件循环（P2-13）。"""
     if cloud_config and cloud_config.get("endpoint"):
         protocol = cloud_config.get("protocol", "openai")
         api_url = cloud_config["endpoint"].rstrip("/") + "/chat/completions"
@@ -2907,8 +2973,9 @@ def _resolve_api_target(cloud_config: dict | None) -> tuple[str, str, dict, bool
         # If the endpoint points to a local server, treat as cloud (native function calling)
         return protocol, api_url, headers, False
     else:
+        from starlette.concurrency import run_in_threadpool
         protocol = "openai"
-        local_api = local_llm.get_api_url()
+        local_api = await run_in_threadpool(local_llm.get_api_url)
         if local_api:
             api_url = local_api + "/chat/completions"
         else:

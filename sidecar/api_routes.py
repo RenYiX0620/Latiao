@@ -145,8 +145,10 @@ async def chat_completion(request: Request):
             cloud_config = _get_best_cloud_config()
             if cloud_config:
                 model = cloud_config.get("model", model)
-        elif intent == "chat" and local_llm.get_api_url():
-            logger.info("Auto-route: chat task → using local model (free)")
+        elif intent == "chat":
+            from starlette.concurrency import run_in_threadpool as _rtp
+            if await _rtp(local_llm.get_api_url):
+                logger.info("Auto-route: chat task → using local model (free)")
             # Keep local model for casual chat
             pass
 
@@ -193,7 +195,7 @@ async def chat_completion(request: Request):
     use_stream = body.get("stream", False)
 
     # Resolve API target
-    protocol, api_url, headers, is_local = _resolve_api_target(cloud_config)
+    protocol, api_url, headers, is_local = await _resolve_api_target(cloud_config)
 
     # Agent loop: LLM autonomously decides when to call tools
     if not skip_tools and protocol == "openai":
@@ -1240,11 +1242,16 @@ async def set_tavily_key(request: Request):
 @app.delete("/v1/settings/tavily-key")
 async def delete_tavily_key():
     """Remove Tavily API key from keychain and config."""
-    try:
+    from starlette.concurrency import run_in_threadpool
+
+    def _sec_delete():
         subprocess.run(
             ["security", "delete-generic-password", "-s", "com.latiao.desktop", "-a", "tavily_api_key"],
             capture_output=True, timeout=5,
         )
+    try:
+        # security 子进程会阻塞事件循环（P2-13）→ 线程池
+        await run_in_threadpool(_sec_delete)
     except Exception:
         logger.debug("Failed to delete Tavily key from keychain", exc_info=True)
     try:

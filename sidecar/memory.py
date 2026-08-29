@@ -412,7 +412,7 @@ async def _refine_learnings(tool_name: str, args: dict, result: str, session_id:
         # Lazy import to avoid circular dependency
         import main
         cloud_config = main._last_cloud_config.get()
-        protocol, api_url, headers, is_local = main._resolve_api_target(cloud_config)
+        protocol, api_url, headers, is_local = await main._resolve_api_target(cloud_config)
         if not api_url:
             return
         # Prefer cloud model for refinement (SUBAGENT_MODEL may be a local 12B)

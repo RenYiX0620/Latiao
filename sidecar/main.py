@@ -388,7 +388,7 @@ async def _match_skill(user_query: str) -> str | None:
 请判断用户的问题是否需要用到某个技能，如果需要，返回技能的名字，如果不需要，返回NONE。
 只返回一个结果，不需要解释。"""
     try:
-        protocol, api_url, skill_headers, _is_local = _resolve_api_target(_last_cloud_config.get())
+        protocol, api_url, skill_headers, _is_local = await _resolve_api_target(_last_cloud_config.get())
         if not api_url:
             return None
         async with httpx.AsyncClient(timeout=httpx.Timeout(10)) as client:

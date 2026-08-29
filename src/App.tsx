@@ -81,7 +81,19 @@ function buildApiMessages(session: SessionInfo, extraUser?: Message, planMode?: 
     ? allMsgs.slice(-MAX_CONTEXT_MSGS)
     : allMsgs;
   for (const msg of recentMsgs) {
-    if (msg.role === "tool" || msg.type === "tool_call") continue;
+    if (msg.role === "tool" || msg.type === "tool_call") {
+      // 工具消息不回灌会让"继续/重试"变成失忆的全新请求（P0-2）：
+      // 转成 user 角色 [工具结果] 回灌，模型知道之前查过什么
+      const raw = (msg.toolResult || msg.content || "").toString();
+      const preview = raw.length > 1000 ? raw.slice(0, 1000) + "\n...(结果过长已截断)" : raw;
+      if (preview.trim()) {
+        msgs.push({
+          role: "user",
+          content: `[工具结果] ${msg.toolName || ""} ${JSON.stringify(msg.toolArgs || {}).slice(0, 200)}\n${preview}`,
+        });
+      }
+      continue;
+    }
     if (msg.role === "user" && msg.imageBase64) {
       msgs.push({
         role: "user",
@@ -678,10 +690,12 @@ const [timeFilter, setTimeFilter] = useState("all");
   /* ── Stream Chat (preserved from original) ── */
   const streamChat = async (
     messages: Record<string, unknown>[],
-    opts?: { model?: string; agent?: string; cloudConfig?: Record<string, unknown>; skipTools?: boolean },
+    opts?: { model?: string; agent?: string; cloudConfig?: Record<string, unknown>; skipTools?: boolean; sessionId?: string },
     signal?: AbortSignal,
   ): Promise<string> => {
     const body: Record<string, unknown> = { messages, stream: true, reflection_mode: reflectionMode, access_mode: accessMode, thinking_level: thinkingLevel };
+    // 传 session_id：后端记忆/停滞检测按会话归档（P0-2）
+    if (opts?.sessionId) body.session_id = opts.sessionId;
     if (opts?.model) body.model = opts.model;
     if (opts?.agent) body.agent = opts.agent;
     if (opts?.cloudConfig) body.cloud_config = opts.cloudConfig;
@@ -853,6 +867,8 @@ const [timeFilter, setTimeFilter] = useState("all");
                 }
               } else if (parsed.event === "tool_start") {
                 flushStream();
+                // 工具执行期静默可超 180s（长命令/重载）：暂停看门狗，tool_end 再续（P0-4）
+                disarmWatchdog();
                 activeTaskStackRef.current.push(`${parsed.tool || ""} ${JSON.stringify(parsed.args || {}).slice(0, 60)}`);
                 setActiveTask(activeTaskStackRef.current[activeTaskStackRef.current.length - 1] || null);
                 const startTs = Number(parsed.ts) || Date.now();
@@ -873,6 +889,7 @@ const [timeFilter, setTimeFilter] = useState("all");
                 });
               } else if (parsed.event === "tool_end") {
                 flushStream();
+                armWatchdog();  // 工具执行结束，恢复看门狗（P0-4）
                 activeTaskStackRef.current.pop();
                 setActiveTask(activeTaskStackRef.current[activeTaskStackRef.current.length - 1] || null);
                 const rawResult = String(parsed.result ?? "");
@@ -1013,7 +1030,7 @@ const [timeFilter, setTimeFilter] = useState("all");
 
     try {
       const apiMessages = buildApiMessages(session, userMsg, accessMode === "plan", lang);
-      const opts: Record<string, unknown> = { agent: activeAgent };
+      const opts: Record<string, unknown> = { agent: activeAgent, sessionId: session.id };
       if (session.selectedModel) opts.model = session.selectedModel;
       if (cloudCfgPre) opts.cloudConfig = { key: cloudCfgPre.key, endpoint: cloudCfgPre.endpoint, protocol: cloudCfgPre.protocol || "openai" };
 

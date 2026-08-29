@@ -523,9 +523,11 @@ async def _delegate_task(agent_type: str, task: str, task_id: str | None = None)
         AGENT_PROFILES,
         TOOL_PERMISSIONS,
         TOOLS,
+        _build_local_tools_prompt,
         _inject_thinking_disabled,
         _last_cloud_config,
         _local_llm_serialized,
+        _parse_prompt_tool_calls,
         _resolve_api_target,
         _sanitize_tool_messages,
         execute_tool,
@@ -551,7 +553,7 @@ async def _delegate_task(agent_type: str, task: str, task_id: str | None = None)
     # 注意：单条 system。本地 llama-cpp 对多条 system 消息有静默空响应 bug
     # （主循环 _build_chat_messages 已修过同一问题），子智能体必须对齐。
 
-    protocol, api_url, sub_headers, _is_local = _resolve_api_target(_last_cloud_config.get())
+    protocol, api_url, sub_headers, _is_local = await _resolve_api_target(_last_cloud_config.get())
     if not api_url:
         return f"[Sub-agent: {agent_type}] 错误: 无法连接模型服务（请配置云端模型或启动本地 LLM）"
 
@@ -560,17 +562,28 @@ async def _delegate_task(agent_type: str, task: str, task_id: str | None = None)
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(60)) as client:
             for _ in range(3):
+                _msgs = _sanitize_tool_messages(current_msgs)
                 body = {
                     "model": SUBAGENT_MODEL,
-                    "messages": _sanitize_tool_messages(current_msgs),
-                    "tools": sub_tools,
-                    "tool_choice": "auto",
+                    "messages": _msgs,
                     "max_tokens": 1024,
                     "stream": False,
                     "temperature": 0.5,
                     "frequency_penalty": 0.6,
                 "stop": ["<|im_end|>", "<|endoftext|>", "<end_of_turn>", "<eos>"],
                 }
+                if _is_local:
+                    # 本地模型不支持原生 function calling（此前无条件发送导致
+                    # 400/空响应，P1-5）：改为 prompt-based 工具提示，
+                    # 返回文本用主循环同款解析器提取工具调用
+                    _msgs = _msgs + [{
+                        "role": "system",
+                        "content": _build_local_tools_prompt(sub_tools),
+                    }]
+                    body["messages"] = _msgs
+                else:
+                    body["tools"] = sub_tools
+                    body["tool_choice"] = "auto"
                 _inject_thinking_disabled(body, SUBAGENT_MODEL)
                 async with _local_llm_serialized(api_url):
                     r = await client.post(api_url, json=body, headers=sub_headers)
@@ -582,6 +595,12 @@ async def _delegate_task(agent_type: str, task: str, task_id: str | None = None)
                 msg = choice.get("message", {})
 
                 tool_calls = msg.get("tool_calls", [])
+                if _is_local and not tool_calls:
+                    # prompt-based 工具调用从文本解析
+                    _clean, tool_calls = _parse_prompt_tool_calls(msg.get("content", "") or "")
+                    if tool_calls:
+                        msg = dict(msg)
+                        msg["content"] = _clean
                 if tool_calls:
                     current_msgs.append({"role": "assistant", "content": msg.get("content"), "tool_calls": tool_calls})
                     for tc in tool_calls:

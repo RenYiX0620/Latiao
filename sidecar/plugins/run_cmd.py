@@ -124,8 +124,9 @@ def execute(args: dict) -> str:
         return f"⛔ Command too long ({len(cmd)} chars, max 1000)"
 
     # ── Execute ──
+    # 30s 会截断 npm install/构建类长任务——放宽到 300s（P2-15）
     try:
-        r = subprocess.run(shlex.split(cmd), shell=False, capture_output=True, text=True, timeout=30)
+        r = subprocess.run(shlex.split(cmd), shell=False, capture_output=True, text=True, timeout=300)
         out = r.stdout.strip()
         if r.returncode != 0:
             out += f"\n(退出码: {r.returncode})"
@@ -133,6 +134,7 @@ def execute(args: dict) -> str:
                 out += f"\n{r.stderr.strip()}"
         return out or "(无输出)"
     except subprocess.TimeoutExpired:
-        return f"超时: {cmd}"
+        return (f"超时: 命令已运行 5 分钟被截断。长任务请拆分为多步执行，"
+                f"或改用后台方式（nohup ... &）。\n命令: {cmd}")
     except Exception as e:
         return f"错误：{e}"

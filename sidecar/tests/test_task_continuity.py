@@ -409,6 +409,50 @@ class TestLoopDetectNotSkippedByDedup(unittest.TestCase):
         # 新顺序：循环检测用原始流式文本判定，能触发截断
         self.assertTrue(_detect_text_loop(raw))
 
+    def test_fallback_regex_matches_newline_repeats(self):
+        """P1-10：兜底正则此前是字面 \\x01 永不匹配。带换行的短片段重复
+        （主检测器因 strip()!=piece 跳过）必须被兜底反向引用捕获。"""
+        from agent_loop import _detect_text_loop
+        piece = "沪指涨0.5%。\n"
+        raw = piece * 20  # 140 字符 ≥120 门槛
+        self.assertTrue(_detect_text_loop(raw))
+
+
+class TestFilterToolsKeepsWebForFinancial(unittest.TestCase):
+    """P0-1：金融意图必须同时保留 web 工具（美股类问题 mx_query 查不到，
+    只有 tavily 能联网搜索）。"""
+
+    def test_us_stock_question_keeps_tavily(self):
+        from agent_loop import _filter_tools
+        fake_tools = [
+            {"function": {"name": "read_file"}},
+            {"function": {"name": "mx_query"}},
+            {"function": {"name": "ak_finance"}},
+            {"function": {"name": "tavily_search"}},
+            {"function": {"name": "bing_search"}},
+        ]
+        names = [t["function"]["name"] for t in _filter_tools("分析昨晚美股大盘走势", fake_tools)]
+        self.assertIn("tavily_search", names)
+        self.assertIn("mx_query", names)
+
+
+class TestStagnationCounterWired(unittest.TestCase):
+    """P2-12：_track_progress 的 text_only 计数此前无调用点，停滞告警永远
+    不触发。接入后连续 3 轮纯文本应触发告警，工具轮复位。"""
+
+    def test_three_text_rounds_trigger_warning(self):
+        from agent_loop import _track_progress, _check_stagnation, _session_states
+        sid = "test-session-stagnation"
+        # 第 1 轮因 phase 从 init 变化而复位，实际需连续 4 轮同 phase
+        for _ in range(3):
+            _track_progress(sid, "t", "text_only")
+        self.assertEqual(_check_stagnation(sid), "")
+        _track_progress(sid, "t", "text_only")
+        self.assertIn("停滞", _check_stagnation(sid))
+        _track_progress(sid, "t", "tool")
+        self.assertEqual(_check_stagnation(sid), "")
+        _session_states.pop(sid, None)
+
 
 class TestGetApiUrlNeverEmpty(unittest.TestCase):
     """修复 1：端口活但引擎不健康时，get_api_url 不得返回空串。"""
