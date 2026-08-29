@@ -719,21 +719,44 @@ def load_plugins(fallback_tools, fallback_dispatch, fallback_permissions):
     _seed_default_plugins()
 
     plugins = []
+
+    def _load_py(f: Path, tag: str):
+        spec = importlib.util.spec_from_file_location(f"plugin_{tag}", f)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        if not all(hasattr(mod, attr) for attr in ("NAME", "DEFINITION", "PERMISSION")):
+            return None
+        if not hasattr(mod, "execute") or not callable(mod.execute):
+            return None
+        return mod
+
     if PLUGINS_DIR.exists():
         for f in sorted(PLUGINS_DIR.glob("*.py")):
             if f.name.startswith("_"):
                 continue
             try:
-                spec = importlib.util.spec_from_file_location(f"plugin_{f.stem}", f)
-                mod = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(mod)
-                if not all(hasattr(mod, attr) for attr in ("NAME", "DEFINITION", "PERMISSION")):
-                    continue
-                if not hasattr(mod, "execute") or not callable(mod.execute):
-                    continue
-                plugins.append(mod)
+                mod = _load_py(f, f.stem)
+                if mod is not None:
+                    plugins.append(mod)
             except Exception:
                 logger.warning("Failed to load plugin", exc_info=True)
+
+    # ── 已安装扩展（~/.local-ai-os/extensions/<name>/<version>/plugin.py）──
+    # 与内置插件同构加载；重名时先加载者赢（内置插件优先）。
+    try:
+        from extension_manager import active_extension_dirs
+        for ext_dir in active_extension_dirs():
+            f = ext_dir / "plugin.py"
+            if not f.exists():
+                continue
+            try:
+                mod = _load_py(f, f"{ext_dir.parent.name}_{ext_dir.name}")
+                if mod is not None:
+                    plugins.append(mod)
+            except Exception:
+                logger.warning("Failed to load extension plugin %s", f, exc_info=True)
+    except Exception:
+        logger.warning("Extension manager unavailable, skipping extension plugins", exc_info=True)
 
     tools = []
     dispatch = {}

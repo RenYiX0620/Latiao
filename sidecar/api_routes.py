@@ -1626,3 +1626,52 @@ async def api_open_identity(agent_id: str, section: str = ""):
         return {"status": "ok"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+
+# ═══════════════════════════════════════════════════════
+#  Extensions: Latiao 扩展市场体系（安装/卸载/启用/禁用）
+# ═══════════════════════════════════════════════════════
+
+@app.get("/v1/extensions")
+async def api_extensions_list():
+    """已安装扩展列表。"""
+    try:
+        from extension_manager import list_extensions
+        return {"status": "ok", "extensions": list_extensions()}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@app.post("/v1/extensions/install")
+async def api_extensions_install(request: Request):
+    """安装扩展：source=本地路径 | URL | GitHub repo，可选 sha256 校验。"""
+    body = await _json_body(request)
+    source = str(body.get("source", "")).strip()
+    sha256 = str(body.get("sha256", "")).strip()
+    label = str(body.get("label", "")).strip()
+    if not source:
+        return {"status": "error", "message": "source required"}
+    from starlette.concurrency import run_in_threadpool
+    from extension_manager import install_extension
+    return await run_in_threadpool(install_extension, source, sha256, label)
+
+
+@app.post("/v1/extensions/uninstall")
+async def api_extensions_uninstall(request: Request):
+    body = await _json_body(request)
+    name = str(body.get("name", "")).strip()
+    if not name:
+        return {"status": "error", "message": "name required"}
+    from extension_manager import uninstall_extension
+    return uninstall_extension(name)
+
+
+@app.post("/v1/extensions/set-enabled")
+async def api_extensions_set_enabled(request: Request):
+    body = await _json_body(request)
+    name = str(body.get("name", "")).strip()
+    enabled = bool(body.get("enabled", True))
+    if not name:
+        return {"status": "error", "message": "name required"}
+    from extension_manager import set_extension_enabled
+    return set_extension_enabled(name, enabled)

@@ -785,7 +785,11 @@ class LocalLLMEngine:
         # 必须实测健康后才复用，否则空响应/挂起会全部传导给用户。
         if self._probe_port(self.server_port):
             if not self.ensure_engine_healthy():
-                return ""
+                # 不健康返回 False 时 ensure_engine_healthy 内部已完成处置
+                # （杀端口 + 后台重载）。此前这里返回空串，导致请求 URL 缺协议
+                # （UnsupportedProtocol）秒死。返回标准 URL 让 agent 层进入
+                # 等待-重试循环，重载完成后自然恢复。
+                return f"http://127.0.0.1:{self.server_port}/v1"
             self.server_status = "running"
             self.status_message = "(reconnected after sidecar restart)"
             if not self._active_backend:
@@ -833,11 +837,23 @@ class LocalLLMEngine:
         try:
             if self._engine_state_file.exists():
                 data = json.loads(self._engine_state_file.read_text(encoding="utf-8"))
-                if data.get("model_id"):
-                    self.current_model_id = data["model_id"]
+                mid = data.get("model_id", "")
+                if mid:
+                    # 本地路径型 model_id 必须真实存在。状态文件可能被测试
+                    # 写入的假 id 污染（如 /models/test-35b），恢复后 sidecar
+                    # 反复对着不存在的模型自动重载 -> 启动日志刷屏且引擎永不就绪。
+                    if mid.startswith(("/", "~", "./")) or ".gguf" in mid or mid.startswith("\\"):
+                        from pathlib import Path as _P
+                        expanded = _P(os.path.expanduser(mid)) if mid.startswith("~") else _P(mid)
+                        if not expanded.exists():
+                            logger.warning(
+                                "引擎状态文件中的模型路径不存在，丢弃: %s", mid)
+                            self._clear_engine_state()
+                            return
+                    self.current_model_id = mid
                     self.current_model_name = data.get("model_name", "")
                     self._active_backend = data.get("backend", "")
-                    logger.info("已恢复引擎状态: %s (backend=%s)", data["model_id"], data.get("backend"))
+                    logger.info("已恢复引擎状态: %s (backend=%s)", mid, data.get("backend"))
         except Exception:
             logger.warning("Failed to restore engine state", exc_info=True)
 
@@ -1001,27 +1017,41 @@ class LocalLLMEngine:
             self._health_fail_count = 0
             return True
         # 两连败之间要求最小时间窗 60s：连续探测间隔过近（cron+用户消息并发），
-        # 引擎忙于长生成时两次都会超时 → 判死。间隔不足视为同一次事件。
+        # 引擎忙于长生成时两次都会超时 -> 判死。间隔不足视为同一次事件。
         prev_fail_at = getattr(self, "_health_first_fail_at", 0.0)
         if prev_fail_at == 0.0 or now - prev_fail_at < 60:
             self._health_first_fail_at = now
+            # 空闲引擎（无活跃流 + 不在宽限期）：挂起状态不会自愈，
+            # 3s 后立即复验一次，仍失败直接处置--不再让用户面对 60s 黑盒。
+            # 忙引擎维持 60s 窗口（复验会排队超时，快速判死有误杀长生成风险）。
+            if not self._engine_busy():
+                time.sleep(3)
+                # 复验期间流可能进入（用户发了新消息）-> 退回慢路径
+                if not self._engine_busy() and not self.verify_engine_health():
+                    self._health_first_fail_at = 0.0
+                    self._dispose_dead_engine()
+                    return False
+                self._health_first_fail_at = 0.0
             logger.info("引擎健康检查首次失败（可能正忙于长生成），暂不处置")
             return True
-        # 第二次失败且间隔 ≥60s → 进入处置
+        # 第二次失败且间隔 ≥60s -> 进入处置
+        self._dispose_dead_engine()
+        return False
+
+    def _dispose_dead_engine(self):
+        """杀掉判定已死的引擎进程并触发后台自动重载（两处判死路径共用）。"""
         self._health_fail_count = 0
         self._health_first_fail_at = 0.0
         logger.warning("本地模型引擎健康检查连续失败，停止引擎进程")
         self._kill_port(self.server_port)
         self.server_status = "stopped"
         self.status_message = ""
-        self._health_fail_count = 0
         # 引擎崩溃/被杀（如系统内存压力）：有当前模型则后台自动重载，
         # 下一条消息直接可用（重载需要时间，等待期间显示提示）
         model_id = self.current_model_id
         if model_id:
             self.status_message = "引擎异常，正在自动重新加载模型..."
             self._request_reload(model_id)
-        return False
 
     # ── Start / Stop ──
 
