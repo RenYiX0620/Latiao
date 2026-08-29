@@ -74,6 +74,9 @@ async def execute(args: dict) -> str:
 
     query = args["query"]
     search_depth = args.get("search_depth", "basic")
+    # 模型常给 "high"/"deep" 等非法值 → 映射为 advanced，避免 HTTP 400 整轮失败
+    if search_depth not in ("basic", "advanced"):
+        search_depth = "advanced"
     try:
         n = int(args.get("max_results", 5))
     except (TypeError, ValueError):
