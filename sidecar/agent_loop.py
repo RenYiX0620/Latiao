@@ -2379,6 +2379,19 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                     streamed_text = _revised
                     yield {"event": "reflection_revised", "content": _revised}
 
+            # 短回答 + 有工具失败：模型很可能因工具报错而放弃（如 400 参数错误）。
+            # 追加一轮提示让它绕过失败的工具重试/换工具，而不是 112 字符草草收场。
+            if (len(streamed_text.strip()) < 200 and not has_called_tool
+                    and any(m.get("role") == "tool" and ("Error" in str(m.get("content", "")) or "⚠️" in str(m.get("content", "")) or "失败" in str(m.get("content", "")))
+                            for m in current_msgs[-4:])):
+                current_msgs.append({
+                    "role": "system",
+                    "content": "上一个工具调用失败了。请换一个工具或调整参数重试，"
+                               "不要因一次失败就直接给简短结论；若全部工具不可用，再如实告知。",
+                })
+                logger.info(f"[LOCAL-AGENT] Iteration {iteration}: 短回答+工具失败，继续追问一轮")
+                continue
+
             _track_progress(session_id, "completed", f"text_response ({len(streamed_text)} chars)")
             logger.info(f"[LOCAL-AGENT] Iteration {iteration}: no tools, returning text ({len(streamed_text)} chars)")
             return
