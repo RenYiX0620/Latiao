@@ -1699,3 +1699,79 @@ async def api_marketplace(url: str = Query(default="")):
         return await run_in_threadpool(get_marketplace_cached, url)
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+
+@app.get("/v1/marketplace/sources")
+async def api_market_sources():
+    """市场源列表（官方内置 + 用户添加）。"""
+    from extension_manager import list_market_sources
+    return {"status": "ok", "sources": list_market_sources()}
+
+
+@app.post("/v1/marketplace/sources")
+async def api_market_source_add(request: Request):
+    """添加市场源：marketplace.json URL 或 GitHub 仓库地址。"""
+    body = await _json_body(request)
+    url = str(body.get("url", "")).strip()
+    name = str(body.get("name", "")).strip()
+    kind = str(body.get("kind", "")).strip()
+    from extension_manager import add_market_source
+    return add_market_source(url, name, kind)
+
+
+@app.delete("/v1/marketplace/sources")
+async def api_market_source_remove(request: Request):
+    """移除市场源（内置源不可删）。"""
+    body = await _json_body(request)
+    url = str(body.get("url", "")).strip()
+    from extension_manager import remove_market_source
+    return remove_market_source(url)
+
+
+@app.get("/v1/marketplace/all")
+async def api_market_all():
+    """聚合所有源的条目：官方 marketplace + 生态源实时发现（线程池）。"""
+    try:
+        from starlette.concurrency import run_in_threadpool
+        from extension_manager import fetch_all_markets
+        return await run_in_threadpool(fetch_all_markets)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@app.get("/v1/marketplace/discover")
+async def api_market_discover(url: str = Query(default="")):
+    """发现任意 GitHub 仓库的可安装内容（格式自动识别）。"""
+    from starlette.concurrency import run_in_threadpool
+    from adapters import discover_auto
+    if not url.strip():
+        return {"status": "error", "message": "url 参数不能为空"}
+    try:
+        return await run_in_threadpool(discover_auto, url.strip())
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@app.post("/v1/extensions/install-github")
+async def api_extensions_install_github(request: Request):
+    """安装生态源条目（github 仓库 + skill_path + kind）。"""
+    body = await _json_body(request)
+    repo = str(body.get("repo", "")).strip()
+    skill_path = str(body.get("skill_path", "")).strip()
+    kind = str(body.get("kind", "")).strip() or "openclaw-skill"
+    if not repo:
+        return {"status": "error", "message": "repo 不能为空"}
+    try:
+        from starlette.concurrency import run_in_threadpool
+        from extension_manager import install_github_item
+        result = await run_in_threadpool(install_github_item, repo, skill_path, kind)
+        # 安装成功后热重载：技能/插件注册进能力表与工具表（否则要手动重启才生效）
+        if isinstance(result, dict) and result.get("status") == "ok":
+            try:
+                from main import _hot_reload_extensions
+                result["reload"] = await _hot_reload_extensions()
+            except Exception:
+                logger.warning("生态安装热重载失败", exc_info=True)
+        return result
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
