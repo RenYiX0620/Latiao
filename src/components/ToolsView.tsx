@@ -54,7 +54,7 @@ export default function ToolsView({ tools, setTools, showToast }: ToolsViewProps
       const data = await resp.json();
       if (data.status === "ok") setMarketPlugins(data.plugins || []);
       else setMarketErr(data.message || "市场加载失败");
-    } catch { setMarketErr("市场加载失败"); }
+    } catch (e) { console.error("市场加载失败:", e); setMarketErr("市场加载失败（" + String((e as Error)?.message || e) + "）"); }
     finally { setMarketLoading(false); }
   }, []);
 

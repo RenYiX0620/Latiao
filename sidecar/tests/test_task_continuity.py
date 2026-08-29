@@ -119,7 +119,8 @@ class TestIdleEngineFastDispose(unittest.TestCase):
 class TestConnectErrorRecoveryRace(unittest.TestCase):
     """修复 2a：ConnectError 快速失败只在"无可恢复资源"时发生。"""
 
-    def _run_stream_error(self, engine, api_url="http://127.0.0.1:1235/v1/chat/completions"):
+    def _run_stream_error(self, engine, api_url="http://127.0.0.1:1235/v1/chat/completions",
+                          client=None):
         import asyncio
         import httpx
         import agent_loop
@@ -127,14 +128,12 @@ class TestConnectErrorRecoveryRace(unittest.TestCase):
         original = getattr(local_llm, "_engine", None)
         local_llm._engine = engine
         # 排队等待的 sleep 立即返回（只验控制流，不真等 6 分钟）
-        original_engine = local_llm._engine
-        if hasattr(engine, "_engine_busy_until"):
-            pass
-        try:
+        if client is None:
             class _BrokenClient:
                 def stream(self, *a, **kw):
                     raise httpx.ConnectError("refused")
-
+            client = _BrokenClient()
+        try:
             async def _fast_sleep(*a, **kw):
                 return None
             _orig_sleep = agent_loop.asyncio.sleep
@@ -143,7 +142,7 @@ class TestConnectErrorRecoveryRace(unittest.TestCase):
             async def main():
                 try:
                     async with agent_loop._local_llm_stream(
-                            _BrokenClient(), api_url, {}, {}) as r:
+                            client, api_url, {}, {}) as r:
                         pass
                 except httpx.ConnectError as e:
                     return ("connect", e)
@@ -189,4 +188,110 @@ class TestConnectErrorRecoveryRace(unittest.TestCase):
         kind, err = self._run_stream_error(
             eng, api_url="http://127.0.0.1:1234/v1/chat/completions")
         self.assertIn("外部", str(err))
+
+    def test_reload_failed_fails_fast(self):
+        """重载已请求且已结束仍连不上（状态 error）：快速失败，不等 6 分钟。"""
+        import httpx
+        eng = _FakeEngine(current_model_id="m1", _auto_reloading=True,
+                          server_status="stopped")
+        eng._request_reload = lambda mid: (_ for _ in ()).throw(
+            AssertionError("重载已进行过，不应再次触发"))
+
+        class _ReloadFailsClient:
+            def __init__(self, engine):
+                self.engine = engine
+                self.calls = 0
+
+            def stream(self, *a, **kw):
+                self.calls += 1
+                if self.calls >= 2:
+                    # 模拟重载线程结束并失败
+                    self.engine._auto_reloading = False
+                    self.engine.server_status = "error"
+                    self.engine.status_message = "模型文件不存在"
+                raise httpx.ConnectError("refused")
+
+        kind, err = self._run_stream_error(eng, client=_ReloadFailsClient(eng))
+        self.assertIn("自动重载失败", str(err))
+
+
+class TestGetApiUrlNeverEmpty(unittest.TestCase):
+    """修复 1：端口活但引擎不健康时，get_api_url 不得返回空串。"""
+
+    def _eng(self):
+        from local_llm import LocalLLMEngine
+        eng = LocalLLMEngine.__new__(LocalLLMEngine)
+        eng.server_port = 1235
+        eng._external_engine = ""
+        eng._external_url = ""
+        eng.is_running = lambda: False
+        return eng
+
+    def test_unhealthy_engine_returns_url(self):
+        from local_llm import LocalLLMEngine
+        eng = self._eng()
+        eng._probe_port = lambda port, timeout=1: True
+        eng.ensure_engine_healthy = lambda force=False: False  # 已处置完（内部已杀+重载）
+        url = LocalLLMEngine.get_api_url(eng)
+        self.assertEqual(url, "http://127.0.0.1:1235/v1")
+        self.assertTrue(url.startswith("http://"))  # 有协议，不再 UnsupportedProtocol
+
+    def test_healthy_engine_returns_url(self):
+        from local_llm import LocalLLMEngine
+        eng = self._eng()
+        eng._probe_port = lambda port, timeout=1: True
+        eng.ensure_engine_healthy = lambda force=False: True
+        eng.server_status = "stopped"
+        eng._active_backend = "mlx"
+        eng.status_message = ""
+        url = LocalLLMEngine.get_api_url(eng)
+        self.assertEqual(url, "http://127.0.0.1:1235/v1")
+
+
+class TestEngineStateRestoreValidation(unittest.TestCase):
+    """修复 6：状态文件里的假路径必须被丢弃（test-35b 污染事件）。"""
+
+    def setUp(self):
+        import tempfile
+        from local_llm import LocalLLMEngine
+        self._tmp = tempfile.TemporaryDirectory()
+        LocalLLMEngine._engine_state_file = (
+            __import__("pathlib").Path(self._tmp.name) / ".engine_state.json")
+        self.addCleanup(self._tmp.cleanup)
+
+    def _eng(self):
+        from local_llm import LocalLLMEngine
+        eng = LocalLLMEngine.__new__(LocalLLMEngine)
+        eng.current_model_id = ""
+        eng.current_model_name = ""
+        eng._active_backend = ""
+        eng.server_port = 1235
+        return eng
+
+    def test_fake_slash_path_discarded(self):
+        from local_llm import LocalLLMEngine
+        eng = self._eng()
+        eng.current_model_id = "/models/test-35b"
+        eng.current_model_name = "test"
+        eng._active_backend = "mlx"
+        LocalLLMEngine._save_engine_state(eng)
+        eng2 = self._eng()
+        LocalLLMEngine._restore_engine_state(eng2)
+        self.assertEqual(eng2.current_model_id, "")
+        # 状态文件也应被清掉
+        self.assertFalse(LocalLLMEngine._engine_state_file.exists())
+
+    def test_real_path_restored(self):
+        import os
+        from local_llm import LocalLLMEngine
+        real = os.path.join(self._tmp.name, "m.gguf")
+        open(real, "w").close()
+        eng = self._eng()
+        eng.current_model_id = real
+        eng.current_model_name = "real"
+        eng._active_backend = "llama-cpp"
+        LocalLLMEngine._save_engine_state(eng)
+        eng2 = self._eng()
+        LocalLLMEngine._restore_engine_state(eng2)
+        self.assertEqual(eng2.current_model_id, real)
 

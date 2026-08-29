@@ -1706,7 +1706,10 @@ async def api_extensions_set_enabled(request: Request):
 async def api_marketplace(url: str = Query(default="")):
     """读取市场清单（默认官方市场；可选 url 覆盖）。"""
     try:
+        from starlette.concurrency import run_in_threadpool
         from extension_manager import fetch_marketplace
-        return fetch_marketplace(url)
+        # 同步网络请求必须进线程池——阻塞事件循环会让 WebView 的
+        # fetch 等超时（"市场加载失败"的根因之一）
+        return await run_in_threadpool(fetch_marketplace, url)
     except Exception as e:
         return {"status": "error", "message": str(e)}
