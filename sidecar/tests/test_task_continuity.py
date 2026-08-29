@@ -49,6 +49,9 @@ class _FakeEngine:
     def _auto_reload(self, mid):
         self._auto_reloading = False
 
+    def _kill_port(self, port):
+        self.killed_port = port
+
     def _request_reload(self, model_id):
         self.reload_calls.append(model_id)
         self._auto_reloading = True

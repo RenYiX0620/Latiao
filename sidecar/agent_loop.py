@@ -193,10 +193,18 @@ async def _local_llm_stream(client, api_url: str, body: dict, headers: dict):
         # 流中途断裂抛出明确异常，由 agent 循环的零交付重试接管。
         last_err: Exception | None = None
         _yielded = False
-        # 引擎闪断/自动重载期间 404/503：等待恢复（35B 重载窗口 3-5 分钟），
-        # 每 5s 重试一次、最长 5 分钟--用户消息自然排队到引擎就绪，不再秒败
+        # 等待恢复的总时长上限：72 次尝试本意覆盖 ~6 分钟重载窗口（每次失败
+        # 连接被拒是秒级的），但引擎"挂起"（端口活、不吐响应头）时单次尝试
+        # 要耗满读超时 120s——无时间上限理论上可静默拖 2.5 小时。
+        _wait_deadline = time.monotonic() + 600
+        # 引擎挂起判定计数：连续 2 次读超时（端口活但不吐数据）
+        _hung_strikes = 0
         try:
             for _attempt in range(72):
+                if time.monotonic() >= _wait_deadline:
+                    raise httpx.ConnectError(
+                        "等待本地模型恢复超时（10 分钟）。请到模型页检查引擎状态后重发消息。"
+                    )
                 try:
                     async with client.stream("POST", api_url, json=body, headers=headers) as r:
                         r.raise_for_status()  # httpx 不自动抛 4xx/5xx，必须显式检查
@@ -230,6 +238,24 @@ async def _local_llm_stream(client, api_url: str, body: dict, headers: dict):
                             "若本轮尚无输出，任务将自动等待引擎恢复并重试。"
                         ) from e
                     if _local:
+                        # 挂起检测：读超时/读错误 = 端口活着但不吐数据。连续 2 次
+                        # 且没有其他活跃流（=没有别的请求在生成长文本）→ 判定挂起，
+                        # 杀掉重载。有其他活跃流时可能是排队等长生成，不动（A3 忙保护）。
+                        if (isinstance(e, (httpx.ReadTimeout, httpx.ReadError))
+                                and engine._active_local_streams <= 1):
+                            _hung_strikes += 1
+                            if (_hung_strikes >= 2 and not engine._auto_reloading
+                                    and engine.current_model_id
+                                    and not getattr(engine, "_explicit_stop", False)
+                                    and engine.server_status != "error"):
+                                logger.warning(
+                                    "引擎端口存活但连续读超时且无其他活跃流，判定挂起，强制重载")
+                                try:
+                                    engine._kill_port(engine.server_port)
+                                    engine.server_status = "stopped"
+                                except Exception:
+                                    pass
+                                _request_recovery_reload()
                         # 判断有无恢复资源，决定快速失败还是排队等重载。
                         # 此前只要 _auto_reloading 未置位就秒死，而引擎几秒后
                         # 就能自动恢复（kill 与 reload 置位之间的竞态窗口）。
@@ -2564,20 +2590,22 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                 })
                 logger.info(f"[LOCAL-AGENT] Iteration {iteration}: 短回答+工具失败，继续追问一轮")
                 continue
-            # 短回答 + 工具成功且资料量充足（如美股任务搜到 6 条结果+指数数据，
-            # 最终却只回 192 字符"草草收场"）：提示模型基于已有资料输出完整报告。
-            # 只追加一次，防止与空响应 nudge 互相触发死循环。
+            # 短回答 + 工具成功且有实质资料（如查大盘指数拿到 45 行预览，
+            # 最终却只回 84 字符"草草收场"）：提示模型基于已有资料给出
+            # 充分、带数据的回答。阈值 600：低于它的大多是"几点了"这类
+            # 小工具查询，逼长回答反而奇怪。只追加一次，防止死循环。
             _tool_out_total = sum(len(str(m.get("content") or "")) for m in current_msgs if m.get("role") == "tool")
             if (len(streamed_text.strip()) < 200 and has_called_tool
-                    and _tool_out_total > 2048 and not _brief_answer_nudged):
+                    and _tool_out_total > 600 and not _brief_answer_nudged):
                 _brief_answer_nudged = True
                 current_msgs.append({
                     "role": "system",
-                    "content": "你已通过工具收集了充分的资料（见上方工具结果）。"
-                               "请基于这些结果输出完整的分析报告，包含关键数据与结论，"
-                               "不要只给一两句话的简短总结。",
+                    "content": "你已通过工具获得了实质数据（见上方工具结果），"
+                               "但刚才的回答太简短。请基于这些数据给出充分的回答："
+                               "包含关键数字与必要的展开说明，让用户不需要再追问。"
+                               "若任务确已完成且无需展开，再如实收尾。",
                 })
-                logger.info(f"[LOCAL-AGENT] Iteration {iteration}: 短回答+资料充足({_tool_out_total} chars)，追问完整报告一轮")
+                logger.info(f"[LOCAL-AGENT] Iteration {iteration}: 短回答+有实质资料({_tool_out_total} chars)，追问充分回答一轮")
                 continue
 
             _track_progress(session_id, "completed", f"text_response ({len(streamed_text)} chars)")
