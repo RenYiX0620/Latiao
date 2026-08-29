@@ -89,6 +89,17 @@ from tool_executor import _resolve_permission
 logger = logging.getLogger("latiao-sidecar")
 
 
+def _get_cloud_model_names() -> list[dict]:
+    """读 config.json 里配置的云端模型条目（路由透明化日志用，读不到返回空）。"""
+    try:
+        if CONFIG_FILE.exists():
+            cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            return cfg.get("cloud_models", []) or []
+    except Exception:
+        logger.debug("Failed to read cloud model names", exc_info=True)
+    return []
+
+
 async def _json_body(request: Request) -> dict:
     """解析请求 JSON body；非法 JSON 或非对象时返回 400，而不是让端点抛 500。"""
     try:
@@ -139,6 +150,18 @@ async def chat_completion(request: Request):
             pass
 
     logger.info("Chat request: model=%s, msg_count=%d, stream=%s", model, len(messages), body.get("stream", False))
+    # 路由透明化：请求声明了具体模型名但既没带 cloud_config、名字也不匹配任何
+    # 已配置的云端模型时，实际会走本地引擎（如 gpt-4o-mini 落到本地 35B）。
+    # 此前这一事实只藏在日志里--用户以为在用云端快模型，实际跑的是最慢的路径。
+    if not cloud_config and user_selected_model:
+        try:
+            _names = {str(m.get("name", "")) for m in _get_cloud_model_names()}
+            if user_selected_model not in _names:
+                logger.warning(
+                    "模型 %r 不在云端配置中（已配置: %s），本请求将使用本地模型引擎",
+                    user_selected_model, ", ".join(sorted(n for n in _names if n)) or "无")
+        except Exception:
+            pass
 
     skip_tools = body.get("skip_tools", False)
     agent_id = body.get("agent", "latiao")
@@ -1636,6 +1659,8 @@ async def api_open_identity(agent_id: str, section: str = ""):
 async def api_extensions_list():
     """已安装扩展列表。"""
     try:
+        from agent_loop import ensure_mcp_loaded
+        ensure_mcp_loaded()
         from extension_manager import list_extensions
         return {"status": "ok", "extensions": list_extensions()}
     except Exception as e:
@@ -1675,3 +1700,13 @@ async def api_extensions_set_enabled(request: Request):
         return {"status": "error", "message": "name required"}
     from extension_manager import set_extension_enabled
     return set_extension_enabled(name, enabled)
+
+
+@app.get("/v1/marketplace")
+async def api_marketplace(url: str = Query(default="")):
+    """读取市场清单（默认官方市场；可选 url 覆盖）。"""
+    try:
+        from extension_manager import fetch_marketplace
+        return fetch_marketplace(url)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}

@@ -143,3 +143,52 @@ class TestGithubUrlParsing(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestSingleDirWrapper(unittest.TestCase):
+    """zip -r 产生的单层目录包装（finance-pack/manifest.yaml）必须可安装。"""
+
+    def test_wrapped_zip_installs(self):
+        import tempfile as tf
+        with tf.TemporaryDirectory() as td:
+            zp = Path(td) / "wrapped.zip"
+            zp.write_bytes(_make_zip({
+                "finance-pack/manifest.yaml": MANIFEST,
+                "finance-pack/plugin.py": PLUGIN_PY,
+            }))
+            res = em.install_extension(str(zp))
+            self.assertEqual(res["status"], "ok", res)
+            em.uninstall_extension("demo-ext")
+
+
+class TestMarketplaceFetch(unittest.TestCase):
+    def test_local_marketplace_file(self):
+        import tempfile as tf
+        with tf.TemporaryDirectory() as td:
+            mp = Path(td) / "marketplace.json"
+            mp.write_text(json.dumps({
+                "name": "test-market",
+                "plugins": [{
+                    "name": "x", "version": "1.0.0", "description": "d",
+                    "author": {"name": "a"}, "category": "dev",
+                    "source": {"type": "zip", "url": "https://example.com/x.zip", "sha256": "abc"},
+                }],
+            }))
+            out = em.fetch_marketplace(str(mp))
+            self.assertEqual(out["status"], "ok")
+            self.assertEqual(len(out["plugins"]), 1)
+            self.assertEqual(out["plugins"][0]["name"], "x")
+            self.assertFalse(out["plugins"][0]["installed"])
+
+    def test_missing_file_error(self):
+        out = em.fetch_marketplace("/tmp/definitely-missing-marketplace.json")
+        self.assertEqual(out["status"], "error")
+
+
+class TestMCPClientTools(unittest.TestCase):
+    """MCP stdio 桩工具：_rpc 帧协议级验证（不依赖外部服务器）。"""
+
+    def test_sanitize_names(self):
+        from mcp_client import sanitize_tool_name
+        self.assertEqual(sanitize_tool_name("search-repo todo"), "search_repo_todo")
+        self.assertEqual(sanitize_tool_name("123abc"), "t_123abc")

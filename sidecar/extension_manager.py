@@ -163,8 +163,18 @@ def _download(url: str) -> bytes:
         else:
             url = f"https://codeload.github.com/{owner}/{repo}/zip/refs/heads/main"
     with httpx.Client(timeout=60, follow_redirects=True) as client:
-        resp = client.get(url)
-        resp.raise_for_status()
+        try:
+            resp = client.get(url)
+            resp.raise_for_status()
+        except Exception:
+            # 镜像兜底：raw.githubusercontent -> jsDelivr
+            import re as _re
+            _m = _re.match(r"https://raw\.githubusercontent\.com/([^/]+)/([^/]+)/main/(.+)$", url)
+            murl = ("https://cdn.jsdelivr.net/gh/%s/%s@main/%s" % _m.groups()) if _m else ""
+            if not murl:
+                raise
+            resp = client.get(murl)
+            resp.raise_for_status()
         data = resp.content
     # GitHub codeload zip 是仓库整体包：若指定了子目录，需要裁剪
     if m and subdir:
@@ -213,7 +223,17 @@ def install_extension(source: str, sha256: str = "", label: str = "") -> dict:
             _safe_extract(zip_bytes, Path(tmp))
         except ValueError as e:
             return {"status": "error", "message": f"包校验失败: {e}"}
-        manifest = _read_manifest(Path(tmp))
+        # 包根定位：支持 zip -r 产生的单层目录包装（finance-pack/manifest.yaml）
+        pkg_root = Path(tmp)
+        manifest = _read_manifest(pkg_root)
+        if not manifest and pkg_root.is_dir():
+            child_dirs = [d for d in pkg_root.iterdir() if d.is_dir()]
+            for d in child_dirs:
+                mf = _read_manifest(d)
+                if mf:
+                    pkg_root = d
+                    manifest = mf
+                    break
         if not manifest:
             return {"status": "error", "message": "扩展包缺少 manifest.yaml"}
         name = str(manifest.get("name", "")).strip()
@@ -229,7 +249,7 @@ def install_extension(source: str, sha256: str = "", label: str = "") -> dict:
         if not perms:
             perms = ["readonly"]
         has_content = any(
-            (Path(tmp) / f).exists() for f in ("plugin.py", "skills", "agents")
+            (pkg_root / f).exists() for f in ("plugin.py", "skills", "agents")
         )
         if not has_content:
             return {"status": "error", "message": "扩展包没有任何内容（plugin.py/skills/agents）"}
@@ -243,7 +263,7 @@ def install_extension(source: str, sha256: str = "", label: str = "") -> dict:
         if pkg_dir.exists():
             shutil.rmtree(pkg_dir)
         pkg_dir.mkdir(parents=True, exist_ok=True)
-        for item in Path(tmp).iterdir():
+        for item in pkg_root.iterdir():
             if item.is_dir():
                 shutil.copytree(item, pkg_dir / item.name)
             else:
@@ -273,6 +293,75 @@ def install_extension(source: str, sha256: str = "", label: str = "") -> dict:
             "permissions": perms,
             "message": f"已安装 {name}@{version}",
         }
+
+
+# ── 市场（Phase 2a）──
+# jsDelivr CDN 国内可达；raw.githubusercontent 常被屏蔽。fetch 内自动 fallback。
+DEFAULT_MARKETPLACE = "https://cdn.jsdelivr.net/gh/RenYiX0620/latiao-marketplace@main/marketplace.json"
+# 扩展 zip 下载同理：source.url 是 jsDelivr 链接，raw 版本兜底
+MIRROR_SUFFIXES = (
+    ("cdn.jsdelivr.net/gh/", "raw.githubusercontent.com/"),
+)
+_ZIP_URL_RE = __import__("re").compile(r"cdn\.jsdelivr\.net/gh/([^/]+)/([^/]+)@main/(.+)$")
+
+
+def fetch_marketplace(url: str = "", timeout: float = 20) -> dict:
+    """拉取 marketplace.json：返回规范化插件列表。
+    支持 http(s) URL 或本地文件路径（开发用）。"""
+    url = (url or DEFAULT_MARKETPLACE).strip()
+    try:
+        if url.startswith(("http://", "https://")):
+            with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+                try:
+                    resp = client.get(url)
+                    resp.raise_for_status()
+                    data = resp.json()
+                except Exception:
+                    # 镜像兜底：jsDelivr -> raw.githubusercontent
+                    _m = _ZIP_URL_RE.match(url)
+                    rurl = "https://raw.githubusercontent.com/%s/%s/main/%s" % _m.groups() if _m else ""
+                    if not rurl:
+                        raise
+                    resp = client.get(rurl)
+                    resp.raise_for_status()
+                    data = resp.json()
+        else:
+            p = Path(url).expanduser()
+            if not p.exists():
+                return {"status": "error", "message": f"市场文件不存在: {url}"}
+            import yaml as _yaml
+            text = p.read_text(encoding="utf-8")
+            data = _yaml.safe_load(text) if p.suffix in (".yaml", ".yml") else json.loads(text)
+    except Exception as e:
+        return {"status": "error", "message": f"拉取市场失败: {e}"}
+
+    plugins = []
+    for p_ in data.get("plugins", []) or []:
+        source = p_.get("source") or {}
+        plugins.append({
+            "name": p_.get("name", ""),
+            "version": p_.get("version", "0.0.0"),
+            "description": p_.get("description", ""),
+            "description_i18n": p_.get("description_i18n", {}),
+            "author": p_.get("author", {}),
+            "category": p_.get("category", ""),
+            "keywords": p_.get("keywords", []),
+            "source_url": source.get("url", ""),
+            "sha256": source.get("sha256", ""),
+        })
+    out = {"status": "ok", "name": data.get("name", ""),
+           "description": data.get("description", ""), "plugins": plugins}
+    installed = _load_installed()
+    for p_ in out["plugins"]:
+        rec = _find_record(installed, p_["name"])
+        if rec:
+            p_["installed"] = True
+            p_["installed_version"] = rec.get("version", "")
+            p_["update_available"] = rec.get("version", "") != p_["version"]
+        else:
+            p_["installed"] = False
+            p_["update_available"] = False
+    return out
 
 
 def uninstall_extension(name: str) -> dict:
