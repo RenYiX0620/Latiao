@@ -92,8 +92,11 @@ async def _verify_llm_health(api_url: str) -> bool:
     26GB 重载→内存翻倍），现在只有端口确实死亡（连接被拒）才判死。"""
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(25)) as c:
+            # model 必须用真实加载的 id：假名会让 mlx_lm.server 去 Hub 按名
+            # 解析 → 镜像 SSL 校验失败 → 健康检查对健康引擎也报死。
+            _model_ref = getattr(local_llm._engine, "current_model_id", "") or ""
             resp = await c.post(api_url, json={
-                "model": "health-check", "stream": False, "max_tokens": 4,
+                "model": _model_ref, "stream": False, "max_tokens": 4,
                 "messages": [{"role": "user", "content": "hi"}],
             })
             resp.raise_for_status()
@@ -238,10 +241,11 @@ async def _local_llm_stream(client, api_url: str, body: dict, headers: dict):
                             "若本轮尚无输出，任务将自动等待引擎恢复并重试。"
                         ) from e
                     if _local:
-                        # 挂起检测：读超时/读错误 = 端口活着但不吐数据。连续 2 次
-                        # 且没有其他活跃流（=没有别的请求在生成长文本）→ 判定挂起，
-                        # 杀掉重载。有其他活跃流时可能是排队等长生成，不动（A3 忙保护）。
-                        if (isinstance(e, (httpx.ReadTimeout, httpx.ReadError))
+                        # 挂起检测：读超时/读错误 = 端口活着但不吐数据；连接超时
+                        # 同样可能（引擎 accept 积压已满）。连续 2 次且没有其他
+                        # 活跃流（=没有别的请求在生成长文本）→ 判定挂起，杀掉重载。
+                        # 有其他活跃流时可能是排队等长生成，不动（A3 忙保护）。
+                        if (isinstance(e, (httpx.ReadError, httpx.TimeoutException))
                                 and engine._active_local_streams <= 1):
                             _hung_strikes += 1
                             if (_hung_strikes >= 2 and not engine._auto_reloading

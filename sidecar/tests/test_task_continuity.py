@@ -74,6 +74,7 @@ class TestIdleEngineFastDispose(unittest.TestCase):
         eng = LocalLLMEngine.__new__(LocalLLMEngine)
         eng.server_port = 1235
         eng.current_model_id = "m1"
+        eng.server_status = "stopped"  # 非加载中——加载中探活失败不处置
         eng._health_ok = False
         eng._health_verified_at = 0.0
         eng._health_first_fail_at = 0.0
@@ -97,6 +98,29 @@ class TestIdleEngineFastDispose(unittest.TestCase):
         self.assertTrue(getattr(eng, "disposed", True))
         self.assertEqual(len(slept), 1)  # 3s 复验等待过一次
         self.assertEqual(calls["n"], 2)  # 首验 + 复验
+
+    def test_loading_engine_not_disposed(self):
+        """加载中的引擎探活失败（模型未就绪 404）是常态：不处置、不误杀
+        （14:38 事故回归——误杀正在加载的引擎会再拉一轮重载）。"""
+        from local_llm import LocalLLMEngine
+        eng = LocalLLMEngine.__new__(LocalLLMEngine)
+        eng.server_port = 1235
+        eng.current_model_id = "m1"
+        eng.server_status = "starting"
+        eng._health_ok = False
+        eng._health_verified_at = 0.0
+        eng._health_first_fail_at = 0.0
+        eng._health_fail_count = 0
+        eng._engine_busy = lambda: False
+        eng._dispose_dead_engine = lambda: setattr(eng, "disposed", True)
+        eng.verify_engine_health = lambda timeout=20: False
+        LocalLLMEngine._wait_before_recheck = staticmethod(lambda s: None)
+        try:
+            ok = LocalLLMEngine.ensure_engine_healthy(eng)
+        finally:
+            LocalLLMEngine._wait_before_recheck = staticmethod(time.sleep)
+        self.assertTrue(ok)  # 暂不处置
+        self.assertFalse(getattr(eng, "disposed", False))
 
     def test_busy_engine_keeps_slow_window(self):
         """忙引擎：首次失败仍走 60s 慢窗口，不立即处置（防误杀长生成）。"""
@@ -263,6 +287,70 @@ class TestDeadProcessKeepsModel(unittest.TestCase):
         eng._request_reload = lambda mid: reloads.append(mid)
         LocalLLMEngine._handle_dead_process(eng)
         self.assertEqual(reloads, [])
+
+
+class TestHealthProbeUsesRealModel(unittest.TestCase):
+    """健康检查必须用真实模型 id 而非假名 "health-check"：
+    假名会让 mlx_lm.server 去 HuggingFace Hub 按名解析 → 镜像 SSL 校验失败 →
+    健康检查对健康引擎也报死，挂起检测整条链失明（14:22 事故根因之一）。"""
+
+    def test_probe_sends_real_model_id(self):
+        import json
+        import urllib.request
+        from local_llm import LocalLLMEngine
+        eng = LocalLLMEngine.__new__(LocalLLMEngine)
+        eng.server_port = 1235
+        eng.current_model_id = "/models/real-gguf"
+        eng.current_model_name = "real"
+        captured = {}
+
+        class _FakeResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return json.dumps(
+                    {"choices": [{"message": {"content": "ok"}}]}).encode()
+
+        def fake_urlopen(req, timeout, context=None):
+            captured["body"] = json.loads(req.data.decode())
+            return _FakeResp()
+
+        eng._probe_port = lambda port, timeout=1: True
+        original = urllib.request.urlopen
+        urllib.request.urlopen = fake_urlopen
+        try:
+            ok = LocalLLMEngine.verify_engine_health(eng)
+        finally:
+            urllib.request.urlopen = original
+        self.assertTrue(ok)
+        self.assertEqual(captured["body"]["model"], "/models/real-gguf")
+        self.assertNotEqual(captured["body"]["model"], "health-check")
+
+
+class TestAutoReloadClearsExplicitStop(unittest.TestCase):
+    """自动重载失败 ≠ 用户手动停止：_auto_reload 失败后必须复位 _explicit_stop，
+    否则排队请求收到误导性的"已被手动停止"（14:41 事故回归）。"""
+
+    def test_auto_reload_failure_resets_explicit_stop(self):
+        from local_llm import LocalLLMEngine
+        eng = LocalLLMEngine.__new__(LocalLLMEngine)
+        eng._explicit_stop = False
+        eng._auto_reloading = True
+        eng.server_status = "running"
+
+        def fail_start(mid):
+            eng._explicit_stop = True  # 模拟失败路径经 stop_model 置位
+            eng.server_status = "error"
+
+        eng.start_model = fail_start
+        LocalLLMEngine._auto_reload(eng, "m1")
+        self.assertFalse(eng._auto_reloading)
+        self.assertFalse(eng._explicit_stop)  # 已复位
+        self.assertEqual(eng.server_status, "error")
 
 
 class TestGetApiUrlNeverEmpty(unittest.TestCase):
