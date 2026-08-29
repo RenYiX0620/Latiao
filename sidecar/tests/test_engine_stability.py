@@ -94,3 +94,30 @@ class TestBusyEngineProtection(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestLoopDetection(unittest.TestCase):
+    """复读循环检测：本地小模型长生成偶发两三句话无限重复。"""
+
+    def test_detects_sentence_loop(self):
+        from agent_loop import _detect_text_loop
+        loop = "沪指涨0.5%，报3400点。深成指涨0.8%。" * 10
+        self.assertTrue(_detect_text_loop(loop))
+
+    def test_normal_text_not_flagged(self):
+        from agent_loop import _detect_text_loop
+        normal = ("今天大盘上涨1.2%，成交量明显放大。科技板块领涨，半导体涨超3%。"
+                  "北向资金净流入50亿元，市场情绪回暖。券商板块午后异动。"
+                  "展望后市，分析师认为短期仍有震荡整固需求。") * 2
+        self.assertFalse(_detect_text_loop(normal))
+
+    def test_short_text_ignored(self):
+        from agent_loop import _detect_text_loop
+        self.assertFalse(_detect_text_loop("好的，"))
+
+    def test_high_freq_short_fragment(self):
+        from agent_loop import _detect_text_loop
+        # ≥120 字符才会进入检测（防短消息误判），50 次 = 150 字符
+        self.assertTrue(_detect_text_loop("好的，" * 50))
+        # 90 字符（30 次）低于最短长度守卫 → 不判（防误报）
+        self.assertFalse(_detect_text_loop("好的，" * 30))

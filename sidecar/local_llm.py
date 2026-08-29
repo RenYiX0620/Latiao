@@ -872,18 +872,32 @@ class LocalLLMEngine:
     # 不能据此判定引擎死亡。agent_loop 在流开始/结束时调用这两个方法，
     # 健康检查看到宽限窗口内的忙标志直接视为存活。
     _engine_busy_until = 0.0
+    _active_local_streams = 0  # 活跃本地流计数（agent_loop 进入/退出时增减）
 
     def mark_engine_busy(self, grace_sec: float = 45.0):
-        """标记引擎正在服务流式请求（宽限期内健康检查跳过）。"""
+        """标记引擎正在服务流式请求（时间戳兜底，主判定看 _active_local_streams）。"""
         import time as _t
-        type(self)._engine_busy_until = _t.monotonic() + grace_sec
+        type(self)._engine_busy_until = _t.monotonic() + max(grace_sec, 180.0)
 
     def mark_engine_idle(self):
         import time as _t
         type(self)._engine_busy_until = 0.0
 
+    @classmethod
+    def mark_stream_enter(cls):
+        cls._active_local_streams += 1
+        import time as _t
+        cls._engine_busy_until = _t.monotonic() + 300.0
+
+    @classmethod
+    def mark_stream_exit(cls):
+        cls._active_local_streams = max(0, cls._active_local_streams - 1)
+
     def _engine_busy(self) -> bool:
         import time as _t
+        # 活跃流计数是主判定：只要还有本地流在读，引擎就是在正常干活
+        if type(self)._active_local_streams > 0:
+            return True
         return _t.monotonic() < type(self)._engine_busy_until
 
     def _probe_external_engine(self) -> tuple[str, str, str] | None:
