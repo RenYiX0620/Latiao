@@ -720,12 +720,7 @@ class LocalLLMEngine:
                 self.current_model_name = ""
                 self._active_backend = ""
         if self._process and self._process.poll() is not None:
-            # Only overwrite if not already set to a detailed error by startup
-            if self.server_status != "error":
-                self.server_status = "stopped"
-                self.status_message = f"进程已退出 (code: {self._process.returncode})"
-            self.current_model_id = ""
-            self.current_model_name = ""
+            self._handle_dead_process()
         # If engine thinks we're stopped but a model server is still on our port
         # (e.g. sidecar restarted, model process outlived it), reconnect so the UI
         # shows accurate status without waiting for a chat request.
@@ -863,6 +858,11 @@ class LocalLLMEngine:
             self.start_model(model_id)
         finally:
             self._auto_reloading = False
+            # start_model 失败路径可能经 stop_model 置位 _explicit_stop——但这是
+            # 自动重载失败，不是用户手动停止；复位让排队中的请求收到准确的
+            # "自动重载失败"错误，而不是误导性的"已被手动停止"（14:41 事故）。
+            if self.server_status == "error":
+                self._explicit_stop = False
 
     def _request_reload(self, model_id: str) -> bool:
         """统一的重载请求入口（带防重入守卫）。
@@ -971,13 +971,19 @@ class LocalLLMEngine:
 
         被中断/长时间运行的 llama.cpp 引擎可能处于"端口活着但生成异常"的
         状态（空响应/挂起），只探测端口发现不了，必须实测生成。
+
+        注意：model 必须用真实加载的模型 id。此前用假名 "health-check"，
+        mlx_lm.server 会按名字去 HuggingFace Hub 解析 → 镜像证书不被内置
+        Python 信任 → SSL 校验失败 → 健康检查对健康引擎也永远报死，
+        把"引擎挂起检测"整条链弄瞎（误杀健康引擎 + 真挂起时探测不到）。
         """
         import urllib.request
         if not self._probe_port(self.server_port, timeout=1):
             return False
         try:
+            _model_ref = self.current_model_id or self.current_model_name or ""
             body = json.dumps({
-                "model": "health-check", "stream": False, "max_tokens": 4,
+                "model": _model_ref, "stream": False, "max_tokens": 4,
                 "messages": [{"role": "user", "content": "hi"}],
             }).encode()
             req = urllib.request.Request(
@@ -1025,6 +1031,11 @@ class LocalLLMEngine:
             # 3s 后立即复验一次，仍失败直接处置--不再让用户面对 60s 黑盒。
             # 忙引擎维持 60s 窗口（复验会排队超时，快速判死有误杀长生成风险）。
             if not self._engine_busy():
+                if self.server_status == "starting":
+                    # 加载中的引擎探活失败是常态（模型未就绪时 chat 404/无响应），
+                    # 快速处置只会杀掉正在加载的引擎、再拉一轮重载（14:38 事故）
+                    logger.info("引擎健康检查首次失败（模型加载中），暂不处置")
+                    return True
                 LocalLLMEngine._wait_before_recheck(3)
                 # 复验期间流可能进入（用户发了新消息）-> 退回慢路径
                 if not self._engine_busy() and not self.verify_engine_health():
@@ -1040,6 +1051,22 @@ class LocalLLMEngine:
 
     # 空闲复验前的等待（默认 3s）；类属性便于测试替换成零等待
     _wait_before_recheck = staticmethod(time.sleep)
+
+    def _handle_dead_process(self):
+        """引擎子进程意外退出（崩溃/OOM/被杀）的统一处置。
+
+        保留模型记录并自动重载（与 _dispose_dead_engine 同口径）——此前
+        get_status 轮询在这里直接清空 current_model_id，正在排队等待恢复的
+        请求会因"无模型记录"被秒死，前端也显示已卸载。用户主动停止由
+        _explicit_stop 区分（stop_model 已自行清空状态并置位）。"""
+        if self.server_status != "error":
+            self.server_status = "stopped"
+            self.status_message = (
+                f"进程已退出 (code: {getattr(self._process, 'returncode', '?')})")
+        if (self.current_model_id and not self._explicit_stop
+                and not self._auto_reloading and self.server_status != "error"):
+            self.status_message = "引擎异常，正在自动重新加载模型..."
+            self._request_reload(self.current_model_id)
 
     def _dispose_dead_engine(self):
         """杀掉判定已死的引擎进程并触发后台自动重载（两处判死路径共用）。"""
@@ -1441,6 +1468,14 @@ class LocalLLMEngine:
             ]
             env = os.environ.copy()
             env.pop("HF_ENDPOINT", None)
+            # 端口残留兜底：前一个引擎刚被杀（冻结/崩溃/残留），socket 可能短暂
+            # 滞留，直接 bind 会 "Address already in use" 秒崩（14:41 事故）。
+            # 先清场并等端口真正释放（probe 从"能连"变为"拒绝"即已释放）。
+            self._kill_port(port)
+            for _ in range(20):
+                if not self._probe_port(port, timeout=0.5):
+                    break
+                time.sleep(0.5)
             # stdout 无人读取，必须 DEVNULL，否则管道缓冲满后子进程死锁
             proc = subprocess.Popen(
                 cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, env=env
@@ -1478,11 +1513,21 @@ class LocalLLMEngine:
                     "exited early" if proc.poll() is not None else "HTTP timeout",
                     err_text[:500] if err_text else "no stderr",
                 )
-                self.stop_model()
+                # 失败清理：杀残留进程即可。绝不能调 stop_model——它会连
+                # current_model_id 和状态文件一起清空，自动重载场景下
+                # "请求自动重载"分支从此失明（14:41 事故），后续请求只能
+                # 报"请到模型页加载"而无法自愈。保留模型记录 + 标记 error，
+                # 排队请求会收到明确的"自动重载失败"错误。
+                try:
+                    if proc.poll() is None:
+                        proc.terminate()
+                        proc.wait(timeout=5)
+                except Exception:
+                    pass
+                self._kill_port(port)
+                self._process = None
                 self.server_status = "error"
                 self.status_message = f"启动失败: {err_summary}" if err_summary else "模型加载超时或进程已退出"
-                self.current_model_id = ""
-                self.current_model_name = ""
                 return self.get_status()
 
             self.server_status = "running"
@@ -1531,7 +1576,21 @@ class LocalLLMEngine:
             # Kill any stale process on the target port before starting
             self._kill_port(port)
             if self._process and self._process.poll() is None:
-                self.stop_model()
+                # 旧进程还在跑（常见于刚被 SIGKILL 但内核尚未回收的僵尸窗口）。
+                # 绝不能调 stop_model——它会置 _cancel_load 取消事件，让本次
+                # 加载的 _wait_for_http 立即失败并杀掉新引擎（15:04 事故根因：
+                # 处置杀引擎后 1ms 重载线程进来，poll() 误判旧进程存活）。
+                # 这里直接 terminate 旧进程即可。
+                try:
+                    self._process.terminate()
+                    self._process.wait(timeout=5)
+                except Exception:
+                    try:
+                        self._process.kill()
+                        self._process.wait(timeout=5)
+                    except Exception:
+                        pass
+                self._process = None
             self.server_port = port
 
             if self.backend == "none":

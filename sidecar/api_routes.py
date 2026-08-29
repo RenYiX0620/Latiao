@@ -145,8 +145,10 @@ async def chat_completion(request: Request):
             cloud_config = _get_best_cloud_config()
             if cloud_config:
                 model = cloud_config.get("model", model)
-        elif intent == "chat" and local_llm.get_api_url():
-            logger.info("Auto-route: chat task → using local model (free)")
+        elif intent == "chat":
+            from starlette.concurrency import run_in_threadpool as _rtp
+            if await _rtp(local_llm.get_api_url):
+                logger.info("Auto-route: chat task → using local model (free)")
             # Keep local model for casual chat
             pass
 
@@ -193,7 +195,7 @@ async def chat_completion(request: Request):
     use_stream = body.get("stream", False)
 
     # Resolve API target
-    protocol, api_url, headers, is_local = _resolve_api_target(cloud_config)
+    protocol, api_url, headers, is_local = await _resolve_api_target(cloud_config)
 
     # Agent loop: LLM autonomously decides when to call tools
     if not skip_tools and protocol == "openai":
@@ -369,8 +371,8 @@ async def chat_completion(request: Request):
                             perm = _resolve_permission(tool_name, tool_args)
                             if perm == "confirm":
                                 result = f"⛔ 操作需要用户确认: {tool_name}。请在流式模式下重试。"
-                            elif perm == "danger":
-                                result = f"⛔ 高危操作已阻止: {tool_name}。请联系管理员。"
+                            elif perm in ("danger", "deny", "blocked"):
+                                result = f"⛔ 权限规则已阻止: {tool_name}（级别 {perm}）。"
                             else:
                                 logger.info("Tool executing (non-streaming): %s %s", tool_name, str(tool_args)[:100])
                                 result = await execute_tool(tool_name, tool_args)
@@ -1240,11 +1242,16 @@ async def set_tavily_key(request: Request):
 @app.delete("/v1/settings/tavily-key")
 async def delete_tavily_key():
     """Remove Tavily API key from keychain and config."""
-    try:
+    from starlette.concurrency import run_in_threadpool
+
+    def _sec_delete():
         subprocess.run(
             ["security", "delete-generic-password", "-s", "com.latiao.desktop", "-a", "tavily_api_key"],
             capture_output=True, timeout=5,
         )
+    try:
+        # security 子进程会阻塞事件循环（P2-13）→ 线程池
+        await run_in_threadpool(_sec_delete)
     except Exception:
         logger.debug("Failed to delete Tavily key from keychain", exc_info=True)
     try:
@@ -1684,7 +1691,15 @@ async def api_extensions_install(request: Request):
         return {"status": "error", "message": "source required"}
     from starlette.concurrency import run_in_threadpool
     from extension_manager import install_extension
-    return await run_in_threadpool(install_extension, source, sha256, label)
+    result = await run_in_threadpool(install_extension, source, sha256, label)
+    if isinstance(result, dict) and result.get("status") == "ok":
+        # 热重载：插件/技能/MCP 立即可用，无需重启
+        try:
+            from main import _hot_reload_extensions
+            result["reload"] = await _hot_reload_extensions()
+        except Exception:
+            logger.warning("扩展热重载失败", exc_info=True)
+    return result
 
 
 @app.post("/v1/extensions/uninstall")
@@ -1694,7 +1709,14 @@ async def api_extensions_uninstall(request: Request):
     if not name:
         return {"status": "error", "message": "name required"}
     from extension_manager import uninstall_extension
-    return uninstall_extension(name)
+    result = uninstall_extension(name)
+    if isinstance(result, dict) and result.get("status") == "ok":
+        try:
+            from main import _hot_reload_extensions
+            result["reload"] = await _hot_reload_extensions()
+        except Exception:
+            logger.warning("扩展热重载失败", exc_info=True)
+    return result
 
 
 @app.post("/v1/extensions/set-enabled")
@@ -1705,7 +1727,15 @@ async def api_extensions_set_enabled(request: Request):
     if not name:
         return {"status": "error", "message": "name required"}
     from extension_manager import set_extension_enabled
-    return set_extension_enabled(name, enabled)
+    result = set_extension_enabled(name, enabled)
+    if isinstance(result, dict) and result.get("status") == "ok":
+        # 启停同样热重载：启用后工具立即可用，禁用后立即移除
+        try:
+            from main import _hot_reload_extensions
+            result["reload"] = await _hot_reload_extensions()
+        except Exception:
+            logger.warning("扩展热重载失败", exc_info=True)
+    return result
 
 
 @app.get("/v1/marketplace")

@@ -25,9 +25,17 @@ def _safe_path(path: str) -> str | None:
     if not path:
         return None
     expanded = os.path.expanduser(path)
-    # 必须本身就是绝对路径（realpath 会把相对路径变成绝对路径，所以先查）
     if not os.path.isabs(expanded):
-        return None
+        # 相对路径按 sidecar 工作目录解析：模型常发 "."（列当前目录），
+        # 此前直接拒绝并误报"路径穿越"（18:13 事故——自检任务第一步就被拦）
+        try:
+            from agent_loop import _safe_cwd
+            base = _safe_cwd()
+            if not base:
+                return None
+            expanded = os.path.join(base, expanded)
+        except Exception:
+            return None
     # Block path traversal — 两种分隔符都查
     if ".." in path.split("/") or ".." in path.split("\\"):
         return None
@@ -38,7 +46,7 @@ def _safe_path(path: str) -> str | None:
 def execute(args: dict) -> str:
     p = _safe_path(args["path"])
     if p is None:
-        return "⛔ Blocked: path traversal not allowed"
+        return "⛔ Blocked: 路径无效（空路径或包含 .. 穿越片段）"
     try:
         entries = os.listdir(p)
         lines = [f"  {'📁' if os.path.isdir(os.path.join(p, e)) else '📄'} {e}"

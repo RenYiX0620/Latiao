@@ -12,14 +12,13 @@ import { useSkills } from "./hooks/useSkills";
 import ChatView from "./components/ChatView";
 import ModelsView from "./components/ModelsView";
 import ToolsView from "./components/ToolsView";
-import SkillsView from "./components/SkillsView";
 import CronView from "./components/CronView";
 import ChannelsView from "./components/ChannelsView";
 import AgentView from "./components/AgentView";
 import SettingsView from "./components/SettingsView";
 import RecoveryView from "./components/RecoveryView";
 import LogsView from "./components/LogsView";
-import { MessageSquare, Brain, Wrench, Puzzle, Clock, Radio, Bot, Settings, ScrollText } from "lucide-react";
+import { MessageSquare, Brain, Wrench, Clock, Radio, Bot, Settings, ScrollText } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import "./App.css";
 
@@ -60,7 +59,6 @@ const NAV_ITEMS: { id: ViewId; icon: LucideIcon; key: string }[] = [
   { id: "chat", icon: MessageSquare, key: "nav.chat" },
   { id: "models", icon: Brain, key: "nav.models" },
   { id: "tools", icon: Wrench, key: "nav.tools" },
-  { id: "skills", icon: Puzzle, key: "nav.skills" },
   { id: "cron", icon: Clock, key: "nav.cron" },
   { id: "channels", icon: Radio, key: "nav.channels" },
   { id: "agents", icon: Bot, key: "nav.agents" },
@@ -81,7 +79,19 @@ function buildApiMessages(session: SessionInfo, extraUser?: Message, planMode?: 
     ? allMsgs.slice(-MAX_CONTEXT_MSGS)
     : allMsgs;
   for (const msg of recentMsgs) {
-    if (msg.role === "tool" || msg.type === "tool_call") continue;
+    if (msg.role === "tool" || msg.type === "tool_call") {
+      // 工具消息不回灌会让"继续/重试"变成失忆的全新请求（P0-2）：
+      // 转成 user 角色 [工具结果] 回灌，模型知道之前查过什么
+      const raw = (msg.toolResult || msg.content || "").toString();
+      const preview = raw.length > 1000 ? raw.slice(0, 1000) + "\n...(结果过长已截断)" : raw;
+      if (preview.trim()) {
+        msgs.push({
+          role: "user",
+          content: `[工具结果] ${msg.toolName || ""} ${JSON.stringify(msg.toolArgs || {}).slice(0, 200)}\n${preview}`,
+        });
+      }
+      continue;
+    }
     if (msg.role === "user" && msg.imageBase64) {
       msgs.push({
         role: "user",
@@ -678,10 +688,12 @@ const [timeFilter, setTimeFilter] = useState("all");
   /* ── Stream Chat (preserved from original) ── */
   const streamChat = async (
     messages: Record<string, unknown>[],
-    opts?: { model?: string; agent?: string; cloudConfig?: Record<string, unknown>; skipTools?: boolean },
+    opts?: { model?: string; agent?: string; cloudConfig?: Record<string, unknown>; skipTools?: boolean; sessionId?: string },
     signal?: AbortSignal,
   ): Promise<string> => {
     const body: Record<string, unknown> = { messages, stream: true, reflection_mode: reflectionMode, access_mode: accessMode, thinking_level: thinkingLevel };
+    // 传 session_id：后端记忆/停滞检测按会话归档（P0-2）
+    if (opts?.sessionId) body.session_id = opts.sessionId;
     if (opts?.model) body.model = opts.model;
     if (opts?.agent) body.agent = opts.agent;
     if (opts?.cloudConfig) body.cloud_config = opts.cloudConfig;
@@ -832,8 +844,29 @@ const [timeFilter, setTimeFilter] = useState("all");
                     return msgs;
                   });
                 }
+              } else if (parsed.event === "content_revised") {
+                // 追问续写轮：把最后一条 assistant 消息替换为当前累积文本。
+                // 与 reflection_revised 的区别：不加"已自查修正"角标。
+                flushStream();
+                const revised = String(parsed.content ?? "");
+                if (revised.trim()) {
+                  full = revised;
+                  streamFinalized = true;
+                  setMessages((prev) => {
+                    const msgs = [...prev];
+                    for (let i = msgs.length - 1; i >= 0; i--) {
+                      if (msgs[i].role === "assistant" && msgs[i].content && msgs[i].content.trim()) {
+                        msgs[i] = { ...msgs[i], content: revised };
+                        break;
+                      }
+                    }
+                    return msgs;
+                  });
+                }
               } else if (parsed.event === "tool_start") {
                 flushStream();
+                // 工具执行期静默可超 180s（长命令/重载）：暂停看门狗，tool_end 再续（P0-4）
+                disarmWatchdog();
                 activeTaskStackRef.current.push(`${parsed.tool || ""} ${JSON.stringify(parsed.args || {}).slice(0, 60)}`);
                 setActiveTask(activeTaskStackRef.current[activeTaskStackRef.current.length - 1] || null);
                 const startTs = Number(parsed.ts) || Date.now();
@@ -854,6 +887,7 @@ const [timeFilter, setTimeFilter] = useState("all");
                 });
               } else if (parsed.event === "tool_end") {
                 flushStream();
+                armWatchdog();  // 工具执行结束，恢复看门狗（P0-4）
                 activeTaskStackRef.current.pop();
                 setActiveTask(activeTaskStackRef.current[activeTaskStackRef.current.length - 1] || null);
                 const rawResult = String(parsed.result ?? "");
@@ -879,6 +913,10 @@ const [timeFilter, setTimeFilter] = useState("all");
                 pendingThinking += String(parsed.reasoning);
                 scheduleFlush();
               } else if (parsed.content) {
+                // 追问轮（content_revised）之后若又出现新一轮正常内容
+                // （如工具调用后的新回答）：重置累积，另起新气泡，
+                // 不再把替换文本与新内容拼在一起
+                if (streamFinalized) { full = ""; streamFinalized = false; }
                 full += parsed.content;
                 scheduleFlush();
               }
@@ -990,7 +1028,7 @@ const [timeFilter, setTimeFilter] = useState("all");
 
     try {
       const apiMessages = buildApiMessages(session, userMsg, accessMode === "plan", lang);
-      const opts: Record<string, unknown> = { agent: activeAgent };
+      const opts: Record<string, unknown> = { agent: activeAgent, sessionId: session.id };
       if (session.selectedModel) opts.model = session.selectedModel;
       if (cloudCfgPre) opts.cloudConfig = { key: cloudCfgPre.key, endpoint: cloudCfgPre.endpoint, protocol: cloudCfgPre.protocol || "openai" };
 
@@ -1358,22 +1396,15 @@ const [timeFilter, setTimeFilter] = useState("all");
           />
         </div>
 
-        {/* ═══ Tools View ═══ */}
+        {/* ═══ Tools View（工具 + 技能合并页） ═══ */}
         <div className={`view-panel${activeView === "tools" ? " active" : ""}`} id="view-tools" style={sidecarStatus === "offline" ? { display: "none" } : undefined}>
           <div className="page-header">
-            <div><div className="page-title">{t("page.tools")}</div><div className="page-desc">{t("page.tools_desc", { count: tools.length })}</div></div>
+            <div><div className="page-title">{t("page.tools")}</div><div className="page-desc">{t("page.tools_desc", { count: tools.length, skills_enabled: skills.filter(s => s.enabled).length, skills_total: skills.length })}</div></div>
           </div>
           <div className="page-body">
             {tools.length === 0 && <div style={{padding:20,color:'var(--warning)',fontFamily:'monospace',whiteSpace:'pre-wrap'}}>{fetchDiag}</div>}
-            <ToolsView tools={tools} setTools={setTools} showToast={showToast} />
-          </div>
-        </div>
-        <div className={`view-panel${activeView === "skills" ? " active" : ""}`} id="view-skills" style={sidecarStatus === "offline" ? { display: "none" } : undefined}>
-          <div className="page-header">
-            <div><div className="page-title">{t("page.skills")}</div><div className="page-desc">{t("page.skills_desc", { enabled: skills.filter(s => s.enabled).length, total: skills.length })}</div></div>
-          </div>
-          <div className="page-body">
-            <SkillsView skills={skills} newSkill={newSkill} setNewSkill={setNewSkill}
+            <ToolsView tools={tools} setTools={setTools} showToast={showToast}
+              skills={skills} newSkill={newSkill} setNewSkill={setNewSkill}
               toggleSkill={toggleSkill} deleteSkill={deleteSkill} addSkill={addSkill}
               tavilyKey={tavilyKey} onSaveTavilyKey={saveTavilyKey} onDeleteTavilyKey={deleteTavilyKey} />
           </div>

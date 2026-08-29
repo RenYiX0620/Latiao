@@ -238,10 +238,14 @@ fn restart_sidecar(state: tauri::State<'_, SidecarProcess>) -> Result<String, St
         // 重启后继续存活（模型加载耗时巨大，重新加载会中断用户任务）
         // token 必须走 stdin 而不是 -H 参数：argv 会出现在 `ps` 输出里泄漏
         let token = AUTH_TOKEN.get().map(|s| s.as_str()).unwrap_or("").to_string();
+        // sidecar 的 _check_auth 只认 x-latiao-token / Authorization 头，
+        // 此前 token 只放 body → 生产模式必 401、detach 失效、引擎被杀（P1-8）
+        let auth_header = format!("Authorization: Bearer {}", token);
         let mut curl = Command::new("curl")
             .args([
                 "-s", "-m", "2", "-X", "POST",
                 "-H", "Content-Type: application/json",
+                "-H", &auth_header,
                 "--data-binary", "@-",
                 "http://127.0.0.1:8765/v1/engine/detach",
             ])

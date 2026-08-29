@@ -49,6 +49,9 @@ class _FakeEngine:
     def _auto_reload(self, mid):
         self._auto_reloading = False
 
+    def _kill_port(self, port):
+        self.killed_port = port
+
     def _request_reload(self, model_id):
         self.reload_calls.append(model_id)
         self._auto_reloading = True
@@ -71,6 +74,7 @@ class TestIdleEngineFastDispose(unittest.TestCase):
         eng = LocalLLMEngine.__new__(LocalLLMEngine)
         eng.server_port = 1235
         eng.current_model_id = "m1"
+        eng.server_status = "stopped"  # 非加载中——加载中探活失败不处置
         eng._health_ok = False
         eng._health_verified_at = 0.0
         eng._health_first_fail_at = 0.0
@@ -94,6 +98,29 @@ class TestIdleEngineFastDispose(unittest.TestCase):
         self.assertTrue(getattr(eng, "disposed", True))
         self.assertEqual(len(slept), 1)  # 3s 复验等待过一次
         self.assertEqual(calls["n"], 2)  # 首验 + 复验
+
+    def test_loading_engine_not_disposed(self):
+        """加载中的引擎探活失败（模型未就绪 404）是常态：不处置、不误杀
+        （14:38 事故回归——误杀正在加载的引擎会再拉一轮重载）。"""
+        from local_llm import LocalLLMEngine
+        eng = LocalLLMEngine.__new__(LocalLLMEngine)
+        eng.server_port = 1235
+        eng.current_model_id = "m1"
+        eng.server_status = "starting"
+        eng._health_ok = False
+        eng._health_verified_at = 0.0
+        eng._health_first_fail_at = 0.0
+        eng._health_fail_count = 0
+        eng._engine_busy = lambda: False
+        eng._dispose_dead_engine = lambda: setattr(eng, "disposed", True)
+        eng.verify_engine_health = lambda timeout=20: False
+        LocalLLMEngine._wait_before_recheck = staticmethod(lambda s: None)
+        try:
+            ok = LocalLLMEngine.ensure_engine_healthy(eng)
+        finally:
+            LocalLLMEngine._wait_before_recheck = staticmethod(time.sleep)
+        self.assertTrue(ok)  # 暂不处置
+        self.assertFalse(getattr(eng, "disposed", False))
 
     def test_busy_engine_keeps_slow_window(self):
         """忙引擎：首次失败仍走 60s 慢窗口，不立即处置（防误杀长生成）。"""
@@ -227,6 +254,242 @@ class TestConnectErrorRecoveryRace(unittest.TestCase):
 
         kind, err = self._run_stream_error(eng, client=_ReloadFailsClient(eng))
         self.assertIn("自动重载失败", str(err))
+
+
+class TestDeadProcessKeepsModel(unittest.TestCase):
+    """get_status 轮询发现引擎子进程死亡：必须保留模型记录并自动重载，
+    不得清空 current_model_id（否则排队中的请求因"无模型"被秒死）。"""
+
+    def _eng(self):
+        from local_llm import LocalLLMEngine
+        eng = LocalLLMEngine.__new__(LocalLLMEngine)
+        eng._process = type("_DeadProc", (), {"returncode": -9, "poll": lambda s: -9})()
+        eng.server_status = "running"
+        eng.current_model_id = "m1"
+        eng._explicit_stop = False
+        eng._auto_reloading = False
+        return eng
+
+    def test_dead_process_keeps_model_and_reloads(self):
+        from local_llm import LocalLLMEngine
+        eng = self._eng()
+        reloads = []
+        eng._request_reload = lambda mid: reloads.append(mid)
+        LocalLLMEngine._handle_dead_process(eng)
+        self.assertEqual(reloads, ["m1"])              # 自动重载已触发
+        self.assertEqual(eng.current_model_id, "m1")   # 模型记录保留
+
+    def test_dead_process_no_model_no_reload(self):
+        from local_llm import LocalLLMEngine
+        eng = self._eng()
+        eng.current_model_id = ""
+        reloads = []
+        eng._request_reload = lambda mid: reloads.append(mid)
+        LocalLLMEngine._handle_dead_process(eng)
+        self.assertEqual(reloads, [])
+
+
+class TestHealthProbeUsesRealModel(unittest.TestCase):
+    """健康检查必须用真实模型 id 而非假名 "health-check"：
+    假名会让 mlx_lm.server 去 HuggingFace Hub 按名解析 → 镜像 SSL 校验失败 →
+    健康检查对健康引擎也报死，挂起检测整条链失明（14:22 事故根因之一）。"""
+
+    def test_probe_sends_real_model_id(self):
+        import json
+        import urllib.request
+        from local_llm import LocalLLMEngine
+        eng = LocalLLMEngine.__new__(LocalLLMEngine)
+        eng.server_port = 1235
+        eng.current_model_id = "/models/real-gguf"
+        eng.current_model_name = "real"
+        captured = {}
+
+        class _FakeResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return json.dumps(
+                    {"choices": [{"message": {"content": "ok"}}]}).encode()
+
+        def fake_urlopen(req, timeout, context=None):
+            captured["body"] = json.loads(req.data.decode())
+            return _FakeResp()
+
+        eng._probe_port = lambda port, timeout=1: True
+        original = urllib.request.urlopen
+        urllib.request.urlopen = fake_urlopen
+        try:
+            ok = LocalLLMEngine.verify_engine_health(eng)
+        finally:
+            urllib.request.urlopen = original
+        self.assertTrue(ok)
+        self.assertEqual(captured["body"]["model"], "/models/real-gguf")
+        self.assertNotEqual(captured["body"]["model"], "health-check")
+
+
+class TestAutoReloadClearsExplicitStop(unittest.TestCase):
+    """自动重载失败 ≠ 用户手动停止：_auto_reload 失败后必须复位 _explicit_stop，
+    否则排队请求收到误导性的"已被手动停止"（14:41 事故回归）。"""
+
+    def test_auto_reload_failure_resets_explicit_stop(self):
+        from local_llm import LocalLLMEngine
+        eng = LocalLLMEngine.__new__(LocalLLMEngine)
+        eng._explicit_stop = False
+        eng._auto_reloading = True
+        eng.server_status = "running"
+
+        def fail_start(mid):
+            eng._explicit_stop = True  # 模拟失败路径经 stop_model 置位
+            eng.server_status = "error"
+
+        eng.start_model = fail_start
+        LocalLLMEngine._auto_reload(eng, "m1")
+        self.assertFalse(eng._auto_reloading)
+        self.assertFalse(eng._explicit_stop)  # 已复位
+        self.assertEqual(eng.server_status, "error")
+
+
+class TestMergeSystemMessages(unittest.TestCase):
+    """mlx_lm.server v0.31 只接受一个 system 且必须在最前面，任何位置的
+    第二个 system 都 404（"System message must be at the beginning"）。
+    nudge 轮在尾部追加 system 是任务迭代 2+ 全 404 的真凶（16:16 实测
+    roles=[system,user,assistant,system]）——所有 system 必须合并。"""
+
+    def test_merges_leading_systems(self):
+        from agent_loop import _merge_system_messages
+        msgs = [
+            {"role": "system", "content": "A"},
+            {"role": "system", "content": "B"},
+            {"role": "user", "content": "hi"},
+        ]
+        out = _merge_system_messages(msgs)
+        self.assertEqual(out[0], {"role": "system", "content": "A\n\nB"})
+        self.assertEqual([m.get("role") for m in out], ["system", "user"])
+
+    def test_merges_trailing_system(self):
+        """nudge 轮的真实形态：尾部 system 必须并入开头（16:16 事故）。"""
+        from agent_loop import _merge_system_messages
+        msgs = [
+            {"role": "system", "content": "A"},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "x"},
+            {"role": "system", "content": "不要写执行计划，直接行动。"},
+        ]
+        out = _merge_system_messages(msgs)
+        self.assertEqual([m.get("role") for m in out], ["system", "user", "assistant"])
+        self.assertIn("A", out[0]["content"])
+        self.assertIn("直接行动", out[0]["content"])
+
+    def test_single_system_unchanged(self):
+        from agent_loop import _merge_system_messages
+        msgs = [{"role": "system", "content": "A"}, {"role": "user", "content": "hi"}]
+        self.assertEqual(_merge_system_messages(msgs), msgs)
+
+    def test_no_system_unchanged(self):
+        from agent_loop import _merge_system_messages
+        msgs = [{"role": "user", "content": "hi"}]
+        self.assertEqual(_merge_system_messages(msgs), msgs)
+
+
+class TestLoopDetectNotSkippedByDedup(unittest.TestCase):
+    """复读循环检测必须先于 dedup 过滤执行：模型以自我介绍开头复读时，
+    _deduplicate_response 会截断文本，旧代码在此 continue 跳过循环检测，
+    导致无限复读全程无输出无截断（16:29 任务"停在尾端"帮凶）。"""
+
+    def test_loop_detectable_when_dedup_would_shorten(self):
+        from agent_loop import _deduplicate_response, _detect_text_loop
+        intro = "我是辣条，你的AI助手。今天为您分析美股大盘走势。"
+        raw = intro + intro * 6  # 无换行：检测器只检无空白片段
+        # 旧短路条件成立：dedup 命中会截断文本
+        self.assertLess(len(_deduplicate_response(raw)), len(raw))
+        # 新顺序：循环检测用原始流式文本判定，能触发截断
+        self.assertTrue(_detect_text_loop(raw))
+
+    def test_fallback_regex_matches_newline_repeats(self):
+        """P1-10：兜底正则此前是字面 \\x01 永不匹配。带换行的短片段重复
+        （主检测器因 strip()!=piece 跳过）必须被兜底反向引用捕获。"""
+        from agent_loop import _detect_text_loop
+        piece = "沪指涨0.5%。\n"
+        raw = piece * 20  # 140 字符 ≥120 门槛
+        self.assertTrue(_detect_text_loop(raw))
+
+
+class TestFilterToolsKeepsWebForFinancial(unittest.TestCase):
+    """P0-1：金融意图必须同时保留 web 工具（美股类问题 mx_query 查不到，
+    只有 tavily 能联网搜索）。"""
+
+    def test_us_stock_question_keeps_tavily(self):
+        from agent_loop import _filter_tools
+        fake_tools = [
+            {"function": {"name": "read_file"}},
+            {"function": {"name": "mx_query"}},
+            {"function": {"name": "ak_finance"}},
+            {"function": {"name": "tavily_search"}},
+            {"function": {"name": "bing_search"}},
+        ]
+        names = [t["function"]["name"] for t in _filter_tools("分析昨晚美股大盘走势", fake_tools)]
+        self.assertIn("tavily_search", names)
+        self.assertIn("mx_query", names)
+
+
+class TestStagnationCounterWired(unittest.TestCase):
+    """P2-12：_track_progress 的 text_only 计数此前无调用点，停滞告警永远
+    不触发。接入后连续 3 轮纯文本应触发告警，工具轮复位。"""
+
+    def test_three_text_rounds_trigger_warning(self):
+        from agent_loop import _track_progress, _check_stagnation, _session_states
+        sid = "test-session-stagnation"
+        # 第 1 轮因 phase 从 init 变化而复位，实际需连续 4 轮同 phase
+        for _ in range(3):
+            _track_progress(sid, "t", "text_only")
+        self.assertEqual(_check_stagnation(sid), "")
+        _track_progress(sid, "t", "text_only")
+        self.assertIn("停滞", _check_stagnation(sid))
+        _track_progress(sid, "t", "tool")
+        self.assertEqual(_check_stagnation(sid), "")
+        _session_states.pop(sid, None)
+
+
+class TestPermissionDangerBlocked(unittest.TestCase):
+    """权限漏洞回归：自定义规则返回 danger/deny 必须拦截执行。
+    此前主循环只拦 confirm，danger 规则落空直接执行（实测 list_dir
+    设 danger 仍读到目录内容）。"""
+
+    def test_danger_rule_blocks_tool(self):
+        import asyncio
+        from agent_loop import _handle_tool_execution
+        from main import _custom_permissions
+        _custom_permissions.append({"tool": "list_dir", "permission": "danger"})
+        try:
+            current_msgs = []
+            tc = {"id": "t1", "function": {"name": "list_dir", "arguments": '{"path": "/tmp"}'}}
+            ok, events = asyncio.run(
+                _handle_tool_execution(tc, current_msgs, "sess-test", "latiao", "full"))
+            results = [str(e.get("result", "")) for e in events]
+            self.assertTrue(any("权限规则拒绝" in r for r in results), results)
+            # 消息也必须回灌拒绝原因（模型能看到"被拒绝"）
+            self.assertTrue(any("权限规则拒绝" in str(m.get("content", "")) for m in current_msgs))
+        finally:
+            _custom_permissions.pop()
+
+    def test_deny_rule_blocks_tool(self):
+        import asyncio
+        from agent_loop import _handle_tool_execution
+        from main import _custom_permissions
+        _custom_permissions.append({"tool": "list_dir", "permission": "deny"})
+        try:
+            current_msgs = []
+            tc = {"id": "t2", "function": {"name": "list_dir", "arguments": '{"path": "/tmp"}'}}
+            ok, events = asyncio.run(
+                _handle_tool_execution(tc, current_msgs, "sess-test", "latiao", "full"))
+            results = [str(e.get("result", "")) for e in events]
+            self.assertTrue(any("权限规则拒绝" in r for r in results), results)
+        finally:
+            _custom_permissions.pop()
 
 
 class TestGetApiUrlNeverEmpty(unittest.TestCase):
