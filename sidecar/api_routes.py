@@ -49,6 +49,7 @@ from agent_loop import (
     _load_custom_agents,
     _local_agent_loop_stream,
     _local_llm_serialized,
+    _local_llm_stream,
     _parse_native_tool_calls,
     _parse_prompt_tool_calls,
     _pending_confirmations,
@@ -212,9 +213,12 @@ async def chat_completion(request: Request):
                         async for event in _agent_loop_stream(messages, model, api_url, headers, session_id, agent_id, _reflection_mode, _access_mode):
                             yield f"data: {json.dumps(event)}\n\n"
                     yield "data: [DONE]\n\n"
-                except (httpx.ConnectError, httpx.RemoteProtocolError) as e:
+                except httpx.TransportError as e:
                     logger.error(f"Agent stream 连接错误: {type(e).__name__}: {e}", exc_info=True)
-                    yield f"data: {json.dumps({'error': '无法连接模型服务。请检查后端是否已启动。'})}\n\n"
+                    # 优先透传底层带指引的具体原因（手动停止/自动重载失败/外部引擎等），
+                    # 兜底才是无上下文的通用提示
+                    _msg = str(e).strip() or "无法连接模型服务。请检查后端是否已启动。"
+                    yield f"data: {json.dumps({'error': _msg}, ensure_ascii=False)}\n\n"
                     yield "data: [DONE]\n\n"
                 except httpx.HTTPStatusError as e:
                     # 记录 doubao/openai 等云端 API 返回的 HTTP 错误（429限流/401鉴权/500服务端）
@@ -418,32 +422,34 @@ async def chat_completion(request: Request):
             lm_body = {"model": model, "messages": msgs_for_model, "stream": True, "max_tokens": 2048, "temperature": 0.5, "frequency_penalty": 0.6, "stop": ["<|im_end|>", "<|endoftext|>"]}
             try:
                 async with httpx.AsyncClient(timeout=httpx.Timeout(120)) as c:
-                    # 本地引擎并发流式请求会崩溃 → 与 agent loop 共用串行锁
-                    async with _local_llm_serialized(api_url):
-                        async with c.stream("POST", api_url, json=lm_body, headers=headers) as r:
-                            r.raise_for_status()  # httpx 不自动抛 4xx/5xx，必须显式检查
-                            async for line in r.aiter_lines():
-                                if line and line.startswith("data: "):
-                                    data_str = line[6:]
-                                    if data_str == "[DONE]":
-                                        yield "data: [DONE]\n\n"
-                                        return
-                                    try:
-                                        event = json.loads(data_str)
-                                        delta = event.get("choices", [{}])[0].get("delta", {})
-                                        text = delta.get("content", "")
-                                        reasoning = delta.get("reasoning", "")
-                                        if reasoning:
-                                            yield f"data: {json.dumps({'content': reasoning})}\n\n"
-                                        if text:
-                                            yield f"data: {json.dumps({'content': text})}\n\n"
-                                    except (json.JSONDecodeError, KeyError, IndexError):
-                                        pass  # Malformed SSE event — skip, try next
-                                    except Exception:
-                                        logger.warning("Unexpected error in SSE stream fallback", exc_info=True)
-                                        raise
-            except (httpx.ConnectError, httpx.RemoteProtocolError):
-                yield f"data: {json.dumps({'error': '无法连接模型服务。请检查 LM Studio 或本地 LLM 是否已启动。'})}\n\n"
+                    # 复用 _local_llm_stream：内部含串行锁 + 引擎死亡时触发自动
+                    # 重载并排队等待（此前单次连接失败即报错，重载窗口内必秒死）。
+                    # 注意不能再包一层 _local_llm_serialized——锁不可重入会死锁。
+                    async with _local_llm_stream(c, api_url, lm_body, headers) as r:
+                        # raise_for_status 已由 _local_llm_stream 在 yield 前调用
+                        async for line in r.aiter_lines():
+                            if line and line.startswith("data: "):
+                                data_str = line[6:]
+                                if data_str == "[DONE]":
+                                    yield "data: [DONE]\n\n"
+                                    return
+                                try:
+                                    event = json.loads(data_str)
+                                    delta = event.get("choices", [{}])[0].get("delta", {})
+                                    text = delta.get("content", "")
+                                    reasoning = delta.get("reasoning", "")
+                                    if reasoning:
+                                        yield f"data: {json.dumps({'content': reasoning})}\n\n"
+                                    if text:
+                                        yield f"data: {json.dumps({'content': text})}\n\n"
+                                except (json.JSONDecodeError, KeyError, IndexError):
+                                    pass  # Malformed SSE event — skip, try next
+                                except Exception:
+                                    logger.warning("Unexpected error in SSE stream fallback", exc_info=True)
+                                    raise
+            except httpx.TransportError as e:
+                _msg = str(e).strip() or "无法连接模型服务。请检查 LM Studio 或本地 LLM 是否已启动。"
+                yield f"data: {json.dumps({'error': _msg}, ensure_ascii=False)}\n\n"
                 yield "data: [DONE]\n\n"
             except httpx.HTTPStatusError as e:
                 logger.error(f"Stream fallback HTTP {e.response.status_code}", exc_info=True)
@@ -1707,9 +1713,8 @@ async def api_marketplace(url: str = Query(default="")):
     """读取市场清单（默认官方市场；可选 url 覆盖）。"""
     try:
         from starlette.concurrency import run_in_threadpool
-        from extension_manager import fetch_marketplace
-        # 同步网络请求必须进线程池——阻塞事件循环会让 WebView 的
-        # fetch 等超时（"市场加载失败"的根因之一）
-        return await run_in_threadpool(fetch_marketplace, url)
+        from extension_manager import get_marketplace_cached
+        # 走预热缓存：命中即秒回；miss 才线程池拉取（不阻塞事件循环）
+        return await run_in_threadpool(get_marketplace_cached, url)
     except Exception as e:
         return {"status": "error", "message": str(e)}

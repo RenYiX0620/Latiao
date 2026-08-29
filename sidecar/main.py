@@ -425,6 +425,11 @@ async def lifespan(app: FastAPI):
     # Write PID file so the Rust process manager can find us (after _init_db creates dir)
     SIDECAR_PID = PROGRESS_DIR / "sidecar.pid"
     SIDECAR_PID.write_text(str(os.getpid()))
+    try:
+        from extension_manager import warm_market_cache
+        warm_market_cache()
+    except Exception:
+        logger.warning("市场预热启动失败", exc_info=True)
     cron_task = asyncio.create_task(_cron_loop())
     catchup_task = asyncio.create_task(run_cron_catchup())  # 补跑关闭期间错过的任务
     logger.info("Sidecar 启动 — cron loop started")

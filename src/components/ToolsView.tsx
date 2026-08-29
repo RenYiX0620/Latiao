@@ -49,13 +49,20 @@ export default function ToolsView({ tools, setTools, showToast }: ToolsViewProps
   const refreshMarket = useCallback(async () => {
     setMarketLoading(true);
     setMarketErr("");
-    try {
-      const resp = await authFetch("/v1/marketplace?url=");
-      const data = await resp.json();
-      if (data.status === "ok") setMarketPlugins(data.plugins || []);
-      else setMarketErr(data.message || "市场加载失败");
-    } catch (e) { console.error("市场加载失败:", e); setMarketErr("市场加载失败（" + String((e as Error)?.message || e) + "）"); }
-    finally { setMarketLoading(false); }
+    // 市场数据由 sidecar 启动时预热缓存，正常秒回；瞬时抖动自动重试一次
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const resp = await authFetch("/v1/marketplace?url=");
+        const data = await resp.json();
+        if (data.status === "ok") { setMarketPlugins(data.plugins || []); setMarketErr(""); break; }
+        setMarketErr(data.message || "市场加载失败");
+      } catch (e) {
+        console.error("市场加载失败(尝试" + (attempt + 1) + "):", e);
+        if (attempt === 0) { await new Promise(r => setTimeout(r, 800)); continue; }
+        setMarketErr("市场加载失败（" + String((e as Error)?.message || e) + "）");
+      }
+    }
+    setMarketLoading(false);
   }, []);
 
   useEffect(() => { refreshMarket(); }, [refreshMarket]);

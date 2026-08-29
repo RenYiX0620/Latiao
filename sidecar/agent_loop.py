@@ -216,7 +216,10 @@ async def _local_llm_stream(client, api_url: str, body: dict, headers: dict):
                         await asyncio.sleep(5)  # 5s × 72 = 最大约 6 分钟等待
                         continue
                     raise
-                except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError) as e:
+                except httpx.TransportError as e:
+                    # TransportError = ConnectError/ReadError/WriteError/
+                    # RemoteProtocolError/各超时的共同基类。引擎被杀可能表现为
+                    # 其中任何一种（实测 kill -9 在预填充期抛 ReadError）。
                     if _yielded:
                         # 流中途断裂（引擎被杀/系统压力/网络断）：生成器内不能重发，
                         # 抛出明确语义的异常，由 agent 循环的零交付重试接管
@@ -224,8 +227,8 @@ async def _local_llm_stream(client, api_url: str, body: dict, headers: dict):
                             "本地模型流中断（引擎死亡或连接断开）。"
                             "若本轮尚无输出，任务将自动等待引擎恢复并重试。"
                         ) from e
-                    if isinstance(e, httpx.ConnectError) and _local:
-                        # 连接被拒：判断有无恢复资源，决定快速失败还是排队等重载。
+                    if _local:
+                        # 判断有无恢复资源，决定快速失败还是排队等重载。
                         # 此前只要 _auto_reloading 未置位就秒死，而引擎几秒后
                         # 就能自动恢复（kill 与 reload 置位之间的竞态窗口）。
                         if not _own_engine:
@@ -2389,7 +2392,9 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                                     logger.error("Local agent SSE parse error", exc_info=True)
                                     raise
                     break
-                except httpx.RemoteProtocolError as e:
+                except httpx.TransportError as e:
+                    # 与 _local_llm_stream 同口径：任何传输层错误都算流中断。
+                    # 已有部分输出时重发会重复，直接抛出。
                     if streamed_text.strip() or _stream_break_retries >= 1:
                         raise
                     _stream_break_retries += 1
