@@ -57,12 +57,16 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
   const [extensions, setExtensions] = useState<ExtensionInfo[]>([]);
   const [installSrc, setInstallSrc] = useState("");
   const [installing, setInstalling] = useState(false);
-  const [confirming, setConfirming] = useState<{ source: string; sha256: string; permissions: string[] } | null>(null);
+  const [confirming, setConfirming] = useState<{ source: string; sha256: string; permissions: string[]; githubItem?: any; isGitHubItem?: boolean } | null>(null);
   // ── 市场 ──
   const [marketTab, setMarketTab] = useState<"market" | "installed">("market");
   const [marketPlugins, setMarketPlugins] = useState<any[]>([]);
   const [marketLoading, setMarketLoading] = useState(false);
   const [marketErr, setMarketErr] = useState("");
+  // ── 多市场源（Phase 1） ──
+  const [marketSources, setMarketSources] = useState<any[]>([]);
+  const [newSourceUrl, setNewSourceUrl] = useState("");
+  const [showSourceForm, setShowSourceForm] = useState(false);
   // ── 统一能力列表（工具与技能一个列表，不分栏） ──
   // ── 新建技能表单 ──
   const [newSkillName, setNewSkillName] = useState("");
@@ -76,12 +80,17 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
   const refreshMarket = useCallback(async () => {
     setMarketLoading(true);
     setMarketErr("");
-    // 市场数据由 sidecar 启动时预热缓存，正常秒回；瞬时抖动自动重试一次
+    // 聚合所有源（官方 marketplace + 生态源发现）；瞬时抖动自动重试一次
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        const resp = await authFetch("/v1/marketplace?url=");
+        const resp = await authFetch("/v1/marketplace/all");
         const data = await resp.json();
-        if (data.status === "ok") { setMarketPlugins(data.plugins || []); setMarketErr(""); break; }
+        if (data.status === "ok") {
+          setMarketPlugins(data.plugins || []);
+          const errs = data.errors || [];
+          setMarketErr(errs.length ? errs.join("；") : "");
+          break;
+        }
         setMarketErr(data.message || "市场加载失败");
       } catch (e) {
         console.error("市场加载失败(尝试" + (attempt + 1) + "):", e);
@@ -92,7 +101,15 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
     setMarketLoading(false);
   }, []);
 
-  useEffect(() => { refreshMarket(); }, [refreshMarket]);
+  const refreshSources = useCallback(async () => {
+    try {
+      const resp = await authFetch("/v1/marketplace/sources");
+      const data = await resp.json();
+      if (data.status === "ok") setMarketSources(data.sources || []);
+    } catch { /* 静默 */ }
+  }, []);
+
+  useEffect(() => { refreshMarket(); refreshSources(); }, [refreshMarket, refreshSources]);
 
   const refreshExtensions = useCallback(async () => {
     try {
@@ -128,10 +145,21 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
   const doInstall = async (source: string, sha256: string) => {
     setInstalling(true);
     try {
-      const resp = await authFetch("/v1/extensions/install", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ source, sha256 }),
-      });
+      // 生态源条目：download+pack 后安装（install-github）；否则走现有 install
+      const isGitHub = !!confirming?.isGitHubItem && confirming?.githubItem;
+      const resp = isGitHub
+        ? await authFetch("/v1/extensions/install-github", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              repo: confirming.githubItem.repo || confirming.githubItem.source_url,
+              skill_path: confirming.githubItem.skill_path || "",
+              kind: confirming.githubItem.source_kind || "openclaw-skill",
+            }),
+          })
+        : await authFetch("/v1/extensions/install", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ source, sha256 }),
+          });
       const data = await resp.json();
       if (data.status === "ok") {
         showToast(data.message || "已安装");
@@ -153,6 +181,44 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
 
   const installFromMarket = async (item: any) => {
     setConfirming({ source: item.source_url || "", sha256: item.sha256 || "", permissions: [] });
+  };
+
+  // ── 多市场源 & 生态安装（Phase 1） ──
+  const addSource = async () => {
+    if (!newSourceUrl.trim()) { showToast("请粘贴市场地址", "warn"); return; }
+    try {
+      const resp = await authFetch("/v1/marketplace/sources", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: newSourceUrl.trim() }),
+      });
+      const data = await resp.json();
+      if (data.status === "ok") { showToast(data.message || "已添加"); setNewSourceUrl(""); setShowSourceForm(false); refreshSources(); refreshMarket(); }
+      else { showToast(data.message || "添加失败", "warn"); }
+    } catch (e) { console.error(e); showToast("添加失败", "warn"); }
+  };
+
+  const removeSource = async (src: any) => {
+    if (src.builtin && src.removed === false) { showToast("内置源不可删除", "warn"); return; }
+    try {
+      const resp = await authFetch("/v1/marketplace/sources", {
+        method: "DELETE", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: src.url }),
+      });
+      const data = await resp.json();
+      if (data.status === "ok") { showToast(data.message || "已移除"); refreshSources(); refreshMarket(); }
+      else { showToast(data.message || "移除失败", "warn"); }
+    } catch (e) { console.error(e); showToast("移除失败", "warn"); }
+  };
+
+  // 生态条目安装：走 install-github（下载→打包→安装），复用确认流
+  const installGitHubItem = async (item: any) => {
+    setConfirming({
+      source: `生态源: ${item.repo || item.source_url}`,
+      sha256: item.sha256 || "",
+      permissions: item.permissions || [],
+      githubItem: item,
+      isGitHubItem: true,
+    });
   };
 
   const toggleExt = async (ext: ExtensionInfo) => {
@@ -288,40 +354,96 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
       </div>
 
       {marketTab === "market" && (
+      <>
+        {/* 市场源管理 */}
         <div className="card" style={{ marginBottom: 14 }}>
-          <div className="card-title" style={{ marginBottom: 8 }}>官方市场</div>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+            <div className="card-title" style={{ marginBottom: 0 }}>市场源</div>
+            <button className="btn btn-sm btn-ghost" onClick={() => setShowSourceForm(!showSourceForm)}>
+              {showSourceForm ? "取消" : "＋ 添加源"}
+            </button>
+          </div>
+          {showSourceForm && (
+            <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+              <input
+                className="text-input"
+                style={{ flex: 1 }}
+                placeholder="marketplace.json URL / GitHub 仓库（自动识别格式）"
+                value={newSourceUrl}
+                onChange={(e) => setNewSourceUrl(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter") addSource(); }}
+              />
+              <button className="btn btn-sm btn-primary" onClick={addSource}>添加</button>
+            </div>
+          )}
+          <div className="card-desc" style={{ marginTop: 8, fontSize: 11 }}>
+            官方市场是内置源；可添加任意 GitHub agent 仓库（OpenClaw 技能 / Claude Code 插件自动发现）或 marketplace.json 地址。
+          </div>
+          <div style={{ marginTop: 6 }}>
+            {marketSources.map((src) => (
+              <div key={src.id || src.url} style={{
+                display: "flex", alignItems: "center", gap: 8, padding: "5px 0",
+                borderBottom: "1px solid var(--border-default)",
+              }}>
+                <span style={{ fontSize: 12, fontWeight: 600 }}>{src.removed ? "(已忽略) " : ""}{src.name}</span>
+                <span className="badge badge-safe">{src.kind}</span>
+                <span style={{ flex: 1, fontSize: 10, color: "var(--text-muted)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {src.description || src.url}
+                </span>
+                {src.builtin ? (
+                  <span style={{ fontSize: 10, color: "var(--text-muted)" }}>内置</span>
+                ) : (
+                  <button className="btn-icon" style={{ fontSize: 12, color: "var(--danger)" }}
+                    onClick={() => removeSource(src)} title="移除源">✕</button>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* 聚合列表（按源分组） */}
+        <div className="card" style={{ marginBottom: 14 }}>
+          <div className="card-title" style={{ marginBottom: 8 }}>扩展市场</div>
           {marketLoading && <div className="card-desc">加载中…</div>}
           {marketErr && <div className="card-desc" style={{ color: "var(--danger)" }}>{marketErr}</div>}
           {!marketLoading && !marketErr && marketPlugins.length === 0 && (
-            <div className="card-desc">市场为空——等待官方扩展上架。已支持：粘贴 URL/GitHub 仓库/本地文件安装。</div>
+            <div className="card-desc">市场为空——等待官方扩展上架或添加 GitHub 源。已支持：粘贴 URL/GitHub 仓库/本地文件安装。</div>
           )}
-          {marketPlugins.map((item) => (
-            <div key={item.name} style={{
+          {marketPlugins.map((item) => {
+            const isEco = !!item.source_kind && item.source_kind !== "";
+            const onClick = isEco
+              ? () => installGitHubItem(item)
+              : () => (item.installed && item.update_available
+                  ? setConfirming({ source: item.source_url, sha256: item.sha256, permissions: [] })
+                  : installFromMarket(item));
+            return (
+            <div key={`${item.market_source}:${item.name}`} style={{
               display: "flex", alignItems: "center", gap: 10, padding: "8px 0",
               borderBottom: "1px solid var(--border-default)",
             }}>
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                  <span style={{ fontWeight: 650, fontSize: 13 }}>🧩 {item.name}</span>
+                  <span style={{ fontWeight: 650, fontSize: 13 }}>{isEco ? "🌐" : "🧩"} {item.display_name || item.name}</span>
                   <span className="badge badge-safe">v{item.version}</span>
+                  {item.market_source && <span className="badge badge-active">{item.market_source}</span>}
                   {item.update_available && <span className="badge badge-confirm">有更新</span>}
                 </div>
-                <div className="card-desc" style={{ marginTop: 2 }}>{item.description}</div>
+                <div className="card-desc" style={{ marginTop: 2 }}>{(item.description || "").slice(0, 140)}</div>
                 <div className="card-meta" style={{ marginTop: 2 }}>
                   {typeof item.author === "object" && item.author ? item.author.name || "" : ""}
                   {item.category ? ` · ${item.category}` : ""}
+                  {isEco ? ` · ${item.repo || ""}` : ""}
                 </div>
               </div>
-              <button className={`btn btn-sm ${item.installed ? "btn-ghost" : "btn-primary"}`}
+              <button className={`btn btn-sm ${item.installed && !item.update_available ? "btn-ghost" : "btn-primary"}`}
                 disabled={item.installed && !item.update_available}
-                onClick={() => item.installed && item.update_available
-                  ? setConfirming({ source: item.source_url, sha256: item.sha256, permissions: [] })
-                  : installFromMarket(item)}>
+                onClick={onClick}>
                 {item.update_available ? "更新" : item.installed ? "已安装" : "安装"}
               </button>
             </div>
-          ))}
+          )})}
         </div>
+      </>
       )}
 
       {marketTab === "installed" && (
@@ -354,7 +476,9 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
             {confirming.source}
           </div>
           <div className="card-desc" style={{ marginTop: 4 }}>
-            扩展包将获得其 manifest 声明的权限（只读/文件/网络/命令）。安装前请确认来源可信。
+            {confirming.isGitHubItem
+              ? `社区内容将打包为扩展安装（权限：${(confirming.permissions || []).join("/") || "只读"}）。安装前请确认来源可信。`
+              : "扩展包将获得其 manifest 声明的权限（只读/文件/网络/命令）。安装前请确认来源可信。"}
           </div>
           <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
             <button className="btn btn-primary" disabled={installing}

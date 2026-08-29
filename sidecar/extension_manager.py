@@ -33,6 +33,7 @@ logger = logging.getLogger("latiao-sidecar")
 
 EXTENSIONS_DIR = Path.home() / ".local-ai-os" / "extensions"
 INSTALLED_FILE = EXTENSIONS_DIR / ".installed.json"
+MARKET_SOURCES_FILE = Path.home() / ".local-ai-os" / "market_sources.json"
 
 _MAX_EXTRACT_BYTES = 50 * 1024 * 1024  # 50MB 上限，防 zip 炸弹
 
@@ -421,3 +422,301 @@ def set_extension_enabled(name: str, enabled: bool) -> dict:
     _save_installed(state)
     logger.info("扩展 %s 已%s", name, "启用" if enabled else "禁用")
     return {"status": "ok", "message": f"{name} 已{'启用' if enabled else '禁用'}"}
+
+
+# ═══════════════════════════════════════════════════════
+#  多市场源（Phase 1）：官方 + 用户自定义 + 生态仓库发现源
+# ═══════════════════════════════════════════════════════
+
+DEFAULT_SOURCES = [
+    {
+        "id": "official",
+        "name": "Latiao 官方",
+        "description": "官方扩展市场：工具/技能/子智能体组合包",
+        "url": DEFAULT_MARKETPLACE,
+        "kind": "marketplace",
+        "builtin": True,
+    },
+    {
+        "id": "openclaw-skills",
+        "name": "OpenClaw 技能库",
+        "description": "社区技能仓库（SKILL.md 格式，发现式浏览）",
+        "url": "https://github.com/21-DOT-DEV/openclaw-skills",
+        "kind": "openclaw",
+        "builtin": True,
+    },
+]
+
+
+def _load_sources() -> dict:
+    try:
+        if MARKET_SOURCES_FILE.exists():
+            data = json.loads(MARKET_SOURCES_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and isinstance(data.get("sources"), list):
+                return data
+    except (OSError, json.JSONDecodeError):
+        logger.warning("Failed to load market sources", exc_info=True)
+    return {"sources": []}
+
+
+def _save_sources(state: dict):
+    PROGRESS_DIR = Path.home() / ".local-ai-os"
+    PROGRESS_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = MARKET_SOURCES_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(MARKET_SOURCES_FILE)
+
+
+def list_market_sources() -> list[dict]:
+    """市场源列表：内置 + 用户添加。"""
+    state = _load_sources()
+    user_sources = state.get("sources", [])
+    builtin = [s for s in DEFAULT_SOURCES]
+    user_keys = {s.get("url") for s in user_sources}
+    for b in builtin:
+        if b["url"] in user_keys:
+            b["removed"] = True
+    return builtin + user_sources
+
+
+def add_market_source(url: str, name: str = "", kind: str = "") -> dict:
+    """添加市场源。url：marketplace.json URL 或 github 仓库地址（生态源自动识别）。"""
+    from adapters import parse_github_repo
+    url = (url or "").strip()
+    if not url:
+        return {"status": "error", "message": "url 不能为空"}
+    repo = parse_github_repo(url)
+    if repo and not kind:
+        kind = "openclaw"  # 会被 discover 自动细判，先按生态源
+    if not kind:
+        kind = "marketplace"
+    if not name:
+        name = repo or url.split("/")[-1].replace(".json", "")
+    state = _load_sources()
+    for s in state["sources"]:
+        if s.get("url") == url:
+            return {"status": "ok", "message": "源已存在", "source": s}
+    src = {"id": f"user-{len(state['sources'])+1}", "name": name, "description": "",
+           "url": url, "kind": kind, "builtin": False}
+    state["sources"].append(src)
+    _save_sources(state)
+    return {"status": "ok", "message": "已添加市场源", "source": src}
+
+
+def remove_market_source(url: str) -> dict:
+    state = _load_sources()
+    before = len(state["sources"])
+    state["sources"] = [s for s in state["sources"] if s.get("url") != url]
+    if len(state["sources"]) == before:
+        return {"status": "error", "message": "源不存在或不可删除（内置源）"}
+    _save_sources(state)
+    return {"status": "ok", "message": "已移除市场源"}
+
+
+def fetch_all_markets() -> dict:
+    """聚合所有源的条目（官方 marketplace + 生态源发现）。生态源走 adapters。"""
+    sources = list_market_sources()
+    merged = []
+    errors = []
+    for src in sources:
+        if src.get("removed"):
+            continue
+        try:
+            if src.get("kind") == "marketplace" or src["url"].endswith((".json", ".yaml", ".yml")):
+                data = fetch_marketplace(src["url"])
+                if data.get("status") == "ok":
+                    for p in data.get("plugins", []):
+                        p["market_source"] = src["name"]
+                        merged.append(p)
+                else:
+                    errors.append(f"{src['name']}: {data.get('message', '拉取失败')}")
+            else:
+                # 生态源：jsDelivr 树发现（openclaw / generic）
+                from adapters import discover_auto
+                data = discover_auto(src["url"])
+                if data.get("status") == "ok":
+                    for p in data.get("plugins", []):
+                        p["market_source"] = src["name"]
+                        merged.append(p)
+                else:
+                    errors.append(f"{src['name']}: {data.get('message', '发现失败')}")
+        except Exception as e:
+            logger.warning("fetch source %s failed", src.get("url"), exc_info=True)
+            errors.append(f"{src['name']}: {e}")
+    return {"status": "ok", "plugins": merged, "errors": errors, "count": len(merged)}
+
+
+def install_github_item(repo: str, skill_path: str = "", kind: str = "openclaw-skill") -> dict:
+    """安装生态源条目：下载/打包成 .latiaoext 走 install_extension。"""
+    from adapters import (install_openclaw_skill, install_claude_plugin,
+                          parse_github_repo)
+    repo = parse_github_repo(repo)
+    if not repo:
+        return {"status": "error", "message": f"无法识别仓库: {repo!r}"}
+    if kind.startswith("openclaw") and skill_path:
+        zip_bytes = install_openclaw_skill(repo, skill_path)
+    elif kind.startswith("claude"):
+        zip_bytes = install_claude_plugin(repo)
+    else:
+        zip_bytes = install_openclaw_skill(repo, skill_path) if skill_path else install_claude_plugin(repo)
+    if zip_bytes is None:
+        return {"status": "error", "message": "下载/打包失败（源不可达或格式不符）"}
+    import tempfile as _tf
+    label = skill_path or f"{repo}"
+    with _tf.TemporaryDirectory() as tmp:
+        p = Path(tmp) / "pkg.latiaoext"
+        p.write_bytes(zip_bytes)
+        result = install_extension(str(p), "", label=label)
+        return result
+
+
+# ═══════════════════════════════════════════════════════
+#  多市场源（Phase 1）：官方 + 用户自定义 + 生态仓库发现源
+# ═══════════════════════════════════════════════════════
+
+DEFAULT_SOURCES = [
+    {
+        "id": "official",
+        "name": "Latiao 官方",
+        "description": "官方扩展市场：工具/技能/子智能体组合包",
+        "url": DEFAULT_MARKETPLACE,
+        "kind": "marketplace",
+        "builtin": True,
+    },
+    {
+        "id": "openclaw-skills",
+        "name": "OpenClaw 技能库",
+        "description": "社区技能仓库（SKILL.md 格式，发现式浏览）",
+        "url": "https://github.com/21-DOT-DEV/openclaw-skills",
+        "kind": "openclaw",
+        "builtin": True,
+    },
+]
+
+
+def _load_sources() -> dict:
+    try:
+        if MARKET_SOURCES_FILE.exists():
+            data = json.loads(MARKET_SOURCES_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and isinstance(data.get("sources"), list):
+                return data
+    except (OSError, json.JSONDecodeError):
+        logger.warning("Failed to load market sources", exc_info=True)
+    return {"sources": []}
+
+
+def _save_sources(state: dict):
+    PROGRESS_DIR = Path.home() / ".local-ai-os"
+    PROGRESS_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = MARKET_SOURCES_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(MARKET_SOURCES_FILE)
+
+
+def list_market_sources() -> list[dict]:
+    """市场源列表：内置 + 用户添加。"""
+    state = _load_sources()
+    user_sources = state.get("sources", [])
+    user_urls = {s.get("url") for s in user_sources}
+    out = []
+    for s in DEFAULT_SOURCES:
+        s = dict(s)
+        s["removed"] = s["url"] in user_urls and \
+            any((u.get("removed") or u.get("state") == "removed") for u in user_sources if u.get("url") == s["url"])
+        out.append(s)
+    return out + [
+        {**u, "removed": False} for u in user_sources
+        if not (u.get("removed") or u.get("state") == "removed")
+    ]
+
+
+def add_market_source(url: str, name: str = "", kind: str = "") -> dict:
+    """添加市场源。url：marketplace.json URL 或 github 仓库地址（生态源自动识别）。"""
+    from adapters import parse_github_repo
+    url = (url or "").strip()
+    if not url:
+        return {"status": "error", "message": "url 不能为空"}
+    repo = parse_github_repo(url)
+    if repo and not kind:
+        kind = "openclaw"  # 会被 discover 自动细判，先按生态源
+    if not kind:
+        kind = "marketplace"
+    if not name:
+        name = repo or url.split("/")[-1].replace(".json", "")
+    state = _load_sources()
+    for s in state["sources"]:
+        if s.get("url") == url and s.get("state") != "removed":
+            return {"status": "ok", "message": "源已存在", "source": s}
+    src = {"id": f"user-{len(state['sources'])+1}", "name": name, "description": "",
+           "url": url, "kind": kind, "builtin": False}
+    state["sources"].append(src)
+    _save_sources(state)
+    return {"status": "ok", "message": "已添加市场源", "source": src}
+
+
+def remove_market_source(url: str) -> dict:
+    state = _load_sources()
+    before = len(state["sources"])
+    state["sources"] = [s for s in state["sources"] if s.get("url") != url]
+    if len(state["sources"]) == before:
+        return {"status": "error", "message": "源不存在或不可删除（内置源）"}
+    _save_sources(state)
+    return {"status": "ok", "message": "已移除市场源"}
+
+
+def fetch_all_markets() -> dict:
+    """聚合所有源的条目（官方 marketplace + 生态源发现）。生态源走 adapters。"""
+    sources = list_market_sources()
+    merged = []
+    errors = []
+    for src in sources:
+        if src.get("removed"):
+            continue
+        try:
+            if src.get("kind") == "marketplace" or src["url"].endswith((".json", ".yaml", ".yml")):
+                data = fetch_marketplace(src["url"])
+                if data.get("status") == "ok":
+                    for p in data.get("plugins", []):
+                        p["market_source"] = src["name"]
+                        merged.append(p)
+                else:
+                    errors.append(f"{src['name']}: {data.get('message', '拉取失败')}")
+            else:
+                # 生态源：jsDelivr 树发现（openclaw / generic）
+                from adapters import discover_auto
+                data = discover_auto(src["url"])
+                if data.get("status") == "ok":
+                    for p in data.get("plugins", []):
+                        p["market_source"] = src["name"]
+                        merged.append(p)
+                else:
+                    errors.append(f"{src['name']}: {data.get('message', '发现失败')}")
+        except Exception as e:
+            logger.warning("fetch source %s failed", src.get("url"), exc_info=True)
+            errors.append(f"{src['name']}: {e}")
+    return {"status": "ok", "plugins": merged, "errors": errors, "count": len(merged)}
+
+
+def install_github_item(repo: str, skill_path: str = "", kind: str = "openclaw-skill") -> dict:
+    """安装生态源条目：下载/打包成 .latiaoext 走 install_extension。"""
+    from adapters import (install_openclaw_skill, install_claude_plugin,
+                          parse_github_repo)
+    repo = parse_github_repo(repo)
+    if not repo:
+        return {"status": "error", "message": f"无法识别仓库: {repo!r}"}
+    if kind.startswith("openclaw") and skill_path:
+        zip_bytes = install_openclaw_skill(repo, skill_path)
+    elif kind.startswith("claude"):
+        zip_bytes = install_claude_plugin(repo)
+    else:
+        zip_bytes = (install_openclaw_skill(repo, skill_path) if skill_path
+                     else install_claude_plugin(repo))
+    if zip_bytes is None:
+        return {"status": "error", "message": "下载/打包失败（源不可达或格式不符）"}
+    import tempfile as _tf
+    label = skill_path or f"{repo}"
+    with _tf.TemporaryDirectory() as tmp:
+        p = Path(tmp) / "pkg.latiaoext"
+        p.write_bytes(zip_bytes)
+        result = install_extension(str(p), "", label=label)
+        return result

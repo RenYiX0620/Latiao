@@ -373,12 +373,14 @@ async def _hot_reload_extensions() -> dict:
     重新注册 MCP 工具——刚装完的扩展立即可用，无需重启（此前只写磁盘
     配置，插件/MCP 工具要重启才生效）。"""
     import agent_loop
-    from tool_system import (
+    # fallback 定义实际在 tool_executor（此前误 import tool_system，从未触发过
+    # 直至生态安装路径真正调用才暴露）
+    from tool_executor import (
         _FALLBACK_DISPATCH,
         _FALLBACK_PERMISSIONS,
         _FALLBACK_TOOLS,
-        load_plugins,
     )
+    from tool_system import load_plugins
     # 1) 能力表同步：技能三来源 + 工具注册表（prune 清理已卸载扩展的能力行）
     import capability_registry
     capability_registry.sync_skills()
