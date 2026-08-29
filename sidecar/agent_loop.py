@@ -654,6 +654,48 @@ TOOLS.append(_create_cron_def)
 TOOL_DISPATCH["create_cron"] = lambda a: _create_cron(a.get("schedule", "0 9 * * *"), a.get("task", ""))
 TOOL_PERMISSIONS["create_cron"] = "safe"
 
+# ── use_skill：统一能力模型的技能调用通道（ZCode 式按需加载）──
+# 技能正文存 capability_registry 表，运行时调用取全文；目录注入 system prompt。
+# 与普通工具走同一条执行/权限确认/计数通道，技能安全等级由 registry 解析。
+_use_skill_def = {
+    "type": "function",
+    "function": {
+        "name": "use_skill",
+        "description": "加载一个技能并获取其完整使用说明。执行特定领域任务（如代码审查、git 工作流、金融分析等）时，先调用本工具取得对应技能的完整指引，再按其执行。可用技能目录见系统提示。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "skill_name": {"type": "string", "description": "要加载的技能名（与系统提示技能目录中的名字一致）"},
+            },
+            "required": ["skill_name"],
+        },
+    },
+}
+TOOLS.append(_use_skill_def)
+
+
+def _dispatch_use_skill(args: dict) -> str:
+    """use_skill 分发：从 registry 取技能全文。未启用/不存在时返回可用目录。"""
+    import capability_registry
+    name = str(args.get("skill_name") or "").strip()
+    if not name:
+        return "错误: 缺少 skill_name 参数"
+    skill = capability_registry.get_skill_content(name)
+    if skill is None:
+        catalog = capability_registry.skill_catalog()
+        names = "、".join(s["name"] for s in catalog) or "(空)"
+        return f"技能 {name!r} 不存在或已禁用。当前可用技能: {names}"
+    return (
+        f"# 技能: {skill['name']}\n"
+        f"描述: {skill['description'] or '(无)'}\n"
+        f"安全等级: {skill['permission']}\n\n"
+        f"{skill['content']}"
+    )
+
+
+TOOL_DISPATCH["use_skill"] = _dispatch_use_skill
+TOOL_PERMISSIONS["use_skill"] = "safe"
+
 # 工具列表顺序 = 模型看到的"优先级"：搜索类模型明显倾向选靠前的工具。
 # 插件按文件名排序加载（bing_search.py < tavily_search.py），导致 tavily 永远排在
 # bing 之后，且 _cap_tools 按原序截断时 tavily_search 总被先切掉——模型根本没机会
@@ -663,10 +705,18 @@ _TOOL_PRIORITY = (
     "tavily_search", "web_search", "bing_search",
     "mx_query", "ak_finance",
     "open_app", "open_folder", "run_cmd",
-    "delegate_task", "create_cron",
+    "use_skill", "delegate_task", "create_cron",
 )
 _TOOL_RANK = {_name: _rank for _rank, _name in enumerate(_TOOL_PRIORITY)}
 TOOLS.sort(key=lambda _t: _TOOL_RANK.get(_t.get("function", {}).get("name", ""), len(_TOOL_RANK)))
+
+# 能力表初始同步（仅 upsert，不裁剪——MCP 工具稍后才加载）
+try:
+    import capability_registry as _cap_reg
+    _cap_reg.sync_tools(TOOLS, TOOL_PERMISSIONS, TOOL_DISPATCH, prune=False)
+    _cap_reg.sync_skills()
+except Exception:
+    logger.warning("capability sync at import failed", exc_info=True)
 
 
 # ── MCP 扩展：启用扩展声明 mcpServers → 动态注册远程工具 ──
@@ -770,6 +820,15 @@ async def execute_tool(tool_name: str, arguments: dict) -> str:
         return f"Error: Missing required argument {e} for tool '{tool_name}'"
     except Exception as e:
         return f"Error executing {tool_name}: {e}"
+
+    # ── 统一能力计数：工具与技能（use_skill）共用 capabilities 表 ──
+    try:
+        import capability_registry
+        capability_registry.bump_usage(tool_name)
+        if tool_name == "use_skill":
+            capability_registry.bump_usage(str(arguments.get("skill_name") or ""))
+    except Exception:
+        logger.debug("bump_usage failed for %s", tool_name, exc_info=True)
 
     # ── Feedback subsystem: post-execution verification ──
     if tool_name == "write_file":
@@ -1412,24 +1471,6 @@ async def _await_tool_confirmation(call_id: str, tool_name: str, args: dict) -> 
             _pending_confirmations.pop(call_id, None)
     return approved, events
 
-
-def _check_skill_permission(skill_name: str, args: dict) -> tuple[bool, list[dict], str]:
-    """Check skill permission level. Returns (need_confirm, events, confirm_prompt)."""
-    # SKILL_INDEX 由 main.py 门面持有 → 函数内 lazy import 避免循环依赖
-    from main import SKILL_INDEX
-    if skill_name not in SKILL_INDEX:
-        return False, [], ""
-    level = SKILL_INDEX[skill_name].get("security_level", "safe")
-    if level == "safe":
-        return False, [], ""
-    elif level == "confirm":
-        call_id = str(uuid.uuid4())
-        prompt = f"⚠️ 你正在使用 {skill_name} 技能，该操作会修改你的本地文件或访问外部服务，是否确认执行？"
-        events = [{"event": "tool_confirm", "call_id": call_id, "tool": skill_name, "args": args, "prompt": prompt}]
-        return True, events, prompt
-    elif level == "danger":
-        return True, [], f"⛔ {skill_name} 是高危技能，已被系统禁止调用，请联系管理员。"
-    return False, [], ""
 
 def _check_pre_hooks(tool_name: str, args: dict) -> tuple[bool, list[dict], str]:
     """Run pre-tool hooks. Returns (vetoed, events, result_if_vetoed)."""
@@ -2851,12 +2892,12 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
 # ║  _build_chat_messages, _resolve_api_target, etc.     ║
 # ╚══════════════════════════════════════════════════════╝
 
-def _build_chat_messages(body: dict, messages: list, matched_skill: str|None = None) -> list:
+def _build_chat_messages(body: dict, messages: list) -> list:
     """Assemble the full message array with identity, env, skills, agent, and image injections.
     All system prompts are merged into ONE message to work around a llama-cpp bug
     where multiple system messages cause empty responses."""
-    # 技能系统/提示词由 main.py 门面持有 → 函数内 lazy import 避免循环依赖
-    from main import SKILL_INDEX, _build_skill_prompt
+    # 技能目录由 capability_registry 提供（统一能力模型）→ lazy import 避免循环依赖
+    import capability_registry
     last_user_text = _extract_last_user_text(messages)
     intent_result = _process_identity_intents(last_user_text)
 
@@ -2909,20 +2950,19 @@ def _build_chat_messages(body: dict, messages: list, matched_skill: str|None = N
         f"- {env_labels['sh']}: {os.environ.get('SHELL', os.environ.get('COMSPEC', 'unknown'))}"
     )
 
-    # Matched skill
-    if matched_skill and matched_skill in SKILL_INDEX:
-        skill = SKILL_INDEX[matched_skill]
-        skill_intro = _get_localized_text(user_lang, {
-            "zh": {"use": f"你现在可以使用以下技能：{skill['name']}", "desc": f"技能说明：{skill['description']}", "level": f"技能安全等级：{skill.get('security_level', 'safe')}", "rules": f"技能使用规则：\n{skill['content']}", "follow": "请根据技能规则来回答用户的问题。"},
-            "en": {"use": f"You can now use this skill: {skill['name']}", "desc": f"Description: {skill['description']}", "level": f"Security level: {skill.get('security_level', 'safe')}", "rules": f"Rules:\n{skill['content']}", "follow": "Follow the skill rules when responding."},
-            "ja": {"use": f"次のスキルを使用できます：{skill['name']}", "desc": f"説明：{skill['description']}", "level": f"セキュリティレベル：{skill.get('security_level', 'safe')}", "rules": f"ルール：\n{skill['content']}", "follow": "スキルルールに従って回答してください。"},
+    # Skill catalog（统一能力模型）：只注入目录，模型按需调用 use_skill 取全文
+    _catalog = capability_registry.skill_catalog()
+    if _catalog:
+        catalog_label = _get_localized_text(user_lang, {
+            "zh": "## 可用技能（按需调用）",
+            "en": "## Available skills (load on demand)",
+            "ja": "## 利用可能なスキル（オンデマンド）",
         })
-        system_parts.append(f"{skill_intro['use']}\n{skill_intro['desc']}\n{skill_intro['level']}\n{skill_intro['rules']}\n{skill_intro['follow']}")
-
-    # Skill prompt
-    skill_prompt = _build_skill_prompt()
-    if skill_prompt:
-        system_parts.append(skill_prompt)
+        lines = [catalog_label, "执行以下领域的任务时，先调用 use_skill 工具获取对应技能的完整说明，再按其执行："]
+        for s in _catalog:
+            desc = (s.get("description") or "").strip()
+            lines.append(f"- **{s['name']}**: {desc[:120]}" if desc else f"- **{s['name']}**")
+        system_parts.append("\n".join(lines))
 
     # Goal mode / progressive delivery
     goal_mode = body.get("goal_mode", False)

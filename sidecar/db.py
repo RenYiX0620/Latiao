@@ -106,6 +106,26 @@ def _init_db():
                 "key, value, content='preferences', content_rowid='rowid')",
             ])
 
+        # ── 统一能力模型：工具与技能合并为一张能力表（capability registry）──
+        # kind: 'tool'（代码插件）| 'skill'（markdown 提示词）
+        # source: 'builtin' | 'extension:<名>' | 'user'
+        # 工具的执行代码仍在内存 dispatch，本表是其目录/开关/权限/计数的唯一事实源
+        # perm_override: 1 = 用户经 API 设置的权限覆盖（优先于插件默认 TOOL_PERMISSIONS）
+        _create_table(conn, "capabilities",
+            "name TEXT PRIMARY KEY, kind TEXT NOT NULL, display_name TEXT NOT NULL, "
+            "description TEXT DEFAULT '', definition TEXT DEFAULT '{}', "
+            "content TEXT DEFAULT '', permission TEXT DEFAULT 'safe', "
+            "perm_override INTEGER DEFAULT 0, "
+            "enabled INTEGER DEFAULT 1, source TEXT DEFAULT 'builtin', "
+            "source_path TEXT DEFAULT '', usage_count INTEGER DEFAULT 0, "
+            "created_at TEXT DEFAULT (datetime('now')), "
+            "updated_at TEXT DEFAULT (datetime('now'))")
+        # 兼容早期开发库：缺 perm_override 列时补上（幂等）
+        try:
+            conn.execute("ALTER TABLE capabilities ADD COLUMN perm_override INTEGER DEFAULT 0")
+        except Exception:
+            pass
+
         try:
             conn.execute("CREATE TABLE IF NOT EXISTS reflections ("
                 "id TEXT PRIMARY KEY, session_id TEXT NOT NULL, tool_name TEXT NOT NULL, "

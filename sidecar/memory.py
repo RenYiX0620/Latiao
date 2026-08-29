@@ -8,7 +8,8 @@ from datetime import datetime
 
 import httpx
 
-from config import LM_STUDIO_URL, SKILLS_DIR, SUBAGENT_MODEL
+from config import LM_STUDIO_URL, SUBAGENT_MODEL
+from capability_registry import USER_SKILLS_DIR
 from db import _db_write_lock
 
 logger = logging.getLogger(__name__)
@@ -548,16 +549,16 @@ async def _maybe_generate_skill(tool_name: str, args: dict, result: str):
             skill_content += f"\n## 注意事项\n\n- 此技能由 Agent 自动生成，基于 {len(rows)} 次成功调用\n"
             skill_content += "- 使用前请确认适用场景\n"
 
-        # Write to skills directory
+        # Write to user skills directory（统一能力模型：表为事实源，文件为持久载体）
         skill_key = re.sub(r'[^a-z0-9-]', '', skill_name.lower().replace(" ", "-"))[:40]
-        filepath = SKILLS_DIR / f"{skill_key}.md"
+        filepath = USER_SKILLS_DIR / f"{skill_key}.md"
         if not filepath.exists():
-            SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+            USER_SKILLS_DIR.mkdir(parents=True, exist_ok=True)
             filepath.write_text(skill_content, encoding="utf-8")
             logger.info("Auto-generated skill: %s (%d learnings)", skill_key, len(rows))
-            # Reload skills（写回 main 模块的全局缓存；函数内 lazy import 避免循环依赖）
-            import main
-            main._loaded_skills = main._load_skills()
+            # 重新同步能力表（函数内 lazy import 避免循环依赖）
+            import capability_registry
+            capability_registry.sync_skills()
     except Exception:
         logger.warning("Auto-skill generation failed for %s", tool_name, exc_info=True)
 
