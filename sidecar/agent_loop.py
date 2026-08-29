@@ -155,19 +155,15 @@ async def _local_llm_stream(client, api_url: str, body: dict, headers: dict):
             engine.mark_engine_busy()
             engine.mark_stream_enter()
         # 本流内是否已请求过重载（幂等守卫：防重载失败结束后被反复拉起）。
-        # 注意不能拿"入口时 _auto_reloading=True"做初值——那次重载可能中途
-        # 完成或失败，之后引擎再死就没人请求恢复了。
-        _reload_requested = False
-
+        # 注意不能做"本流只请求一次重载"的单发守卫：引擎可能反复挂起/404，
+        # 每个循环都需要重新杀+重载（15:41 事故：单发守卫让最后一轮杀完
+        # 引擎却不重载，端口空置任务永等）。防重复由 _request_reload 内部的
+        # _auto_reloading 同步标志保障。
         def _request_recovery_reload() -> bool:
-            nonlocal _reload_requested
-            if _reload_requested:
-                return False
             if (_own_engine and engine.current_model_id
                     and not getattr(engine, "_explicit_stop", False)
                     and not engine._auto_reloading
                     and engine.server_status not in ("starting", "error")):
-                _reload_requested = True
                 return engine._request_reload(engine.current_model_id)
             return False
 
@@ -184,7 +180,16 @@ async def _local_llm_stream(client, api_url: str, body: dict, headers: dict):
                         engine.server_status = "stopped"
                 except Exception:
                     pass
-                if not _request_recovery_reload():
+                if not _request_recovery_reload() and not engine._auto_reloading:
+                    # 重载无法进行：区分具体原因给出准确指引（重载进行中则
+                    # 落入下方等待-重试循环排队，不再秒死）
+                    if getattr(engine, "_explicit_stop", False):
+                        raise httpx.ConnectError(
+                            "本地模型已被手动停止，任务已中断。请到模型页重新加载模型后重发消息。")
+                    if engine.server_status == "error":
+                        raise httpx.ConnectError(
+                            f"本地模型自动重载失败（{(engine.status_message or '未知错误')[:120]}）。"
+                            "请到模型页检查模型。")
                     raise httpx.ConnectError(
                         "本地模型引擎状态异常，已自动停止。请到模型页重新加载模型。"
                     )
@@ -224,8 +229,22 @@ async def _local_llm_stream(client, api_url: str, body: dict, headers: dict):
                 except httpx.HTTPStatusError as e:
                     if _yielded:
                         raise  # 流中途断裂：生成器内不能重试（见函数注释）
-                    if e.response.status_code in (404, 503) and _attempt < 71:
+                    _status = e.response.status_code
+                    if _status in (404, 503) and _attempt < 71:
                         last_err = e
+                        # 本地引擎连续 404 = 引擎状态损坏（挂起的 404 变体，
+                        # 15:25 事故：模型明明加载着，迭代 2 却连续 6 分钟 404）。
+                        # 健康引擎对正确路径绝不会 404——连续 2 次后杀+重载，
+                        # 而不是空转 71×5s 后报"模型未就绪"。503 保持纯等待语义。
+                        if (_status == 404 and _local and _own_engine
+                                and _attempt >= 1 and not engine._auto_reloading):
+                            logger.warning("本地引擎连续 404，判定状态损坏，强制重载")
+                            try:
+                                engine._kill_port(engine.server_port)
+                                engine.server_status = "stopped"
+                            except Exception:
+                                pass
+                            _request_recovery_reload()
                         await asyncio.sleep(5)  # 5s × 72 = 最大约 6 分钟等待
                         continue
                     raise
@@ -1224,6 +1243,32 @@ def _sanitize_tool_messages(msgs: list[dict]) -> list[dict]:
     if pending_ids:  # 消息末尾仍有未响应的 tool_call
         for tid in pending_ids:
             out.append({"role": "tool", "tool_call_id": tid, "content": "[工具结果缺失，已自动补空]"})
+    return out
+
+
+def _merge_system_messages(messages: list) -> list:
+    """把所有 system 消息合并进开头的那一个（内容用空行连接）。
+
+    mlx_lm.server v0.31 只接受一个 system 消息且必须在最前面，任何位置的
+    第二个 system 都直接 404（"System message must be at the beginning"）。
+    nudge 轮在消息列表尾部追加 system（16:16 实测 roles=
+    [system, user, assistant, system] 全 404）——必须全部合并。
+    """
+    sys_contents = [str(m.get("content", "")) for m in messages if m.get("role") == "system"]
+    if not sys_contents:
+        return messages
+    merged_system = {"role": "system", "content": "\n\n".join(c for c in sys_contents if c)}
+    out = []
+    inserted = False
+    for m in messages:
+        if m.get("role") == "system":
+            if not inserted:
+                out.append(merged_system)
+                inserted = True
+            continue
+        out.append(m)
+    if not inserted:
+        out.insert(0, merged_system)
     return out
 
 
@@ -2345,6 +2390,12 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
             else:
                 loop_msgs.insert(0, {"role": "system", "content": current_prompt})
 
+            # mlx_lm.server v0.31 只接受一个 system 消息且必须在最前面，
+            # 多个 system 直接 404 "System message must be at the beginning"
+            # （15:25 后任务迭代 2+ 全部 404 的真凶：nudge 轮会追加第二个
+            # system 消息）。发送前把开头连续的 system 合并为一个。
+            loop_msgs = _merge_system_messages(loop_msgs)
+
             body = {
                 "model": model, "messages": loop_msgs,
                 "max_tokens": _resolve_max_tokens(model), "stream": True,
@@ -2372,11 +2423,38 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                         aiter = r.aiter_lines()
                         while True:
                             try:
-                                line = await asyncio.wait_for(anext(aiter), timeout=180)
+                                # 自适应停滞超时：本地引擎首 token（预填充）在
+                                # 正常时只需几秒，90s 足够覆盖长上下文；此后按
+                                # 180s 容忍长生成中的停顿。
+                                _stall_timeout = 90 if (not streamed_text.strip()
+                                                        and _raw_delta_count == 0) else 180
+                                line = await asyncio.wait_for(anext(aiter), timeout=_stall_timeout)
                             except asyncio.TimeoutError:
                                 _llm_suspect_since = _llm_suspect_since or time.monotonic()
+                                if not streamed_text.strip() and _is_local_llm_url(api_url):
+                                    # 零交付停滞 = 引擎挂起（接受连接但不出字，
+                                    # 15:10 事故同款）。杀掉+重载，并抛传输异常
+                                    # 让外层零交付重试接管：引擎恢复后本轮调用
+                                    # 自动重跑，任务不再以错误中断。
+                                    logger.warning(
+                                        "[LOCAL-AGENT] Iteration %s: 零交付停滞 %.0fs，"
+                                        "判定引擎挂起，强制重载后重试本轮",
+                                        iteration, _stall_timeout)
+                                    _eng = local_llm._engine
+                                    try:
+                                        _eng._kill_port(_eng.server_port)
+                                        _eng.server_status = "stopped"
+                                    except Exception:
+                                        pass
+                                    if (_eng.current_model_id
+                                            and not getattr(_eng, "_explicit_stop", False)
+                                            and not _eng._auto_reloading
+                                            and _eng.server_status != "error"):
+                                        _eng._request_reload(_eng.current_model_id)
+                                    raise httpx.ReadTimeout(
+                                        "本地模型输出停滞（引擎挂起），已自动重载，任务将自动重试。")
                                 raise TimeoutError(
-                                    f"本地模型输出停滞超 180 秒（模型可能过大或未加载完）：{model[:60]}"
+                                    f"本地模型输出停滞超 {_stall_timeout:.0f} 秒（模型可能过大或未加载完）：{model[:60]}"
                                 )
                             except StopAsyncIteration:
                                 break

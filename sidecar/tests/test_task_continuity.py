@@ -353,6 +353,48 @@ class TestAutoReloadClearsExplicitStop(unittest.TestCase):
         self.assertEqual(eng.server_status, "error")
 
 
+class TestMergeSystemMessages(unittest.TestCase):
+    """mlx_lm.server v0.31 只接受一个 system 且必须在最前面，任何位置的
+    第二个 system 都 404（"System message must be at the beginning"）。
+    nudge 轮在尾部追加 system 是任务迭代 2+ 全 404 的真凶（16:16 实测
+    roles=[system,user,assistant,system]）——所有 system 必须合并。"""
+
+    def test_merges_leading_systems(self):
+        from agent_loop import _merge_system_messages
+        msgs = [
+            {"role": "system", "content": "A"},
+            {"role": "system", "content": "B"},
+            {"role": "user", "content": "hi"},
+        ]
+        out = _merge_system_messages(msgs)
+        self.assertEqual(out[0], {"role": "system", "content": "A\n\nB"})
+        self.assertEqual([m.get("role") for m in out], ["system", "user"])
+
+    def test_merges_trailing_system(self):
+        """nudge 轮的真实形态：尾部 system 必须并入开头（16:16 事故）。"""
+        from agent_loop import _merge_system_messages
+        msgs = [
+            {"role": "system", "content": "A"},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "x"},
+            {"role": "system", "content": "不要写执行计划，直接行动。"},
+        ]
+        out = _merge_system_messages(msgs)
+        self.assertEqual([m.get("role") for m in out], ["system", "user", "assistant"])
+        self.assertIn("A", out[0]["content"])
+        self.assertIn("直接行动", out[0]["content"])
+
+    def test_single_system_unchanged(self):
+        from agent_loop import _merge_system_messages
+        msgs = [{"role": "system", "content": "A"}, {"role": "user", "content": "hi"}]
+        self.assertEqual(_merge_system_messages(msgs), msgs)
+
+    def test_no_system_unchanged(self):
+        from agent_loop import _merge_system_messages
+        msgs = [{"role": "user", "content": "hi"}]
+        self.assertEqual(_merge_system_messages(msgs), msgs)
+
+
 class TestGetApiUrlNeverEmpty(unittest.TestCase):
     """修复 1：端口活但引擎不健康时，get_api_url 不得返回空串。"""
 
