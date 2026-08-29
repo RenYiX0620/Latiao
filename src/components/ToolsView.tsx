@@ -63,8 +63,7 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
   const [marketPlugins, setMarketPlugins] = useState<any[]>([]);
   const [marketLoading, setMarketLoading] = useState(false);
   const [marketErr, setMarketErr] = useState("");
-  // ── 统一能力列表：筛选 chips（全部/工具/技能） ──
-  const [capFilter, setCapFilter] = useState<"all" | "tool" | "skill">("all");
+  // ── 统一能力列表（工具与技能一个列表，不分栏） ──
   // ── 新建技能表单 ──
   const [newSkillName, setNewSkillName] = useState("");
   const [newSkillContent, setNewSkillContent] = useState("");
@@ -269,7 +268,9 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
   const authorName = (a: ExtensionInfo["author"]) =>
     typeof a === "string" ? a : (a?.name || "");
 
-  const filtered = capabilities.filter(c => capFilter === "all" || c.kind === capFilter);
+  // 来源是唯一保留的区分信息：决定条目能否删除（只有自建可删）
+  const sourceLabel = (src: string) =>
+    src === "builtin" ? "内置" : src === "user" ? "自建" : src.replace(/^extension:/, "扩展·");
 
   return (
     <div>
@@ -398,33 +399,23 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
       </>
       )}
 
-      {/* ═══ 统一能力列表（工具 + 技能，一套系统） ═══ */}
+      {/* ═══ 统一能力列表（工具与技能，一个列表不分栏） ═══ */}
       <div className="page-header" style={{ margin: "18px 0 12px" }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          <div className="card-title" style={{ fontSize: 15 }}>⚙️ 能力</div>
-          <div className="tab-bar" style={{ marginBottom: 0 }}>
-            <button className={`tab-btn${capFilter === "all" ? " active" : ""}`} onClick={() => setCapFilter("all")}>全部</button>
-            <button className={`tab-btn${capFilter === "tool" ? " active" : ""}`} onClick={() => setCapFilter("tool")}>🔧 工具</button>
-            <button className={`tab-btn${capFilter === "skill" ? " active" : ""}`} onClick={() => setCapFilter("skill")}>📗 技能</button>
-          </div>
-        </div>
+        <div className="card-title" style={{ fontSize: 15 }}>⚙️ 能力</div>
         <div className="card-desc" style={{ marginTop: 4 }}>
-          工具与技能统一管理：启用开关、权限级别、使用次数共用一套能力表；技能由模型按需调用（use_skill）
+          工具与技能统一为一个能力列表：启用开关、权限级别、使用次数共用一套能力表；技能由模型按需调用（use_skill）
         </div>
       </div>
 
       <div className="card-grid">
-        {filtered.map((cap) => {
+        {capabilities.map((cap) => {
           const isTool = cap.kind === "tool";
           const permBadge = cap.permission === "safe" ? "badge-safe"
             : cap.permission === "confirm" ? "badge-confirm" : "badge-inactive";
           return (
           <div key={`${cap.kind}:${cap.name}`} className="card" style={cap.enabled ? {} : { opacity: 0.5 }}>
             <div className="card-title">
-              <span style={{ fontSize: 15 }}>{isTool ? "🔧" : "📗"}</span> {cap.display_name || cap.name}
-              <span className={`badge ${isTool ? "badge-safe" : "badge-active"}`} style={{ marginLeft: 4 }}>
-                {isTool ? "工具" : "技能"}
-              </span>
+              <span style={{ fontSize: 15 }}>⚙️</span> {cap.display_name || cap.name}
               <span className={`badge ${permBadge}`} style={{ marginLeft: 4 }}>
                 {CAP_PERM_LABEL[cap.permission] || cap.permission}
               </span>
@@ -432,7 +423,7 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
             </div>
             <div className="card-desc">{cap.description}</div>
             <div className="card-meta" style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-              <span>{t("tools.calls", { count: cap.usage_count })}</span>
+              <span>{t("tools.calls", { count: cap.usage_count })} · {sourceLabel(cap.source)}</span>
               <span style={{ fontSize: 10, color: "var(--text-muted)", fontFamily: "var(--font-mono)" }}>{cap.name}</span>
             </div>
             <div style={{ display: "flex", gap: 6, marginTop: 10 }}>
@@ -450,7 +441,7 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
             </div>
           </div>
         )})}
-        {filtered.length === 0 && (
+        {capabilities.length === 0 && (
           <div className="card" style={{ gridColumn: "1 / -1" }}>
             <div className="card-desc">没有匹配的能力条目。</div>
           </div>
