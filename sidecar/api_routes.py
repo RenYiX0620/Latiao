@@ -219,6 +219,11 @@ async def chat_completion(request: Request):
                         err_msg = f"模型服务返回错误 HTTP {e.response.status_code}"
                     yield f"data: {json.dumps({'error': err_msg})}\n\n"
                     yield "data: [DONE]\n\n"
+                except TimeoutError as e:
+                    # 复读循环截断 / 总时长看门狗等主动中止——正常收尾而非报错
+                    logger.warning(f"Agent stream 主动中止: {e}")
+                    yield f"data: {json.dumps({'content': f'\n\n⚠️ {e}'})}\n\n"
+                    yield "data: [DONE]\n\n"
                 except httpx.TimeoutException as e:
                     logger.error(f"Agent stream 超时: {type(e).__name__}: {e}", exc_info=True)
                     yield f"data: {json.dumps({'error': '模型服务响应超时，请检查网络或模型是否过大。'})}\n\n"

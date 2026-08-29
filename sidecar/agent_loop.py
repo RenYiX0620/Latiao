@@ -134,6 +134,7 @@ async def _local_llm_stream(client, api_url: str, body: dict, headers: dict):
         global _llm_suspect_since
         if _is_local_llm_url(api_url):
             local_llm._engine.mark_engine_busy()
+            local_llm._engine.mark_stream_enter()
         if _is_local_llm_url(api_url) and _llm_suspect_since is not None:
             ok = await _verify_llm_health(api_url)
             if not ok:
@@ -197,6 +198,7 @@ async def _local_llm_stream(client, api_url: str, body: dict, headers: dict):
                 raise last_err
         finally:
             if _is_local_llm_url(api_url):
+                local_llm._engine.mark_stream_exit()
                 local_llm._engine.mark_engine_idle()
 
 # ═══════════════════════════════════════════════════════
@@ -617,6 +619,38 @@ def _deduplicate_response(text: str) -> str:
         if m:
             return m.group(1).strip()
     return text
+
+
+def _detect_text_loop(text: str) -> bool:
+    """检测流式输出陷入复读循环（同一片段连续重复）。
+
+    本地小模型长生成时偶发：最后两三句话无限重复直到 max_tokens。
+    判定：取尾部窗口，若存在长度 ≥12 字符的片段在尾部连续重复 ≥3 次
+    （或尾部 200 字符内同一片段出现 ≥4 次），判为循环。
+    性能：只在流式累积每 ~2KB 时调用一次，非逐 token。"""
+    if not text or len(text) < 120:
+        return False
+    tail = text[-600:]
+    n = len(tail)
+    # 尝试所有可能的循环片段长度（12 ~ 100 字符）
+    for plen in range(12, min(100, n // 3) + 1):
+        piece = tail[-plen:]
+        if piece.strip() != piece or len(piece.strip()) < 12:
+            continue
+        # 该片段在尾部连续出现次数
+        count = 0
+        pos = n
+        while pos - plen >= 0 and tail[pos - plen:pos] == piece:
+            count += 1
+            pos -= plen
+        if count >= 3:
+            return True
+    # 兜底：短片段高频重复（如"好的，"×8）
+    import re as _re
+    m = _re.search(r"(.{6,40}?)(?:){4,}$", tail, _re.DOTALL)
+    if m:
+        return True
+    return False
 
 
 def _record_tool_call_db(session_id: str, tool_name: str, args: dict, result: str):
@@ -1548,6 +1582,12 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                                 # Anti-repetition: skip tokens once the first complete intro is detected
                                 if len(_deduplicate_response(streamed_text)) < len(streamed_text):
                                     continue
+                                # 复读循环检测（节流）
+                                _raw_delta_count += 1
+                                if _raw_delta_count % 40 == 0 and _detect_text_loop(streamed_text):
+                                    logger.warning("[AGENT] 检测到输出复读循环，截断生成")
+                                    yield {"content": "\n\n⚠️ 检测到输出重复，已自动截断。"}
+                                    raise TimeoutError("输出复读循环，已截断")
                                 # nudge 重试期间不再向用户重复输出已交付的文本
                                 if text_output_delivered:
                                     continue
@@ -2172,6 +2212,13 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                                 if text_output_delivered:
                                     continue
                                 yield {"content": content}
+                                # 复读循环检测（节流：每 ~2KB 一次）：本地小模型长生成
+                                # 偶发最后两句话无限重复，直 max_tokens 才停
+                                _raw_delta_count += 1
+                                if _raw_delta_count % 40 == 0 and _detect_text_loop(streamed_text):
+                                    logger.warning("[LOCAL-AGENT] 检测到输出复读循环，截断生成")
+                                    yield {"content": "\n\n⚠️ 检测到输出重复，已自动截断。"}
+                                    raise TimeoutError("输出复读循环，已截断")
                             elif reasoning:
                                 streamed_text += reasoning
                                 if len(_deduplicate_response(streamed_text)) < len(streamed_text):
