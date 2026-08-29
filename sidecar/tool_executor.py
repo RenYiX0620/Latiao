@@ -631,9 +631,9 @@ async def _delegate_task(agent_type: str, task: str, task_id: str | None = None)
                                         or targs.get("path") or targs.get("pattern") or "")[:60]
                             s["last_activity"] = f"{tname}: {brief}" if brief else tname
                             s["updated_at"] = _time.time()
-                        if perm == "deny":
-                            tres = "⛔ 工具已被权限系统阻止: " + tname
-                            logger.warning("Sub-agent attempted blocked tool: " + tname)
+                        if perm in ("deny", "danger", "blocked"):
+                            tres = f"⛔ 工具已被权限规则阻止（级别 {perm}）: " + tname
+                            logger.warning("Sub-agent attempted blocked tool: %s (%s)", tname, perm)
                         elif perm == "confirm":
                             tres = "⛔ 子 Agent 不能执行需要用户确认的工具 (" + tname + ")。跳过执行。"
                             logger.warning("Sub-agent blocked from confirm-level tool: " + tname)

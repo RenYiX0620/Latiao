@@ -375,8 +375,8 @@ async def _execute_cron_job(job: dict):
                         except json.JSONDecodeError:
                             tool_args = {}
                         perm = _resolve_permission(tool_name, tool_args)
-                        if perm in ("confirm", "danger"):
-                            result = f"⛔ Cron 任务不支持需要确认的操作: {tool_name}"
+                        if perm in ("confirm", "danger", "deny", "blocked"):
+                            result = f"⛔ Cron 任务不支持需要确认或被权限规则阻止的操作: {tool_name}（级别 {perm}）"
                         else:
                             result = await execute_tool(tool_name, tool_args)
                         if len(result) > 3000:

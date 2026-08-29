@@ -1471,6 +1471,18 @@ async def _handle_tool_execution(tc: dict, current_msgs: list, session_id: str,
         current_msgs.append({"role": "tool", "tool_call_id": call_id, "content": result})
         return True, [{"event": "tool_end", "call_id": call_id, "tool": tool_name, "result": result, "ts": int(time.time() * 1000)}]
 
+    # ── 权限规则拒绝（deny/danger）──
+    # 自定义权限规则返回 danger/deny 时必须拦截，此前落空直接执行——
+    # 权限语义严重不一致（实测 list_dir 设 danger 仍读到目录）
+    _perm_level = _resolve_permission(tool_name, args)
+    if _perm_level in ("deny", "danger", "blocked"):
+        result = (
+            f"⛔ 权限规则拒绝执行: {tool_name}（级别: {_perm_level}）。"
+            "如需执行，请在设置中调整该工具的权限规则后重试。"
+        )
+        current_msgs.append({"role": "tool", "tool_call_id": call_id, "content": result})
+        return True, [{"event": "tool_end", "call_id": call_id, "tool": tool_name, "result": result, "ts": int(time.time() * 1000)}]
+
     # ── User confirmation ──
     _access = _normalize_access(access_mode)
     _auto_edit_bypass = False
@@ -1482,7 +1494,7 @@ async def _handle_tool_execution(tc: dict, current_msgs: list, session_id: str,
         except Exception:
             _has_rule = False
         _auto_edit_bypass = not _has_rule
-    if _resolve_permission(tool_name, args) == "confirm" and not _auto_edit_bypass:
+    if _perm_level == "confirm" and not _auto_edit_bypass:
         approved, events = await _await_tool_confirmation(call_id, tool_name, args)
         if not approved:
             result = f"⛔ User denied this operation: {tool_name}"
@@ -1718,8 +1730,11 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
     iteration = 0
     text_only_streak = 0   # 与 local loop 对齐，消除空响应分支 (text_only_streak += 1) 的 NameError 崩溃
     text_output_delivered = False  # nudge 重试期间抑制已交付文本的重复流式输出
-    # 总时长看门狗：单次请求硬上限 15 分钟。此前模型服务器偶发 hold 连接
-    # 滴灌字节可绕过单次 read timeout（180s×N），用户面对 18 分钟无响应。
+    # 进展感知看门狗：无进展静默期硬上限 15 分钟。此前模型服务器偶发 hold
+    # 连接滴灌字节可绕过单次 read timeout（180s×N），用户面对 18 分钟无响应。
+    # 纯墙钟一刀切会误杀正常推进的长任务（如多轮深度研究），改为
+    # 每轮有实质进展（内容产出/工具执行）就顺延——只有连续 15 分钟
+    # 完全无进展才中止。
     loop_deadline = time.monotonic() + 900
 
     # ── Self-Learning: Heuristic extraction + learning_context via _build_chat_messages ──
@@ -1746,8 +1761,8 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
         while iteration < 50:  # hard cap at 50, dynamic exit via stagnation
             iteration += 1
             if time.monotonic() > loop_deadline:
-                logger.error("[AGENT] 总时长超 900s，中止任务")
-                yield {"content": "\n\n⚠️ 任务总时长超过 15 分钟上限，已中止。模型服务可能异常（如响应停滞）。可重试或检查网络。"}
+                logger.error("[AGENT] 连续 15 分钟无进展，中止任务")
+                yield {"content": "\n\n⚠️ 任务连续 15 分钟无进展（未产出内容或执行工具），已中止。模型服务可能异常（如响应停滞）。可重试或检查网络。"}
                 _track_progress(session_id, "stalled", "total_duration_limit")
                 return
             # Re-evaluate tool set every 3 iterations for multi-step tasks
@@ -1909,8 +1924,11 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
             if not tool_calls:
                 # 纯文本轮计入停滞计数（工具轮/完成轮会复位，P2-12）
                 _track_progress(session_id, "text_round", "text_only")
+                if streamed_text.strip():
+                    loop_deadline = time.monotonic() + 900  # 产出内容=实质进展，顺延看门狗
 
             if tool_calls:
+                loop_deadline = time.monotonic() + 900  # 实质进展：顺延无进展看门狗
                 _append_loop_log(f"Iteration {iteration}: found {len(tool_calls)} tool(s): {[tc.get('function',{}).get('name') for tc in tool_calls]}\n")
                 _track_progress(session_id, "tool_calling", f"{len(tool_calls)} tool(s)")
                 logger.info(f"[LOCAL-AGENT] Iteration {iteration}: {len(tool_calls)} tool(s) called, msgs_in_context={len(current_msgs)}")
@@ -2410,8 +2428,17 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
             break
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(120)) as client:
+        # 进展感知无进展看门狗（与云端循环同口径）：连续 15 分钟完全
+        # 无进展（未产出内容/未执行工具）才中止；正常推进的长时间
+        # 研究任务不受影响
+        _no_progress_deadline = time.monotonic() + 900
         while iteration < max_iterations:
             iteration += 1
+            if time.monotonic() > _no_progress_deadline:
+                logger.error("[LOCAL-AGENT] 连续 15 分钟无进展，中止任务")
+                yield {"content": "\n\n⚠️ 任务连续 15 分钟无进展，已中止。模型服务可能异常（如响应停滞）。可重试或检查网络。"}
+                _track_progress(session_id, "stalled", "total_duration_limit")
+                return
             _append_loop_log(f"Iteration {iteration}: current_msgs={len(current_msgs)}, roles={[m.get('role') for m in current_msgs[-5:]]}\n")
 
             # Build messages for this iteration: merge tools + current context
@@ -2629,6 +2656,7 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
             tool_names = {t.get("function", {}).get("name") for t in active_tools}
             tool_calls = [tc for tc in tool_calls if tc.get("function", {}).get("name") in tool_names]
             if tool_calls:
+                _no_progress_deadline = time.monotonic() + 900  # 工具执行=实质进展
                 _track_progress(session_id, "tool_calling", f"{len(tool_calls)} tool(s)")
 
                 # Add assistant message (cleaned text)
@@ -2672,6 +2700,8 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
             # No tool calls — pure text response done
             # 停滞计数：纯文本轮计入 stalled_rounds（工具轮/完成轮会复位，P2-12）
             _track_progress(session_id, "text_round", "text_only")
+            if streamed_text.strip():
+                _no_progress_deadline = time.monotonic() + 900  # 产出内容=实质进展
             # Check if there are pending tasks: if the last message is a tool result
             # and model didn't call another tool, it might have prematurely stopped
             has_recent_tool_result = any(

@@ -454,6 +454,44 @@ class TestStagnationCounterWired(unittest.TestCase):
         _session_states.pop(sid, None)
 
 
+class TestPermissionDangerBlocked(unittest.TestCase):
+    """权限漏洞回归：自定义规则返回 danger/deny 必须拦截执行。
+    此前主循环只拦 confirm，danger 规则落空直接执行（实测 list_dir
+    设 danger 仍读到目录内容）。"""
+
+    def test_danger_rule_blocks_tool(self):
+        import asyncio
+        from agent_loop import _handle_tool_execution
+        from main import _custom_permissions
+        _custom_permissions.append({"tool": "list_dir", "permission": "danger"})
+        try:
+            current_msgs = []
+            tc = {"id": "t1", "function": {"name": "list_dir", "arguments": '{"path": "/tmp"}'}}
+            ok, events = asyncio.run(
+                _handle_tool_execution(tc, current_msgs, "sess-test", "latiao", "full"))
+            results = [str(e.get("result", "")) for e in events]
+            self.assertTrue(any("权限规则拒绝" in r for r in results), results)
+            # 消息也必须回灌拒绝原因（模型能看到"被拒绝"）
+            self.assertTrue(any("权限规则拒绝" in str(m.get("content", "")) for m in current_msgs))
+        finally:
+            _custom_permissions.pop()
+
+    def test_deny_rule_blocks_tool(self):
+        import asyncio
+        from agent_loop import _handle_tool_execution
+        from main import _custom_permissions
+        _custom_permissions.append({"tool": "list_dir", "permission": "deny"})
+        try:
+            current_msgs = []
+            tc = {"id": "t2", "function": {"name": "list_dir", "arguments": '{"path": "/tmp"}'}}
+            ok, events = asyncio.run(
+                _handle_tool_execution(tc, current_msgs, "sess-test", "latiao", "full"))
+            results = [str(e.get("result", "")) for e in events]
+            self.assertTrue(any("权限规则拒绝" in r for r in results), results)
+        finally:
+            _custom_permissions.pop()
+
+
 class TestGetApiUrlNeverEmpty(unittest.TestCase):
     """修复 1：端口活但引擎不健康时，get_api_url 不得返回空串。"""
 

@@ -563,6 +563,39 @@ def _load_skills() -> list[dict]:
     return skills
 
 
+async def _hot_reload_extensions() -> dict:
+    """扩展安装/启停后的热重载：重建技能索引 + 原地重载插件注册表 +
+    重新注册 MCP 工具——刚装完的扩展立即可用，无需重启（此前只写磁盘
+    配置，插件/MCP 工具要重启才生效）。"""
+    import agent_loop
+    from tool_system import (
+        _FALLBACK_DISPATCH,
+        _FALLBACK_PERMISSIONS,
+        _FALLBACK_TOOLS,
+        load_plugins,
+    )
+    # 1) 技能索引原地重建
+    _load_skill_index()
+    # 2) 插件注册表原地重载。绝不能 rebind agent_loop.TOOLS——各模块
+    #    （main/api_routes/cron 等）持有 from agent_loop import TOOLS 的
+    #    旧引用，rebind 会让它们全部失效；原地 clear+extend 保持同一对象。
+    new_tools, new_dispatch, new_perms, new_hooks = load_plugins(
+        _FALLBACK_TOOLS, _FALLBACK_DISPATCH, _FALLBACK_PERMISSIONS)
+    agent_loop.TOOLS.clear()
+    agent_loop.TOOLS.extend(new_tools)
+    agent_loop.TOOL_DISPATCH.clear()
+    agent_loop.TOOL_DISPATCH.update(new_dispatch)
+    agent_loop.TOOL_PERMISSIONS.clear()
+    agent_loop.TOOL_PERMISSIONS.update(new_perms)
+    agent_loop.TOOL_HOOKS.clear()
+    agent_loop.TOOL_HOOKS.update(new_hooks)
+    # 3) MCP 远程工具重新注册
+    await agent_loop._load_mcp_tools()
+    logger.info("扩展热重载完成: %d 工具 / %d 技能",
+                len(agent_loop.TOOLS), len(SKILL_INDEX))
+    return {"status": "ok", "tools": len(agent_loop.TOOLS), "skills": len(SKILL_INDEX)}
+
+
 def _build_skill_prompt() -> str:
     """Build a lightweight skill directory for system prompt.
     Only injects name + description (progressive disclosure).
