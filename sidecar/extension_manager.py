@@ -514,10 +514,37 @@ def remove_market_source(url: str) -> dict:
 
 
 def fetch_all_markets() -> dict:
-    """聚合所有源的条目（官方 marketplace + 生态源发现）。生态源走 adapters。"""
+    """聚合所有源的条目（官方 marketplace + 生态源发现 + GitHub 自动发现索引）。
+    去重：统一 key = (repo, skill_path) 生态条目 / (name, version) marketplace，
+    首次出现者赢——避免同一技能被"手动源"+"GitHub 发现"重复展示。
+    已安装回填：生态条目按 name 匹配 .installed.json（name 相同视为已装）。"""
     sources = list_market_sources()
-    merged = []
+    merged: list[dict] = []
+    seen_keys: set[tuple] = set()
     errors = []
+    installed_records = {}
+    try:
+        state = _load_installed()
+        for rec in state.get("extensions", []):
+            installed_records[rec.get("name", "")] = rec
+    except Exception:
+        pass
+
+    def _append(p: dict):
+        # 统一 key
+        key: tuple
+        if p.get("repo") and p.get("skill_path"):
+            key = ("eco", p["repo"].lower(), p["skill_path"].strip().lower())
+        else:
+            key = ("mkt", p.get("name", ""), p.get("version", ""))
+        if key in seen_keys:
+            return  # 重复，跳过
+        seen_keys.add(key)
+        # 安装状态回填（生态条目无法按 exact name 定位时保守显示未装）
+        p["installed"] = bool(installed_records.get(str(p.get("name", ""))))
+        p["update_available"] = False
+        merged.append(p)
+
     for src in sources:
         if src.get("removed"):
             continue
@@ -527,7 +554,7 @@ def fetch_all_markets() -> dict:
                 if data.get("status") == "ok":
                     for p in data.get("plugins", []):
                         p["market_source"] = src["name"]
-                        merged.append(p)
+                        _append(p)
                 else:
                     errors.append(f"{src['name']}: {data.get('message', '拉取失败')}")
             else:
@@ -537,7 +564,7 @@ def fetch_all_markets() -> dict:
                 if data.get("status") == "ok":
                     for p in data.get("plugins", []):
                         p["market_source"] = src["name"]
-                        merged.append(p)
+                        _append(p)
                 else:
                     errors.append(f"{src['name']}: {data.get('message', '发现失败')}")
         except Exception as e:
@@ -549,7 +576,7 @@ def fetch_all_markets() -> dict:
         for p in get_discovered_entries():
             p = dict(p)
             p["market_source"] = "GitHub 发现"
-            merged.append(p)
+            _append(p)
     except Exception:
         logger.warning("discovery entries merge failed", exc_info=True)
     return {"status": "ok", "plugins": merged, "errors": errors, "count": len(merged)}

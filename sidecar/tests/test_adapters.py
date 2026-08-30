@@ -109,9 +109,11 @@ class TestDiscoverOpenclaw(unittest.TestCase):
 
 class TestInstallOpenclaw(unittest.TestCase):
     def test_pack_valid_zip(self):
-        with mock.patch("adapters._jsdelivr_file",
-                        return_value="---\nname: my-skill\ndescription: test\ndescription: z\n---\nstep 1\nstep 2"):
-            data = install_openclaw_skill("owner/repo", "skills/my-skill/SKILL.md")
+        with mock.patch("adapters._jsdelivr_tree",
+                        return_value=["skills/my-skill/SKILL.md"]):
+            with mock.patch("adapters._jsdelivr_file",
+                            return_value="---\nname: my-skill\ndescription: test\ndescription: z\n---\nstep 1\nstep 2"):
+                data = install_openclaw_skill("owner/repo", "skills/my-skill/SKILL.md")
         self.assertIsNotNone(data)
         with zipfile.ZipFile(io.BytesIO(data)) as zf:
             names = set(zf.namelist())
