@@ -395,12 +395,25 @@ def _get_agent_config(agent_id: str) -> dict:
 
 
 def _get_agent_tools(agent_id: str, all_tools: list[dict]) -> list[dict]:
-    """Filter tools based on agent's allowed tools. 'all' means all tools."""
+    """Filter tools based on agent's allowed tools. 'all' means all tools.
+
+    同时过滤 Tools 页被禁用的工具（capabilities.enabled=0）——此前禁用
+    开关只写库、agent 管线从不读，禁用 run_cmd 后模型照常执行
+    （审计 A1 安全项）。"""
     cfg = _get_agent_config(agent_id)
     allowed = cfg.get("tools", "all")
-    if allowed == "all":
-        return all_tools
-    return [t for t in all_tools if t.get("function", {}).get("name") in allowed]
+    if allowed != "all":
+        all_tools = [t for t in all_tools if t.get("function", {}).get("name") in allowed]
+    # 工具启用/禁用开关（惰性容错：capabilities 表未初始化时不过滤）
+    try:
+        from capability_registry import list_capabilities
+        disabled = {c.get("name") for c in list_capabilities("tool") if not c.get("enabled")}
+        if disabled:
+            all_tools = [t for t in all_tools
+                         if t.get("function", {}).get("name") not in disabled]
+    except Exception:
+        pass
+    return all_tools
 
 
 def _load_custom_agents() -> dict[str, dict]:
@@ -859,8 +872,44 @@ def _record_progress(entry: str):
         now = datetime.now().isoformat()
         with open(PROGRESS_FILE, "a", encoding="utf-8") as f:
             f.write(f"### {now}\n{entry}\n\n")
+        # 体积轮转（审计 B10）：append-only 已长到 1.1MB 且无上限。
+        # 超 1MB 时保留尾部 500KB——read_file 从头截断读最旧 5 万字符，
+        # 轮转同时保证最近进度仍在文件里（尾部注入读的也是最新段）
+        if PROGRESS_FILE.stat().st_size > 1024 * 1024:
+            _rotate_progress_file()
     except Exception:
         logger.warning("Failed to record progress", exc_info=True)
+
+
+def _rotate_progress_file():
+    """把 PROGRESS.md 截到最近 500KB（保留尾部，即最新进度）。"""
+    try:
+        keep = 500 * 1024
+        size = PROGRESS_FILE.stat().st_size
+        if size <= keep:
+            return
+        with open(PROGRESS_FILE, "rb") as f:
+            f.seek(size - keep)
+            tail = f.read()
+        with open(PROGRESS_FILE, "wb") as f:
+            f.write("(早期进度已轮转)\n\n".encode("utf-8") + tail)
+    except Exception:
+        logger.warning("PROGRESS 轮转失败", exc_info=True)
+
+
+def _progress_tail(max_chars: int = 2000) -> str:
+    """读取 PROGRESS.md 尾部（最新进度），用于注入 system prompt。"""
+    try:
+        if not PROGRESS_FILE.exists():
+            return ""
+        size = PROGRESS_FILE.stat().st_size
+        read = min(size, max_chars * 4)  # 多读些字节再截字符，中文占 3 字节
+        with open(PROGRESS_FILE, "rb") as f:
+            f.seek(max(0, size - read))
+            tail = f.read().decode("utf-8", errors="replace")
+        return tail[-max_chars:]
+    except Exception:
+        return ""
 
 
 
@@ -1138,10 +1187,10 @@ _PLAN_KEYWORDS = (
 
 def _should_plan(user_text: str, is_local: bool) -> bool:
     """复杂任务触发规划模式：任务关键词 + 消息够长。本地模型不触发（避免额外等待）。"""
-    if is_local or not user_text or len(user_text.strip()) < 30:
+    if is_local or not user_text:
         return False
-    t = user_text.lower()
-    return any(k in t for k in _PLAN_KEYWORDS)
+    # plan 访问档强制规划（此前档位对规划无任何影响，审计 A2）
+    return len(user_text.strip()) >= 30 and any(k in user_text.lower() for k in _PLAN_KEYWORDS)
 
 
 async def _generate_plan(user_text: str, model: str, api_url: str, headers: dict,
@@ -1556,7 +1605,11 @@ async def _handle_tool_execution(tc: dict, current_msgs: list, session_id: str,
         except Exception:
             _has_rule = False
         _auto_edit_bypass = not _has_rule
-    if _perm_level == "confirm" and not _auto_edit_bypass:
+    # full（完全访问）档：confirm 级工具免确认直接执行——此前 5 档中
+    # confirm/plan/full 三档无门控、与默认档完全等价（审计 A2）。
+    # danger/deny 规则拦截仍在上方生效，不受此豁免影响。
+    _full_bypass = (_access == "full")
+    if _perm_level == "confirm" and not _auto_edit_bypass and not _full_bypass:
         approved, events = await _await_tool_confirmation(call_id, tool_name, args)
         if not approved:
             result = f"⛔ User denied this operation: {tool_name}"
@@ -1813,7 +1866,7 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(120)) as client:
         # ── 规划模式：复杂任务先生成执行计划（显示给用户，按计划执行） ──
-        if _should_plan(last_user_text, _is_local_llm_url(api_url)):
+        if _should_plan(last_user_text, _is_local_llm_url(api_url)) or _normalize_access(access_mode) == "plan":
             _plan = await _generate_plan(last_user_text, model, api_url, headers, client)
             if _plan:
                 yield {"event": "agent_plan", "content": _plan}
@@ -1873,6 +1926,7 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
             reasoning_text = ""  # 累积 reasoning_content——DeepSeek 推理模型要求传回
             tool_call_bufs: dict[int, dict] = {}
             _raw_delta_count = 0  # 复读循环检测节流计数（每 40 个 delta 检查一次）
+            _dedup_fired = False  # 去重一次性截断标志（审计 A5）
 
             async with client.stream("POST", api_url, json=body, headers=headers) as r:
                 if r.status_code != 200:
@@ -1913,9 +1967,13 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                                     logger.warning("[AGENT] 检测到输出复读循环，截断生成")
                                     yield {"content": "\n\n⚠️ 检测到输出重复，已自动截断。"}
                                     raise TimeoutError("输出复读循环，已截断")
-                                # Anti-repetition: skip tokens once the first complete intro is detected
-                                if len(_deduplicate_response(streamed_text)) < len(streamed_text):
-                                    continue
+                                # 自我介绍去重：只截断一次，之后照常流式输出
+                                # （审计 A5：此前命中后永久吞掉后续真实内容）
+                                if not _dedup_fired:
+                                    _ded = _deduplicate_response(streamed_text)
+                                    if len(_ded) < len(streamed_text):
+                                        _dedup_fired = True
+                                        streamed_text = _ded + content
                                 if text_output_delivered:
                                     # 追问续写轮：替换上一条而非追加（重复堆叠修复）
                                     if _raw_delta_count % 40 == 0:
@@ -1937,8 +1995,11 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                                     logger.warning("[AGENT] 检测到输出复读循环，截断生成")
                                     yield {"content": "\n\n⚠️ 检测到输出重复，已自动截断。"}
                                     raise TimeoutError("输出复读循环，已截断")
-                                if len(_deduplicate_response(streamed_text)) < len(streamed_text):
-                                    continue
+                                if not _dedup_fired:
+                                    _ded = _deduplicate_response(streamed_text)
+                                    if len(_ded) < len(streamed_text):
+                                        _dedup_fired = True
+                                        streamed_text = _ded + reasoning
                                 if text_output_delivered:
                                     if _raw_delta_count % 40 == 0:
                                         yield {"event": "content_revised", "content": streamed_text}
@@ -2446,6 +2507,10 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
     _brief_answer_nudged = False  # "资料充足却短回答"的追问只触发一次，防死循环
     # Build tool prompt
     last_user_text = _extract_last_user_text(current_msgs)
+    # 学习提取与云端循环同口径（审计 B9）：此前只在云端入口调用，
+    # 纯本地用户偏好/知识永不入库，"记住你的偏好"完全失效
+    if last_user_text:
+        _extract_learnings_heuristic(last_user_text, session_id)
     agent_tools = _get_agent_tools(agent_id, TOOLS)
     active_tools = _filter_tools(last_user_text, agent_tools) if last_user_text else agent_tools
     active_tools = _filter_tools_by_access(active_tools, access_mode)
@@ -2560,6 +2625,7 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
             # "执行一半停止"。已有部分输出时重发会重复，直接抛出。
             _stream_break_retries = 0
             _any_output = False  # 本轮是否产出过 content/reasoning（role-only 空块不算，P1-6）
+            _dedup_fired = False  # 去重一次性截断标志（审计 A5：命中后不再永久吞输出）
             while True:
                 try:
                     async with _local_llm_stream(client, api_url, body, headers) as r:
@@ -2634,9 +2700,15 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                                             logger.warning("[LOCAL-AGENT] 检测到输出复读循环，截断生成")
                                             yield {"content": "\n\n⚠️ 检测到输出重复，已自动截断。"}
                                             raise TimeoutError("输出复读循环，已截断")
-                                        # Anti-repetition: skip tokens after the first complete intro
-                                        if len(_deduplicate_response(streamed_text)) < len(streamed_text):
-                                            continue
+                                        # 自我介绍去重：只截断一次，保留首段后继续流式
+                                        # 输出——此前命中后永久 continue，模型第二次
+                                        # "我是辣条"之后的所有真实内容被静默丢弃
+                                        # （审计 A5：用户在推理模型里看到回复停在中间）
+                                        if not _dedup_fired:
+                                            _ded = _deduplicate_response(streamed_text)
+                                            if len(_ded) < len(streamed_text):
+                                                _dedup_fired = True
+                                                streamed_text = _ded + content
                                         if text_output_delivered:
                                             # 追问续写轮：用替换事件更新上一条消息，
                                             # 不再追加新气泡（17:07/17:08 重复堆叠的修复）。
@@ -2653,8 +2725,11 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                                             logger.warning("[LOCAL-AGENT] 检测到输出复读循环，截断生成")
                                             yield {"content": "\n\n⚠️ 检测到输出重复，已自动截断。"}
                                             raise TimeoutError("输出复读循环，已截断")
-                                        if len(_deduplicate_response(streamed_text)) < len(streamed_text):
-                                            continue
+                                        if not _dedup_fired:
+                                            _ded = _deduplicate_response(streamed_text)
+                                            if len(_ded) < len(streamed_text):
+                                                _dedup_fired = True
+                                                streamed_text = _ded + reasoning
                                         if text_output_delivered:
                                             if _raw_delta_count % 40 == 0:
                                                 yield {"event": "content_revised", "content": streamed_text}
@@ -2687,6 +2762,7 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                         streamed_text = ""
                         _raw_delta_count = 0
                         _any_output = False
+                        _dedup_fired = False
                         _stream_break_retries += 1
                         await asyncio.sleep(10)
                         continue
@@ -2999,6 +3075,16 @@ def _build_chat_messages(body: dict, messages: list) -> list:
             desc = (s.get("description") or "").strip()
             lines.append(f"- **{s['name']}**: {desc[:120]}" if desc else f"- **{s['name']}**")
         system_parts.append("\n".join(lines))
+
+    # 上次会话进展（审计 B10）：PROGRESS.md 尾部注入，跨会话断点续作生效
+    _tail = _progress_tail()
+    if _tail.strip():
+        _pt_label = _get_localized_text(user_lang, {
+            "zh": "## 上次会话进展（最近记录）",
+            "en": "## Recent progress from previous sessions",
+            "ja": "## 前回セッションの進捗（最近の記録）",
+        })
+        system_parts.append(f"{_pt_label}:\n{_tail}\n（以上为历史记录，仅供参考；继续当前任务时请注意衔接。）")
 
     # Goal mode / progressive delivery
     goal_mode = body.get("goal_mode", False)

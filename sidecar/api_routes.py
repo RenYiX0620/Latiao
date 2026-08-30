@@ -204,7 +204,9 @@ async def chat_completion(request: Request):
                             yield f"data: {json.dumps(event)}\n\n"
                     else:
                         # 云端模型：原生 OpenAI function calling
-                        async for event in _agent_loop_stream(messages, model, api_url, headers, session_id, agent_id, _reflection_mode, _access_mode):
+                        # 此前漏传 thinking_level → 恒用默认 high，
+                        # UI 的 off/max 档对云端完全无效（审计 B6）
+                        async for event in _agent_loop_stream(messages, model, api_url, headers, session_id, agent_id, _reflection_mode, _access_mode, _thinking_level):
                             yield f"data: {json.dumps(event)}\n\n"
                     yield "data: [DONE]\n\n"
                 except httpx.TransportError as e:
@@ -929,6 +931,25 @@ async def search_learnings(q: str = Query(default="", min_length=0), limit: int 
         return {"status": "ok", "learnings": results, "query": q}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+
+@app.post("/v1/feedback")
+async def api_feedback(request: Request):
+    """点赞/点踩反馈 → 存入 learnings 表（高置信度），经既有 learnings
+    注入影响后续回复（审计 B12：此前反馈只写 localStorage，永不回流）。"""
+    body = await _json_body(request)
+    content = str(body.get("content", "")).strip()
+    kind = str(body.get("kind", ""))
+    if not content or kind not in ("up", "down"):
+        return {"status": "error", "message": "content and kind(up/down) required"}
+    try:
+        from memory import _store_learning
+        topic = "用户点赞的回答" if kind == "up" else "用户点踩的回答"
+        _store_learning("feedback", topic, content[:500],
+                        confidence=0.9, source_type="feedback")
+    except Exception:
+        logger.warning("feedback 存储失败", exc_info=True)
+    return {"status": "ok"}
 
 
 @app.post("/v1/memory/learn")

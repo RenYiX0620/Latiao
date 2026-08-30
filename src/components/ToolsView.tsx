@@ -72,6 +72,8 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
   const [discoverRefreshing, setDiscoverRefreshing] = useState(false);
   // ── 市场列表折叠（默认收起，890 条太长） ──
   const [marketCollapsed, setMarketCollapsed] = useState(false);
+  // ── 市场搜索（890 条过滤，纯前端） ──
+  const [marketQuery, setMarketQuery] = useState("");
   // ── 统一能力列表（工具与技能一个列表，不分栏） ──
   // ── 新建技能表单 ──
   const [newSkillName, setNewSkillName] = useState("");
@@ -364,6 +366,15 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
   const sourceLabel = (src: string) =>
     src === "builtin" ? "内置" : src === "user" ? "自建" : src.replace(/^extension:/, "扩展·");
 
+  // 市场搜索：按名称/描述/来源过滤（890 条纯前端，零压力）
+  const q = marketQuery.trim().toLowerCase();
+  const filteredPlugins = q
+    ? marketPlugins.filter((p) => {
+        const hay = `${p.display_name || p.name || ""} ${p.description || ""} ${p.market_source || ""} ${p.repo || ""}`.toLowerCase();
+        return hay.includes(q);
+      })
+    : marketPlugins;
+
   return (
     <div>
       {/* ═══ 扩展市场 ═══ */}
@@ -463,10 +474,29 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
           {!marketCollapsed && (<>
           {marketLoading && <div className="card-desc">加载中…</div>}
           {marketErr && <div className="card-desc" style={{ color: "var(--danger)" }}>{marketErr}</div>}
+          {/* 搜索框 */}
+          <div style={{ display: "flex", gap: 8, marginBottom: 8, marginTop: 10 }}>
+            <input
+              className="text-input"
+              style={{ flex: 1, fontSize: 12 }}
+              placeholder="搜索技能 / 插件 / 仓库…（名称、描述、来源）"
+              value={marketQuery}
+              onChange={(e) => setMarketQuery(e.target.value)}
+            />
+            {marketQuery && (
+              <button className="btn btn-xs btn-ghost" onClick={() => setMarketQuery("")}>清空</button>
+            )}
+          </div>
+          <div className="card-desc" style={{ marginBottom: 6, fontSize: 11 }}>
+            {marketPlugins.length} 条中匹配 <b style={{ color: "var(--accent)" }}>{filteredPlugins.length}</b> 条
+          </div>
           {!marketLoading && !marketErr && marketPlugins.length === 0 && (
             <div className="card-desc" style={{ marginTop: 8 }}>市场为空——等待官方扩展上架或添加 GitHub 源。已支持：粘贴 URL/GitHub 仓库/本地文件安装。</div>
           )}
-          {marketPlugins.map((item) => {
+          {filteredPlugins.length === 0 && marketPlugins.length > 0 && (
+            <div className="card-desc" style={{ marginTop: 8 }}>没有匹配"{marketQuery}"的内容。</div>
+          )}
+          {filteredPlugins.map((item) => {
             const isEco = !!item.source_kind && item.source_kind !== "";
             const onClick = isEco
               ? () => installGitHubItem(item)
@@ -526,26 +556,6 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
         </div>
       </div>
 
-      {/* 权限确认弹层 */}
-      {confirming && (
-        <div className="card" style={{ marginBottom: 14, borderLeft: "2px solid var(--warning)" }}>
-          <div className="card-title">⚠️ 确认安装来源</div>
-          <div className="card-desc" style={{ marginTop: 4, wordBreak: "break-all" }}>
-            {confirming.source}
-          </div>
-          <div className="card-desc" style={{ marginTop: 4 }}>
-            {confirming.isGitHubItem
-              ? `社区内容将打包为扩展安装（权限：${(confirming.permissions || []).join("/") || "只读"}）。安装前请确认来源可信。`
-              : "扩展包将获得其 manifest 声明的权限（只读/文件/网络/命令）。安装前请确认来源可信。"}
-          </div>
-          <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
-            <button className="btn btn-primary" disabled={installing}
-              onClick={() => doInstall(confirming.source, confirming.sha256)}>确认安装</button>
-            <button className="btn btn-ghost" onClick={() => setConfirming(null)}>取消</button>
-          </div>
-        </div>
-      )}
-
       <div className="card-grid">
         {extensions.map((ext) => (
           <div key={ext.name} className="card" style={ext.enabled ? {} : { opacity: 0.55 }}>
@@ -579,6 +589,26 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
         )}
       </div>
       </>
+      )}
+
+      {/* 权限确认弹层（市场/已安装 tab 共用，放公共位置） */}
+      {confirming && (
+        <div className="card" style={{ marginBottom: 14, borderLeft: "2px solid var(--warning)", background: "var(--bg-card)" }}>
+          <div className="card-title">⚠️ 确认安装来源</div>
+          <div className="card-desc" style={{ marginTop: 4, wordBreak: "break-all" }}>
+            {confirming.source}
+          </div>
+          <div className="card-desc" style={{ marginTop: 4 }}>
+            {confirming.isGitHubItem
+              ? `社区内容将打包为扩展安装（权限：${(confirming.permissions || []).join("/") || "只读"}）。安装前请确认来源可信。`
+              : "扩展包将获得其 manifest 声明的权限（只读/文件/网络/命令）。安装前请确认来源可信。"}
+          </div>
+          <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+            <button className="btn btn-primary" disabled={installing}
+              onClick={() => doInstall(confirming.source, confirming.sha256)}>确认安装</button>
+            <button className="btn btn-ghost" onClick={() => setConfirming(null)}>取消</button>
+          </div>
+        </div>
       )}
 
       {/* ═══ 统一能力列表（工具与技能，一个列表不分栏） ═══ */}

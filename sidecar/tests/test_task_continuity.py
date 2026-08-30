@@ -516,6 +516,71 @@ class TestMetaWrapupDetection(unittest.TestCase):
         self.assertFalse(_is_meta_wrapup("任务完成。" + "分析内容。" * 300))
 
 
+class TestDisabledToolsFiltered(unittest.TestCase):
+    """A1：Tools 页禁用的工具（capabilities.enabled=0）必须从 agent 管线
+    消失——此前禁用开关只写库、模型照样调用。"""
+
+    def test_disabled_tool_excluded(self):
+        import capability_registry
+        from agent_loop import _get_agent_tools
+        tools = [
+            {"function": {"name": "run_cmd"}},
+            {"function": {"name": "read_file"}},
+        ]
+        original = capability_registry.list_capabilities
+        capability_registry.list_capabilities = lambda kind=None: [
+            {"name": "run_cmd", "enabled": False, "kind": "tool"},
+            {"name": "read_file", "enabled": True, "kind": "tool"},
+        ]
+        try:
+            names = [t["function"]["name"] for t in _get_agent_tools("latiao", tools)]
+            self.assertNotIn("run_cmd", names)
+            self.assertIn("read_file", names)
+        finally:
+            capability_registry.list_capabilities = original
+
+
+class TestFullModeSkipsConfirmation(unittest.TestCase):
+    """A2：full（完全访问）档下 confirm 级工具免确认直接执行；
+    confirm 档仍走确认流程（此前两档行为完全等价）。"""
+
+    def _run_tool(self, access_mode):
+        import asyncio
+        import tempfile
+        import os
+        from agent_loop import _handle_tool_execution
+        tmp = tempfile.mkdtemp()
+        target = os.path.join(tmp, "out.txt")
+        calls = {"n": 0}
+
+        async def fake_confirm(call_id, tool_name, args):
+            calls["n"] += 1
+            return False, [{"event": "tool_confirm", "call_id": call_id}]
+
+        import agent_loop as al
+        original = al._await_tool_confirmation
+        al._await_tool_confirmation = fake_confirm
+        try:
+            tc = {"id": "t1", "function": {
+                "name": "write_file",
+                "arguments": '{"path": "%s", "content": "hello"}' % target}}
+            ok, events = asyncio.run(
+                _handle_tool_execution(tc, [], "sess", "latiao", access_mode))
+        finally:
+            al._await_tool_confirmation = original
+        return calls["n"], os.path.exists(target), events
+
+    def test_full_mode_executes_without_confirmation(self):
+        n, exists, events = self._run_tool("full")
+        self.assertEqual(n, 0)      # 不弹确认
+        self.assertTrue(exists)     # 真实执行了
+
+    def test_confirm_mode_still_confirms(self):
+        n, exists, events = self._run_tool("confirm")
+        self.assertEqual(n, 1)      # 走了确认流程
+        self.assertFalse(exists)    # 确认被 mock 拒绝 → 未执行
+
+
 class TestGetApiUrlNeverEmpty(unittest.TestCase):
     """修复 1：端口活但引擎不健康时，get_api_url 不得返回空串。"""
 
