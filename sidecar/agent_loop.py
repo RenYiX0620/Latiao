@@ -717,6 +717,9 @@ _TOOL_PRIORITY = (
     "read_file", "write_file", "list_dir", "search_files",
     "tavily_search", "web_search", "bing_search",
     "mx_query", "ak_finance",
+    "screen_capture", "control_list_processes", "control_process_log", "control_audit",
+    "control_wait", "control_launch", "control_mouse_move", "control_mouse_click",
+    "control_keyboard_type", "control_keyboard_press", "control_kill_process",
     "open_app", "open_folder", "run_cmd",
     "use_skill", "delegate_task", "create_cron",
 )
@@ -1862,7 +1865,7 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
     active_tools = _filter_tools_by_access(active_tools, access_mode)
     # Cap tools to prevent overflowing model context
     if len(active_tools) > 5:
-        active_tools = _cap_tools(active_tools, 5)
+        active_tools = _cap_tools(active_tools, 8)
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(120)) as client:
         # ── 规划模式：复杂任务先生成执行计划（显示给用户，按计划执行） ──
@@ -1884,7 +1887,7 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
             if iteration > 1 and iteration % 3 == 0:
                 # 恢复全量工具，但仍须套用权限过滤（read_only 等模式不可绕过）
                 # （本函数为云端循环，无 is_local 变量；本地循环独立实现）
-                active_tools = _cap_tools(_filter_tools_by_access(agent_tools, access_mode), 5)
+                active_tools = _cap_tools(_filter_tools_by_access(agent_tools, access_mode), 8)
             # ── Auto-Fix: if last verify failed, include error context ──
             if last_verify_failed and retry_count < max_retries:
                 current_msgs.append({
@@ -2515,7 +2518,7 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
     active_tools = _filter_tools(last_user_text, agent_tools) if last_user_text else agent_tools
     active_tools = _filter_tools_by_access(active_tools, access_mode)
     if len(active_tools) > 8:
-        active_tools = _cap_tools(active_tools, 8)
+        active_tools = _cap_tools(active_tools, 12)
     tools_prompt = _build_local_tools_prompt(active_tools)
     # 4B-class models often have only ~8K ctx. If the system prompt + tool list
     # blows past it, llama.cpp silently truncates the prompt and the model
