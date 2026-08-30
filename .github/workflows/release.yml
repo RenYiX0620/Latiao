@@ -133,12 +133,19 @@ jobs:
         run: |
           $headers = @{ "User-Agent" = "Latiao-CI" }
           $release = Invoke-RestMethod -Uri "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest" -Headers $headers
-          $tag = $release.tag_name
-          $zipUrl = "https://github.com/ggml-org/llama.cpp/releases/download/$tag/llama-$tag-bin-win-cpu-x64.zip"
-          Invoke-WebRequest -Uri $zipUrl -OutFile "$env:RUNNER_TEMP\llama.zip"
+          # 上游资产命名时有变化，从 assets 列表动态匹配 win-cpu x64 zip
+          $asset = $release.assets | Where-Object { $_.name -like "*bin-win-cpu-x64*.zip" } | Select-Object -First 1
+          if (-not $asset) {
+            $asset = $release.assets | Where-Object { $_.name -like "*bin-win-x64*.zip" } | Select-Object -First 1
+          }
+          if (-not $asset) { Write-Error "llama.cpp release $($release.tag_name) 无 win x64 zip 资产"; exit 1 }
+          Write-Host "Downloading: $($asset.name)"
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile "$env:RUNNER_TEMP\llama.zip"
           Expand-Archive -Path "$env:RUNNER_TEMP\llama.zip" -DestinationPath "$env:RUNNER_TEMP\llama" -Force
           $exe = Get-ChildItem -Path "$env:RUNNER_TEMP\llama" -Recurse -Filter "llama-server.exe" | Select-Object -First 1
+          if (-not $exe) { Write-Error "zip 内未找到 llama-server.exe"; exit 1 }
           Copy-Item $exe.FullName -Destination "sidecar\llama-server.exe" -Force
+          Write-Host "llama-server.exe ready: $($exe.FullName)"
 
       - name: Build Tauri (NSIS + MSI，updater 自动签名)
         env:
