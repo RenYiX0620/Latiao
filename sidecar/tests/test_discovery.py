@@ -304,3 +304,64 @@ class TestMarketDedup(unittest.TestCase):
                         return_value={"extensions": [{"name": "installed-skill", "version": "1"}]}):
             out = extension_manager.fetch_all_markets()
         self.assertEqual(out["plugins"][0]["installed"], True)
+
+
+class TestClaudePluginAndDeps(unittest.TestCase):
+    """Claude 插件发现 + 外部依赖标注。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._old_index = discovery.INDEX_FILE
+        discovery.INDEX_FILE = Path(self._tmp.name) / "idx.json"
+        discovery.CACHE_FILE = Path(self._tmp.name) / "cach.json"
+
+    def tearDown(self):
+        discovery.INDEX_FILE = self._old_index
+        self._tmp.cleanup()
+
+    def _make_zip(self, with_plugin=True, with_skill=True):
+        import io, json as j, zipfile
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            if with_plugin:
+                zf.writestr("repo-main/.claude-plugin/plugin.json", j.dumps(
+                    {"name": "my-plugin", "version": "2.0.0",
+                     "description": "A plugin", "author": {"name": "me"}}))
+            if with_skill:
+                zf.writestr("repo-main/skills/code/SKILL.md",
+                            "---\nname: code\n---\n# CR\n")
+        return buf.getvalue()
+
+    @mock.patch("discovery._jsdelivr_tree")
+    @mock.patch("discovery._codeload_zip")
+    def test_claude_plugin_discovered(self, mock_zip, mock_tree):
+        mock_tree.return_value = [".claude-plugin/plugin.json", "skills/code/SKILL.md"]
+        mock_zip.return_value = self._make_zip()
+        entries = discovery._scan_repo("me/plugin", force=True)
+        kinds = [e["source_kind"] for e in entries]
+        self.assertIn("claude-plugin", kinds)
+        claude = next(e for e in entries if e["source_kind"] == "claude-plugin")
+        self.assertEqual(claude["name"], "my-plugin")
+        self.assertEqual(claude["version"], "2.0.0")
+
+    @mock.patch("discovery._jsdelivr_tree")
+    @mock.patch("discovery._codeload_zip")
+    def test_external_deps_marked(self, mock_zip, mock_tree):
+        mock_tree.return_value = ["skills/notion/SKILL.md"]
+        buf = io.BytesIO()
+        import zipfile
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("repo-main/skills/notion/SKILL.md",
+                        "---\nname: notion\ndescription: x\nrequires:\n  bins: [ntask]\n---\nbody")
+        mock_zip.return_value = buf.getvalue()
+        entries = discovery._scan_repo("me/notion", force=True)
+        self.assertEqual(len(entries), 1)
+        self.assertTrue(entries[0]["external_deps"])
+
+    def test_has_external_deps_variants(self):
+        self.assertTrue(discovery._has_external_deps({"requires": {"bins": ["x"]}}))
+        self.assertTrue(discovery._has_external_deps({"requires": {"anyBins": ["x"]}}))
+        self.assertTrue(discovery._has_external_deps({"install": "brew install x"}))
+        self.assertTrue(discovery._has_external_deps({"primaryEnv": "API_KEY"}))
+        self.assertTrue(discovery._has_external_deps({"envVars": {"X": {"required": True}}}))
+        self.assertFalse(discovery._has_external_deps({"name": "x", "description": "y"}))

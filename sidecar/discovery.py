@@ -397,21 +397,69 @@ def _collect_candidates() -> dict[str, dict]:
     return out
 
 
+def _has_external_deps(front: dict) -> bool:
+    """检测技能是否依赖外部工具/CLI/API（requires.bins/install/primaryEnv/envVars）。"""
+    requires = front.get("requires") or {}
+    if isinstance(requires, dict):
+        if requires.get("bins") or requires.get("anyBins"):
+            return True
+    return bool(front.get("install") or front.get("primaryEnv") or front.get("envVars"))
+
+
+def _scan_claude_plugin(repo: str, zip_files: dict[str, bytes]) -> list[dict]:
+    """从仓库 zip 中解析 .claude-plugin/plugin.json 生成 Claude 插件条目。"""
+    # 找一个 .claude-plugin/plugin.json（可能带 repo-main/ 前缀）
+    plugin_json_rel = None
+    for n in zip_files:
+        if n.endswith(".claude-plugin/plugin.json"):
+            plugin_json_rel = n
+            break
+    if plugin_json_rel is None:
+        return []
+    try:
+        data = json.loads(zip_files[plugin_json_rel].decode("utf-8", "ignore"))
+    except Exception:
+        logger.warning("claude plugin.json parse failed %s", repo, exc_info=True)
+        return []
+    if not isinstance(data, dict) or not data.get("name"):
+        return []
+    author = data.get("author", {})
+    if isinstance(author, dict):
+        author = {"name": author.get("name", repo.split("/")[0])}
+    else:
+        author = {"name": str(author or repo.split("/")[0])}
+    return [{
+        "name": _safe_name(str(data.get("name"))),
+        "display_name": str(data.get("name")),
+        "version": str(data.get("version") or "1.0.0"),
+        "description": str(data.get("description") or "Claude Code 插件"),
+        "author": author,
+        "category": "claude-plugin",
+        "source_url": f"https://github.com/{repo}",
+        "source_kind": "claude-plugin",
+        "repo": repo,
+        "skill_path": "",
+        "permissions": ["readonly"],
+        "sha256": "",
+        "external_deps": False,
+    }]
+
+
 def _scan_repo(repo: str, force: bool = False) -> list[dict]:
     """扫描单个仓库：jsDelivr 树（秒级，判有无技能）→ codeload 整仓 zip（1-15s）
-    → 本地解压抽 SKILL.md → 条目。避免逐文件网络读（此前主瓶颈）。"""
+    → 本地解压抽 SKILL.md → 条目；同时识别 .claude-plugin/plugin.json → Claude 插件条目。"""
     paths = _jsdelivr_tree(repo)
     if paths is None:
         return []
     entries_spec = _has_skill_patterns(paths)
-    if not entries_spec:
+    has_claude = any(".claude-plugin/plugin.json" in p.lower() for p in paths)
+    if not entries_spec and not has_claude:
         return []
     # 先取内容相关指纹：路径指纹 + 已缓存内容 hash（无内容 hash 时用路径指纹先判）
     cache = _load_cache()
     if not force:
         cached = cache.get("fingerprints", {}).get(repo, "")
         if cached and cached.split("-")[0] == _fingerprint(paths):
-            # 路径未变且原指纹无内容段 → 旧仓库直接跳过；有内容段则仍需读内容比对新指纹
             if "-" not in cached:
                 return []  # 旧指纹（仅路径），未变
     # 一次 codeload 整仓 zip（1-16s，无重定向坑），本地解压抽 SKILL.md 解析 frontmatter
@@ -423,7 +471,7 @@ def _scan_repo(repo: str, force: bool = False) -> list[dict]:
         with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
             for info in zf.infolist():
                 name = info.filename.replace("\\", "/")
-                if name.lower().endswith("skill.md"):
+                if name.lower().endswith("skill.md") or ".claude-plugin/plugin.json" in name.lower():
                     files[name] = zf.read(info)
     except Exception:
         logger.warning("discovery zip parse failed %s", repo, exc_info=True)
@@ -464,7 +512,11 @@ def _scan_repo(repo: str, force: bool = False) -> list[dict]:
             "skill_path": spec["skill_path"],
             "permissions": _infer_permissions(meta),
             "sha256": "",
+            "external_deps": _has_external_deps(meta),
         })
+    # Claude 插件条目叠加（若存在 plugin.json）
+    if has_claude:
+        entries.extend(_scan_claude_plugin(repo, files))
     cache.setdefault("fingerprints", {})[repo] = fp
     _save_cache(cache)
     return entries

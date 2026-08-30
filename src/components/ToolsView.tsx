@@ -537,6 +537,7 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
                   <span className="badge badge-safe">v{item.version}</span>
                   {item.market_source && <span className="badge badge-active">{item.market_source}</span>}
                   {item.update_available && <span className="badge badge-confirm">有更新</span>}
+                  {item.external_deps && <span className="badge badge-inactive" title="该技能依赖外部 CLI/API 工具，安装后可读取说明但需自行安装依赖">⚠️ 依赖外部工具</span>}
                 </div>
                 <div className="card-desc" style={{ marginTop: 2 }}>{(item.description || "").slice(0, 140)}</div>
                 <div className="card-meta" style={{ marginTop: 2 }}>
@@ -627,6 +628,12 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
               ? `社区内容将打包为扩展安装（权限：${(confirming.permissions || []).join("/") || "只读"}）。安装前请确认来源可信。`
               : "扩展包将获得其 manifest 声明的权限（只读/文件/网络/命令）。安装前请确认来源可信。"}
           </div>
+          {confirming.isGitHubItem && confirming.githubItem?.external_deps && (
+            <div className="card-desc" style={{ marginTop: 4, color: "var(--warning)" }}>
+              ⚠️ 该技能声明依赖外部 CLI/API 工具（如 ntask、特定二进制）。安装后 Latiao 可读取其使用说明，
+              但执行依赖的命令需自行安装对应工具，否则模型将无法完成该操作。
+            </div>
+          )}
           <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
             <button className="btn btn-primary" disabled={installing}
               onClick={() => doInstall(confirming.source, confirming.sha256)}>确认安装</button>
