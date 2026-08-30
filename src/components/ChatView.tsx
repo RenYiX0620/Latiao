@@ -7,6 +7,7 @@ import {
   Eye, ShieldCheck, PencilRuler, ListChecks, Zap, CircleOff, Brain, BrainCircuit,
   Bot, User, ChevronRight, ChevronDown, Wrench, Search, Database, FileText,
   FolderOpen, FilePen, Terminal, AppWindow, Users, Clock,
+  MousePointer2, Keyboard, Camera, ListTree, Play, History, ScanLine,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 
@@ -26,6 +27,18 @@ const TOOL_CATEGORIES: Record<string, { verb: string; noun: string; icon: Lucide
   open_app: { verb: "打开", noun: "应用", icon: AppWindow },
   delegate_task: { verb: "委派", noun: "任务", icon: Users },
   create_cron: { verb: "定时", noun: "任务", icon: Clock },
+  // 五控工具
+  screen_capture: { verb: "截图", noun: "屏幕", icon: Camera },
+  control_list_processes: { verb: "查看", noun: "进程", icon: ListTree },
+  control_kill_process: { verb: "终止", noun: "进程", icon: ScanLine },
+  control_launch: { verb: "启动", noun: "进程", icon: Play },
+  control_process_log: { verb: "读取", noun: "日志", icon: FileText },
+  control_mouse_move: { verb: "移动", noun: "鼠标", icon: MousePointer2 },
+  control_mouse_click: { verb: "点击", noun: "鼠标", icon: MousePointer2 },
+  control_keyboard_type: { verb: "键入", noun: "键盘", icon: Keyboard },
+  control_keyboard_press: { verb: "按键", noun: "键盘", icon: Keyboard },
+  control_wait: { verb: "等待", noun: "进程", icon: Clock },
+  control_audit: { verb: "查询", noun: "记录", icon: History },
 };
 const TOOL_CATEGORY_FALLBACK = { verb: "工具", noun: "调用", icon: Wrench };
 import ReactMarkdown from "react-markdown";

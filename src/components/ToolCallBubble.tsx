@@ -6,6 +6,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   Search, Database, LineChart, FilePen, FileText, FolderOpen, AppWindow,
   Terminal, FileSearch, Users, Clock, Wrench, ChevronRight, ChevronDown, Loader2,
+  MousePointer2, Keyboard, Camera, ListTree, Play, History, ScanLine,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import type { Message } from "../types";
@@ -20,6 +21,18 @@ export const TOOL_ICONS: Record<string, LucideIcon> = {
   list_dir: FolderOpen, open_folder: FolderOpen,
   open_app: AppWindow, run_cmd: Terminal, search_files: FileSearch,
   delegate_task: Users, create_cron: Clock,
+  // 五控工具
+  screen_capture: Camera,
+  control_list_processes: ListTree,
+  control_kill_process: ScanLine,
+  control_launch: Play,
+  control_process_log: FileText,
+  control_mouse_move: MousePointer2,
+  control_mouse_click: MousePointer2,
+  control_keyboard_type: Keyboard,
+  control_keyboard_press: Keyboard,
+  control_wait: Clock,
+  control_audit: History,
 };
 
 function formatToolArgs(args?: Record<string, unknown>): string {
