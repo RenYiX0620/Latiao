@@ -14,8 +14,11 @@ curl -fL "https://gh-proxy.com/https://github.com/ggml-org/llama.cpp/releases/do
 unzip -o -j "$TMP_DIR/llama.zip" "*/llama-server.exe" -d sidecar/
 echo "llama-server.exe: $(sidecar/llama-server.exe --version 2>&1 || echo 'ok')"
 
-echo "=== 2/4 PyInstaller 打包 sidecar ==="
+echo "=== 2/4 安装 sidecar 依赖 + PyInstaller 打包 ==="
 cd sidecar
+# 必须先装 requirements-win.txt —— PyInstaller 只是打包，不会自动装依赖，
+# 缺失 httpx 等模块会导致 sidecar.exe 运行时报 ModuleNotFoundError
+pip install -r requirements-win.txt
 pip install "pyinstaller==6.*"
 pyinstaller latiao.spec
 cd ..

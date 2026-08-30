@@ -692,6 +692,25 @@ const [timeFilter, setTimeFilter] = useState("all");
     toastTimerRef.current = setTimeout(() => setToast(null), 2200);
   }, []);
 
+  /* ── 自动更新（此前零接线：死开关 + 硬编码版本号，审计修复）── */
+  const [appVersion, setAppVersion] = useState("…");
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const runUpdateCheck = useCallback(async (silent: boolean) => {
+    if (checkingUpdate) return;
+    setCheckingUpdate(true);
+    const { checkForUpdates } = await import("./utils/updater");
+    const res = await checkForUpdates((msg) => showToast(msg));
+    setCheckingUpdate(false);
+    if (!silent && res === "none") showToast("已是最新版本");
+  }, [checkingUpdate, showToast]);
+  useEffect(() => {
+    import("./utils/updater").then(({ getAppVersion }) => {
+      getAppVersion().then(setAppVersion).catch(() => setAppVersion("0.3.1"));
+    }).catch(() => setAppVersion("0.3.1"));
+    if (autoCheckUpdate) runUpdateCheck(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // Extracted hooks (cron — depends on showToast)
   const { cronJobs, newCron, setNewCron, addCronJob, toggleCronJob, deleteCronJob, runCronJob } = useCronJobs(showToast);
 
@@ -1467,6 +1486,7 @@ const [timeFilter, setTimeFilter] = useState("all");
             autoStartGateway={autoStartGateway} setAutoStartGateway={setAutoStartGateway}
             anonymousData={anonymousData} setAnonymousData={setAnonymousData}
             autoCheckUpdate={autoCheckUpdate} setAutoCheckUpdate={setAutoCheckUpdate}
+            appVersion={appVersion} checkingUpdate={checkingUpdate} onCheckUpdate={() => runUpdateCheck(false)}
             reflectionMode={reflectionMode} setReflectionMode={setReflectionMode}
           />
         </div>

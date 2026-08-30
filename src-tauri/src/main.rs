@@ -498,6 +498,7 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_process::init())
         .manage(managed_sidecar)
         .invoke_handler(tauri::generate_handler![sidecar_proxy, get_auth_token, restart_sidecar, store_secret, get_secret, delete_secret, open_model_dir])
         .on_window_event(|window, event| {
