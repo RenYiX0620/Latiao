@@ -872,8 +872,44 @@ def _record_progress(entry: str):
         now = datetime.now().isoformat()
         with open(PROGRESS_FILE, "a", encoding="utf-8") as f:
             f.write(f"### {now}\n{entry}\n\n")
+        # 体积轮转（审计 B10）：append-only 已长到 1.1MB 且无上限。
+        # 超 1MB 时保留尾部 500KB——read_file 从头截断读最旧 5 万字符，
+        # 轮转同时保证最近进度仍在文件里（尾部注入读的也是最新段）
+        if PROGRESS_FILE.stat().st_size > 1024 * 1024:
+            _rotate_progress_file()
     except Exception:
         logger.warning("Failed to record progress", exc_info=True)
+
+
+def _rotate_progress_file():
+    """把 PROGRESS.md 截到最近 500KB（保留尾部，即最新进度）。"""
+    try:
+        keep = 500 * 1024
+        size = PROGRESS_FILE.stat().st_size
+        if size <= keep:
+            return
+        with open(PROGRESS_FILE, "rb") as f:
+            f.seek(size - keep)
+            tail = f.read()
+        with open(PROGRESS_FILE, "wb") as f:
+            f.write("(早期进度已轮转)\n\n".encode("utf-8") + tail)
+    except Exception:
+        logger.warning("PROGRESS 轮转失败", exc_info=True)
+
+
+def _progress_tail(max_chars: int = 2000) -> str:
+    """读取 PROGRESS.md 尾部（最新进度），用于注入 system prompt。"""
+    try:
+        if not PROGRESS_FILE.exists():
+            return ""
+        size = PROGRESS_FILE.stat().st_size
+        read = min(size, max_chars * 4)  # 多读些字节再截字符，中文占 3 字节
+        with open(PROGRESS_FILE, "rb") as f:
+            f.seek(max(0, size - read))
+            tail = f.read().decode("utf-8", errors="replace")
+        return tail[-max_chars:]
+    except Exception:
+        return ""
 
 
 
@@ -2471,6 +2507,10 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
     _brief_answer_nudged = False  # "资料充足却短回答"的追问只触发一次，防死循环
     # Build tool prompt
     last_user_text = _extract_last_user_text(current_msgs)
+    # 学习提取与云端循环同口径（审计 B9）：此前只在云端入口调用，
+    # 纯本地用户偏好/知识永不入库，"记住你的偏好"完全失效
+    if last_user_text:
+        _extract_learnings_heuristic(last_user_text, session_id)
     agent_tools = _get_agent_tools(agent_id, TOOLS)
     active_tools = _filter_tools(last_user_text, agent_tools) if last_user_text else agent_tools
     active_tools = _filter_tools_by_access(active_tools, access_mode)
@@ -3035,6 +3075,16 @@ def _build_chat_messages(body: dict, messages: list) -> list:
             desc = (s.get("description") or "").strip()
             lines.append(f"- **{s['name']}**: {desc[:120]}" if desc else f"- **{s['name']}**")
         system_parts.append("\n".join(lines))
+
+    # 上次会话进展（审计 B10）：PROGRESS.md 尾部注入，跨会话断点续作生效
+    _tail = _progress_tail()
+    if _tail.strip():
+        _pt_label = _get_localized_text(user_lang, {
+            "zh": "## 上次会话进展（最近记录）",
+            "en": "## Recent progress from previous sessions",
+            "ja": "## 前回セッションの進捗（最近の記録）",
+        })
+        system_parts.append(f"{_pt_label}:\n{_tail}\n（以上为历史记录，仅供参考；继续当前任务时请注意衔接。）")
 
     # Goal mode / progressive delivery
     goal_mode = body.get("goal_mode", False)

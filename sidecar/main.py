@@ -279,6 +279,13 @@ async def lifespan(app: FastAPI):
         capability_registry.initialize(TOOLS, TOOL_PERMISSIONS, TOOL_DISPATCH)
     except Exception:
         logger.warning("capability initialize failed", exc_info=True)
+    # MCP 扩展工具启动即注册（审计 B7）：此前只有打开扩展页才加载，
+    # 声明了 mcpServers 的扩展在正常使用中模型根本看不到其工具
+    try:
+        from agent_loop import ensure_mcp_loaded
+        ensure_mcp_loaded()
+    except Exception:
+        logger.warning("MCP 启动注册失败", exc_info=True)
     # Write PID file so the Rust process manager can find us (after _init_db creates dir)
     SIDECAR_PID = PROGRESS_DIR / "sidecar.pid"
     SIDECAR_PID.write_text(str(os.getpid()))

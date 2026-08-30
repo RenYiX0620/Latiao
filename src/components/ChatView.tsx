@@ -147,17 +147,27 @@ export default memo(function ChatView({
     sendMessage();
   }, [sendMessage]);
 
-  // 点赞/点踩本地反馈状态（localStorage 持久化，可扩展为反馈学习数据）
+  // 点赞/点踩本地反馈状态（localStorage 持久化 + 回流后端 learnings，审计 B12）
   const [msgFeedback, setMsgFeedback] = useState<Record<string, "up" | "down">>(() => {
     try { return JSON.parse(localStorage.getItem("latiao_msg_feedback") || "{}"); } catch { return {}; }
   });
-  const toggleFeedback = (msgId: string, kind: "up" | "down") => {
+  const toggleFeedback = (msgId: string, kind: "up" | "down", content?: string) => {
     const cur = msgFeedback[msgId];
     const next = cur === kind ? undefined : kind;
     const m = { ...msgFeedback };
     if (next) m[msgId] = next; else delete m[msgId];
     setMsgFeedback(m);
     try { localStorage.setItem("latiao_msg_feedback", JSON.stringify(m)); } catch { /* ignore */ }
+    // 回流：点赞/点踩写入 learnings（高置信度），影响后续回复
+    if (next && content && content.trim()) {
+      import("../utils/api").then(({ authFetch }) => {
+        authFetch("/v1/feedback", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ content: content.slice(0, 500), kind: next }),
+        }).catch(() => { /* 反馈失败不打扰用户 */ });
+      });
+    }
   };
   const fmtTime = (ts?: number) => ts ? new Date(ts).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false }) : "";
 
@@ -300,9 +310,9 @@ export default memo(function ChatView({
                       navigator.clipboard?.writeText(msg.content).then(() => showToast(t("chat.copied"))).catch(() => showToast(t("chat.copy_fail"), "warn"));
                     }}>⧉</button>
                     <button className={`btn-icon${msgFeedback[msg.id || ""] === "up" ? " active" : ""}`} title={t("chat.like")}
-                      onClick={() => msg.id && toggleFeedback(msg.id, "up")}>👍</button>
+                      onClick={() => msg.id && toggleFeedback(msg.id, "up", msg.content)}>👍</button>
                     <button className={`btn-icon${msgFeedback[msg.id || ""] === "down" ? " active" : ""}`} title={t("chat.dislike")}
-                      onClick={() => msg.id && toggleFeedback(msg.id, "down")}>👎</button>
+                      onClick={() => msg.id && toggleFeedback(msg.id, "down", msg.content)}>👎</button>
                     {fmtTime(msg.ts) && <span className="msg-time">{fmtTime(msg.ts)}</span>}
                   </div>
                 </div>
