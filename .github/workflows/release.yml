@@ -24,7 +24,7 @@ jobs:
 
       - run: npm install
 
-      - name: Guard: signing key configured?
+      - name: "Guard: signing key configured?"
         run: |
           if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
             echo "::error::TAURI_PRIVATE_KEY secret not configured - aborting release job to avoid unsigned artifacts overwriting latest.json"
@@ -112,7 +112,7 @@ jobs:
 
       - run: npm install
 
-      - name: Guard: signing key configured?
+      - name: "Guard: signing key configured?"
         shell: pwsh
         run: |
           if ([string]::IsNullOrEmpty($env:TAURI_SIGNING_PRIVATE_KEY)) {
