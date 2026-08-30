@@ -596,6 +596,7 @@ img.sidebar-logo {
 
 /* ── Buttons ── */
 .btn { display: inline-flex; align-items: center; justify-content: center; gap: 5px; border: none; border-radius: var(--radius-md); cursor: pointer; font-family: var(--font-sans); font-weight: 500; transition: all 0.15s ease; white-space: nowrap; flex-shrink: 0; }
+.btn-xs { padding: 2px 7px; font-size: 10px; border-radius: var(--radius-sm); }
 .btn-sm { padding: 5px 11px; font-size: 10.5px; }
 .btn-md { padding: 7px 16px; font-size: 12px; }
 .btn-ghost { background: transparent; color: var(--text-secondary); border: 1px solid var(--border-strong); }
