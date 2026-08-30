@@ -70,6 +70,8 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
   // ── GitHub 自动发现（Discovery Engine） ──
   const [discoverState, setDiscoverState] = useState<any>({ last_scan_ts: 0, repos: 0, entries: 0 });
   const [discoverRefreshing, setDiscoverRefreshing] = useState(false);
+  // ── 市场列表折叠（默认收起，890 条太长） ──
+  const [marketCollapsed, setMarketCollapsed] = useState(false);
   // ── 统一能力列表（工具与技能一个列表，不分栏） ──
   // ── 新建技能表单 ──
   const [newSkillName, setNewSkillName] = useState("");
@@ -444,13 +446,25 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
           </div>
         </div>
 
-        {/* 聚合列表（按源分组） */}
+        {/* 聚合列表（按源分组，默认折叠） */}
         <div className="card" style={{ marginBottom: 14 }}>
-          <div className="card-title" style={{ marginBottom: 8 }}>扩展市场</div>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", cursor: "pointer" }}
+            onClick={() => setMarketCollapsed(c => !c)}>
+            <div className="card-title" style={{ marginBottom: 0 }}>
+              {marketCollapsed ? "▸" : "▾"} 扩展市场
+              <span className="badge badge-safe" style={{ marginLeft: 6, fontFamily: "var(--font-mono)" }}>
+                {marketLoading ? "…" : marketPlugins.length}
+              </span>
+            </div>
+            {!marketCollapsed && (
+              <button className="btn btn-xs btn-ghost" onClick={(e) => { e.stopPropagation(); setMarketCollapsed(true); }}>收起</button>
+            )}
+          </div>
+          {!marketCollapsed && (<>
           {marketLoading && <div className="card-desc">加载中…</div>}
           {marketErr && <div className="card-desc" style={{ color: "var(--danger)" }}>{marketErr}</div>}
           {!marketLoading && !marketErr && marketPlugins.length === 0 && (
-            <div className="card-desc">市场为空——等待官方扩展上架或添加 GitHub 源。已支持：粘贴 URL/GitHub 仓库/本地文件安装。</div>
+            <div className="card-desc" style={{ marginTop: 8 }}>市场为空——等待官方扩展上架或添加 GitHub 源。已支持：粘贴 URL/GitHub 仓库/本地文件安装。</div>
           )}
           {marketPlugins.map((item) => {
             const isEco = !!item.source_kind && item.source_kind !== "";
@@ -485,6 +499,7 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
               </button>
             </div>
           )})}
+          </>)}
         </div>
       </>
       )}
