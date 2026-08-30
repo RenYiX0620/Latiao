@@ -143,7 +143,8 @@ info "Creating updater archive..."
 BUNDLE_DIR="src-tauri/target/release/bundle/macos"
 
 # Determine app bundle name and architecture
-APP_BUNDLE=$(ls "$BUNDLE_DIR"/*.app 2>/dev/null | head -1)
+# 注意必须 ls -d：ls 对目录参数默认列出目录内容（会把 "Contents" 当结果）
+APP_BUNDLE=$(ls -d "$BUNDLE_DIR"/*.app 2>/dev/null | head -1)
 if [ -z "$APP_BUNDLE" ]; then
   err "No .app bundle found in $BUNDLE_DIR/"; exit 1
 fi
