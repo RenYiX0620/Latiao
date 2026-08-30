@@ -92,9 +92,11 @@ jobs:
             latest.json
           draft: false
           generate_release_notes: true
+          overwrite: true
 
   release-windows:
     runs-on: windows-latest
+    needs: release-macos
     permissions:
       contents: write
 
@@ -132,13 +134,18 @@ jobs:
       - name: Download llama-server.exe
         run: |
           $headers = @{ "User-Agent" = "Latiao-CI" }
-          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest" -Headers $headers
-          # 上游资产命名时有变化，从 assets 列表动态匹配 win-cpu x64 zip
-          $asset = $release.assets | Where-Object { $_.name -like "*bin-win-cpu-x64*.zip" } | Select-Object -First 1
-          if (-not $asset) {
-            $asset = $release.assets | Where-Object { $_.name -like "*bin-win-x64*.zip" } | Select-Object -First 1
+          # releases/latest 可能只是无二进制的占位 release（如 v0.3.0 仅含 nightly-tag.txt），
+          # 因此扫描最近 release，取第一个带 win-cpu x64 zip 的
+          $releases = Invoke-RestMethod -Uri "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=10" -Headers $headers
+          $asset = $null
+          foreach ($rel in $releases) {
+            $asset = $rel.assets | Where-Object { $_.name -like "*bin-win-cpu-x64*.zip" } | Select-Object -First 1
+            if (-not $asset) {
+              $asset = $rel.assets | Where-Object { $_.name -like "*bin-win-x64*.zip" } | Select-Object -First 1
+            }
+            if ($asset) { Write-Host "Matched release: $($rel.tag_name)"; break }
           }
-          if (-not $asset) { Write-Error "llama.cpp release $($release.tag_name) 无 win x64 zip 资产"; exit 1 }
+          if (-not $asset) { Write-Error "最近 10 个 llama.cpp release 均无 win x64 zip 资产"; exit 1 }
           Write-Host "Downloading: $($asset.name)"
           Invoke-WebRequest -Uri $asset.browser_download_url -OutFile "$env:RUNNER_TEMP\llama.zip"
           Expand-Archive -Path "$env:RUNNER_TEMP\llama.zip" -DestinationPath "$env:RUNNER_TEMP\llama" -Force
@@ -203,3 +210,4 @@ jobs:
             src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
           draft: false
           generate_release_notes: true
+          overwrite: true
