@@ -407,42 +407,46 @@ def _has_external_deps(front: dict) -> bool:
 
 
 def _scan_claude_plugin(repo: str, zip_files: dict[str, bytes]) -> list[dict]:
-    """从仓库 zip 中解析 .claude-plugin/plugin.json 生成 Claude 插件条目。"""
-    # 找一个 .claude-plugin/plugin.json（可能带 repo-main/ 前缀）
-    plugin_json_rel = None
-    for n in zip_files:
-        if n.endswith(".claude-plugin/plugin.json"):
-            plugin_json_rel = n
-            break
-    if plugin_json_rel is None:
+    """从仓库 zip 中解析 .claude-plugin/plugin.json 生成 Claude 插件条目。
+    支持多插件（external_plugins/<名>/ 下每个 .claude-plugin/plugin.json 各一条）。"""
+    out: list[dict] = []
+    plugin_files = [n for n in zip_files if n.endswith(".claude-plugin/plugin.json")]
+    if not plugin_files:
         return []
-    try:
-        data = json.loads(zip_files[plugin_json_rel].decode("utf-8", "ignore"))
-    except Exception:
-        logger.warning("claude plugin.json parse failed %s", repo, exc_info=True)
-        return []
-    if not isinstance(data, dict) or not data.get("name"):
-        return []
-    author = data.get("author", {})
-    if isinstance(author, dict):
-        author = {"name": author.get("name", repo.split("/")[0])}
-    else:
-        author = {"name": str(author or repo.split("/")[0])}
-    return [{
-        "name": _safe_name(str(data.get("name"))),
-        "display_name": str(data.get("name")),
-        "version": str(data.get("version") or "1.0.0"),
-        "description": str(data.get("description") or "Claude Code 插件"),
-        "author": author,
-        "category": "claude-plugin",
-        "source_url": f"https://github.com/{repo}",
-        "source_kind": "claude-plugin",
-        "repo": repo,
-        "skill_path": "",
-        "permissions": ["readonly"],
-        "sha256": "",
-        "external_deps": False,
-    }]
+    seen: set[str] = set()
+    for n in plugin_files:
+        try:
+            data = json.loads(zip_files[n].decode("utf-8", "ignore"))
+        except Exception:
+            logger.warning("claude plugin.json parse failed %s:%s", repo, n, exc_info=True)
+            continue
+        if not isinstance(data, dict) or not data.get("name"):
+            continue
+        pname = _safe_name(str(data.get("name")))
+        if pname in seen:
+            continue
+        seen.add(pname)
+        author = data.get("author", {})
+        if isinstance(author, dict):
+            author = {"name": author.get("name", repo.split("/")[0])}
+        else:
+            author = {"name": str(author or repo.split("/")[0])}
+        out.append({
+            "name": pname,
+            "display_name": str(data.get("name")),
+            "version": str(data.get("version") or "1.0.0"),
+            "description": str(data.get("description") or "Claude Code 插件"),
+            "author": author,
+            "category": "claude-plugin",
+            "source_url": f"https://github.com/{repo}",
+            "source_kind": "claude-plugin",
+            "repo": repo,
+            "skill_path": "",
+            "permissions": ["readonly"],
+            "sha256": "",
+            "external_deps": False,
+        })
+    return out
 
 
 def _scan_repo(repo: str, force: bool = False) -> list[dict]:
