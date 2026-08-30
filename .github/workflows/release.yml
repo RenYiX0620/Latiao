@@ -92,7 +92,7 @@ jobs:
             latest.json
           draft: false
           generate_release_notes: true
-          overwrite: true
+          overwrite_files: true
 
   release-windows:
     runs-on: windows-latest
@@ -210,4 +210,4 @@ jobs:
             src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
           draft: false
           generate_release_notes: true
-          overwrite: true
+          overwrite_files: true
