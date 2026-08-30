@@ -886,7 +886,7 @@ dependencies = [
 
 [[package]]
 name = "dtor"
-version = "0.3.4"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1057d6c64987086ff8ed0fd3fbf377a6b7d205cc7715868cd401705f715cbe4"
 dependencies = [
@@ -2158,7 +2158,7 @@ checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 
 [[package]]
 name = "local-ai-os"
-version = "0.3.0"
+version = "0.3.4"
 dependencies = [
  "reqwest 0.12.28",
  "serde",
