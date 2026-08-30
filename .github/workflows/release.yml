@@ -6,7 +6,7 @@ on:
       - "v*"
 
 jobs:
-  release:
+  release-macos:
     runs-on: macos-latest
     permissions:
       contents: write
@@ -24,7 +24,7 @@ jobs:
 
       - run: npm install
 
-      - name: Build
+      - name: Build (updater 插件自动产出签名更新包)
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
@@ -36,43 +36,56 @@ jobs:
           cd ..
           npm run tauri build
 
-      - name: Sign DMG
+      - name: Prepare updater archive (fallback 手动打包+签名)
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
         run: |
           BUNDLE="src-tauri/target/release/bundle"
-          DMG_FILE=$(ls "$BUNDLE"/dmg/*.dmg 2>/dev/null | head -1)
-          if [ -z "$DMG_FILE" ]; then echo "No DMG"; exit 0; fi
-          npx @tauri-apps/cli signer sign             --password "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD"             "$DMG_FILE"
-          ls -la "$DMG_FILE.sig" && echo "Signature generated"
-
-      - name: Generate manifest
-        run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          BUNDLE="src-tauri/target/release/bundle"
-          DMG_FILE=$(ls "$BUNDLE"/dmg/*.dmg 2>/dev/null | head -1)
-          SIG_FILE=$(find "$BUNDLE" -name "*.sig" 2>/dev/null | head -1)
-          echo "=== Build artifacts ==="
-          find "$BUNDLE" -type f | sort
-          if [ -z "$DMG_FILE" ]; then
-            echo "No DMG (macOS bundle not produced) - skipping Sparkle manifest"
-            exit 0
+          case "$(uname -m)" in arm64) ARCH="aarch64" ;; *) ARCH="x86_64" ;; esac
+          ARCHIVE="$BUNDLE/macos/Latiao_${VERSION}_${ARCH}.app.tar.gz"
+          if [ ! -f "$ARCHIVE" ]; then
+            APP=$(ls "$BUNDLE"/macos/*.app | head -1)
+            cd "$BUNDLE/macos" && tar czf "$(basename "$ARCHIVE")" "$(basename "$APP")" && cd -
+            npx @tauri-apps/cli signer sign --password "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" "$ARCHIVE"
           fi
-          SIG=$(cat "$SIG_FILE" 2>/dev/null || echo "")
-          echo '{"version":"'$VERSION'","notes":"Latiao v'$VERSION'","pub_date":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'","platforms":{"darwin-aarch64":{"url":"https://github.com/RenYiX0620/Latiao/releases/download/'$GITHUB_REF_NAME'/Latiao_'$VERSION'_aarch64.dmg","signature":"'$SIG'"}}}' > "$BUNDLE/dmg/latest.json"
-          echo "Manifest: $(cat "$BUNDLE/dmg/latest.json")"
+          ls -la "$BUNDLE/macos"
 
-      - uses: softprops/action-gh-release@v2
+      - name: Generate latest.json (darwin 条目)
+        run: |
+          BUNDLE="src-tauri/target/release/bundle"
+          VERSION="${GITHUB_REF_NAME#v}"
+          case "$(uname -m)" in arm64) ARCH="aarch64" ;; *) ARCH="x86_64" ;; esac
+          ARCHIVE="$BUNDLE/macos/Latiao_${VERSION}_${ARCH}.app.tar.gz"
+          SIG=$(cat "$ARCHIVE.sig" | tr -d '\n')
+          cat > latest.json <<EOF
+          {
+            "version": "$VERSION",
+            "notes": "Latiao v$VERSION",
+            "pub_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "platforms": {
+              "darwin-$ARCH": {
+                "signature": "$SIG",
+                "url": "https://github.com/RenYiX0620/Latiao/releases/download/${GITHUB_REF_NAME}/Latiao_${VERSION}_${ARCH}.app.tar.gz"
+              }
+            }
+          }
+          EOF
+          echo "Manifest: $(cat latest.json)"
+
+      - name: Upload release (macOS)
+        uses: softprops/action-gh-release@v2
         with:
           files: |
+            src-tauri/target/release/bundle/macos/*.app.tar.gz
+            src-tauri/target/release/bundle/macos/*.app.tar.gz.sig
             src-tauri/target/release/bundle/dmg/*.dmg
-            src-tauri/target/release/bundle/dmg/*.sig
-            src-tauri/target/release/bundle/dmg/latest.json
+            latest.json
           draft: false
           generate_release_notes: true
 
-  build-windows:
+  release-windows:
     runs-on: windows-latest
     permissions:
       contents: write
@@ -109,16 +122,59 @@ jobs:
           $exe = Get-ChildItem -Path "$env:RUNNER_TEMP\llama" -Recurse -Filter "llama-server.exe" | Select-Object -First 1
           Copy-Item $exe.FullName -Destination "sidecar\llama-server.exe" -Force
 
-      - name: Build Tauri MSI
+      - name: Build Tauri (NSIS + MSI，updater 自动签名)
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
         run: npm run tauri build -- --target x86_64-pc-windows-msvc
 
-      - name: Upload MSI to release
+      - name: Sign NSIS installer (fallback 手动签名)
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+        run: |
+          $BUNDLE = "src-tauri\target\x86_64-pc-windows-msvc\release\bundle"
+          $exe = Get-ChildItem -Path "$BUNDLE\nsis" -Filter "*-setup.exe" | Select-Object -First 1
+          if ($exe -and -not (Test-Path "$($exe.FullName).sig")) {
+            npx @tauri-apps/cli signer sign --password $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD $exe.FullName
+          }
+          Get-ChildItem -Path "$BUNDLE\nsis" | Select-Object Name
+
+      - name: Append windows-x86_64 to latest.json and upload
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $VERSION = $env:GITHUB_REF_NAME.TrimStart('v')
+          $BUNDLE = "src-tauri\target\x86_64-pc-windows-msvc\release\bundle"
+          $exe = Get-ChildItem -Path "$BUNDLE\nsis" -Filter "*-setup.exe" | Select-Object -First 1
+          if (-not $exe) { Write-Host "No NSIS installer - skipping manifest entry"; exit 0 }
+          # 等 mac job 先上传 latest.json（重试 10 次 × 10s）
+          for ($i = 0; $i -lt 10; $i++) {
+            gh release download $env:GITHUB_REF_NAME --repo RenYiX0620/Latiao --pattern latest.json --clobber 2>$null
+            if ($LASTEXITCODE -eq 0 -and (Test-Path latest.json)) { break }
+            Start-Sleep -Seconds 10
+          }
+          if (-not (Test-Path latest.json)) {
+            # mac job 未产出清单：自建仅 windows 条目（mac 条目由 mac job 补）
+            $man = @{ version = $VERSION; notes = "Latiao v$VERSION";
+                      pub_date = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ");
+                      platforms = @{} }
+          } else {
+            $man = Get-Content latest.json -Raw | ConvertFrom-Json
+          }
+          $sig = (Get-Content "$($exe.FullName).sig" -Raw) -replace "`r|`n", ""
+          $url = "https://github.com/RenYiX0620/Latiao/releases/download/$env:GITHUB_REF_NAME/$($exe.Name)"
+          $entry = [ordered]@{ signature = $sig; url = $url }
+          $man.platforms | Add-Member -NotePropertyName "windows-x86_64" -NotePropertyValue $entry -Force
+          $man | ConvertTo-Json -Depth 5 | Set-Content latest.json -Encoding UTF8
+          gh release upload $env:GITHUB_REF_NAME latest.json --repo RenYiX0620/Latiao --clobber
+
+      - name: Upload Windows artifacts
         uses: softprops/action-gh-release@v2
         with:
           files: |
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.sig
             src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
           draft: false
           generate_release_notes: true

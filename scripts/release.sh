@@ -20,8 +20,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
-# 失败路径也清理临时产物（与成功路径一致：.release-notes.md / latest.json）
-cleanup() { rm -f "$PROJECT_DIR/.release-notes.md" "$PROJECT_DIR/latest.json"; }
+# 失败路径也清理临时产物（latest.json 已提交进 git，不再删除）
+cleanup() { rm -f "$PROJECT_DIR/.release-notes.md"; }
 trap cleanup EXIT
 
 # ─── Color helpers ────────────────────────────────────────────────────────
@@ -63,20 +63,38 @@ d = json.load(open(fp))
 d['version'] = '$VERSION'
 json.dump(d, open(fp, 'w'), indent=2)
 "
+  # package.json 版本同步（此前只改 tauri.conf 导致两处不一致）
+  python3 -c "
+import json
+fp = 'package.json'
+d = json.load(open(fp))
+d['version'] = '$VERSION'
+json.dump(d, open(fp, 'w'), indent=2, ensure_ascii=False)
+open(fp, 'a').write('\n')
+"
   ok "Version updated"
 else
   info "Keeping current version $VERSION"
 fi
 
 # ─── Signing key ──────────────────────────────────────────────────────────
-KEY_FILE="$PROJECT_DIR/tauri-key"
+# 密钥路径可用 LATIAO_KEY_FILE 覆盖（应用密钥实际在 ~/.config/latiao/tauri-key）
+KEY_FILE="${LATIAO_KEY_FILE:-$PROJECT_DIR/tauri-key}"
 if [ ! -f "$KEY_FILE" ]; then
   err "No signing key found at $KEY_FILE"
   echo "  Generate one: npx tauri signer generate -w tauri-key"
+  echo "  Or point to the app key: LATIAO_KEY_FILE=~/.config/latiao/tauri-key npm run release -- $VERSION"
   exit 1
 fi
-read -s -p "Private key password: " KEY_PASSWORD
-echo
+# 密码可从环境变量传入（CI/非交互）；无环境变量且有 TTY 时交互输入
+if [ -n "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}" ]; then
+  KEY_PASSWORD="$TAURI_SIGNING_PRIVATE_KEY_PASSWORD"
+elif [ -t 0 ]; then
+  read -s -p "Private key password: " KEY_PASSWORD
+  echo
+else
+  KEY_PASSWORD=""
+fi
 
 # ─── Release notes ────────────────────────────────────────────────────────
 NOTES_FILE=".release-notes.md"
@@ -236,7 +254,8 @@ git push origin "$TAG" 2>/dev/null && ok "Tag pushed" || warn "Tag push failed"
 git push origin HEAD 2>/dev/null || true
 
 # ─── Cleanup ─────────────────────────────────────────────────────────────
-rm -f "$NOTES_FILE" latest.json
+# latest.json 保留：已 git commit（第 5 步），且作为仓库最新清单供参考
+rm -f "$NOTES_FILE"
 
 echo ""
 echo -e "${GREEN}══════════════════════════════════════════════════════════════${NC}"

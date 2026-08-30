@@ -20,6 +20,9 @@ interface SettingsViewProps {
   setAnonymousData: (v: boolean) => void;
   autoCheckUpdate: boolean;
   setAutoCheckUpdate: (v: boolean) => void;
+  appVersion: string;
+  checkingUpdate: boolean;
+  onCheckUpdate: () => void;
   reflectionMode: "off" | "light" | "deep";
   setReflectionMode: (v: "off" | "light" | "deep") => void;
 }
@@ -39,6 +42,7 @@ export default function SettingsView({
   selectedModel, cloudModels, setActiveView,
   autoLaunch, setAutoLaunch, autoStartGateway, setAutoStartGateway,
   anonymousData, setAnonymousData, autoCheckUpdate, setAutoCheckUpdate,
+  appVersion, checkingUpdate, onCheckUpdate,
   reflectionMode, setReflectionMode,
 }: SettingsViewProps) {
   const { t, lang, setLanguage } = useTranslation();
@@ -165,7 +169,7 @@ export default function SettingsView({
           <div className="settings-group-header">{t("settings.updates")}</div>
           <div className="settings-row">
             <div><div className="settings-row-label">{t("settings.version")}</div><div className="settings-row-desc">{t("settings.version_desc")}</div></div>
-            <span style={{ fontFamily: "var(--font-mono)", fontSize: 12, color: "var(--text-muted)" }}>v0.1.0</span>
+            <span style={{ fontFamily: "var(--font-mono)", fontSize: 12, color: "var(--text-muted)" }}>v{appVersion}</span>
           </div>
           <div className="settings-row">
             <div><div className="settings-row-label">{t("settings.auto_update")}</div><div className="settings-row-desc">{t("settings.auto_update_desc")}</div></div>
@@ -173,6 +177,12 @@ export default function SettingsView({
               <input type="checkbox" checked={autoCheckUpdate} onChange={toggleOnChange(setAutoCheckUpdate, "latiao_auto_check_update")} />
               <span className="toggle-slider"></span>
             </label>
+          </div>
+          <div className="settings-row">
+            <div><div className="settings-row-label">{t("settings.check_update")}</div><div className="settings-row-desc">{t("settings.check_update_desc")}</div></div>
+            <button className="btn-secondary" onClick={onCheckUpdate} disabled={checkingUpdate}>
+              {checkingUpdate ? t("settings.checking") : t("settings.check_now")}
+            </button>
           </div>
         </div>
 
