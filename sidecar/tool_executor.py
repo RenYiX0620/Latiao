@@ -570,6 +570,19 @@ async def _delegate_task(agent_type: str, task: str, task_id: str | None = None)
     if not api_url:
         return f"[Sub-agent: {agent_type}] 错误: 无法连接模型服务（请配置云端模型或启动本地 LLM）"
 
+    # 模型名解析（审计 A3）：此前写死 SUBAGENT_MODEL（gpt-4o-mini）——
+    # 云端配 GLM/DeepSeek 时发错名字必 404；纯本地时把假名发给 mlx 引擎
+    # 同样必失败。改为：云端用当前云端配置的模型名，本地用引擎真实
+    # 加载的模型 id（与健康检查同口径）。
+    _cloud_cfg = _last_cloud_config.get()
+    if _is_local:
+        import local_llm
+        _sub_model = (getattr(local_llm._engine, "current_model_id", "")
+                      or getattr(local_llm._engine, "current_model_name", "")
+                      or SUBAGENT_MODEL)
+    else:
+        _sub_model = (_cloud_cfg or {}).get("model") or SUBAGENT_MODEL
+
     current_msgs = list(messages)
 
     try:
@@ -577,7 +590,7 @@ async def _delegate_task(agent_type: str, task: str, task_id: str | None = None)
             for _ in range(3):
                 _msgs = _sanitize_tool_messages(current_msgs)
                 body = {
-                    "model": SUBAGENT_MODEL,
+                    "model": _sub_model,
                     "messages": _msgs,
                     "max_tokens": 1024,
                     "stream": False,

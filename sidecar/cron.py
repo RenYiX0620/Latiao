@@ -308,7 +308,16 @@ async def _execute_cron_job(job: dict):
         logger.warning("Cron job skipped: no API target（云端未配置且本地模型未运行）: %s", task[:50])
         _record_cron_result(job, "skipped", "跳过：无可用模型（云端未配置且本地模型未运行）")
         return
-    model = (cloud or {}).get("model") or SUBAGENT_MODEL
+    # 模型名解析（审计 A4）：本地时用引擎真实加载的模型 id——此前
+    # 落回 SUBAGENT_MODEL（gpt-4o-mini）发给本地 mlx 引擎必 404，
+    # 每条本地定时任务都走 error 路径
+    if is_local:
+        import local_llm
+        model = (getattr(local_llm._engine, "current_model_id", "")
+                 or getattr(local_llm._engine, "current_model_name", "")
+                 or SUBAGENT_MODEL)
+    else:
+        model = (cloud or {}).get("model") or SUBAGENT_MODEL
     agent_tools = _get_agent_tools("latiao", TOOLS)
     active_tools = _filter_tools(task, agent_tools)
     if len(active_tools) > 5:
