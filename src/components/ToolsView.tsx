@@ -524,51 +524,56 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
       )}
 
       {/* ═══ 统一能力列表（工具与技能，一个列表不分栏） ═══ */}
-      <div className="page-header" style={{ margin: "18px 0 12px" }}>
-        <div className="card-title" style={{ fontSize: 15 }}>⚙️ 能力</div>
-        <div className="card-desc" style={{ marginTop: 4 }}>
-          工具与技能统一为一个能力列表：启用开关、权限级别、使用次数共用一套能力表；技能由模型按需调用（use_skill）
+      <div className="page-header" style={{ margin: "14px 0 8px" }}>
+        <div className="card-title" style={{ fontSize: 14 }}>⚙️ 能力</div>
+        <div className="card-desc" style={{ marginTop: 2, fontSize: 11 }}>
+          工具与技能统一管理：启用开关、权限级别、使用次数共用一套能力表；技能由模型按需调用（use_skill）
         </div>
       </div>
 
-      <div className="card-grid">
+      <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
         {capabilities.map((cap) => {
           const isTool = cap.kind === "tool";
           const permBadge = cap.permission === "safe" ? "badge-safe"
             : cap.permission === "confirm" ? "badge-confirm" : "badge-inactive";
           return (
-          <div key={`${cap.kind}:${cap.name}`} className="card" style={cap.enabled ? {} : { opacity: 0.5 }}>
-            <div className="card-title">
-              <span style={{ fontSize: 15 }}>⚙️</span> {cap.display_name || cap.name}
-              <span className={`badge ${permBadge}`} style={{ marginLeft: 4 }}>
-                {CAP_PERM_LABEL[cap.permission] || cap.permission}
-              </span>
-              {!cap.enabled && <span className="badge badge-confirm">已禁用</span>}
-            </div>
-            <div className="card-desc">{cap.description}</div>
-            <div className="card-meta" style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-              <span>{t("tools.calls", { count: cap.usage_count })} · {sourceLabel(cap.source)}</span>
-              <span style={{ fontSize: 10, color: "var(--text-muted)", fontFamily: "var(--font-mono)" }}>{cap.name}</span>
-            </div>
-            <div style={{ display: "flex", gap: 6, marginTop: 10 }}>
-              <button className={`btn btn-sm ${cap.enabled ? "btn-ghost" : "btn-primary"}`}
+          <div key={`${cap.kind}:${cap.name}`} style={{
+            display: "flex", alignItems: "center", gap: 8, padding: "4px 8px",
+            borderRadius: "var(--radius-sm)",
+            background: cap.enabled ? "transparent" : "color-mix(in srgb, var(--bg-card) 55%, transparent)",
+            opacity: cap.enabled ? 1 : 0.55,
+          }}>
+            <span style={{ fontSize: 13, flexShrink: 0 }}>⚙️</span>
+            <span style={{ fontWeight: 600, fontSize: 12, flexShrink: 0, minWidth: 110, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+              {cap.display_name || cap.name}
+            </span>
+            <span className={`badge ${permBadge}`} style={{ flexShrink: 0 }}>
+              {CAP_PERM_LABEL[cap.permission] || cap.permission}
+            </span>
+            {!cap.enabled && <span className="badge badge-confirm" style={{ flexShrink: 0 }}>已禁用</span>}
+            <span style={{ flex: 1, minWidth: 0, fontSize: 11, color: "var(--text-muted)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {cap.description}
+            </span>
+            <span style={{ flexShrink: 0, fontSize: 10, color: "var(--text-muted)" }}>
+              {t("tools.calls", { count: cap.usage_count })} · {sourceLabel(cap.source)}
+            </span>
+            <span style={{ display: "flex", gap: 4, flexShrink: 0, alignItems: "center" }}>
+              <button className="btn btn-xs btn-ghost"
                 onClick={() => toggleCap(cap)}>{cap.enabled ? "禁用" : "启用"}</button>
               {isTool && (
-                <button className="btn btn-sm btn-ghost" onClick={() => togglePerm(cap)}>
+                <button className="btn btn-xs btn-ghost" onClick={() => togglePerm(cap)}>
                   {cap.permission === "safe" ? t("tools.set_confirm") : t("tools.set_safe")}
                 </button>
               )}
               {!isTool && cap.source === "user" && (
-                <button className="btn btn-sm btn-ghost" style={{ color: "var(--danger)" }}
+                <button className="btn btn-xs btn-ghost" style={{ color: "var(--danger)" }}
                   onClick={() => deleteCap(cap)}>删除</button>
               )}
-            </div>
+            </span>
           </div>
         )})}
         {capabilities.length === 0 && (
-          <div className="card" style={{ gridColumn: "1 / -1" }}>
-            <div className="card-desc">没有匹配的能力条目。</div>
-          </div>
+          <div className="card-desc">没有匹配的能力条目。</div>
         )}
       </div>
 
