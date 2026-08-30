@@ -24,6 +24,10 @@ jobs:
 
       - run: npm install
 
+      - name: "Prepare portable Python (sidecar 运行时)"
+        run: |
+          bash scripts/setup-portable-python.sh
+
       - name: "Guard: signing key configured?"
         run: |
           if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
@@ -38,11 +42,6 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
         run: |
-          cd sidecar
-          python3 -m venv venv
-          source venv/bin/activate
-          pip install -r requirements.txt
-          cd ..
           npm run tauri build
 
       - name: Prepare updater archive (fallback 手动打包+签名)
