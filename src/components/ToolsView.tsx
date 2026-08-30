@@ -67,6 +67,9 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
   const [marketSources, setMarketSources] = useState<any[]>([]);
   const [newSourceUrl, setNewSourceUrl] = useState("");
   const [showSourceForm, setShowSourceForm] = useState(false);
+  // ── GitHub 自动发现（Discovery Engine） ──
+  const [discoverState, setDiscoverState] = useState<any>({ last_scan_ts: 0, repos: 0, entries: 0 });
+  const [discoverRefreshing, setDiscoverRefreshing] = useState(false);
   // ── 统一能力列表（工具与技能一个列表，不分栏） ──
   // ── 新建技能表单 ──
   const [newSkillName, setNewSkillName] = useState("");
@@ -109,7 +112,28 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
     } catch { /* 静默 */ }
   }, []);
 
-  useEffect(() => { refreshMarket(); refreshSources(); }, [refreshMarket, refreshSources]);
+  const refreshDiscover = useCallback(async () => {
+    try {
+      const resp = await authFetch("/v1/marketplace/discover-status");
+      const data = await resp.json();
+      if (data.status === "ok") setDiscoverState(data);
+    } catch { /* 静默 */ }
+  }, []);
+
+  const triggerDiscoverRefresh = async () => {
+    setDiscoverRefreshing(true);
+    try {
+      const resp = await authFetch("/v1/marketplace/discover-refresh", { method: "POST" });
+      const data = await resp.json();
+      if (data.status === "ok") {
+        showToast(data.message || "GitHub 抓取已开始");
+        // 轮询状态直到完成（抓取 3-5 分钟）
+        setTimeout(async () => { await refreshDiscover(); await refreshMarket(); setDiscoverRefreshing(false); }, 12000);
+      } else { showToast(data.message || "刷新失败", "warn"); setDiscoverRefreshing(false); }
+    } catch (e) { console.error(e); showToast("刷新失败", "warn"); setDiscoverRefreshing(false); }
+  };
+
+  useEffect(() => { refreshMarket(); refreshSources(); refreshDiscover(); }, [refreshMarket, refreshSources, refreshDiscover]);
 
   const refreshExtensions = useCallback(async () => {
     try {
@@ -398,6 +422,25 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
                 )}
               </div>
             ))}
+          </div>
+        </div>
+
+        {/* GitHub 自动发现（Discovery Engine：主动抓取生态仓库） */}
+        <div className="card" style={{ marginBottom: 14 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+            <div className="card-title" style={{ marginBottom: 0 }}>🌐 GitHub 自动发现</div>
+            <button className="btn btn-sm btn-ghost" disabled={discoverRefreshing}
+              onClick={triggerDiscoverRefresh}>
+              {discoverRefreshing ? "抓取中…" : "立即抓取"}
+            </button>
+          </div>
+          <div className="card-desc" style={{ marginTop: 6, fontSize: 11 }}>
+            系统从 GitHub 搜索 agent 技能仓库并自动解析 SKILL.md。当前已发现：
+            <b style={{ color: "var(--accent)" }}> {discoverState.entries || 0} 个技能</b>
+            · 来自 <b>{discoverState.repos || 0}</b> 个仓库
+            {discoverState.last_scan_ts
+              ? ` · 上次扫描 ${new Date(discoverState.last_scan_ts * 1000).toLocaleString("zh-CN")}`
+              : " · 尚未扫描（点击立即抓取或等待启动扫描）"}
           </div>
         </div>
 

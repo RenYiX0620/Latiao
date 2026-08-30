@@ -1,0 +1,177 @@
+"""Discovery Engine 测试：主动抓取 GitHub agent 技能。
+
+网络隔离：mock 所有 httpx 调用，不真实打包抓取。聚焦核心逻辑：
+- 树发现 / 指纹缓存 / 索引合并幂等 / 后端接入 merge / 状态
+"""
+import json
+import sys
+import tempfile
+import unittest
+import zipfile
+import io
+from pathlib import Path
+from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+import discovery
+
+
+def _fake_tree(files):
+    return [{"name": f, "hash": "x", "size": 10} for f in files]
+
+
+def _fake_codeload_zip(files):
+    """构造 fake 仓库 zip：repo-main/... 前缀。"""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for f in files:
+            zf.writestr(f"repo-main/{f.lstrip('/')}", b"---\nname: my-skill\ndescription: a skill\n---\nbody")
+    return buf.getvalue()
+
+
+class _FakeResp:
+    def __init__(self, text="", json_data=None, status=200, content=None):
+        self._text = text
+        self._json = json_data or {}
+        self.status_code = status
+        self.content = content or text.encode()
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise Exception(f"HTTP {self.status_code}")
+
+    @property
+    def text(self):
+        return self._text
+
+    @property
+    def is_success(self):
+        return self.status_code < 400
+
+    @property
+    def content_bytes(self):
+        return self.content
+
+    def json(self):
+        return self._json
+
+
+class TestDiscoveryCore(unittest.TestCase):
+    def setUp(self):
+        # 隔离持久化文件
+        self._tmp = tempfile.TemporaryDirectory()
+        self._index = Path(self._tmp.name) / "index.json"
+        self._cache = Path(self._tmp.name) / "cache.json"
+        self._old_index = discovery.INDEX_FILE
+        self._old_cache = discovery.CACHE_FILE
+        discovery.INDEX_FILE = self._index
+        discovery.CACHE_FILE = self._cache
+
+    def tearDown(self):
+        discovery.INDEX_FILE = self._old_index
+        discovery.CACHE_FILE = self._old_cache
+        self._tmp.cleanup()
+
+    def test_has_skill_patterns(self):
+        paths = ["/skills/a/SKILL.md", "/skills/b/skill.md", "/README.md"]
+        specs = discovery._has_skill_patterns(paths)
+        self.assertEqual(len(specs), 2)
+
+    def test_fingerprint_stable(self):
+        a = discovery._fingerprint(["/x/SKILL.md", "/y.md"])
+        b = discovery._fingerprint(["/x/SKILL.md", "/y.md"])
+        self.assertEqual(a, b)
+
+    def test_parse_frontmatter(self):
+        meta, body = discovery._parse_frontmatter("---\nname: foo\ndescription: bar\n---\nhi")
+        self.assertEqual(meta["name"], "foo")
+        self.assertEqual(body, "hi")
+
+    def test_infer_permissions_shell_vs_readonly(self):
+        self.assertEqual(discovery._infer_permissions({"requires": {"bins": ["x"]}}), ["shell", "network"])
+        self.assertEqual(discovery._infer_permissions({}), ["readonly"])
+
+    @mock.patch("discovery._jsdelivr_tree", return_value=["/skills/foo/SKILL.md"])
+    @mock.patch("discovery._codeload_zip")
+    def test_scan_repo_generates_entries(self, mock_zip, mock_tree):
+        mock_zip.return_value = _fake_codeload_zip(["/skills/foo/SKILL.md"])
+        entries = discovery._scan_repo("owner/repo", force=True)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["repo"], "owner/repo")
+        self.assertEqual(entries[0]["source_kind"], "openclaw-skill")
+        self.assertIn("/skills/foo/SKILL.md", entries[0]["skill_path"])
+
+    @mock.patch("discovery._jsdelivr_tree", return_value=["/skills/foo/SKILL.md"])
+    @mock.patch("discovery._codeload_zip")
+    def test_scan_fingerprint_skip(self, mock_zip, mock_tree):
+        mock_zip.return_value = _fake_codeload_zip(["/skills/foo/SKILL.md"])
+        discovery._scan_repo("owner/repo", force=True)  # 首次
+        # 二次（非 force）指纹相同 → 跳过（不调用 codeload）
+        mock_zip.reset_mock()
+        entries = discovery._scan_repo("owner/repo", force=False)
+        self.assertEqual(entries, [])
+        mock_zip.assert_not_called()
+
+    @mock.patch("discovery._jsdelivr_tree", return_value=[])
+    def test_scan_no_skills(self, mock_tree):
+        entries = discovery._scan_repo("owner/repo")
+        self.assertEqual(entries, [])
+
+    @mock.patch("discovery._jsdelivr_tree", return_value=None)
+    def test_scan_tree_unreachable(self, mock_tree):
+        entries = discovery._scan_repo("owner/repo")
+        self.assertEqual(entries, [])
+
+
+class TestDiscoveryApi(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._old_index = discovery.INDEX_FILE
+        self._old_cache = discovery.CACHE_FILE
+        discovery.INDEX_FILE = Path(self._tmp.name) / "idx.json"
+        discovery.CACHE_FILE = Path(self._tmp.name) / "cach.json"
+
+    def tearDown(self):
+        discovery.INDEX_FILE = self._old_index
+        discovery.CACHE_FILE = self._old_cache
+        self._tmp.cleanup()
+
+    def test_index_roundtrip_and_status(self):
+        discovery._save_index({"repos": {"a": {"entries": 3}}, "entries": [{"repo": "a"}], "last_scan_ts": 123, "scan_stats": {"x": 1}})
+        st = discovery.discover_status()
+        self.assertEqual(st["repos"], 1)
+        self.assertEqual(st["last_scan_ts"], 123)
+        entries = discovery.get_discovered_entries()
+        self.assertEqual(len(entries), 1)
+
+    @mock.patch("discovery._collect_candidates")
+    @mock.patch("discovery._scan_repo")
+    def test_run_discovery_accumulates(self, mock_scan, mock_collect):
+        mock_collect.return_value = {"owner/repo": {"stars": 10}, "other/repo": {"stars": 5}}
+        mock_scan.side_effect = lambda repo, force=False: (
+            [{"repo": repo, "skill_path": "/skills/a/SKILL.md", "description": "x"}]
+            if repo == "owner/repo" else []
+        )
+        discovery.INDEX_FILE.write_text(json.dumps({"repos": {}, "entries": [], "last_scan_ts": 0, "scan_stats": {}}), encoding="utf-8")
+        res = discovery.run_discovery(force=True, max_repos=3)
+        self.assertEqual(res["entries"], 1)
+        st = discovery.discover_status()
+        self.assertEqual(st["repos"], 2)  # 两个都记录（无技能也登记）
+
+    def test_fetch_all_merges_discovered(self):
+        import extension_manager
+        from unittest import mock
+        discovery.INDEX_FILE.write_text(json.dumps({
+            "repos": {"owner/repo": {"entries": 1}},
+            "entries": [{"repo": "owner/repo", "skill_path": "/s/SKILL.md", "source_kind": "openclaw-skill"}],
+            "last_scan_ts": 0, "scan_stats": {},
+        }), encoding="utf-8")
+        with mock.patch("extension_manager.list_market_sources", return_value=[]):
+            out = extension_manager.fetch_all_markets()
+        self.assertEqual(out["count"], 1)
+        self.assertEqual(out["plugins"][0]["market_source"], "GitHub 发现")
+
+
+if __name__ == "__main__":
+    unittest.main()
