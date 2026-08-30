@@ -126,7 +126,9 @@ jobs:
       - name: Build sidecar (PyInstaller)
         run: |
           cd sidecar
-          python -m pip install -r requirements.txt
+          # Windows 侧依赖：requirements-win.txt（不含 Mac 专属 mlx/mlx-lm/mlx-metal），
+          # 缺失 httpx 等会导致 sidecar.exe 启动即 ModuleNotFoundError
+          python -m pip install -r requirements-win.txt
           python -m pip install "pyinstaller==6.*"
           python -m PyInstaller latiao.spec
           Copy-Item dist/sidecar.exe -Destination . -Force
