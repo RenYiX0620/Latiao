@@ -159,3 +159,59 @@ def importlib_util(path):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestConfirmFlowIntegration(unittest.TestCase):
+    """确认流集成：confirm 级控制工具 ∈ _handle_tool_execution 的批准/拒绝路径。"""
+
+    def test_confirm_control_tool_approve_executes(self):
+        import asyncio
+        import agent_loop
+        from plugins import control_launch
+
+        async def run():
+            msgs = []
+            orig = agent_loop._await_tool_confirmation
+
+            async def fake_approve(call_id, tool_name, args):
+                return True, []
+
+            agent_loop._await_tool_confirmation = fake_approve
+            try:
+                tc = {"id": "c1", "function": {"name": "control_launch", "arguments": '{"command":"sleep 3"}'}}
+                failed, _ = await agent_loop._handle_tool_execution(tc, msgs, "s", "latiao", "confirm")
+                # 批准后工具真实执行
+                return failed, msgs[-1].get("content", "") if msgs else ""
+            finally:
+                agent_loop._await_tool_confirmation = orig
+
+        failed, content = asyncio.run(run())
+        self.assertFalse(failed)
+        self.assertIn("已启动", content)
+
+    def test_confirm_control_tool_deny_blocks(self):
+        import asyncio
+        import agent_loop
+
+        async def run():
+            msgs = []
+            orig = agent_loop._await_tool_confirmation
+
+            async def fake_deny(call_id, tool_name, args):
+                return False, []
+
+            agent_loop._await_tool_confirmation = fake_deny
+            try:
+                tc = {"id": "c2", "function": {"name": "control_launch", "arguments": '{"command":"sleep 3"}'}}
+                failed, _ = await agent_loop._handle_tool_execution(tc, msgs, "s", "latiao", "confirm")
+                return failed, msgs[-1].get("content", "") if msgs else ""
+            finally:
+                agent_loop._await_tool_confirmation = orig
+
+        failed, content = asyncio.run(run())
+        self.assertTrue(failed)
+        self.assertIn("denied", content.lower())
+
+
+if __name__ == "__main__":
+    unittest.main()
