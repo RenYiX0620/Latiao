@@ -287,6 +287,19 @@ async def lifespan(app: FastAPI):
         warm_market_cache()
     except Exception:
         logger.warning("市场预热启动失败", exc_info=True)
+    # GitHub 生态抓取：启动后台线程（首启全量；24h 内增量跳过），不阻塞启动
+    try:
+        import threading
+        from discovery import run_discovery
+        def _discovery_worker():
+            try:
+                run_discovery()
+                logger.info("GitHub 抓取预热完成")
+            except Exception:
+                logger.warning("GitHub 抓取预热失败", exc_info=True)
+        threading.Thread(target=_discovery_worker, daemon=True).start()
+    except Exception:
+        logger.warning("GitHub 抓取预热启动失败", exc_info=True)
     cron_task = asyncio.create_task(_cron_loop())
     catchup_task = asyncio.create_task(run_cron_catchup())  # 补跑关闭期间错过的任务
     logger.info("Sidecar 启动 — cron loop started")

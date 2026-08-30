@@ -1752,6 +1752,37 @@ async def api_market_discover(url: str = Query(default="")):
         return {"status": "error", "message": str(e)}
 
 
+@app.get("/v1/marketplace/discovered")
+async def api_market_discovered():
+    """GitHub 自动发现索引快照。"""
+    from discovery import discover_status, get_discovered_entries
+    st = discover_status()
+    st["entries"] = get_discovered_entries()
+    return st
+
+
+@app.post("/v1/marketplace/discover-refresh")
+async def api_market_discover_refresh():
+    """触发一轮强制全量抓取（后台线程，立即返回进度）。"""
+    import threading
+    from discovery import run_discovery
+    # 用后台线程跑（抓取 3-5 分钟），不阻塞请求；结果写索引，前端可轮询 discovered
+    def _worker():
+        try:
+            run_discovery(force=True)
+        except Exception:
+            import logging
+            logging.getLogger("latiao-sidecar").warning("手动刷新抓取失败", exc_info=True)
+    threading.Thread(target=_worker, daemon=True).start()
+    return {"status": "ok", "message": "GitHub 抓取已开始，稍后刷新市场可看到新条目"}
+
+
+@app.get("/v1/marketplace/discover-status")
+async def api_market_discover_status():
+    from discovery import discover_status
+    return discover_status()
+
+
 @app.post("/v1/extensions/install-github")
 async def api_extensions_install_github(request: Request):
     """安装生态源条目（github 仓库 + skill_path + kind）。"""
