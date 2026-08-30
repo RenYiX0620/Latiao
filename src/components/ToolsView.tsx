@@ -74,6 +74,8 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
   const [marketCollapsed, setMarketCollapsed] = useState(false);
   // ── 市场搜索（890 条过滤，纯前端） ──
   const [marketQuery, setMarketQuery] = useState("");
+  // ── 市场类别筛选（全部/官方/OpenClaw/Claude/GitHub发现） ──
+  const [marketCat, setMarketCat] = useState<"all" | "official" | "openclaw" | "claude" | "discovered">("all");
   // ── 统一能力列表（工具与技能一个列表，不分栏） ──
   // ── 新建技能表单 ──
   const [newSkillName, setNewSkillName] = useState("");
@@ -368,12 +370,20 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
 
   // 市场搜索：按名称/描述/来源过滤（890 条纯前端，零压力）
   const q = marketQuery.trim().toLowerCase();
-  const filteredPlugins = q
-    ? marketPlugins.filter((p) => {
-        const hay = `${p.display_name || p.name || ""} ${p.description || ""} ${p.market_source || ""} ${p.repo || ""}`.toLowerCase();
-        return hay.includes(q);
-      })
-    : marketPlugins;
+  const catOf = (p: any): string => {
+    if (p.source_kind === "claude-plugin") return "claude";
+    if (p.source_kind === "openclaw-skill" || p.source_kind === "generic-skill") {
+      // 手动源 vs 发现源：靠 market_source 区分
+      return p.market_source === "GitHub 发现" ? "discovered" : "openclaw";
+    }
+    return "official";
+  };
+  const filteredPlugins = marketPlugins.filter((p) => {
+    if (marketCat !== "all" && catOf(p) !== marketCat) return false;
+    if (!q) return true;
+    const hay = `${p.display_name || p.name || ""} ${p.description || ""} ${p.market_source || ""} ${p.repo || ""}`.toLowerCase();
+    return hay.includes(q);
+  });
 
   return (
     <div>
@@ -487,6 +497,19 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
               <button className="btn btn-xs btn-ghost" onClick={() => setMarketQuery("")}>清空</button>
             )}
           </div>
+          {/* 类别筛选 chips */}
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 8 }}>
+            {([
+              ["all", "全部"],
+              ["official", "官方"],
+              ["openclaw", "OpenClaw"],
+              ["claude", "Claude 插件"],
+              ["discovered", "GitHub 发现"],
+            ] as [string, string][]).map(([k, label]) => (
+              <button key={k} className={`btn btn-xs ${marketCat === k ? "btn-primary" : "btn-ghost"}`}
+                onClick={() => setMarketCat(k as any)}>{label}</button>
+            ))}
+          </div>
           <div className="card-desc" style={{ marginBottom: 6, fontSize: 11 }}>
             {marketPlugins.length} 条中匹配 <b style={{ color: "var(--accent)" }}>{filteredPlugins.length}</b> 条
           </div>
@@ -504,7 +527,7 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
                   ? setConfirming({ source: item.source_url, sha256: item.sha256, permissions: [] })
                   : installFromMarket(item));
             return (
-            <div key={`${item.market_source}:${item.name}`} style={{
+            <div key={`${item.repo || item.source_url || ""}:${item.skill_path || item.name}`} style={{
               display: "flex", alignItems: "center", gap: 10, padding: "8px 0",
               borderBottom: "1px solid var(--border-default)",
             }}>
@@ -520,6 +543,7 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
                   {typeof item.author === "object" && item.author ? item.author.name || "" : ""}
                   {item.category ? ` · ${item.category}` : ""}
                   {isEco ? ` · ${item.repo || ""}` : ""}
+                  {typeof item.stars === "number" && item.stars > 0 ? ` · ⭐ ${item.stars.toLocaleString()}` : ""}
                 </div>
               </div>
               <button className={`btn btn-sm ${item.installed && !item.update_available ? "btn-ghost" : "btn-primary"}`}

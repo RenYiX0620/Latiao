@@ -200,22 +200,52 @@ def _first_desc_line(body: str) -> str:
     return ""
 
 
+_SKILL_DIR_MAX = 5 * 1024 * 1024  # 5MB：技能目录超过则退回整仓 codeload
+
+
 def install_openclaw_skill(repo: str, skill_path: str) -> bytes | None:
-    """下载技能目录并打包成 .latiaoext（内存 zip 字节），交给 extension_manager 安装。"""
+    """下载技能目录并打包成 .latiaoext（内存 zip 字节），交给 extension_manager 安装。
+    优先 jsDelivr 树枚举目录全部文件（脚本/参考文件不丢），5MB 内逐文件拼装；
+    树不可用或超 5MB 时退 codeload 整仓裁剪。"""
     repo = parse_github_repo(repo)
     if not repo or not skill_path:
         return None
-    # 技能包通常很小：优先 jsDelivr 单文件拼装；失败再 codeload 整仓裁剪
-    content = _jsdelivr_file(repo, skill_path)
-    if content is None:
-        zip_bytes = _codeload_zip(repo)
-        if zip_bytes is None:
-            return None
-        subset = _zip_subset(zip_bytes, skill_path.rsplit("/", 1)[0] + "/")
-        return _pack_skill_dir(subset, skill_path.rsplit("/", 1)[0])
-    meta, body = parse_frontmatter(content)
-    return _pack_skill_dir({skill_path.rsplit("/", 1)[0] + "/SKILL.md": content},
-                           skill_path.rsplit("/", 1)[0], meta=meta)
+    skills_dir = skill_path.rsplit("/", 1)[0]  # 如 skills/notion-cli
+    # 1) 首选：jsDelivr 树枚举目录内所有文件
+    files_all = _jsdelivr_tree(repo)
+    meta = {}
+    body = ""
+    dir_files: dict[str, bytes] = {}
+    if files_all:
+        prefix = skills_dir.strip("/") + "/"
+        count = 0
+        read_ok = True
+        for f in files_all:
+            rel = f.lstrip("/")
+            if not rel.startswith(prefix):
+                continue
+            # 只要直接挂在技能目录下（含子目录）
+            content = _jsdelivr_file(repo, rel)
+            if content is None:
+                read_ok = False
+                break
+            count += len(content.encode("utf-8"))
+            if count > _SKILL_DIR_MAX:
+                read_ok = False  # 超限，退回整仓
+                break
+            dir_files[rel[len(prefix):]] = content
+        if read_ok and dir_files:
+            # 解析 SKILL.md 的 frontmatter 用于 manifest
+            sk = dir_files.get("SKILL.md") or dir_files.get("skill.md")
+            if sk:
+                meta, body = parse_frontmatter(sk)
+            return _pack_skill_dir(dir_files, skills_dir, meta=meta)
+    # 2) 兜底：codeload 整仓裁剪（多文件保留）
+    zip_bytes = _codeload_zip(repo)
+    if zip_bytes is None:
+        return None
+    subset = _zip_subset(zip_bytes, prefix if 'prefix' in dir() else skills_dir + "/")
+    return _pack_skill_dir(subset, skills_dir)
 
 
 def _zip_subset(zip_bytes: bytes, prefix: str) -> dict[str, bytes]:

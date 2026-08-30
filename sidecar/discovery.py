@@ -267,9 +267,48 @@ def _safe_name(name: str) -> str:
     return re.sub(r"[^a-z0-9._-]+", "-", (name or "").lower()).strip("-")[:64] or "unnamed"
 
 
-def _fingerprint(paths: list[str]) -> str:
-    """仓库指纹：路径拼接的 md5（识别内容变更）。"""
-    return hashlib.md5("\n".join(sorted(paths or [])).encode("utf-8")).hexdigest()[:16]
+_AWESOME_LINK_RE = re.compile(
+    r"(?:https?://)?(?:www\.)?github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?(?:/|\s|$|[)\]}])",
+    re.I,
+)
+
+
+def parse_awesome_links(repo: str, ref: str = "main") -> dict[str, int]:
+    """解析 awesome/curated 类仓库（README.md + categories/*.md）里的 github 链接。
+    返回 {owner/repo: 未知星数(0)}。用 jsDelivr 读文件（无限额）。"""
+    out: dict[str, int] = {}
+    files = _jsdelivr_tree(repo, ref)
+    if not files:
+        return {}
+    targets = [f for f in files if f.lower().endswith(("readme.md", ".md")) and "/categories/" in f.lower() or f.lower().endswith("readme.md")]
+    # 优先 README + categories 下的 md（各取前 6 个，配额理性）
+    targets = targets[:8]
+    for f in targets:
+        text = _read_file(repo, f)
+        if not text:
+            continue
+        for m in _AWESOME_LINK_RE.finditer(text):
+            owner, name = m.group(1).lower(), m.group(2).lower()
+            if owner in ("www", "raw", "cdn", "github") or name in ("", "blob", "tags", "issues", "pulls", "releases"):
+                continue
+            full = f"{owner}/{name}"
+            if full != repo.lower() and full not in out:
+                out[full] = 0
+        if len(out) >= 40:
+            break
+    return out
+
+
+def _fingerprint(paths: list[str], content_hashes: dict[str, str] | None = None) -> str:
+    """仓库指纹：路径列表 md5 ＋ 首 8 个 SKILL.md 内容 hash 摘要。
+    内容变更（同路径不同内容）也会改变指纹，触发增量重扫。"""
+    base = hashlib.md5("\n".join(sorted(paths or [])).encode("utf-8")).hexdigest()[:16]
+    if content_hashes:
+        # 按路径排序取前 8 个 SKILL.md 内容的 md5 拼接
+        md5s = [content_hashes[k] for k in sorted(content_hashes.keys())[:8]]
+        if md5s:
+            base += "-" + hashlib.md5("".join(md5s).encode("utf-8")).hexdigest()[:12]
+    return base
 
 
 # ═══════════════════════════════════════════════════════
@@ -327,22 +366,34 @@ _CANDIDATES: dict[str, dict] = {}  # repo -> {stars, updated_at, reason}
 
 
 def _collect_candidates() -> dict[str, dict]:
-    """仓库发现：repo search（6 查询 × 10 结果）+ 组织补充。"""
+    """仓库发现：repo search（6 查询 × 翻 2 页 × 50）+ 组织 + awesome 列表链接。"""
     out: dict[str, dict] = {}
     for q in SEARCH_QUERIES:
-        repos = search_repositories(q, per_page=10)
-        for r in repos:
-            full = r.get("full_name", "")
-            if not full:
-                continue
-            if full not in out:
-                out[full] = {"stars": r.get("stargazers_count", 0), "reason": f"search:{q[:18]}"}
-        time.sleep(1.5)  # 节流 search 配额
+        for page in (1, 2):  # 翻 2 页扩候选（每页 50，配额允许）
+            repos = search_repositories(q, per_page=50, page=page)
+            for r in repos:
+                full = r.get("full_name", "")
+                if not full:
+                    continue
+                if full not in out:
+                    out[full] = {"stars": r.get("stargazers_count", 0), "reason": f"search:{q[:18]}"}
+            if not repos:
+                break
+            time.sleep(1.5)  # 节流 search 配额
     for org in ORG_NAMES:
         for r in org_repos(org):
             full = r.get("full_name", "")
             if full:
                 out.setdefault(full, {"stars": r.get("stargazers_count", 0), "reason": f"org:{org}"})
+    # awesome/curated 类仓库：解析其 README/categories 里的 github 链接，并入候选池
+    known_awesome = [repo for repo, meta in out.items()
+                     if any(k in repo.lower() for k in ("awesome", "curated", "collection"))]
+    known_awesome = known_awesome[:8]  # 限 8 个，避免配额爆炸
+    for repo in known_awesome:
+        linked = parse_awesome_links(repo)
+        for full, stars in linked.items():
+            out.setdefault(full, {"stars": stars or out.get(full, {}).get("stars", 0),
+                                  "reason": f"awesome:{repo.split('/')[1][:18]}"})
     return out
 
 
@@ -355,10 +406,14 @@ def _scan_repo(repo: str, force: bool = False) -> list[dict]:
     entries_spec = _has_skill_patterns(paths)
     if not entries_spec:
         return []
-    fp = _fingerprint(paths)
+    # 先取内容相关指纹：路径指纹 + 已缓存内容 hash（无内容 hash 时用路径指纹先判）
     cache = _load_cache()
-    if not force and cache.get("fingerprints", {}).get(repo) == fp:
-        return []  # 未变更，跳过（省网络流量）
+    if not force:
+        cached = cache.get("fingerprints", {}).get(repo, "")
+        if cached and cached.split("-")[0] == _fingerprint(paths):
+            # 路径未变且原指纹无内容段 → 旧仓库直接跳过；有内容段则仍需读内容比对新指纹
+            if "-" not in cached:
+                return []  # 旧指纹（仅路径），未变
     # 一次 codeload 整仓 zip（1-16s，无重定向坑），本地解压抽 SKILL.md 解析 frontmatter
     zip_bytes = _codeload_zip(repo)
     if not zip_bytes:
@@ -373,6 +428,15 @@ def _scan_repo(repo: str, force: bool = False) -> list[dict]:
     except Exception:
         logger.warning("discovery zip parse failed %s", repo, exc_info=True)
         return []
+    # 内容指纹：对 zip 内 SKILL.md 内容算 md5（按 skill 相对路径）
+    content_hashes: dict[str, str] = {}
+    for name, data in files.items():
+        # 归一化为技能相对路径（去掉 repo-main/ 前缀根）
+        rel = name.split("/", 1)[1] if "/" in name else name
+        content_hashes[rel] = hashlib.md5(data).hexdigest()[:12]
+    fp = _fingerprint(paths, content_hashes)
+    if not force and cache.get("fingerprints", {}).get(repo) == fp:
+        return []  # 内容未变，跳过
     entries = []
     for spec in entries_spec:
         # zip 内路径带 repo-<branch>/ 前缀（repo-main/skills/...）
@@ -407,22 +471,32 @@ def _scan_repo(repo: str, force: bool = False) -> list[dict]:
 
 
 def run_discovery(force: bool = False, max_repos: int = 60) -> dict:
-    """执行一轮抓取。返回统计。"""
+    """执行一轮抓取。返回统计。
+    轮换策略：新候选（未扫描/未变更）优先扫，已扫且指纹未变的垫底——打破
+    top-N 死局，让不同轮的候选都能进库。"""
     global _CANDIDATES
     import time as _t
     index = _load_index()
     last_ts = index.get("last_scan_ts", 0)
     elapsed = _t.time() - last_ts
     if not force and last_ts and elapsed < 24 * 3600:
-        return {"status": "ok", "skipped": "recent", "last_scan_ts": last_ts}
+        # 增量：优先扫描新面孔（不限于 top-60）
+        return _run_incremental(index, max_repos)
 
     candidates = _collect_candidates()
-    # 保留已知 repo 状态，按星数排序取 top max_repos，新增优先
-    repos = sorted(candidates.items(), key=lambda kv: -kv[1].get("stars", 0))[:max_repos]
+    # 新面孔（未登记或已登记但指纹已变）优先；已扫稳定的垫底
+    seen_old: dict[str, dict] = index.get("repos", {})
+    def _priority(item):
+        repo, meta = item
+        rec = seen_old.get(repo)
+        if rec is None:
+            return (0, -meta.get("stars", 0))       # 未扫描 → 最优先
+        return (1, -meta.get("stars", 0))           # 已扫描 → 次之
+    repos = sorted(candidates.items(), key=_priority)[:max_repos]
 
     scanned = 0
     total_entries = 0
-    seen: dict[str, dict] = index.get("repos", {})
+    seen: dict[str, dict] = dict(seen_old)
     entries_map: dict[tuple, dict] = {}
     # 历史条目基线（repo 仍要被保留才沿用）
     for e in index.get("entries", []):
@@ -435,14 +509,16 @@ def run_discovery(force: bool = False, max_repos: int = 60) -> dict:
             entries = _scan_repo(repo, force=force)
             if entries:
                 seen[repo] = {"stars": meta.get("stars", 0), "entries": len(entries),
-                              "reason": meta.get("reason", ""), "ts": _t.time()}
+                              "reason": meta.get("reason", ""), "ts": _t.time(), "scanned": True}
                 for e in entries:
+                    e["stars"] = meta.get("stars", 0)
                     entries_map[(repo, e["skill_path"])] = e
                 total_entries += len(entries)
             else:
                 # 无技能 或 未变更：保留 repo 但标记
                 seen.setdefault(repo, {"stars": meta.get("stars", 0), "entries": 0,
-                                       "reason": meta.get("reason", ""), "ts": _t.time()})
+                                       "reason": meta.get("reason", ""), "ts": _t.time(),
+                                       "scanned": True})
             scanned += 1
         except Exception as e:
             logger.warning("scan fail %s: %s", repo, e)
@@ -461,6 +537,48 @@ def run_discovery(force: bool = False, max_repos: int = 60) -> dict:
     return {"status": "ok", "scanned": scanned, "entries": len(index["entries"]), "candidates": len(candidates)}
 
 
+def _run_incremental(index: dict, max_repos: int) -> dict:
+    """24h 内的增量扫描：只扫新面孔（index 未登记的候选），不动已扫仓库。"""
+    import time as _t
+    candidates = _collect_candidates()
+    seen: dict[str, dict] = index.get("repos", {})
+    fresh = {repo: meta for repo, meta in candidates.items() if repo not in seen}
+    repos = sorted(fresh.items(), key=lambda kv: -kv[1].get("stars", 0))[:max_repos]
+    if not repos:
+        return {"status": "ok", "skipped": "no-new", "last_scan_ts": index.get("last_scan_ts", 0)}
+
+    entries_map: dict[tuple, dict] = {}
+    for e in index.get("entries", []):
+        entries_map[(e.get("repo", ""), e.get("skill_path", ""))] = e
+    scanned = 0
+    total = 0
+    for repo, meta in repos:
+        try:
+            entries = _scan_repo(repo, force=True)  # 新面孔强制扫
+            if entries:
+                seen[repo] = {"stars": meta.get("stars", 0), "entries": len(entries),
+                              "reason": meta.get("reason", ""), "ts": _t.time(), "scanned": True}
+                for e in entries:
+                    e["stars"] = meta.get("stars", 0)
+                    entries_map[(repo, e["skill_path"])] = e
+                total += len(entries)
+            else:
+                seen.setdefault(repo, {"stars": meta.get("stars", 0), "entries": 0,
+                                       "reason": meta.get("reason", ""), "ts": _t.time(),
+                                       "scanned": True})
+            scanned += 1
+        except Exception as e:
+            logger.warning("incremental scan fail %s: %s", repo, e)
+    index["repos"] = seen
+    index["entries"] = list(entries_map.values())
+    index["last_scan_ts"] = _t.time()
+    index["scan_stats"] = {"scanned": scanned, "entries": len(index["entries"]),
+                           "candidates": len(candidates), "mode": "incremental"}
+    _save_index(index)
+    return {"status": "ok", "scanned": scanned, "entries": len(index["entries"]),
+            "candidates": len(candidates), "mode": "incremental"}
+
+
 def discover_status() -> dict:
     index = _load_index()
     return {
@@ -474,9 +592,15 @@ def discover_status() -> dict:
 
 
 def get_discovered_entries() -> list[dict]:
-    """市场聚合用的发现条目快照。"""
+    """市场聚合用的发现条目快照（注入仓库星数）。"""
     index = _load_index()
-    return index.get("entries", [])
+    repo_stars = {repo: rec.get("stars", 0) for repo, rec in index.get("repos", {}).items()}
+    out = []
+    for e in index.get("entries", []):
+        e = dict(e)
+        e["stars"] = repo_stars.get(e.get("repo", ""), 0)
+        out.append(e)
+    return out
 
 
 # 保证索引目录存在

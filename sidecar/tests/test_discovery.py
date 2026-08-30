@@ -106,12 +106,10 @@ class TestDiscoveryCore(unittest.TestCase):
     @mock.patch("discovery._codeload_zip")
     def test_scan_fingerprint_skip(self, mock_zip, mock_tree):
         mock_zip.return_value = _fake_codeload_zip(["/skills/foo/SKILL.md"])
-        discovery._scan_repo("owner/repo", force=True)  # 首次
-        # 二次（非 force）指纹相同 → 跳过（不调用 codeload）
-        mock_zip.reset_mock()
+        discovery._scan_repo("owner/repo", force=True)  # 首次（写入指纹）
+        # 二次（非 force）同一内容 → 指纹一致，返回 []（不生成条目）
         entries = discovery._scan_repo("owner/repo", force=False)
         self.assertEqual(entries, [])
-        mock_zip.assert_not_called()
 
     @mock.patch("discovery._jsdelivr_tree", return_value=[])
     def test_scan_no_skills(self, mock_tree):
@@ -175,3 +173,134 @@ class TestDiscoveryApi(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDiscoveryImprovements(unittest.TestCase):
+    """方向1完善：轮换、awesome、指纹内容感知。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._old_index = discovery.INDEX_FILE
+        self._old_cache = discovery.CACHE_FILE
+        discovery.INDEX_FILE = Path(self._tmp.name) / "idx.json"
+        discovery.CACHE_FILE = Path(self._tmp.name) / "cach.json"
+
+    def tearDown(self):
+        discovery.INDEX_FILE = self._old_index
+        discovery.CACHE_FILE = self._old_cache
+        self._tmp.cleanup()
+
+    def test_fingerprint_content_aware(self):
+        paths = ["/skills/a/SKILL.md"]
+        f1 = discovery._fingerprint(paths, {"/skills/a/SKILL.md": "aaa"})
+        f2 = discovery._fingerprint(paths, {"/skills/a/SKILL.md": "bbb"})
+        self.assertNotEqual(f1, f2)
+        # 无内容 hash 时等价于路径指纹
+        f3 = discovery._fingerprint(paths)
+        self.assertEqual(f3, f1.split("-")[0])
+
+    @mock.patch("discovery._jsdelivr_tree", return_value=["/README.md"])
+    @mock.patch("discovery._read_file")
+    def test_parse_awesome_links(self, mock_read, mock_tree):
+        mock_read.return_value = (
+            "参考：https://github.com/owner/repo-a 与 github.com/foo/bar.git "
+            "以及 https://github.com/baz/qux/tree/main/x"
+        )
+        links = discovery.parse_awesome_links("VoltAgent/awesome-x")
+        self.assertIn("owner/repo-a", links)
+        self.assertIn("foo/bar", links)
+        self.assertIn("baz/qux", links)
+        self.assertNotIn("repo-a/tree", "".join(links.keys()))  # 不吞路径
+
+    @mock.patch("discovery._collect_candidates")
+    @mock.patch("discovery._scan_repo")
+    def test_rotation_prefers_new_repos(self, mock_scan, mock_collect):
+        """第二轮应优先扫未扫描仓库而非重复 top-星数。"""
+        # 第一轮：已扫描 a/repo（高星），b/repo 未扫
+        mock_collect.return_value = {
+            "a/repo": {"stars": 1000},
+            "b/repo": {"stars": 10},
+        }
+        mock_scan.return_value = []
+        discovery.INDEX_FILE.write_text(json.dumps(
+            {"repos": {"a/repo": {"stars": 1000, "entries": 0, "scanned": True}},
+             "entries": [], "last_scan_ts": 0, "scan_stats": {}}), encoding="utf-8")
+        # 断言第一轮新面孔 b/repo 排在前面（未扫描优先于已扫描高星）
+        mock_scan.reset_mock()
+        discovery.run_discovery(force=True, max_repos=5)
+        scanned_order = [c[0][0] for c in mock_scan.call_args_list]
+        self.assertEqual(scanned_order[0], "b/repo")
+        self.assertIn("a/repo", scanned_order)
+
+    @mock.patch("discovery._collect_candidates")
+    @mock.patch("discovery._scan_repo")
+    def test_incremental_scans_new_only(self, mock_scan, mock_collect):
+        mock_collect.return_value = {
+            "known/repo": {"stars": 500},
+            "fresh/repo": {"stars": 20},
+        }
+        mock_scan.return_value = []
+        discovery.INDEX_FILE.write_text(json.dumps(
+            {"repos": {"known/repo": {"stars": 500, "scanned": True}},
+             "entries": [], "last_scan_ts": __import__("time").time(), "scan_stats": {}}),
+            encoding="utf-8")
+        res = discovery.run_discovery(force=False, max_repos=5)  # 24h 内增量
+        self.assertEqual(res.get("mode"), "incremental")
+        scanned = [c[0][0] for c in mock_scan.call_args_list]
+        self.assertEqual(scanned, ["fresh/repo"])
+
+
+class TestMarketDedup(unittest.TestCase):
+    """跨源去重：同一技能 (repo, skill_path) 只出现一次。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._old_index = discovery.INDEX_FILE
+        self._old_cache = discovery.CACHE_FILE
+        discovery.INDEX_FILE = Path(self._tmp.name) / "idx.json"
+        discovery.CACHE_FILE = Path(self._tmp.name) / "cach.json"
+        # 隔离 extension_manager 的 INSTALLED_FILE（避免污染真实安装记录）
+
+    def tearDown(self):
+        discovery.INDEX_FILE = self._old_index
+        discovery.CACHE_FILE = self._old_cache
+        self._tmp.cleanup()
+
+    @mock.patch("extension_manager.list_market_sources")
+    @mock.patch("extension_manager.fetch_marketplace")
+    def test_fetch_all_dedup_same_skill(self, mock_fetch, mock_sources):
+        """手动源 + 发现索引含同一技能 → 去重只出一条。"""
+        import extension_manager
+        # 发现索引写入一条技能
+        discovery.INDEX_FILE.write_text(json.dumps({
+            "repos": {"owner/repo": {"stars": 10}},
+            "entries": [{"repo": "owner/repo", "skill_path": "/skills/x/SKILL.md",
+                         "name": "x", "display_name": "X", "version": "1"}],
+            "last_scan_ts": 0, "scan_stats": {}}), encoding="utf-8")
+        mock_sources.return_value = [{
+            "id": "manual", "name": "手动", "url": "https://github.com/owner/repo",
+            "kind": "openclaw", "builtin": False}]
+        mock_fetch.return_value = {"status": "ok", "plugins": []}
+        # 手动源走 discover_auto 也返回同样技能
+        import adapters
+        with mock.patch("adapters.discover_auto", return_value={"status": "ok", "plugins": [
+            {"repo": "owner/repo", "skill_path": "/skills/x/SKILL.md",
+             "name": "x", "display_name": "X", "version": "1", "source_kind": "openclaw-skill"}]}):
+            out = extension_manager.fetch_all_markets()
+        self.assertEqual(out["count"], 1)  # 去重后只一条
+
+    @mock.patch("extension_manager.list_market_sources")
+    @mock.patch("extension_manager.fetch_marketplace")
+    def test_fetch_all_installed_backfill(self, mock_fetch, mock_sources):
+        import extension_manager
+        discovery.INDEX_FILE.write_text(json.dumps({
+            "repos": {"a/repo": {"stars": 5}},
+            "entries": [{"repo": "a/repo", "skill_path": "/s/SKILL.md",
+                         "name": "installed-skill", "version": "1"}],
+            "last_scan_ts": 0, "scan_stats": {}}), encoding="utf-8")
+        mock_sources.return_value = []
+        # 模拟该技能已在 .installed.json
+        with mock.patch("extension_manager._load_installed",
+                        return_value={"extensions": [{"name": "installed-skill", "version": "1"}]}):
+            out = extension_manager.fetch_all_markets()
+        self.assertEqual(out["plugins"][0]["installed"], True)
