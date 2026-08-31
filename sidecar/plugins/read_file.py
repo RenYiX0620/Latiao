@@ -92,8 +92,20 @@ def execute(args: dict) -> str:
     except FileNotFoundError:
         return f"错误：文件不存在 - {p}"
     except UnicodeDecodeError:
-        return (f"⚠️ 文件编码不是 UTF-8,无法作为文本读取。\n"
-                f"文件: {p}\n"
-                f"如需查看数据,请读取对应的文本格式文件(如 _raw.json / _description.txt)。")
+        # 容错降级：文件混入少量非 UTF-8 字节（如历史轮转切在多字节汉字
+        # 中间留下的残缺字节）时仍读出内容，残缺处用 � 替代——
+        # 比整个拒绝更利于断点续作（22:46 事故）。
+        try:
+            with open(p, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read(MAX_READ_SIZE + 1)
+            if len(content) > MAX_READ_SIZE:
+                est_lines = content.count("\n")
+                return (
+                    content[:MAX_READ_SIZE]
+                    + f"\n\n... (文件过长，已截断。约 {est_lines}+ 行)"
+                )
+            return content
+        except Exception as e2:
+            return f"错误：{e2}"
     except Exception as e:
         return f"错误：{e}"

@@ -899,7 +899,12 @@ def _record_progress(entry: str):
 
 
 def _rotate_progress_file():
-    """把 PROGRESS.md 截到最近 500KB（保留尾部，即最新进度）。"""
+    """把 PROGRESS.md 截到最近 500KB（保留尾部，即最新进度）。
+
+    切点必须对齐 UTF-8 字符边界：按字节直切会在多字节汉字中间断开，
+    文件从此不再是合法 UTF-8 → read_file 整个拒绝读取 → 断点续作失效
+    （22:46 事故根因："文件编码不是 UTF-8"）。
+    """
     try:
         keep = 500 * 1024
         size = PROGRESS_FILE.stat().st_size
@@ -908,6 +913,15 @@ def _rotate_progress_file():
         with open(PROGRESS_FILE, "rb") as f:
             f.seek(size - keep)
             tail = f.read()
+        # 对齐字符边界：跳过开头的残缺多字节字符（找下一个 UTF-8 合法起始字节）
+        offset = 0
+        while offset < len(tail):
+            b = tail[offset]
+            # 合法起始：ASCII(<0x80) 或 2/3/4 字节前缀(0xC0-0xF7)
+            if b < 0x80 or (0xC0 <= b <= 0xF7):
+                break
+            offset += 1
+        tail = tail[offset:]
         with open(PROGRESS_FILE, "wb") as f:
             f.write("(早期进度已轮转)\n\n".encode("utf-8") + tail)
     except Exception:
@@ -2218,8 +2232,19 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                                     logger.error("SSE tool_call parse error", exc_info=True)
                                     raise  # Real errors (network, memory) must surface
             except TimeoutError:
-                # 引擎挂起/超时（22:27 事故：Qwen3.8 端口活但流不出数据）
-                # ——抛给外层零交付重试，触发引擎健康检查/重载
+                # 引擎挂起/超时（22:27 事故：Qwen3.8 端口活但流不出数据，
+                # httpx read timeout 不触发）。不能只抛错——引擎还挂着，
+                # 下一轮还会超时。这里杀进程+触发重载，让后续请求自愈。
+                logger.warning("本地流 180s 超时，判定引擎挂起，杀进程并触发重载")
+                try:
+                    import local_llm as _llm_mod
+                    _eng = _llm_mod._engine
+                    if _eng.current_model_id:
+                        _eng._kill_port(_eng.server_port)
+                        _eng.server_status = "stopped"
+                        _eng._request_reload(_eng.current_model_id)
+                except Exception:
+                    logger.warning("超时后引擎重载触发失败", exc_info=True)
                 raise TimeoutError(f"本地模型流式响应超时（180s 无进展）：{model[:60]}")
 
             # 追问续写轮收尾：把本轮完整文本作为最终替换发出去（防节流边界丢失）
