@@ -1950,6 +1950,12 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                     return
                 current_msgs.insert(0, {"role": "system",
                     "content": "以下是已确认（用户批准）的执行计划，请严格按计划逐步执行（可调用工具）：\n" + _plan})
+            elif _normalize_access(access_mode) == "plan":
+                # 计划模式档下计划生成失败 → 中止而非裸执行（用户明确要求先出计划）；
+                # 自动触发的规划（非计划模式档）保留降级直执行的旧行为
+                yield {"content": "\n\n⚠️ 计划模式：计划生成失败，任务未执行。请重试或切换到其他模式。"}
+                _track_progress(session_id, "plan_generate_failed", "cloud")
+                return
 
         while iteration < 50:  # hard cap at 50, dynamic exit via stagnation
             iteration += 1
@@ -2636,6 +2642,28 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
             break
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(120)) as client:
+        # ── 规划模式（本地模型）：计划模式档强制生成计划并等待用户确认 ──
+        # 此前本地循环完全没有计划门控：计划模式档形同虚设，模型直接执行
+        if _normalize_access(access_mode) == "plan" and last_user_text:
+            _plan = await _generate_plan(last_user_text, model, api_url, headers, client)
+            if _plan:
+                yield {"event": "agent_plan", "content": _plan}
+                plan_id = f"plan_{uuid.uuid4()}"
+                approved, plan_events = await _await_plan_confirmation(plan_id, _plan)
+                for ev in plan_events:
+                    yield ev
+                if not approved:
+                    _track_progress(session_id, "plan_rejected", "user_denied_plan")
+                    yield {"content": "\n\n⏹️ 计划已被拒绝，任务未执行。你可以调整要求后重新发起。"}
+                    return
+                current_msgs.insert(0, {"role": "system",
+                    "content": "以下是已确认（用户批准）的执行计划，请严格按计划逐步执行（可调用工具）：\n" + _plan})
+            else:
+                # 计划模式档下计划生成失败 → 中止而非裸执行（用户明确要求先出计划）
+                yield {"content": "\n\n⚠️ 计划模式：计划生成失败，任务未执行。请重试或切换到其他模式。"}
+                _track_progress(session_id, "plan_generate_failed", "local")
+                return
+
         # 进展感知无进展看门狗（与云端循环同口径）：连续 15 分钟完全
         # 无进展（未产出内容/未执行工具）才中止；正常推进的长时间
         # 研究任务不受影响

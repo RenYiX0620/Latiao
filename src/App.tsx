@@ -859,17 +859,11 @@ const [timeFilter, setTimeFilter] = useState("all");
                 disarmWatchdog();
                 showToast(t("tool.confirm_toast", { tool: "执行计划" }), "warn");
                 setAgentPhase(t("agent.phase_confirm", { tool: "执行计划" }));
-                setMessages((prev) => {
-                  const msgs = [...prev];
-                  const last = msgs[msgs.length - 1];
-                  const idx = last?.role === "assistant" ? msgs.length - 1 : msgs.length;
-                  msgs.splice(idx, 0, {
-                    id: msgId(), role: "tool", type: "tool_call", content: "",
-                    callId: parsed.call_id, toolName: "执行计划",
-                    toolArgs: parsed.args, toolStatus: "confirming",
-                  });
-                  return msgs;
-                });
+                setMessages((prev) => [...prev, {
+                  id: msgId(), role: "tool", type: "tool_call", content: "",
+                  callId: parsed.call_id, toolName: "执行计划",
+                  toolArgs: parsed.args, toolStatus: "confirming",
+                }]);
               } else if (parsed.event === "reflection_revised") {
                 flushStream();
                 // 输出反思修正：把最后一条 assistant 消息替换为修正版。
