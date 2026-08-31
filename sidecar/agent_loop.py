@@ -3109,7 +3109,14 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                                      "let me", "i'll", "i will", "让我", "我先", "接下来",
                                      "再分析", "稍后", "马上", "look at", "check the")
                 _is_planning = any(sig in streamed_text.lower() for sig in _planning_signals)
-                if len(streamed_text.strip()) >= 200 and not _is_meta_wrapup(streamed_text):
+                # 模型明确说"我改用/我要调用/我再单独查"但整轮没有实际工具调用
+                # （21:42 事故：模型说"改用联网搜索"却直接收尾，未调 tavily）——
+                # 这类带未执行意图的 ≥200 字符正文不算实质完成，继续 nudge。
+                _pending_intent = any(k in streamed_text.lower() for k in
+                                      ("改用", "我再单独查", "我单独查", "我改", "我要调用",
+                                       "我马上", "我这就", "我先查", "我重新查"))
+                if (len(streamed_text.strip()) >= 200 and not _is_meta_wrapup(streamed_text)
+                        and not _pending_intent):
                     # 模型在工具结果后已给出实质性回答（≥200 字符）——接受为
                     # 最终答案直接收尾，不再追问。此前无差别追问导致模型
                     # 从头再答一遍，UI 里重复堆叠（17:07/17:08 两任务的
@@ -3128,16 +3135,12 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                         current_msgs.append({
                             "role": "system",
                             "content": _get_localized_text(_detect_user_language(_extract_last_user_text(current_msgs)), {
-                                "zh": "不要只发声明或道歉。你刚才说还要继续（读取/查询数据等）——"
-                                       "现在就调用工具去执行；如果数据其实已经足够，就直接把"
-                                       "完整分析写进回复正文（含关键数字与结论）。",
-                                "en": "Don't just announce or apologize. You said you would continue"
-                                      " (read/query data etc.) — call the tool NOW; if the data is"
-                                      " already sufficient, write the full analysis into your reply"
-                                      " body (key numbers and conclusions).",
-                                "ja": "宣言や謝罪だけでなく、続けると言ったなら（データの読み取り・照会など）"
-                                      "今すぐツールを呼び出してください。データが十分なら、主要数値と"
-                                      "結論を含む完全な分析を本文に書いてください。",
+                                "zh": "不要只发声明或道歉。你刚才说还要继续——现在就调用工具去执行；如果数据其实已经足够，就把完整分析写进回复正文（含关键数字与结论）。\n"
+                                       "⚠️ 重要：如果连续两次查询都只返回「全部A股」或「指数」汇总（没有各板块明细），说明本查询词对「各板块汇总」无解——请立即改用 tavily_search 搜索板块资金流向排名，或用 mx_query 查具体板块（如：'半导体板块资金流向'、'人工智能板块资金流向'），不要重复查相同的汇总词。",
+                                "en": "Don't just announce or apologize. You said you would continue — call the tool NOW; if the data is sufficient, write the full analysis in your reply body.\n"
+                                      "IMPORTANT: If two consecutive queries return only 'all A-shares' or 'index' summary (no sector detail), that query is unsolved — immediately switch to tavily_search for sector flows, or mx_query a specific sector (e.g., 'semiconductor sector capital flow'). Do NOT repeat the same summary query.",
+                                "ja": "宣言や謝罪だけでなく、続けると言ったなら今すぐツールを呼び出してください。データが十分なら完全な分析を本文に書いてください。\n"
+                                      "重要：連続2回「全A株」「指数」のみの要約しか返らない場合は、そのクエリは無解です。直ちに tavily_search でセクター資金流を検索するか、mx_query で具体的セクター（例：「半導体セクター資金流」）を検索してください。同じ要約クエリを繰り返さないでください。",
                             }),
                         })
                         logger.info(f"[LOCAL-AGENT] Iteration {iteration}: 意图声明未行动，nudge 立即调用工具（{_intent_nudges + 1}/3）")
