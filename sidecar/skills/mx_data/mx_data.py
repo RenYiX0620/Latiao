@@ -266,21 +266,32 @@ class MXData:
 
         output.append(f"**查询结果**: {len(tables)} 个表，共 {total_rows} 行数据\n")
 
-        # Only preview first 20 rows of first table on terminal
-        if tables:
-            first = tables[0]
-            output.append(f"**{first['sheet_name']}** (前20行预览):\n")
-            rows = first["rows"][:20]
+        # Preview EVERY table (not just the first): agent 循环只有工具结果可见，
+        # 若只给第一个表(支撑/压力位)预览，涨跌幅/成交额/资金流向的数据模型
+        # 看不到 → 反复要求"读取描述文件"(20:51 事故)。每表最多 6 行，总量
+        # 控制在 ~3000 字符内 —— 本地模型上下文有限，再多的需 read_file。
+        budget = 3000
+        for table in tables:
+            if budget <= 0:
+                output.append(f"*(其余 {tables.index(table)+1} 张表未预览，可用 read_file 读取原始JSON获取)*\n")
+                break
+            output.append(f"**{table['sheet_name']}** ({len(table['rows'])} 行):\n")
+            rows = table["rows"][:6]
             if rows:
-                fieldnames = first["fieldnames"]
+                fieldnames = table["fieldnames"]
                 output.append("| " + " | ".join(fieldnames) + " |")
                 output.append("| " + " | ".join(["---"] * len(fieldnames)) + " |")
                 for row in rows:
                     cells = [str(row.get(f, "")) for f in fieldnames]
-                    output.append("| " + " | ".join(cells) + " |")
-                if len(first["rows"]) > 20:
-                    output.append("| ... | " * (len(fieldnames) - 1) + "... |")
-                output.append("")
+                    line = "| " + " | ".join(cells) + " |"
+                    budget -= len(line)
+                    if budget < 0:
+                        output.append("| ... |")
+                        break
+                    output.append(line)
+                if len(table["rows"]) > 6:
+                    output.append("| ... |")
+            output.append("")
 
         question_id = search_result.get("questionId", "")
         if question_id:

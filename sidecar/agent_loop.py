@@ -3159,6 +3159,9 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                 current_msgs.append({"role": "assistant", "content": streamed_text.strip()})
                 _track_progress(session_id, "completed", f"text_response ({len(streamed_text)} chars)")
                 logger.warning(f"[LOCAL-AGENT] Iteration {iteration}: {_intent_nudges} 轮追问仍无实质回答，收尾返回")
+                # 必须 return：之前这里只打日志不返回，落回"短回答追问"分支
+                # 再白送一轮（20:48 事故：收尾后又进"追问充分回答一轮"，迭代 6 重复跑）
+                return
             if not has_called_tool and text_only_streak < 3 and streamed_text.strip():
                 # Model gave a text response without calling tools.
                 # Record the response so the model knows it already replied.
