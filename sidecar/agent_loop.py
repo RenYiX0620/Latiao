@@ -2112,104 +2112,115 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
             _raw_delta_count = 0  # 复读循环检测节流计数（每 40 个 delta 检查一次）
             _dedup_fired = False  # 去重一次性截断标志（审计 A5）
 
-            async with client.stream("POST", api_url, json=body, headers=headers) as r:
-                if r.status_code != 200:
-                    try:
-                        err_body = (await r.aread()).decode("utf-8", errors="replace")[:800]
-                    except Exception:
-                        err_body = "<read failed>"
-                    logger.error("Agent stream HTTP %d body: %s", r.status_code, err_body)
-                r.raise_for_status()  # httpx 不自动抛 4xx/5xx，必须显式检查
-                # 流式停顿检测：连续 180s 无数据视为僵死（大模型可能缓慢滴灌，120s 超时永不触发）
-                aiter = r.aiter_lines()
-                while True:
-                    try:
-                        line = await asyncio.wait_for(anext(aiter), timeout=180)
-                    except asyncio.TimeoutError:
-                        raise TimeoutError(f"模型输出停滞超 180 秒（模型可能过大或未加载完）：{model[:60]}")
-                    except StopAsyncIteration:
-                        break
-                    if line and line.startswith("data: "):
-                        data_str = line[6:]
-                        if data_str == "[DONE]":
-                            break
-                        try:
-                            event = json.loads(data_str)
-                            choices = event.get("choices") or []
-                            if not choices:
-                                continue  # usage-only chunk（仅 token 统计，无 delta）
-                            delta = choices[0].get("delta", {})
-                            _raw_delta_count += 1
+            # 流式总超时保护：Qwen3.8 等 27B 推理模型在流式推理时可能让
+            # mlx_lm.server 挂起（端口活、不吐响应头，httpx read timeout 不触发
+            # ——22:27 事故：卡 8 分钟无进展）。响应头等待 + 后续迭代统一受
+            # 180s 硬超时约束，超时抛 TimeoutError 由外层零交付重试接管。
+            stream_ctx = client.stream("POST", api_url, json=body, headers=headers)
+            try:
+                async with asyncio.timeout(180):
+                    async with stream_ctx as r:
+                        if r.status_code != 200:
+                            try:
+                                err_body = (await r.aread()).decode("utf-8", errors="replace")[:800]
+                            except Exception:
+                                err_body = "<read failed>"
+                            logger.error("Agent stream HTTP %d body: %s", r.status_code, err_body)
+                        r.raise_for_status()  # httpx 不自动抛 4xx/5xx，必须显式检查
+                        # 流式停顿检测：连续 180s 无数据视为僵死（大模型可能缓慢滴灌，120s 超时永不触发）
+                        aiter = r.aiter_lines()
+                        while True:
+                            try:
+                                line = await asyncio.wait_for(anext(aiter), timeout=180)
+                            except asyncio.TimeoutError:
+                                raise TimeoutError(f"模型输出停滞超 180 秒（模型可能过大或未加载完）：{model[:60]}")
+                            except StopAsyncIteration:
+                                break
+                            if line and line.startswith("data: "):
+                                data_str = line[6:]
+                                if data_str == "[DONE]":
+                                    break
+                                try:
+                                    event = json.loads(data_str)
+                                    choices = event.get("choices") or []
+                                    if not choices:
+                                        continue  # usage-only chunk（仅 token 统计，无 delta）
+                                    delta = choices[0].get("delta", {})
+                                    _raw_delta_count += 1
 
-                            content = delta.get("content", "")
-                            reasoning = delta.get("reasoning", "")
-                            if content:
-                                streamed_text += content
-                                # 复读循环检测（节流）——放在 dedup 过滤之前，
-                                # 复读被 dedup 过滤时也要能截断
-                                if _raw_delta_count % 40 == 0 and _detect_text_loop(streamed_text):
-                                    logger.warning("[AGENT] 检测到输出复读循环，截断生成")
-                                    yield {"content": "\n\n⚠️ 检测到输出重复，已自动截断。"}
-                                    raise TimeoutError("输出复读循环，已截断")
-                                # 自我介绍去重：只截断一次，之后照常流式输出
-                                # （审计 A5：此前命中后永久吞掉后续真实内容）
-                                if not _dedup_fired:
-                                    _ded = _deduplicate_response(streamed_text)
-                                    if len(_ded) < len(streamed_text):
-                                        _dedup_fired = True
-                                        streamed_text = _ded + content
-                                if text_output_delivered:
-                                    # 追问续写轮：替换上一条而非追加（重复堆叠修复）
-                                    if _raw_delta_count % 40 == 0:
-                                        yield {"event": "content_revised", "content": streamed_text}
-                                    continue
-                                # Filter native control tokens so the UI doesn't show
-                                # raw <|tool_call|> / <|channel> / <|channel|> markers
-                                clean = _NATIVE_CONTROL_RE.sub("", content)
-                                if clean:
-                                    yield {"content": clean}
-                                if len(streamed_text) < 5:
-                                    _track_progress(session_id, "generating", "text_start")
-                            elif reasoning:
-                                # Reasoning model (Qwen3.6, DeepSeek-R1, etc.) — stream thinking as content
-                                # so the UI doesn't appear frozen during the thinking phase
-                                reasoning_text += reasoning
-                                streamed_text += reasoning
-                                if _raw_delta_count % 40 == 0 and _detect_text_loop(streamed_text):
-                                    logger.warning("[AGENT] 检测到输出复读循环，截断生成")
-                                    yield {"content": "\n\n⚠️ 检测到输出重复，已自动截断。"}
-                                    raise TimeoutError("输出复读循环，已截断")
-                                if not _dedup_fired:
-                                    _ded = _deduplicate_response(streamed_text)
-                                    if len(_ded) < len(streamed_text):
-                                        _dedup_fired = True
-                                        streamed_text = _ded + reasoning
-                                if text_output_delivered:
-                                    if _raw_delta_count % 40 == 0:
-                                        yield {"event": "content_revised", "content": streamed_text}
-                                    continue
-                                yield {"reasoning": reasoning, "ts": int(time.time() * 1000)}
+                                    content = delta.get("content", "")
+                                    reasoning = delta.get("reasoning", "")
+                                    if content:
+                                        streamed_text += content
+                                        # 复读循环检测（节流）——放在 dedup 过滤之前，
+                                        # 复读被 dedup 过滤时也要能截断
+                                        if _raw_delta_count % 40 == 0 and _detect_text_loop(streamed_text):
+                                            logger.warning("[AGENT] 检测到输出复读循环，截断生成")
+                                            yield {"content": "\n\n⚠️ 检测到输出重复，已自动截断。"}
+                                            raise TimeoutError("输出复读循环，已截断")
+                                        # 自我介绍去重：只截断一次，之后照常流式输出
+                                        # （审计 A5：此前命中后永久吞掉后续真实内容）
+                                        if not _dedup_fired:
+                                            _ded = _deduplicate_response(streamed_text)
+                                            if len(_ded) < len(streamed_text):
+                                                _dedup_fired = True
+                                                streamed_text = _ded + content
+                                        if text_output_delivered:
+                                            # 追问续写轮：替换上一条而非追加（重复堆叠修复）
+                                            if _raw_delta_count % 40 == 0:
+                                                yield {"event": "content_revised", "content": streamed_text}
+                                            continue
+                                        # Filter native control tokens so the UI doesn't show
+                                        # raw <|tool_call|> / <|channel> / <|channel|> markers
+                                        clean = _NATIVE_CONTROL_RE.sub("", content)
+                                        if clean:
+                                            yield {"content": clean}
+                                        if len(streamed_text) < 5:
+                                            _track_progress(session_id, "generating", "text_start")
+                                    elif reasoning:
+                                        # Reasoning model (Qwen3.6, DeepSeek-R1, etc.) — stream thinking as content
+                                        # so the UI doesn't appear frozen during the thinking phase
+                                        reasoning_text += reasoning
+                                        streamed_text += reasoning
+                                        if _raw_delta_count % 40 == 0 and _detect_text_loop(streamed_text):
+                                            logger.warning("[AGENT] 检测到输出复读循环，截断生成")
+                                            yield {"content": "\n\n⚠️ 检测到输出重复，已自动截断。"}
+                                            raise TimeoutError("输出复读循环，已截断")
+                                        if not _dedup_fired:
+                                            _ded = _deduplicate_response(streamed_text)
+                                            if len(_ded) < len(streamed_text):
+                                                _dedup_fired = True
+                                                streamed_text = _ded + reasoning
+                                        if text_output_delivered:
+                                            if _raw_delta_count % 40 == 0:
+                                                yield {"event": "content_revised", "content": streamed_text}
+                                            continue
+                                        yield {"reasoning": reasoning, "ts": int(time.time() * 1000)}
 
-                            for tc_delta in delta.get("tool_calls", []):
-                                idx = tc_delta.get("index", 0)
-                                if idx not in tool_call_bufs:
-                                    tool_call_bufs[idx] = {
-                                        "id": "", "type": "function",
-                                        "function": {"name": "", "arguments": ""},
-                                    }
-                                buf = tool_call_bufs[idx]
-                                if "id" in tc_delta:
-                                    buf["id"] = tc_delta["id"]
-                                if "function" in tc_delta:
-                                    if "name" in tc_delta["function"]:
-                                        buf["function"]["name"] = tc_delta["function"]["name"]
-                                    if "arguments" in tc_delta["function"]:
-                                        buf["function"]["arguments"] += tc_delta["function"]["arguments"]
-                        except (json.JSONDecodeError, KeyError, TypeError, IndexError):
-                            pass  # Malformed SSE delta — skip this event, try next
-                        except Exception:
-                            logger.error("SSE tool_call parse error", exc_info=True)
-                            raise  # Real errors (network, memory) must surface
+                                    for tc_delta in delta.get("tool_calls", []):
+                                        idx = tc_delta.get("index", 0)
+                                        if idx not in tool_call_bufs:
+                                            tool_call_bufs[idx] = {
+                                                "id": "", "type": "function",
+                                                "function": {"name": "", "arguments": ""},
+                                            }
+                                        buf = tool_call_bufs[idx]
+                                        if "id" in tc_delta:
+                                            buf["id"] = tc_delta["id"]
+                                        if "function" in tc_delta:
+                                            if "name" in tc_delta["function"]:
+                                                buf["function"]["name"] = tc_delta["function"]["name"]
+                                            if "arguments" in tc_delta["function"]:
+                                                buf["function"]["arguments"] += tc_delta["function"]["arguments"]
+                                except (json.JSONDecodeError, KeyError, TypeError, IndexError):
+                                    pass  # Malformed SSE delta — skip this event, try next
+                                except Exception:
+                                    logger.error("SSE tool_call parse error", exc_info=True)
+                                    raise  # Real errors (network, memory) must surface
+            except TimeoutError:
+                # 引擎挂起/超时（22:27 事故：Qwen3.8 端口活但流不出数据）
+                # ——抛给外层零交付重试，触发引擎健康检查/重载
+                raise TimeoutError(f"本地模型流式响应超时（180s 无进展）：{model[:60]}")
 
             # 追问续写轮收尾：把本轮完整文本作为最终替换发出去（防节流边界丢失）
             if text_output_delivered and streamed_text.strip():
@@ -2468,6 +2479,38 @@ def _parse_prompt_tool_calls(text: str) -> tuple[str, list[dict]]:
             "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
         })
         used_ranges.append((m.start(), m.end()))
+
+    # Priority 1.5: Bare JSON tool call — 推理模型（Qwen3.8 等）常直接输出
+    # "我来查...{"query": "..."}" 的裸 JSON（无 ```tool 栅栏），解析器不认 →
+    # JSON 残留在文本里 → 模型复读同样内容 → 复读检测误判循环截断（22:06 事故）。
+    # 这里识别"独立 JSON 对象且参数命中文档化工具名"的裸调用，并剥离。
+    if not tool_calls:
+        _bare_json_re = re.compile(r'\{\s*"(?:query|path|cmd|pattern|url|command)"\s*:\s*"[^"]*"\s*[,}]', re.DOTALL)
+        for b_idx, m in enumerate(_bare_json_re.finditer(search_text)):
+            # 往前看 30 字符是否有"动/查/读/搜"等动作词（避免误判正文 JSON）
+            prefix = search_text[max(0, m.start()-40):m.start()]
+            if not re.search(r'[动查读搜取，。]\s*$', prefix) and not re.search(r'[请让我先我再来]', prefix):
+                continue
+            json_obj = m.group(0)
+            try:
+                args = json.loads(json_obj)
+            except Exception:
+                continue
+            # 根据参数推工具名：query→mx_query/tavily_search；path→read_file；cmd→run_cmd
+            key = next((k for k in args if k in ("query", "path", "cmd", "url")), None)
+            if not key:
+                continue
+            tool_name = ("read_file" if key == "path"
+                         else "run_cmd" if key == "cmd"
+                         else "tavily_search" if key == "url"
+                         else "mx_query")
+            tool_calls.append({
+                "id": f"local_bare_{tool_name}_{b_idx}",
+                "type": "function",
+                "function": {"name": tool_name, "arguments": json.dumps(args, ensure_ascii=False)},
+            })
+            used_ranges.append((m.start(), m.end()))
+            break  # 一次只处理一个裸调用（避免误吞多对象）
 
     # Priority 2: Inline format [TOOL:name key=value ...] or <tool>name{json}</tool> or FUNC:name key=value
     if not tool_calls:
