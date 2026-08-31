@@ -1585,18 +1585,82 @@ async def _await_tool_confirmation(call_id: str, tool_name: str, args: dict) -> 
     return approved, events
 
 
-async def _await_plan_confirmation(plan_id: str, plan: str) -> tuple[bool, list[dict]]:
-    """计划确认门控：等待用户批准/拒绝执行计划（复用 _pending_confirmations）。
+async def _start_tool_confirmation(call_id: str, tool_name: str, args: dict) -> dict:
+    """启动工具确认：注册 pending，返回 {"event": 待发事件, "event_obj": 等待用}。
 
-    与工具确认共用 /v1/confirm_tool 端点与前端批准/拒绝 UI，但事件类型为
-    plan_confirm（前端渲染为计划确认卡）。超时保持暂停并提示（不默认执行）。"""
-    events = [{"event": "plan_confirm", "call_id": plan_id, "tool": "执行计划",
-               "args": {"plan": plan[:2000]}}]
+    ⚠️ SSE 生成器必须**先 yield 该事件、再等待结果**——事件若攒到确认完成后
+    才发出，前端在等待期间收不到 tool_confirm，弹窗永不出现（死锁到超时）。
+    此前 _await_tool_confirmation 正是这个结构，导致确认功能从未真正工作。"""
+    event = asyncio.Event()
+    async with _pending_lock:
+        _pending_confirmations[call_id] = {"event": event, "approved": False}
+    return {"event": {"event": "tool_confirm", "call_id": call_id, "tool": tool_name, "args": args},
+            "event_obj": event}
+
+
+async def _wait_tool_confirmation(call_id: str, tool_name: str,
+                                  event_obj: asyncio.Event, timeout: float = 120) -> tuple[bool, list[dict]]:
+    """等待已启动（_start_tool_confirmation）的确认结果。
+    返回 (approved, events)——events 只含超时提示等补充事件（初始
+    tool_confirm 已由调用方发出）。超时保持暂停，不默认执行。"""
+    events = []
+    try:
+        await asyncio.wait_for(event_obj.wait(), timeout=timeout)
+        async with _pending_lock:
+            approved = _pending_confirmations.get(call_id, {}).get("approved", False)
+    except asyncio.TimeoutError:
+        approved = False
+        events.append({
+            "content": (
+                f"\n\n⚠️ 工具 `{tool_name}` 等待确认超时（2 分钟无人操作），"
+                "任务已暂停，未执行该操作。可在界面中重新批准后继续。"
+            ),
+        })
+    finally:
+        async with _pending_lock:
+            _pending_confirmations.pop(call_id, None)
+    return approved, events
+
+
+async def _await_tool_confirmation(call_id: str, tool_name: str, args: dict) -> tuple[bool, list[dict]]:
+    """兼容入口：启动 + 等待一次性完成（仅限不经过 SSE 的内部调用）。"""
+    started = await _start_tool_confirmation(call_id, tool_name, args)
+    approved, events = await _wait_tool_confirmation(call_id, tool_name, started["event_obj"])
+    return approved, [started["event"]] + events
+
+
+def _confirm_bypassed(tool_name: str, access_mode: str) -> bool:
+    """confirm 级工具是否免确认（full 档全免；auto_edit 档文件类免确认）。
+    供 _handle_tool_execution 与 SSE 调用方（提前发确认事件）共用，避免判定漂移。"""
+    _access = _normalize_access(access_mode)
+    if _access == "full":
+        return True
+    if _access == "auto_edit" and tool_name in AUTO_EDIT_TOOLS:
+        try:
+            from main import _custom_permissions
+            _has_rule = any(r.get("tool") == tool_name for r in _custom_permissions)
+        except Exception:
+            _has_rule = False
+        return not _has_rule
+    return False
+
+
+async def _start_plan_confirmation(plan_id: str, plan: str) -> dict:
+    """启动计划确认（同工具确认：先发事件再等待）。"""
     event = asyncio.Event()
     async with _pending_lock:
         _pending_confirmations[plan_id] = {"event": event, "approved": False}
+    return {"event": {"event": "plan_confirm", "call_id": plan_id, "tool": "执行计划",
+                      "args": {"plan": plan[:2000]}},
+            "event_obj": event}
+
+
+async def _wait_plan_confirmation(plan_id: str, event_obj: asyncio.Event,
+                                  timeout: float = 300) -> tuple[bool, list[dict]]:
+    """等待计划确认结果（给用户 5 分钟阅读计划）。超时保持暂停。"""
+    events = []
     try:
-        await asyncio.wait_for(event.wait(), timeout=300)  # 计划给 5 分钟阅读时间
+        await asyncio.wait_for(event_obj.wait(), timeout=timeout)
         async with _pending_lock:
             approved = _pending_confirmations.get(plan_id, {}).get("approved", False)
     except asyncio.TimeoutError:
@@ -1608,6 +1672,13 @@ async def _await_plan_confirmation(plan_id: str, plan: str) -> tuple[bool, list[
         async with _pending_lock:
             _pending_confirmations.pop(plan_id, None)
     return approved, events
+
+
+async def _await_plan_confirmation(plan_id: str, plan: str) -> tuple[bool, list[dict]]:
+    """兼容入口：启动 + 等待一次性完成。"""
+    started = await _start_plan_confirmation(plan_id, plan)
+    approved, events = await _wait_plan_confirmation(plan_id, started["event_obj"])
+    return approved, [started["event"]] + events
 
 
 def _check_pre_hooks(tool_name: str, args: dict) -> tuple[bool, list[dict], str]:
@@ -1626,8 +1697,13 @@ def _check_pre_hooks(tool_name: str, args: dict) -> tuple[bool, list[dict], str]
 
 
 async def _handle_tool_execution(tc: dict, current_msgs: list, session_id: str,
-                                  agent_id: str, access_mode: str = "full") -> tuple[bool, list[dict]]:
-    """Execute a single tool call within the agent loop. Returns (verify_failed, events)."""
+                                  agent_id: str, access_mode: str = "full",
+                                  pre_started: dict | None = None) -> tuple[bool, list[dict]]:
+    """Execute a single tool call within the agent loop. Returns (verify_failed, events).
+
+    pre_started: SSE 调用方已通过 _start_tool_confirmation 启动确认并发出
+    tool_confirm 事件时传入（含 event_obj）——本函数只等待结果，不再重复发事件。
+    确认事件若在等待完成后才发出，前端弹窗永不出现（死锁）。"""
     call_id = tc.get("id") or str(uuid.uuid4())
     func = tc.get("function", {})
     tool_name = func.get("name", "unknown")
@@ -1678,7 +1754,12 @@ async def _handle_tool_execution(tc: dict, current_msgs: list, session_id: str,
     # danger/deny 规则拦截仍在上方生效，不受此豁免影响。
     _full_bypass = (_access == "full")
     if _perm_level == "confirm" and not _auto_edit_bypass and not _full_bypass:
-        approved, events = await _await_tool_confirmation(call_id, tool_name, args)
+        if pre_started is not None and pre_started.get("event_obj") is not None:
+            # 事件已由 SSE 调用方提前发出（死锁修复），这里只等待结果
+            approved, extra = await _wait_tool_confirmation(call_id, tool_name, pre_started["event_obj"])
+            events.extend(extra)
+        else:
+            approved, events = await _await_tool_confirmation(call_id, tool_name, args)
         if not approved:
             result = f"⛔ User denied this operation: {tool_name}"
             events.append({"event": "tool_end", "call_id": call_id, "tool": tool_name, "result": result, "ts": int(time.time() * 1000)})
@@ -1938,10 +2019,12 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
             _plan = await _generate_plan(last_user_text, model, api_url, headers, client)
             if _plan:
                 yield {"event": "agent_plan", "content": _plan}
-                # 计划门控：弹给用户批准/拒绝，批准后才开始执行（此前列完
-                # 计划直接跑，"等确认"只是提示词约束，模型可无视）
+                # 计划门控：先发 plan_confirm 事件（前端渲染确认卡），再等待结果。
+                # 事件若攒到确认完成后才发，前端在等待期间收不到 → 弹窗死锁。
                 plan_id = f"plan_{uuid.uuid4()}"
-                approved, plan_events = await _await_plan_confirmation(plan_id, _plan)
+                plan_started = await _start_plan_confirmation(plan_id, _plan)
+                yield plan_started["event"]
+                approved, plan_events = await _wait_plan_confirmation(plan_id, plan_started["event_obj"])
                 for ev in plan_events:
                     yield ev
                 if not approved:
@@ -2162,8 +2245,23 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                     if sig not in recent_tool_calls:
                         recent_tool_calls.add(sig)
                         any_new = True
+                    # 先发确认事件再等待（死锁修复）：confirm 级工具的
+                    # tool_confirm 必须在执行前到达前端，弹窗才会出现
+                    if not tc.get("id"):
+                        tc["id"] = str(uuid.uuid4())
+                    pre_started = None
+                    try:
+                        _tname = tc.get("function", {}).get("name", "unknown")
+                        _targs = json.loads(tc.get("function", {}).get("arguments", "{}") or "{}")
+                        if _resolve_permission(_tname, _targs) == "confirm" \
+                                and not _confirm_bypassed(_tname, access_mode) \
+                                and not _check_access(_tname, access_mode):
+                            pre_started = await _start_tool_confirmation(tc["id"], _tname, _targs)
+                            yield pre_started["event"]
+                    except Exception:
+                        pre_started = None
                     verify_failed, events = await _handle_tool_execution(
-                        tc, current_msgs, session_id, agent_id, access_mode)
+                        tc, current_msgs, session_id, agent_id, access_mode, pre_started=pre_started)
                     logger.info(f"[LOCAL-AGENT] Iteration {iteration}: tool={tc.get('function',{}).get('name','')} executed, result_len={len(current_msgs[-1].get('content','')) if current_msgs else 0}")
                     for evt in events:
                         yield evt
@@ -2648,8 +2746,11 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
             _plan = await _generate_plan(last_user_text, model, api_url, headers, client)
             if _plan:
                 yield {"event": "agent_plan", "content": _plan}
+                # 先发 plan_confirm 事件再等待（与云端循环同口径，避免弹窗死锁）
                 plan_id = f"plan_{uuid.uuid4()}"
-                approved, plan_events = await _await_plan_confirmation(plan_id, _plan)
+                plan_started = await _start_plan_confirmation(plan_id, _plan)
+                yield plan_started["event"]
+                approved, plan_events = await _wait_plan_confirmation(plan_id, plan_started["event_obj"])
                 for ev in plan_events:
                     yield ev
                 if not approved:
@@ -2921,8 +3022,23 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                     if sig not in recent_tool_calls:
                         recent_tool_calls.add(sig)
                         any_new = True
+                    # 先发确认事件再等待（死锁修复）：confirm 级工具的
+                    # tool_confirm 必须在执行前到达前端，弹窗才会出现
+                    if not tc.get("id"):
+                        tc["id"] = str(uuid.uuid4())
+                    pre_started = None
+                    try:
+                        _tname = tc.get("function", {}).get("name", "unknown")
+                        _targs = json.loads(tc.get("function", {}).get("arguments", "{}") or "{}")
+                        if _resolve_permission(_tname, _targs) == "confirm" \
+                                and not _confirm_bypassed(_tname, access_mode) \
+                                and not _check_access(_tname, access_mode):
+                            pre_started = await _start_tool_confirmation(tc["id"], _tname, _targs)
+                            yield pre_started["event"]
+                    except Exception:
+                        pre_started = None
                     verify_failed, events = await _handle_tool_execution(
-                        tc, current_msgs, session_id, agent_id, access_mode)
+                        tc, current_msgs, session_id, agent_id, access_mode, pre_started=pre_started)
                     for evt in events:
                         yield evt
                     # 用户拒绝 ≠ 验证失败：拒绝不应清零停滞预算、诱导模型反复

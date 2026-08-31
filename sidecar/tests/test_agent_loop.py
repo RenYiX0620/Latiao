@@ -413,3 +413,50 @@ class TestPlanConfirmationGate(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestConfirmEventTiming(unittest.TestCase):
+    """确认事件时序（死锁修复回归）：tool_confirm/plan_confirm 必须在等待前可得。"""
+
+    def test_tool_confirm_event_available_before_wait(self):
+        import asyncio
+        import agent_loop
+
+        async def run():
+            started = await agent_loop._start_tool_confirmation("t1", "run_cmd", {"cmd": "ls"})
+            # 事件已注册：此刻 pending 表里已有条目（前端可查询/事件可发）
+            async with agent_loop._pending_lock:
+                pending = "t1" in agent_loop._pending_confirmations
+            # 模拟用户批准
+            async with agent_loop._pending_lock:
+                agent_loop._pending_confirmations["t1"]["approved"] = True
+                agent_loop._pending_confirmations["t1"]["event"].set()
+            approved, events = await agent_loop._wait_tool_confirmation("t1", "run_cmd", started["event_obj"])
+            return pending, approved, events
+
+        pending, approved, events = asyncio.run(run())
+        self.assertTrue(pending)          # 等待前已注册（事件可先发）
+        self.assertTrue(approved)
+        # 等待函数不再重复返回 tool_confirm 事件（已由调用方先发）
+        self.assertFalse(any(e.get("event") == "tool_confirm" for e in events))
+
+    def test_plan_confirm_event_available_before_wait(self):
+        import asyncio
+        import agent_loop
+
+        async def run():
+            started = await agent_loop._start_plan_confirmation("p1", "1. A\n2. B")
+            event_payload = started["event"]  # 调用方此刻 yield 给前端
+            async with agent_loop._pending_lock:
+                agent_loop._pending_confirmations["p1"]["approved"] = True
+                agent_loop._pending_confirmations["p1"]["event"].set()
+            approved, events = await agent_loop._wait_plan_confirmation("p1", started["event_obj"])
+            return event_payload, approved, events
+
+        payload, approved, events = asyncio.run(run())
+        self.assertEqual(payload.get("event"), "plan_confirm")
+        self.assertTrue(approved)
+
+
+if __name__ == "__main__":
+    unittest.main()
