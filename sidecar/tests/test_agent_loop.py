@@ -289,3 +289,40 @@ class TestSubagentWhitelistReachable(unittest.TestCase):
         _prune_subtasks(max_keep=50)
         done_left = [t for t, s in _SUBTASKS.items() if t.startswith("old_")]
         self.assertLessEqual(len(done_left), 60)
+
+
+class TestControlToolsSurviveFilter(unittest.TestCase):
+    """五控工具可见性回归：_filter_tools 不得把控制工具全部滤掉
+    （此前 TOOL_CATEGORIES 无 control 类，导致 control_* 永不到模型面前，
+    权限确认弹窗也永不触发——表现为"权限工具没用"）。"""
+
+    def _tool(self, name):
+        return {"type": "function", "function": {"name": name}}
+
+    def setUp(self):
+        import agent_loop
+        self.all_tools = [self._tool(n) for n in
+                          list(agent_loop.TOOL_CATEGORIES["file_read"]) +
+                          ["control_mouse_click", "control_list_processes",
+                           "screen_capture", "control_kill_process"]]
+        self.f = agent_loop._filter_tools
+
+    def test_control_intent_keeps_interactive_control(self):
+        filtered = self.f("帮我点击那个按钮", self.all_tools)
+        names = [t["function"]["name"] for t in filtered]
+        self.assertIn("control_mouse_click", names)
+
+    def test_file_intent_keeps_readonly_control(self):
+        filtered = self.f("分析一下这个文件夹", self.all_tools)
+        names = [t["function"]["name"] for t in filtered]
+        self.assertIn("control_list_processes", names)
+        # 危险交互控制不保留（防误操作）
+        self.assertNotIn("control_mouse_click", names)
+
+    def test_no_intent_keeps_all(self):
+        filtered = self.f("随便", self.all_tools)
+        self.assertEqual(len(filtered), len(self.all_tools))
+
+
+if __name__ == "__main__":
+    unittest.main()

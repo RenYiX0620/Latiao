@@ -1033,7 +1033,16 @@ TOOL_CATEGORIES = {
     "app": ["open_app", "open_folder"],
     "web": ["tavily_search", "web_search", "bing_search"],
     "financial": ["mx_query", "ak_finance"],
+    # 五控：进程/鼠标/屏幕/流程
+    "control": [
+        "screen_capture", "control_list_processes", "control_process_log",
+        "control_audit", "control_wait", "control_launch",
+        "control_mouse_move", "control_mouse_click",
+        "control_keyboard_type", "control_keyboard_press", "control_kill_process",
+    ],
 }
+# 控制类工具在意图匹配不明确时也应保留（避免被 _filter_tools 滤掉）
+CONTROL_TOOL_NAMES = set(TOOL_CATEGORIES["control"])
 
 INTENT_PATTERNS = [
     (re.compile(r"读|看|查看|检查|搜索|找|列出|显示|看看|分析|审查|review|check|read|find|list|show|cat|head|tail|grep|ls|dir", re.IGNORECASE),
@@ -1051,6 +1060,11 @@ INTENT_PATTERNS = [
     # 信息询问型问题（“X 是什么/有哪些/对比/评测”）：给出搜索工具，模型按需调用
     (re.compile(r"是什么|什么是|有哪些|有什么|为什么|如何|怎么|怎么样|怎么回事|介绍一下|介绍下|原理|机制|评测|测评|对比|区别|哪款|哪家|哪个|性价比|值不值得", re.IGNORECASE),
      ["file_read", "web"]),
+    # 五控：进程/鼠标/屏幕/流程控制意图
+    (re.compile(r"进程|pid|杀|终止|启动|后台运行|后台任务|运行中|列表进程|进程列表|cpu|内存占用|tasklist|kill|process|list_process", re.IGNORECASE),
+     ["control"]),
+    (re.compile(r"截屏|截图|屏幕|界面|点一下|点击|鼠标|移动鼠标|滚动|双击|右键|键入|输入文字|按键|快捷键|keyboard|mouse|click|screenshot|screen_capture", re.IGNORECASE),
+     ["control"]),
 ]
 
 
@@ -1103,6 +1117,14 @@ def _filter_tools(user_text: str, all_tools: list[dict]) -> list[dict]:
         allowed_tools.update(TOOL_CATEGORIES.get(cat, []))
     # Always include read_file as fallback
     allowed_tools.add("read_file")
+    # 控制类工具保底：用户意图五花八门（"看看电脑状态"→file_read），
+    # 若把控制工具滤掉，模型无法完成进程/鼠标/屏幕操作——有明确控制意图时
+    # 保留全部控制工具；无控制意图时仅保留轻量只读控制（list/audit/wait）
+    if "control" in allowed_categories:
+        allowed_tools.update(CONTROL_TOOL_NAMES)
+    else:
+        allowed_tools.update({"control_list_processes", "control_audit", "control_wait",
+                              "control_process_log", "screen_capture"})
     # 金融意图同时保留 web 工具：美股/港股等境外市场 mx_query 查不到，
     # 需要 tavily 联网搜索——此前 financial 只给 mx_query/ak_finance，
     # 模型想搜行情时工具被白名单过滤、空响应收场（P0-1）
