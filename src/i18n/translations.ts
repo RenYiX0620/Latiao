@@ -57,6 +57,7 @@ const T: Record<string, Record<Lang, string>> = {
   "chat.thinking_off": { zh: "关闭", en: "Off", ja: "オフ", ru: "Выкл" },
   "chat.thinking_high": { zh: "高", en: "High", ja: "高", ru: "Высокий" },
   "chat.thinking_max": { zh: "最高", en: "Max", ja: "最大", ru: "Макс" },
+  "chat.thinking_cannot_off": { zh: "当前模型强制思考（API 不支持关闭），已保持默认思考", en: "This model always thinks (API has no off switch); keeping default", ja: "このモデルは思考が必須です（オフ不可）", ru: "Модель всегда думает (выключить нельзя)" },
 
   "chat.access_full": { zh: "全部权限", en: "Full access", ja: "フル", ru: "Полный" },
   "chat.send": { zh: "发送", en: "Send", ja: "送信", ru: "Отправить" },

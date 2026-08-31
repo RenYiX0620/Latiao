@@ -326,3 +326,39 @@ class TestControlToolsSurviveFilter(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestThinkingInjection(unittest.TestCase):
+    """思考强度按模型族注入（此前 off 恒写 Anthropic 字段致 DeepSeek/OpenAI 无效）。"""
+
+    def test_off_anthropic(self):
+        import agent_loop
+        body = agent_loop._inject_thinking_disabled({"model": "claude-3-5"}, "claude-3-5", "off")
+        self.assertEqual(body.get("thinking"), {"type": "disabled"})
+
+    def test_off_openai_reasoning(self):
+        import agent_loop
+        body = agent_loop._inject_thinking_disabled({"model": "o3-mini"}, "o3-mini", "off")
+        self.assertEqual(body.get("reasoning_effort"), "none")
+        self.assertNotIn("thinking", body)
+
+    def test_off_deepseek_forced_marks_unsupported(self):
+        import agent_loop
+        body = agent_loop._inject_thinking_disabled({"model": "deepseek-reasoner"}, "deepseek-reasoner", "off")
+        self.assertTrue(body.get("_thinking_unsupported"))
+        self.assertNotIn("thinking", body)  # 不写无效字段
+
+    def test_off_non_reasoning_no_fields(self):
+        import agent_loop
+        body = agent_loop._inject_thinking_disabled({"model": "deepseek-chat"}, "deepseek-chat", "off")
+        self.assertNotIn("thinking", body)
+        self.assertNotIn("reasoning_effort", body)
+
+    def test_max_raises_budget(self):
+        import agent_loop
+        body = agent_loop._inject_thinking_disabled({"model": "deepseek-chat", "max_tokens": 4096}, "deepseek-chat", "max")
+        self.assertGreaterEqual(body["max_tokens"], 18432)
+
+
+if __name__ == "__main__":
+    unittest.main()
