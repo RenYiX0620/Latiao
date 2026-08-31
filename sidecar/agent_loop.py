@@ -236,10 +236,19 @@ async def _local_llm_stream(client, api_url: str, body: dict, headers: dict):
                         # 15:25 事故：模型明明加载着，迭代 2 却连续 6 分钟 404）。
                         # 健康引擎对正确路径绝不会 404——连续 2 次后杀+重载，
                         # 而不是空转 71×5s 后报"模型未就绪"。503 保持纯等待语义。
+                        # ⚠️ 但 404 也可能是"模型名不匹配"：mlx_lm.server 对
+                        # 未加载的 model 名（如 UI 里选中的 cloud 名 gpt-4o-mini）
+                        # 也回 404，但引擎是健康的——此时绝不能杀（21:06 事故：
+                        # 用户模型选了 gpt-4o-mini，本地循环发它 → 404 → 误杀
+                        # 26GB 引擎重载，事件循环卡死 2 分钟）。
+                        _req_model = str(body.get("model") or "")
+                        _loaded = str(getattr(engine, "current_model_id", "") or "") + "|" + str(getattr(engine, "current_model_name", "") or "")
+                        _model_mismatch = bool(_req_model) and _req_model not in _loaded and _req_model not in ("health-check",)
                         if (_status == 404 and _local and _own_engine
                                 and _attempt >= 1 and not engine._auto_reloading
                                 and engine.server_status != "starting"
-                                and time.monotonic() - getattr(engine, "_engine_started_at", 0.0) > 120):
+                                and time.monotonic() - getattr(engine, "_engine_started_at", 0.0) > 120
+                                and not _model_mismatch):
                             # 注意 starting 保护：手动加载期间 chat 接口 404 是
                             # 常态（模型未就绪），绝不能杀正在加载的引擎（P1-7）。
                             # 120s 宽限期是第二道防线：即便 "模型加载完成" 被
@@ -2821,7 +2830,11 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
             loop_msgs = _merge_system_messages(loop_msgs)
 
             body = {
-                "model": model, "messages": loop_msgs,
+                # 本地引擎把任意 model 名当 HuggingFace repo 解析 → 404（21:06 事故：
+                # 用户选了 gpt-4o-mini 但走本地循环，mlx server 对未知名前
+                # Hub 解析 SSL 失败回 404）。必须用引擎实际加载的模型 id。
+                "model": getattr(local_llm._engine, "current_model_id", "") or model,
+                "messages": loop_msgs,
                 "max_tokens": _resolve_max_tokens(model), "stream": True,
                 "temperature": 0.5,
                 "frequency_penalty": 0.6,
