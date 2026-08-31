@@ -165,7 +165,7 @@ export default function LocalModelsTab(props: Props) {
   // 应用内目录选择器：点文件夹进入、点"选择"直接选中该目录——
   // 绕开 macOS 原生目录面板"双击=进入"的歧义
   const [showDirPicker, setShowDirPicker] = useState(false);
-  const [browse, setBrowse] = useState<{ path: string; parent: string | null; roots: string[]; entries: { name: string; path: string; is_dir: boolean; size: number }[] } | null>(null);
+  const [browse, setBrowse] = useState<{ path: string; parent: string | null; roots: { path: string; label: string }[]; entries: { name: string; path: string; is_dir: boolean; size: number }[] } | null>(null);
   const fetchBrowse = async (path?: string) => { try { const q = path ? "?path=" + encodeURIComponent(path) : ""; const resp = await authFetch("/v1/files/browse" + q); const data = await resp.json(); if (data.status === "ok") setBrowse(data); else showToast(data.detail || "无法读取目录"); } catch { showToast("目录读取失败"); } };
   const openDirPicker = () => { setShowDirPicker(true); fetchBrowse(); };
   const pickDir = (path: string) => { setShowDirPicker(false); setLocalModelId(path); startLocalLLM(path); };
@@ -274,7 +274,7 @@ export default function LocalModelsTab(props: Props) {
               <button className="btn btn-sm btn-ghost" onClick={() => setShowDirPicker(false)}>✕</button>
             </div>
             <div style={{ padding: "8px 16px", borderBottom: "1px solid var(--border-default)", display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
-              {browse.roots.map(r => { const seg = r.split("/").filter(Boolean); const label = seg.length ? seg[seg.length - 1] : r; return <button key={r} className="btn btn-sm btn-ghost" style={{ fontSize: 10, padding: "2px 8px" }} onClick={() => fetchBrowse(r)}>{label}</button>; })}
+              {browse.roots.map(r => <button key={r.path} className="btn btn-sm btn-ghost" style={{ fontSize: 10, padding: "2px 8px" }} onClick={() => fetchBrowse(r.path)}>🏠 {r.label}</button>)}
               {browse.parent && <button className="btn btn-sm btn-ghost" style={{ fontSize: 10, padding: "2px 8px" }} onClick={() => fetchBrowse(browse.parent!)}>⬆ 上一级</button>}
               <span style={{ fontSize: 10, fontFamily: "var(--font-mono)", color: "var(--text-muted)", wordBreak: "break-all", width: "100%" }}>{browse.path}</span>
             </div>

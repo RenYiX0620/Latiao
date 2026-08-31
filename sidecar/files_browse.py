@@ -11,21 +11,23 @@ from fastapi import HTTPException, Query
 from main import app
 
 
-def _model_roots() -> list[str]:
+def _model_roots() -> list[tuple[str, str]]:
+    """[(path, label)] — 目录选择器快捷入口。全部基于 Path.home() 动态计算，
+    换设备/换用户名自动适配，无需任何配置。"""
     home = Path.home()
     return [
-        str(home / "Models"),
-        str(home / ".lmstudio" / "models"),
-        str(home),
+        (str(home / "Models"), "Models"),
+        (str(home / ".lmstudio" / "models"), "LM Studio"),
+        (str(home), "主目录"),
     ]
 
 
 @app.get("/v1/files/browse")
 async def files_browse(path: str = Query(default="")):
     """列出目录内容。默认从模型目录根开始。"""
-    roots = [r for r in _model_roots() if os.path.isdir(r)]
+    roots = [(p, label) for p, label in _model_roots() if os.path.isdir(p)]
     if not path:
-        path = roots[0] if roots else str(Path.home())
+        path = roots[0][0] if roots else str(Path.home())
     p = Path(path).expanduser()
     try:
         p = p.resolve()
@@ -56,6 +58,6 @@ async def files_browse(path: str = Query(default="")):
         "status": "ok",
         "path": str(p),
         "parent": None if str(p) == str(p.parent) else str(p.parent),
-        "roots": roots,
+        "roots": [{"path": rp, "label": label} for rp, label in roots],
         "entries": entries[:500],
     }
