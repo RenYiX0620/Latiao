@@ -1357,16 +1357,34 @@ async def _reflect_output(text: str, model: str, api_url: str, headers: dict,
     return current, changed
 
 
+REASONING_MODEL_HINTS = ("reasoner", "r1", "reasoning", "thinking", "o1", "o3", "o4", "gpt-5")
+_FORCED_REASONING = ("deepseek-reasoner",)
+_ANTHROPIC_HINTS = ("claude", "anthropic")
+
+
 def _inject_thinking_disabled(body: dict, model: str, level: str = "high") -> dict:
     """思考强度三档（对应前端 🧠 选择器）：off / high(默认) / max。
-    - off: 显式关闭思考（DeepSeek 设 thinking disabled；各 API 兼容）
-    - high: 思考开启（默认，reasoning_content 回传已处理）
-    - max: 思考开启 + 更大 max_tokens（长推理任务不截断）"""
+
+    按模型族正确设置（此前 off 只写 Anthropic 字段 `thinking`，DeepSeek/OpenAI
+    忽略该字段 → 用户设"关闭思考"无效）：
+    - anthropic(claude):  thinking = {type: disabled}（官方关闭方式）
+    - openai 推理系(o1/o3/o4/gpt-5): reasoning_effort = "none"（官方关闭方式）
+    - deepseek-chat 等非推理: 无需字段（本来就不思考）
+    - deepseek-reasoner:  API 层面强制思考、不提供开关 —— 不设无效字段，
+      返回 body 并带 _thinking_unsupported 标记，前端据此提示
+    """
     m = (model or "").lower()
+    body["_thinking_level"] = level
     if level == "off":
-        body["thinking"] = {"type": "disabled"}
+        if any(h in m for h in _ANTHROPIC_HINTS):
+            body["thinking"] = {"type": "disabled"}
+        elif "deepseek-reasoner" in m or m in _FORCED_REASONING:
+            body["_thinking_unsupported"] = True  # 无法关闭，提示用户
+        elif any(h in m for h in ("o1", "o3", "o4", "gpt-5")) or "reasoner" in m or "r1" in m:
+            body["reasoning_effort"] = "none"
+        # 其他非推理模型：不设字段（默认不思考）
     elif level == "max":
-        # 长推理预算：高于常规 reasoning 预算（12288）约 1.5 倍
+        # 长推理预算：高于常规推理预算（12288）约 1.5 倍
         body.setdefault("max_tokens", 12288)
         if isinstance(body.get("max_tokens"), int) and body["max_tokens"] < 18432:
             body["max_tokens"] = 18432
@@ -1946,6 +1964,9 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                 "stop": ["<|im_end|>", "<|endoftext|>", "<end_of_turn>", "<eos>"],
             }
             _inject_thinking_disabled(body, model, thinking_level)
+            # 私有标记（_thinking_*）仅为内部审计/提示用，绝不能发给 API（未知字段 400）
+            body.pop("_thinking_level", None)
+            body.pop("_thinking_unsupported", None)
 
             streamed_text = ""
             reasoning_text = ""  # 累积 reasoning_content——DeepSeek 推理模型要求传回

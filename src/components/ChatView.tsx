@@ -608,7 +608,17 @@ export default memo(function ChatView({
                   { value: "high", label: t("chat.thinking_high"), icon: <Brain size={15} /> },
                   { value: "max", label: t("chat.thinking_max"), icon: <BrainCircuit size={15} /> },
                 ]}
-                onChange={(v) => setThinkingLevel(v as "off" | "high" | "max")}
+                onChange={(v) => {
+                  setThinkingLevel(v as "off" | "high" | "max");
+                  // 强制思考模型（DeepSeek 推理系等）API 层面无法关闭思考——
+                  // 诚实提示，避免用户设了 off 却不见效果以为工具坏了
+                  if (v === "off") {
+                    const m = (selectedModel || "").toLowerCase();
+                    if (m.includes("reasoner") || m.includes("deepseek-r1") || m.includes("o1") || m.includes("o3") || m.includes("gpt-5")) {
+                      showToast(t("chat.thinking_cannot_off"), "warn");
+                    }
+                  }
+                }}
                 title={t("chat.thinking_title")} />
             </div>
             <div className="toolbar-right">
