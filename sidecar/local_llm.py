@@ -840,6 +840,8 @@ class LocalLLMEngine:
                     if mid.startswith(("/", "~", "./")) or ".gguf" in mid or mid.startswith("\\"):
                         from pathlib import Path as _P
                         expanded = _P(os.path.expanduser(mid)) if mid.startswith("~") else _P(mid)
+                        # exists() 对目录也成立：LM Studio 的 .gguf 目录合法存在，
+                        # 直接放行（start_model 会解析到内部真实文件）。
                         if not expanded.exists():
                             logger.warning(
                                 "引擎状态文件中的模型路径不存在，丢弃: %s", mid)
@@ -1158,8 +1160,22 @@ class LocalLLMEngine:
         return result
 
     def _find_gguf_uncached(self, model_id: str) -> str | None:
-        if model_id.endswith(".gguf") and Path(model_id).exists():
-            return model_id
+        if model_id.endswith(".gguf"):
+            p = Path(model_id)
+            if p.is_file():
+                return model_id
+            # LM Studio 布局：名字以 .gguf 结尾的其实是目录，真正的模型
+            # 文件同名地放在里面（~/.lmstudio/models/<org>/<name>.gguf/<name>.gguf）。
+            # 此前用 exists() 判断--目录也算存在，整个目录被当成模型文件
+            # 传给 llama.cpp -> "Failed to load model from file"（目录无法 mmap）。
+            if p.is_dir():
+                inner = p / p.name
+                if inner.is_file():
+                    return str(inner)
+                # 目录里唯一的 .gguf 也接受（兼容部分变体布局）
+                candidates = sorted(p.glob("*.gguf"))
+                if len(candidates) == 1:
+                    return str(candidates[0])
         # Strip .gguf suffix and repo prefix for fuzzy matching
         key = model_id.replace(".gguf", "").lower()
         # Also try just the filename part
@@ -1204,14 +1220,23 @@ class LocalLLMEngine:
             models_root = MODELS_DIR.resolve()
         except OSError:
             return None
-        if model_id.endswith(".gguf") and Path(model_id).exists():
+        resolved: Path | None = None
+        if model_id.endswith(".gguf"):
+            p = Path(model_id)
+            if p.is_file():
+                resolved = p
+            elif p.is_dir():
+                # LM Studio 式目录：指向内部同名 .gguf，删除同样只认 ~/Models 内的
+                inner = p / p.name
+                resolved = inner if inner.is_file() else (p.glob("*.gguf") and next(iter(sorted(p.glob("*.gguf"))), None))
+        if resolved is not None:
             # 直接路径：必须位于 ~/Models 内
             try:
-                p = Path(model_id).resolve()
-                p.relative_to(models_root)
+                rp = resolved.resolve()
+                rp.relative_to(models_root)
             except (OSError, ValueError):
                 return None
-            return str(p)
+            return str(rp)
         key = model_id.replace(".gguf", "").lower()
         key_short = model_id.rsplit("/", 1)[-1].replace(".gguf", "").lower()
         filename = model_id.rsplit("/", 1)[-1].lower()
@@ -1333,10 +1358,10 @@ class LocalLLMEngine:
                 for line in reversed(err_lines):
                     stripped = line.strip()
                     if stripped and ("Error" in stripped or "error" in stripped.lower() or "ValueError" in stripped or "does not exist" in stripped.lower() or "No such file" in stripped):
-                        err_summary = stripped[-150:]
+                        err_summary = stripped[-300:]
                         break
                 if not err_summary and err_lines:
-                    err_summary = err_lines[-1].strip()[-150:]
+                    err_summary = err_lines[-1].strip()[-300:]
                 logger.error(
                     "llama-cpp server %s: %s",
                     "exited early" if proc.poll() is not None else "HTTP timeout",
@@ -1422,10 +1447,10 @@ class LocalLLMEngine:
             for line in reversed(err_lines):
                 stripped = line.strip()
                 if stripped and ("Error" in stripped or "error" in stripped.lower()):
-                    err_summary = stripped[-150:]
+                    err_summary = stripped[-300:]
                     break
             if not err_summary and err_lines:
-                err_summary = err_lines[-1].strip()[-150:]
+                err_summary = err_lines[-1].strip()[-300:]
             logger.error("llama-server native: %s",
                 "exited early" if proc.poll() is not None else "HTTP timeout")
             self.stop_model()
@@ -1504,10 +1529,10 @@ class LocalLLMEngine:
                 for line in reversed(err_lines):
                     stripped = line.strip()
                     if stripped and ("Error" in stripped or "error" in stripped.lower() or "ValueError" in stripped or "does not exist" in stripped.lower()):
-                        err_summary = stripped[-150:]
+                        err_summary = stripped[-300:]
                         break
                 if not err_summary and err_lines:
-                    err_summary = err_lines[-1].strip()[-150:]
+                    err_summary = err_lines[-1].strip()[-300:]
                 logger.error(
                     "MLX server %s: %s",
                     "exited early" if proc.poll() is not None else "HTTP timeout",

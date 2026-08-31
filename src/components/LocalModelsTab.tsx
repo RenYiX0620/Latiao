@@ -269,7 +269,7 @@ export default function LocalModelsTab(props: Props) {
           <div onClick={() => setShowDirPicker(false)} style={{ position: "absolute", inset: 0, background: "rgba(0,0,0,0.3)", backdropFilter: "blur(2px)", WebkitBackdropFilter: "blur(2px)", zIndex: 199 }} />
           <div style={{ position: "absolute", top: 40, left: "50%", transform: "translateX(-50%)", width: 560, maxWidth: "94%", maxHeight: "72vh", background: "var(--bg-card)", borderRadius: 14, boxShadow: "0 20px 60px rgba(0,0,0,0.25)", zIndex: 200, display: "flex", flexDirection: "column", overflow: "hidden" }}>
             <div style={{ padding: "12px 16px", borderBottom: "1px solid var(--border-default)", display: "flex", alignItems: "center", gap: 8 }}>
-              <span style={{ fontWeight: 700, fontSize: 14 }}>📂 {t("local.select_dir")}</span>
+              <span style={{ fontWeight: 700, fontSize: 14 }}>📂 选择模型（文件夹选为 MLX，.gguf 文件直接加载）</span>
               <button className="btn btn-sm btn-primary" style={{ marginLeft: "auto" }} onClick={() => pickDir(browse.path)}>✅ 选中当前目录</button>
               <button className="btn btn-sm btn-ghost" onClick={() => setShowDirPicker(false)}>✕</button>
             </div>
@@ -280,13 +280,19 @@ export default function LocalModelsTab(props: Props) {
             </div>
             <div style={{ flex: 1, overflowY: "auto", padding: "8px 12px" }} className="custom-scrollbar">
               {browse.entries.length === 0 && <div style={{ fontSize: 12, color: "var(--text-muted)", padding: 24, textAlign: "center" }}>空目录</div>}
-              {browse.entries.map(e => (
+              {browse.entries.map(e => {
+                const isGgufFile = !e.is_dir && e.name.toLowerCase().endsWith(".gguf");
+                return (
                 <div key={e.path} style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 10px", borderRadius: 8, borderBottom: "1px solid var(--border-default)", cursor: e.is_dir ? "pointer" : "default" }}>
-                  <span style={{ fontSize: 14 }}>{e.is_dir ? "📁" : "📄"}</span>
-                  <span style={{ flex: 1, fontSize: 12, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: e.is_dir ? "var(--text-primary)" : "var(--text-muted)" }} onClick={() => e.is_dir && fetchBrowse(e.path)}>{e.name}</span>
+                  <span style={{ fontSize: 14 }}>{e.is_dir ? "📁" : isGgufFile ? "🧠" : "📄"}</span>
+                  <span style={{ flex: 1, fontSize: 12, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: e.is_dir || isGgufFile ? "var(--text-primary)" : "var(--text-muted)" }} onClick={() => e.is_dir && fetchBrowse(e.path)}>{e.name}</span>
+                  {!isGgufFile && e.size > 0 && <span style={{ fontSize: 9, color: "var(--text-muted)", flexShrink: 0 }}>{(e.size / 1073741824).toFixed(1)}GB</span>}
+                  {isGgufFile && <span style={{ fontSize: 9, color: "var(--accent)", flexShrink: 0 }}>{(e.size / 1073741824).toFixed(1)}GB</span>}
                   {e.is_dir && <button className="btn btn-sm btn-primary" style={{ fontSize: 10, padding: "2px 10px", flexShrink: 0 }} onClick={() => pickDir(e.path)}>选择</button>}
+                  {isGgufFile && <button className="btn btn-sm btn-primary" style={{ fontSize: 10, padding: "2px 10px", flexShrink: 0 }} onClick={() => pickDir(e.path)}>加载</button>}
                 </div>
-              ))}
+                );
+              })}
             </div>
           </div>
         </>
