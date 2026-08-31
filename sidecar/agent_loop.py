@@ -1585,6 +1585,31 @@ async def _await_tool_confirmation(call_id: str, tool_name: str, args: dict) -> 
     return approved, events
 
 
+async def _await_plan_confirmation(plan_id: str, plan: str) -> tuple[bool, list[dict]]:
+    """计划确认门控：等待用户批准/拒绝执行计划（复用 _pending_confirmations）。
+
+    与工具确认共用 /v1/confirm_tool 端点与前端批准/拒绝 UI，但事件类型为
+    plan_confirm（前端渲染为计划确认卡）。超时保持暂停并提示（不默认执行）。"""
+    events = [{"event": "plan_confirm", "call_id": plan_id, "tool": "执行计划",
+               "args": {"plan": plan[:2000]}}]
+    event = asyncio.Event()
+    async with _pending_lock:
+        _pending_confirmations[plan_id] = {"event": event, "approved": False}
+    try:
+        await asyncio.wait_for(event.wait(), timeout=300)  # 计划给 5 分钟阅读时间
+        async with _pending_lock:
+            approved = _pending_confirmations.get(plan_id, {}).get("approved", False)
+    except asyncio.TimeoutError:
+        approved = False
+        events.append({
+            "content": "\n\n⚠️ 计划等待确认超时（5 分钟无人操作），任务已暂停未执行。可重新发起任务。",
+        })
+    finally:
+        async with _pending_lock:
+            _pending_confirmations.pop(plan_id, None)
+    return approved, events
+
+
 def _check_pre_hooks(tool_name: str, args: dict) -> tuple[bool, list[dict], str]:
     """Run pre-tool hooks. Returns (vetoed, events, result_if_vetoed)."""
     hooks = TOOL_HOOKS.get(tool_name, {})
@@ -1908,13 +1933,23 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
         active_tools = _cap_tools(active_tools, 8)
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(120)) as client:
-        # ── 规划模式：复杂任务先生成执行计划（显示给用户，按计划执行） ──
+        # ── 规划模式：复杂任务先生成执行计划（显示给用户，等确认后执行） ──
         if _should_plan(last_user_text, _is_local_llm_url(api_url)) or _normalize_access(access_mode) == "plan":
             _plan = await _generate_plan(last_user_text, model, api_url, headers, client)
             if _plan:
                 yield {"event": "agent_plan", "content": _plan}
+                # 计划门控：弹给用户批准/拒绝，批准后才开始执行（此前列完
+                # 计划直接跑，"等确认"只是提示词约束，模型可无视）
+                plan_id = f"plan_{uuid.uuid4()}"
+                approved, plan_events = await _await_plan_confirmation(plan_id, _plan)
+                for ev in plan_events:
+                    yield ev
+                if not approved:
+                    _track_progress(session_id, "plan_rejected", "user_denied_plan")
+                    yield {"content": "\n\n⏹️ 计划已被拒绝，任务未执行。你可以调整要求后重新发起。"}
+                    return
                 current_msgs.insert(0, {"role": "system",
-                    "content": "以下是已确定的执行计划，请严格按计划逐步执行（可调用工具）：\n" + _plan})
+                    "content": "以下是已确认（用户批准）的执行计划，请严格按计划逐步执行（可调用工具）：\n" + _plan})
 
         while iteration < 50:  # hard cap at 50, dynamic exit via stagnation
             iteration += 1
