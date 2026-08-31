@@ -465,6 +465,7 @@ async def _hot_reload_extensions() -> dict:
 
 # ── 路由注册：api_routes 在文件末尾导入，确保 `from main import app` 拿到完整 app ──
 import api_routes  # noqa: E402,F401  (注册全部 FastAPI 路由)
+import files_browse  # noqa: E402,F401  (应用内目录浏览：模型目录选择器)
 
 if __name__ == "__main__":
     import multiprocessing

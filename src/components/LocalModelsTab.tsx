@@ -162,6 +162,14 @@ export default function LocalModelsTab(props: Props) {
   const fetchModelDetail = async (modelId: string) => { const reqId = ++detailReqRef.current; setDetailModelId(modelId); setDetailData(null); setDetailLoading(true); try { const resp = await authFetch("/v1/local-llm/model-detail?model_id=" + encodeURIComponent(modelId)); const data = await resp.json(); if (reqId === detailReqRef.current) setDetailData(data); } catch { if (reqId === detailReqRef.current) setDetailData({ status: "error", message: "加载失败" }); } if (reqId === detailReqRef.current) setDetailLoading(false); };
   const deleteModelFile = async (modelId: string) => { try { const resp = await authFetch("/v1/local-llm/delete-model", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model_id: modelId }) }); const data = await resp.json(); showToast(data.message || t("local.deleted")); if (data.status === "ok" && detailModelId) fetchModelDetail(detailModelId); } catch(e) { console.error(e); showToast(t("local.delete_fail")); } };
 
+  // 应用内目录选择器：点文件夹进入、点"选择"直接选中该目录——
+  // 绕开 macOS 原生目录面板"双击=进入"的歧义
+  const [showDirPicker, setShowDirPicker] = useState(false);
+  const [browse, setBrowse] = useState<{ path: string; parent: string | null; roots: string[]; entries: { name: string; path: string; is_dir: boolean; size: number }[] } | null>(null);
+  const fetchBrowse = async (path?: string) => { try { const q = path ? "?path=" + encodeURIComponent(path) : ""; const resp = await authFetch("/v1/files/browse" + q); const data = await resp.json(); if (data.status === "ok") setBrowse(data); else showToast(data.detail || "无法读取目录"); } catch { showToast("目录读取失败"); } };
+  const openDirPicker = () => { setShowDirPicker(true); fetchBrowse(); };
+  const pickDir = (path: string) => { setShowDirPicker(false); setLocalModelId(path); startLocalLLM(path); };
+
   return (
     <div style={{ position: "relative" }}>
       {setupCheck && setupCheck.issues.length > 0 && (
@@ -228,7 +236,7 @@ export default function LocalModelsTab(props: Props) {
             <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
               <input className="form-input" style={{ flex: 1, margin: 0, fontSize: 12, padding: "8px 12px", fontFamily: "var(--font-mono)" }} placeholder={t("local.model_id_placeholder")} value={localModelId} onChange={e => setLocalModelId(e.target.value)} onKeyDown={e => { if (e.key === "Enter") startLocalLLM(); }} />
               <button className="btn btn-sm btn-primary" onClick={async () => { try { const selected = await open({ multiple: false }); if (selected) { setLocalModelId(selected); startLocalLLM(selected); } } catch { /* dialog cancelled */ } }} title={t("local.select_file")} style={{ minWidth: 100, padding: "8px 16px" }}>📁 {t("local.select_file")}</button>
-              <button className="btn btn-sm" onClick={async () => { try { const selected = await open({ multiple: false }); if (selected) { const p = String(selected); const lastSep = Math.max(p.lastIndexOf("/"), p.lastIndexOf("\\")); const dir = lastSep > 0 ? p.slice(0, lastSep) : p; setLocalModelId(dir); startLocalLLM(dir); } } catch { /* dialog cancelled */ } }} title={t("local.select_dir") + "（进入目录后任选一个文件）"} style={{ minWidth: 100, padding: "8px 16px" }}>📂 {t("local.select_dir")}</button>
+              <button className="btn btn-sm" onClick={openDirPicker} title={t("local.select_dir") + "（点文件夹进入，点「选择」选中）"} style={{ minWidth: 100, padding: "8px 16px" }}>📂 {t("local.select_dir")}</button>
               <button className="btn btn-md btn-primary" style={{ minWidth: 100, padding: "8px 16px" }} onClick={() => startLocalLLM()} disabled={isStarting}>{isStarting ? "⏳ " + t("local.starting") : "🚀 " + t("local.start")}</button>
             </div>
             <div style={{ fontSize: 10, color: "var(--text-muted)", marginTop: 8 }}>{t("local.start_hint")} {localLLMStatus.backend === "mlx" ? t("local.mlx") : t("local.llamacpp")}</div>
@@ -254,6 +262,34 @@ export default function LocalModelsTab(props: Props) {
             )}
           </div>
         </div>
+      )}
+
+      {showDirPicker && browse && (
+        <>
+          <div onClick={() => setShowDirPicker(false)} style={{ position: "absolute", inset: 0, background: "rgba(0,0,0,0.3)", backdropFilter: "blur(2px)", WebkitBackdropFilter: "blur(2px)", zIndex: 199 }} />
+          <div style={{ position: "absolute", top: 40, left: "50%", transform: "translateX(-50%)", width: 560, maxWidth: "94%", maxHeight: "72vh", background: "var(--bg-card)", borderRadius: 14, boxShadow: "0 20px 60px rgba(0,0,0,0.25)", zIndex: 200, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+            <div style={{ padding: "12px 16px", borderBottom: "1px solid var(--border-default)", display: "flex", alignItems: "center", gap: 8 }}>
+              <span style={{ fontWeight: 700, fontSize: 14 }}>📂 {t("local.select_dir")}</span>
+              <button className="btn btn-sm btn-primary" style={{ marginLeft: "auto" }} onClick={() => pickDir(browse.path)}>✅ 选中当前目录</button>
+              <button className="btn btn-sm btn-ghost" onClick={() => setShowDirPicker(false)}>✕</button>
+            </div>
+            <div style={{ padding: "8px 16px", borderBottom: "1px solid var(--border-default)", display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+              {browse.roots.map(r => { const seg = r.split("/").filter(Boolean); const label = seg.length ? seg[seg.length - 1] : r; return <button key={r} className="btn btn-sm btn-ghost" style={{ fontSize: 10, padding: "2px 8px" }} onClick={() => fetchBrowse(r)}>{label}</button>; })}
+              {browse.parent && <button className="btn btn-sm btn-ghost" style={{ fontSize: 10, padding: "2px 8px" }} onClick={() => fetchBrowse(browse.parent!)}>⬆ 上一级</button>}
+              <span style={{ fontSize: 10, fontFamily: "var(--font-mono)", color: "var(--text-muted)", wordBreak: "break-all", width: "100%" }}>{browse.path}</span>
+            </div>
+            <div style={{ flex: 1, overflowY: "auto", padding: "8px 12px" }} className="custom-scrollbar">
+              {browse.entries.length === 0 && <div style={{ fontSize: 12, color: "var(--text-muted)", padding: 24, textAlign: "center" }}>空目录</div>}
+              {browse.entries.map(e => (
+                <div key={e.path} style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 10px", borderRadius: 8, borderBottom: "1px solid var(--border-default)", cursor: e.is_dir ? "pointer" : "default" }}>
+                  <span style={{ fontSize: 14 }}>{e.is_dir ? "📁" : "📄"}</span>
+                  <span style={{ flex: 1, fontSize: 12, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: e.is_dir ? "var(--text-primary)" : "var(--text-muted)" }} onClick={() => e.is_dir && fetchBrowse(e.path)}>{e.name}</span>
+                  {e.is_dir && <button className="btn btn-sm btn-primary" style={{ fontSize: 10, padding: "2px 10px", flexShrink: 0 }} onClick={() => pickDir(e.path)}>选择</button>}
+                </div>
+              ))}
+            </div>
+          </div>
+        </>
       )}
 
       {showSearch && (
