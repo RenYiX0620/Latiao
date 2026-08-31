@@ -2689,6 +2689,8 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
     text_only_streak = 0
     has_called_tool = False
     text_output_delivered = False  # nudge 重试期间抑制已交付文本的重复流式输出
+    _pending_tool_analysis = False  # 工具结果已产出，但尚未收到实质性文字回答
+    _intent_nudges = 0              # “只声明不动手/只道歉”的追问计数
     _brief_answer_nudged = False  # "资料充足却短回答"的追问只触发一次，防死循环
     # Build tool prompt
     last_user_text = _extract_last_user_text(current_msgs)
@@ -3053,6 +3055,12 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                 if any_new or round_failed:
                     stagnation = 0
                     text_only_streak = 0
+                    if any_new:
+                        # 工具产出了新结果：在收到实质性文字回答（≥200 字符）
+                        # 之前，不允许用一句话收尾（“让我读取数据再分析”式
+                        # 声明/道歉不算完成）。
+                        _pending_tool_analysis = True
+                        _intent_nudges = 0
                 else:
                     stagnation += 1
                 if stagnation >= max_stagnation:
@@ -3065,27 +3073,24 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
             _track_progress(session_id, "text_round", "text_only")
             if streamed_text.strip():
                 _no_progress_deadline = time.monotonic() + 900  # 产出内容=实质进展
-            # Check if there are pending tasks: if the last message is a tool result
-            # and model didn't call another tool, it might have prematurely stopped
-            has_recent_tool_result = any(
-                m.get("role") == "tool" or (isinstance(m.get("content"), str) and m["content"].startswith("[工具结果]"))
-                for m in current_msgs[-3:]
+            # 工具已产出结果但模型尚未给出实质性回答时，不允许一句话收尾。
+            # 此前依赖“最近 3 条消息里有工具结果”这个窗口，nudge 消息一多
+            # 工具结果就被挤出窗口，模型连说两轮“让我读取数据再分析”都能
+            # 被当作最终答案返回（16:45 大盘事故）。改为用 _pending_tool_analysis
+            # 状态贯穿：只有 ≥200 字符的实质回答或新的工具调用才算推进。
+            _recent_tool_failed = any(
+                m.get("role") == "tool" and ("Error" in str(m.get("content", "")) or "⚠️" in str(m.get("content", "")) or "失败" in str(m.get("content", "")))
+                for m in current_msgs[-4:]
             )
-            if has_recent_tool_result and text_only_streak < 1 and streamed_text.strip():
-                # Model returned text after a tool result but didn't call another tool.
-                # 推理模型(Muse/Qwen3.5)经常先输出 <think> 思考 + 规划文字,
-                # 下一轮才实际调用工具--这不是停滞,不该 nudge 打断节奏。
-                # 只有当模型明确在"闲聊/总结"而非"规划下一步工具调用"时才 nudge。
+            if _pending_tool_analysis and streamed_text.strip() and not _recent_tool_failed:
+                # 推理模型(Muse/Qwen3.5/Ornith)常先输出规划文字、下一轮才调工具——
+                # 但“只声明不动手”的回复（让我读取/我再查一下…）不能当完成。
                 _planning_signals = ("tool", "工具", "读取", "查询", "搜索", "执行", "调用",
                                      "read_file", "list_dir", "run_cmd", "write_file",
-                                     "search", "tavily", "mx_query", "step", "步骤", "下一步")
+                                     "search", "tavily", "mx_query", "step", "步骤", "下一步",
+                                     "let me", "i'll", "i will", "让我", "我先", "接下来",
+                                     "再分析", "稍后", "马上", "look at", "check the")
                 _is_planning = any(sig in streamed_text.lower() for sig in _planning_signals)
-                if _is_planning and text_only_streak < 2:
-                    # 模型在规划下一步,给它一轮空间自然调工具,不 nudge
-                    current_msgs.append({"role": "assistant", "content": streamed_text.strip()})
-                    text_only_streak += 1
-                    text_output_delivered = True
-                    continue
                 if len(streamed_text.strip()) >= 200 and not _is_meta_wrapup(streamed_text):
                     # 模型在工具结果后已给出实质性回答（≥200 字符）——接受为
                     # 最终答案直接收尾，不再追问。此前无差别追问导致模型
@@ -3094,34 +3099,61 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                     # 例外：元评论式收尾（"上面的分析已覆盖…任务完成"）不算
                     # 实质回答——分析只在模型思考里，正文从未交付（19:38
                     # 事故），继续走追问轮。
+                    _pending_tool_analysis = False
                     current_msgs.append({"role": "assistant", "content": streamed_text.strip()})
                     _track_progress(session_id, "completed", f"text_response ({len(streamed_text)} chars)")
                     logger.info(f"[LOCAL-AGENT] Iteration {iteration}: no tools, returning text ({len(streamed_text)} chars)")
                     return
-                logger.info(f"[LOCAL-AGENT] Iteration {iteration}: model returned text after tool result, pushing for continuation")
-                current_msgs.append({
-                    "role": "system",
-                    "content": _get_localized_text(_detect_user_language(_extract_last_user_text(current_msgs)), {
-                        "zh": "⚠️ 你刚才收到了工具的执行结果，但你的回复里没有给出实质内容"
-                               "（只说了“任务完成/上面的分析已覆盖”之类的收尾话，"
-                               "真正的分析还留在你的思考里）。\n"
-                               "请把完整的分析写进回复正文：包含从工具结果中得到的关键"
-                               "数据与结论，让用户直接读到。\n"
-                               "调用工具格式：```tool 工具名\n{\"参数\":\"值\"}\n```",
-                        "en": "⚠️ You received tool results but your reply contained no real content"
-                              " (only meta-commentary like 'task complete').\n"
-                              "Write the FULL analysis into your reply body with key data and"
-                              " conclusions from the tool results.\n"
-                              "Tool format: ```tool tool_name\n{\"param\":\"value\"}\n```",
-                        "ja": "⚠️ ツール実行結果を受け取りましたが、返信に実質的な内容がありません"
-                              "（「タスク完了」等のメタコメントのみ）。\n"
-                              "ツール結果の主要データと結論を本文に書いてください。\n"
-                              "形式：```tool ツール名\n{\"パラメータ\":\"値\"}\n```",
-                    }),
-                })
-                text_output_delivered = True  # 文本已交付，nudge 重试不再重复输出
-                text_only_streak += 1
-                continue
+                if _intent_nudges < 3:
+                    current_msgs.append({"role": "assistant", "content": streamed_text.strip()})
+                    if _is_planning:
+                        current_msgs.append({
+                            "role": "system",
+                            "content": _get_localized_text(_detect_user_language(_extract_last_user_text(current_msgs)), {
+                                "zh": "不要只发声明或道歉。你刚才说还要继续（读取/查询数据等）——"
+                                       "现在就调用工具去执行；如果数据其实已经足够，就直接把"
+                                       "完整分析写进回复正文（含关键数字与结论）。",
+                                "en": "Don't just announce or apologize. You said you would continue"
+                                      " (read/query data etc.) — call the tool NOW; if the data is"
+                                      " already sufficient, write the full analysis into your reply"
+                                      " body (key numbers and conclusions).",
+                                "ja": "宣言や謝罪だけでなく、続けると言ったなら（データの読み取り・照会など）"
+                                      "今すぐツールを呼び出してください。データが十分なら、主要数値と"
+                                      "結論を含む完全な分析を本文に書いてください。",
+                            }),
+                        })
+                        logger.info(f"[LOCAL-AGENT] Iteration {iteration}: 意图声明未行动，nudge 立即调用工具（{_intent_nudges + 1}/3）")
+                    else:
+                        current_msgs.append({
+                            "role": "system",
+                            "content": _get_localized_text(_detect_user_language(_extract_last_user_text(current_msgs)), {
+                                "zh": "⚠️ 你刚才收到了工具的执行结果，但你的回复里没有给出实质内容"
+                                       "（只有收尾话或道歉，真正的分析还留在你的思考里）。\n"
+                                       "如果还需要数据，直接调用工具；否则把完整的分析写进回复正文："
+                                       "包含从工具结果中得到的关键数据与结论，让用户直接读到。\n"
+                                       "调用工具格式：```tool 工具名\n{\"参数\":\"值\"}\n```",
+                                "en": "⚠️ You received tool results but your reply contained no real content"
+                                      " (only meta-commentary or apologies).\n"
+                                      "If you still need data, call a tool directly; otherwise write"
+                                      " the FULL analysis into your reply body with key data and"
+                                      " conclusions from the tool results.\n"
+                                      "Tool format: ```tool tool_name\n{\"param\":\"value\"}\n```",
+                                "ja": "⚠️ ツール実行結果を受け取りましたが、返信に実質的な内容がありません"
+                                      "（メタコメントや謝罪のみ）。\n"
+                                      "データがまだ必要なら直接ツールを呼び出し、そうでなければ主要データと"
+                                      "結論を含む完全な分析を本文に書いてください。\n"
+                                      "形式：```tool ツール名\n{\"パラメータ\":\"値\"}\n```",
+                            }),
+                        })
+                        logger.info(f"[LOCAL-AGENT] Iteration {iteration}: model returned text after tool result, pushing for continuation（{_intent_nudges + 1}/3）")
+                    text_output_delivered = True  # 文本已交付，nudge 重试不再重复输出
+                    text_only_streak += 1
+                    _intent_nudges += 1
+                    continue
+                # 追问到上限仍只有声明/道歉：把最后这句交给用户，避免死循环
+                current_msgs.append({"role": "assistant", "content": streamed_text.strip()})
+                _track_progress(session_id, "completed", f"text_response ({len(streamed_text)} chars)")
+                logger.warning(f"[LOCAL-AGENT] Iteration {iteration}: {_intent_nudges} 轮追问仍无实质回答，收尾返回")
             if not has_called_tool and text_only_streak < 3 and streamed_text.strip():
                 # Model gave a text response without calling tools.
                 # Record the response so the model knows it already replied.
