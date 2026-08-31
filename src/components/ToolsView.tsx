@@ -616,28 +616,38 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
       </>
       )}
 
-      {/* 权限确认弹层（市场/已安装 tab 共用，放公共位置） */}
+      {/* 权限确认弹层（模态居中——此前内嵌卡片排在长列表末尾、视口外，表现为"点了没反应"） */}
       {confirming && (
-        <div className="card" style={{ marginBottom: 14, borderLeft: "2px solid var(--warning)", background: "var(--bg-card)" }}>
-          <div className="card-title">⚠️ 确认安装来源</div>
-          <div className="card-desc" style={{ marginTop: 4, wordBreak: "break-all" }}>
-            {confirming.source}
-          </div>
-          <div className="card-desc" style={{ marginTop: 4 }}>
-            {confirming.isGitHubItem
-              ? `社区内容将打包为扩展安装（权限：${(confirming.permissions || []).join("/") || "只读"}）。安装前请确认来源可信。`
-              : "扩展包将获得其 manifest 声明的权限（只读/文件/网络/命令）。安装前请确认来源可信。"}
-          </div>
-          {confirming.isGitHubItem && confirming.githubItem?.external_deps && (
-            <div className="card-desc" style={{ marginTop: 4, color: "var(--warning)" }}>
-              ⚠️ 该技能声明依赖外部 CLI/API 工具（如 ntask、特定二进制）。安装后 Latiao 可读取其使用说明，
-              但执行依赖的命令需自行安装对应工具，否则模型将无法完成该操作。
+        <div style={{
+          position: "fixed", inset: 0, zIndex: 1000,
+          background: "rgba(0,0,0,0.55)",
+          display: "flex", alignItems: "center", justifyContent: "center",
+        }} onClick={() => { if (!installing) setConfirming(null); }}>
+          <div className="card" style={{
+            width: "min(560px, 92vw)", maxHeight: "80vh", overflowY: "auto",
+            borderLeft: "2px solid var(--warning)", background: "var(--bg-card)",
+            boxShadow: "0 20px 60px rgba(0,0,0,0.5)",
+          }} onClick={(e) => e.stopPropagation()}>
+            <div className="card-title">⚠️ 确认安装来源</div>
+            <div className="card-desc" style={{ marginTop: 4, wordBreak: "break-all" }}>
+              {confirming.source}
             </div>
-          )}
-          <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
-            <button className="btn btn-primary" disabled={installing}
-              onClick={() => doInstall(confirming.source, confirming.sha256)}>确认安装</button>
-            <button className="btn btn-ghost" onClick={() => setConfirming(null)}>取消</button>
+            <div className="card-desc" style={{ marginTop: 4 }}>
+              {confirming.isGitHubItem
+                ? `社区内容将打包为扩展安装（权限：${(confirming.permissions || []).join("/") || "只读"}）。安装前请确认来源可信。`
+                : "扩展包将获得其 manifest 声明的权限（只读/文件/网络/命令）。安装前请确认来源可信。"}
+            </div>
+            {confirming.isGitHubItem && confirming.githubItem?.external_deps && (
+              <div className="card-desc" style={{ marginTop: 4, color: "var(--warning)" }}>
+                ⚠️ 该技能声明依赖外部 CLI/API 工具（如 ntask、特定二进制）。安装后 Latiao 可读取其使用说明，
+                但执行依赖的命令需自行安装对应工具，否则模型将无法完成该操作。
+              </div>
+            )}
+            <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+              <button className="btn btn-primary" disabled={installing}
+                onClick={() => doInstall(confirming.source, confirming.sha256)}>确认安装</button>
+              <button className="btn btn-ghost" onClick={() => setConfirming(null)}>取消</button>
+            </div>
           </div>
         </div>
       )}
