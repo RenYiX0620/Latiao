@@ -1773,6 +1773,47 @@ async def api_market_discover(url: str = Query(default="")):
         return {"status": "error", "message": str(e)}
 
 
+# ── 应用自更新预下载代理（根治大文件断流：sidecar 续传 + updater 本地下载）──
+
+@app.post("/v1/update/prepare")
+async def api_update_prepare(request: Request):
+    """启动预下载（后台线程，幂等）。body: {current_version: "x.y.z"}"""
+    import update_service
+    try:
+        body = await _json_body(request)
+    except Exception:
+        body = {}
+    current = str(body.get("current_version", "")).strip()
+    st = update_service.start_prepare(current)
+    return {"status": "ok", "progress": st}
+
+
+@app.get("/v1/update/progress")
+async def api_update_progress():
+    """预下载进度（前端轮询显示百分比）。"""
+    import update_service
+    return {"status": "ok", "progress": update_service.get_progress()}
+
+
+@app.get("/v1/update-latest.json")
+async def api_update_latest_json():
+    """Tauri updater 的清单源（本地生成，url 指向本地文件流式端点）。
+    免鉴权：updater 插件请求不带自定义 token（main._check_auth 豁免）。"""
+    import update_service
+    return update_service.get_tauri_manifest(update_service.current_app_version())
+
+
+@app.get("/v1/update-file")
+async def api_update_file():
+    """流式返回本地安装包给 updater（本地回环，无断流可能）。免鉴权。"""
+    import update_service
+    from starlette.responses import FileResponse
+    path = update_service.get_update_file_path()
+    if not path:
+        raise HTTPException(status_code=404, detail="update package not ready")
+    return FileResponse(str(path), filename=path.name, media_type="application/octet-stream")
+
+
 @app.get("/v1/marketplace/discovered")
 async def api_market_discovered():
     """GitHub 自动发现索引快照。"""
