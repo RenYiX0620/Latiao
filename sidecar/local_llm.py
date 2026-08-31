@@ -994,10 +994,13 @@ class LocalLLMEngine:
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
-            with urllib.request.urlopen(req, timeout=timeout, context=_ssl_ctx) as resp:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
                 data = json.loads(resp.read())
-            content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
-            return bool(content.strip())
+            # 只看响应结构：推理模型（Ornith 等）max_tokens=4 时 token 全进
+            # <think>，content 恒为空——按 content 判会永远认为引擎不健康
+            # （20:25 事故：35B 运行中被"健康检查连续失败"杀重载循环）
+            msg = (data.get("choices") or [{}])[0].get("message")
+            return bool(msg)
         except Exception:
             return False
 
@@ -1087,13 +1090,27 @@ class LocalLLMEngine:
 
     # ── Start / Stop ──
 
-    @staticmethod
-    def _wait_for_http(port: int, timeout_sec: float = 120, process: subprocess.Popen | None = None,
+    def _wait_for_http(self, port: int, timeout_sec: float = 120, process: subprocess.Popen | None = None,
                       cancel: "threading.Event | None" = None) -> bool:
-        """Poll the model server's /v1/models endpoint until it responds, times out, or the process dies.
+        """Poll the model server until a REAL chat completion succeeds, times out, or dies.
+
+        ⚠️ 不能只探 GET /v1/models：mlx_lm.server 在模型加载完成前就无条件
+        200（/health、/v1/models 都是裸 200）——端口通了 ≠ 模型就绪。
+        20:05-20:07 事故：35B 权重还在加载即被标记 running，用户消息 chat
+        404 → agent_loop 判"引擎损坏"杀进程 → 假完成 → 再 404 → 每 5s 死循环，
+        内存永远驻留不下来。这里 POST 最小 chat，返回 200 且有内容才是真就绪；
+        加载期间 mlx server 对 chat 回 404，继续等。
 
         cancel 置位时立即返回 False（用户点停止 / 要取消加载）。"""
         import urllib.request
+        # ⚠️ model 字段必须用真实加载的模型 id（或省略）：mlx_lm.server 会把
+        # 未知模型名当 HuggingFace repo 解析 → SSL 失败 → 404（假名 health-check
+        # 是 verify_engine_health 已踩过的同款坑，20:17 事故重演）。
+        _model_ref = self.current_model_id or self.current_model_name or ""
+        body = json.dumps({
+            "model": _model_ref, "stream": False, "max_tokens": 1,
+            "messages": [{"role": "user", "content": "hi"}],
+        }).encode()
         deadline = time.time() + timeout_sec
         while time.time() < deadline:
             if cancel is not None and cancel.is_set():
@@ -1101,10 +1118,24 @@ class LocalLLMEngine:
             if process is not None and process.poll() is not None:
                 return False  # Process died — caller will read stderr
             try:
-                urllib.request.urlopen(f"http://127.0.0.1:{port}/v1/models", timeout=3)
-                return True
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/v1/chat/completions",
+                    data=body, headers={"Content-Type": "application/json"}, method="POST")
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    data = json.loads(resp.read())
+                # 生成成功 = 就绪。⚠️ 不能要求 content 非空：推理模型
+                # （Ornith/GLM 等）在 max_tokens=1 时 token 全被 <think> 推理
+                # 吃掉，content 恒为空但生成已成功——按 content 判断会永远
+                # 以为在加载（20:33 事故：35B 已就绪却永远 starting）。
+                if resp.status == 200 and (data.get("choices") or [{}])[0].get("message"):
+                    return True
+            except urllib.error.HTTPError as e:
+                if e.code in (404, 503):
+                    time.sleep(1)  # 模型仍在加载（mlx 加载期 chat=404）
+                    continue
             except Exception:
-                time.sleep(0.5)
+                pass
+            time.sleep(0.5)
         return False
 
     @staticmethod
@@ -1574,6 +1605,9 @@ class LocalLLMEngine:
         with self._proc_lock:
             self._explicit_stop = False
             self._cancel_load.clear()
+            # 引擎启动时刻：agent_loop 的 404 判死用它做 120s 宽限，
+            # 防止"假完成"（端口通但权重仍在加载）时误杀刚启动的引擎
+            self._engine_started_at = time.monotonic()
 
             # ── External engine mode (LM Studio / Ollama) ──
             # 默认关闭：辣条自启引擎加载模型。仅当环境变量

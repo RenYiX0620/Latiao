@@ -238,9 +238,14 @@ async def _local_llm_stream(client, api_url: str, body: dict, headers: dict):
                         # 而不是空转 71×5s 后报"模型未就绪"。503 保持纯等待语义。
                         if (_status == 404 and _local and _own_engine
                                 and _attempt >= 1 and not engine._auto_reloading
-                                and engine.server_status != "starting"):
+                                and engine.server_status != "starting"
+                                and time.monotonic() - getattr(engine, "_engine_started_at", 0.0) > 120):
                             # 注意 starting 保护：手动加载期间 chat 接口 404 是
-                            # 常态（模型未就绪），绝不能杀正在加载的引擎（P1-7）
+                            # 常态（模型未就绪），绝不能杀正在加载的引擎（P1-7）。
+                            # 120s 宽限期是第二道防线：即便 "模型加载完成" 被
+                            # 误报（状态已置 running 但权重还在载入，20:05 事故的
+                            # 假完成），引擎启动后 2 分钟内也只等待不杀——
+                            # 35B 权重加载可长达数分钟，被误杀只会再拉一轮重载。
                             logger.warning("本地引擎连续 404，判定状态损坏，强制重载")
                             try:
                                 engine._kill_port(engine.server_port)
