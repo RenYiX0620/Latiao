@@ -1355,13 +1355,10 @@ const [timeFilter, setTimeFilter] = useState("all");
           </span>
           <span className={`status-dot ${sidecarStatus === "online" ? "online" : "offline"}`}></span>
           <span className="status-label">{sidecarStatus === "online" ? t("sidebar.online") : t("sidebar.offline")}</span>
-          {isProcessing && agentPhase && (
-            <span style={{ fontSize: 11, color: "var(--accent)", marginLeft: 8, padding: "2px 8px", borderRadius: "var(--radius-sm)", background: "var(--accent-soft)" }}>
-              {agentPhase}
-            </span>
-          )}
           {isProcessing && (
-            <span style={{ fontSize: 11, color: "var(--text-muted)", marginLeft: 4 }}>{t("sidebar.processing")}</span>
+            <span style={{ fontSize: 11, color: agentPhase ? "var(--accent)" : "var(--text-muted)", marginLeft: 8, padding: "2px 8px", borderRadius: "var(--radius-sm)", background: agentPhase ? "var(--accent-soft)" : "transparent" }}>
+              {agentPhase || t("sidebar.processing")}
+            </span>
           )}
         </div>
 
