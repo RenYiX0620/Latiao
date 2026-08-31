@@ -1659,6 +1659,34 @@ class LocalLLMEngine:
             self._process = None
             self._active_backend = ""
 
+    def shutdown_engine(self) -> None:
+        """应用退出时调用：杀掉本地模型进程并释放端口（释放显存/内存）。
+
+        与 stop_model 的区别：不动引擎状态文件（.engine_state.json），
+        下次启动仍可按需自动重新加载上次的模型（B1 恢复路径）。
+        外部引擎模式（LM Studio/Ollama）不碰任何外部进程。
+        """
+        if self._external_engine:
+            return
+        with self._proc_lock:
+            if self._process:
+                try:
+                    self._process.terminate()
+                    self._process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    self._process.kill()
+                    self._process.wait()
+                except Exception:
+                    try:
+                        self._process.kill()
+                    except Exception:
+                        pass
+                self._process = None
+        # detach 过的引擎（sidecar 重启后接管端口）没有 _process 句柄，
+        # 端口兜底清理同样要杀——应用都退出了，模型不该继续占内存
+        self._kill_port(self.server_port)
+        logger.info("Sidecar 关闭 — 本地模型引擎已停止（状态保留，下次自动重载）")
+
     def stop_model(self) -> dict:
         # 先置取消事件：让加载期持锁的 start_model 尽快释放锁，
         # 否则 Stop 会被阻塞到加载完成（最长 300s）
@@ -2235,6 +2263,10 @@ def start_model(model_id: str, port: int = 1235) -> dict:
 
 def stop_model() -> dict:
     return _engine.stop_model()
+
+
+def shutdown_engine() -> None:
+    return _engine.shutdown_engine()
 
 def delete_model_file(model_id: str) -> dict:
     return _engine.delete_model_file(model_id)

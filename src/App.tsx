@@ -699,7 +699,7 @@ const [timeFilter, setTimeFilter] = useState("all");
     if (checkingUpdate) return;
     setCheckingUpdate(true);
     const { checkForUpdates } = await import("./utils/updater");
-    const res = await checkForUpdates((msg) => showToast(msg));
+    const res = await checkForUpdates((msg) => showToast(msg), !silent);
     setCheckingUpdate(false);
     if (!silent && res === "none") showToast("已是最新版本");
   }, [checkingUpdate, showToast]);

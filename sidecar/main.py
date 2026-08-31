@@ -241,10 +241,12 @@ def _check_auth(request: Request) -> None:
     - 校验 X-Latiao-Token，兼容 Authorization: Bearer <token>
     - LATIAO_AUTH_TOKEN 未设置 → 直接放行（无鉴权模式）
     - /health 豁免：前端启动探测用，且不返回敏感信息
+    - /v1/update-latest.json、/v1/update-file 豁免：Tauri updater 插件的
+      请求不携带自定义 token（本地回环 + 安装包经 minisign 签名验证，安全）
     """
     if not AUTH_TOKEN:
         return
-    if request.url.path == "/health":
+    if request.url.path in ("/health", "/v1/update-latest.json", "/v1/update-file"):
         return
     token = request.headers.get("x-latiao-token", "") or ""
     if not token:
@@ -256,6 +258,16 @@ def _check_auth(request: Request) -> None:
 
 # Log key lifecycle events
 logger.info("Sidecar 启动")
+
+# 诊断设施：进程无响应时 kill -USR1 <pid> 可 dump 全线程堆栈到日志文件
+try:
+    import faulthandler as _fh
+    import signal as _signal
+    _fh.register(_signal.SIGUSR1, file=open(str(PROGRESS_DIR / "stack_dump.txt"), "w"))
+    logger.info("faulthandler SIGUSR1 诊断已注册")
+    # （临时定时 dump 已移除——诊断完成；SIGUSR1 按需 dump 保留）
+except Exception:
+    pass
 
 # huggingface — 国内网络可用 hf-mirror.com 镜像
 # os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
@@ -307,10 +319,43 @@ async def lifespan(app: FastAPI):
         threading.Thread(target=_discovery_worker, daemon=True).start()
     except Exception:
         logger.warning("GitHub 抓取预热启动失败", exc_info=True)
+    # 孤儿看门狗：Tauri 宿主被强杀/崩溃时（无 SIGTERM），sidecar 会被
+    # reparent 给 launchd 继续活着，35B 引擎随之常驻内存（"退了还占内存"）。
+    # 轮询 ppid 检测宿主消失，自杀前先停掉模型引擎。
+    import time as _time
+    _watchdog_ppid = os.getppid()
+
+    def _orphan_watchdog():
+        import threading as _th
+
+        def _watch():
+            while True:
+                _time.sleep(3)
+                try:
+                    if os.getppid() != _watchdog_ppid:
+                        logger.warning("检测到宿主进程已退出，sidecar 自杀清理")
+                        try:
+                            from local_llm import shutdown_engine
+                            shutdown_engine()
+                        except Exception:
+                            logger.warning("退出清理时停止引擎失败", exc_info=True)
+                        os._exit(0)
+                except Exception:
+                    break
+        _th.Thread(target=_watch, daemon=True).start()
+
+    _orphan_watchdog()
     cron_task = asyncio.create_task(_cron_loop())
     catchup_task = asyncio.create_task(run_cron_catchup())  # 补跑关闭期间错过的任务
     logger.info("Sidecar 启动 — cron loop started")
     yield
+    # 正常退出（应用关窗/托盘退出，Rust 端发 SIGTERM）：停掉本地模型引擎，
+    # 释放显存/内存。sidecar 单独重启走 detach+SIGKILL，不会经过这里。
+    try:
+        from local_llm import shutdown_engine
+        shutdown_engine()
+    except Exception:
+        logger.warning("Sidecar 关闭 — 停止引擎失败", exc_info=True)
     SIDECAR_PID.unlink(missing_ok=True)
     cron_task.cancel()
     catchup_task.cancel()
@@ -430,6 +475,7 @@ async def _hot_reload_extensions() -> dict:
 
 # ── 路由注册：api_routes 在文件末尾导入，确保 `from main import app` 拿到完整 app ──
 import api_routes  # noqa: E402,F401  (注册全部 FastAPI 路由)
+import files_browse  # noqa: E402,F401  (应用内目录浏览：模型目录选择器)
 
 if __name__ == "__main__":
     import multiprocessing

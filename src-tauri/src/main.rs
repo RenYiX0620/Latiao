@@ -405,6 +405,7 @@ fn start_sidecar() -> Option<Child> {
         .current_dir(&sidecar_dir)
         .env("LATIAO_CTX_LEN", "64000")
         .env("LATIAO_AUTH_TOKEN", AUTH_TOKEN.get().map(|s| s.as_str()).unwrap_or(""))
+        .env("LATIAO_APP_VERSION", env!("CARGO_PKG_VERSION"))
         .spawn()
     {
         Ok(child) => {
