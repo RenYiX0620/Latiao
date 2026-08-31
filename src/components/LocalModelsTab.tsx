@@ -1,5 +1,5 @@
 import { lazy, Suspense, useState, useEffect, useCallback, useRef } from "react";
-import { open, ask } from "@tauri-apps/plugin-dialog";
+import { ask } from "@tauri-apps/plugin-dialog";
 import { useTranslation } from "../i18n";
 import { authFetch } from "../utils/api";
 import type { HFModelResult, DownloadState, SetupIssue, LLMStatus } from "../types";
@@ -235,8 +235,7 @@ export default function LocalModelsTab(props: Props) {
           <div style={{ padding: "12px 16px" }}>
             <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
               <input className="form-input" style={{ flex: 1, margin: 0, fontSize: 12, padding: "8px 12px", fontFamily: "var(--font-mono)" }} placeholder={t("local.model_id_placeholder")} value={localModelId} onChange={e => setLocalModelId(e.target.value)} onKeyDown={e => { if (e.key === "Enter") startLocalLLM(); }} />
-              <button className="btn btn-sm btn-primary" onClick={async () => { try { const selected = await open({ multiple: false }); if (selected) { setLocalModelId(selected); startLocalLLM(selected); } } catch { /* dialog cancelled */ } }} title={t("local.select_file")} style={{ minWidth: 100, padding: "8px 16px" }}>📁 {t("local.select_file")}</button>
-              <button className="btn btn-sm" onClick={openDirPicker} title={t("local.select_dir") + "（点文件夹进入，点「选择」选中）"} style={{ minWidth: 100, padding: "8px 16px" }}>📂 {t("local.select_dir")}</button>
+              <button className="btn btn-sm" onClick={openDirPicker} title="点文件夹进入；.gguf 文件点「加载」，MLX 目录点「选择」" style={{ minWidth: 100, padding: "8px 16px" }}>📂 选择模型</button>
               <button className="btn btn-md btn-primary" style={{ minWidth: 100, padding: "8px 16px" }} onClick={() => startLocalLLM()} disabled={isStarting}>{isStarting ? "⏳ " + t("local.starting") : "🚀 " + t("local.start")}</button>
             </div>
             <div style={{ fontSize: 10, color: "var(--text-muted)", marginTop: 8 }}>{t("local.start_hint")} {localLLMStatus.backend === "mlx" ? t("local.mlx") : t("local.llamacpp")}</div>
