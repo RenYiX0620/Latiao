@@ -259,6 +259,16 @@ def _check_auth(request: Request) -> None:
 # Log key lifecycle events
 logger.info("Sidecar 启动")
 
+# 诊断设施：进程无响应时 kill -USR1 <pid> 可 dump 全线程堆栈到日志文件
+try:
+    import faulthandler as _fh
+    import signal as _signal
+    _fh.register(_signal.SIGUSR1, file=open(str(PROGRESS_DIR / "stack_dump.txt"), "w"))
+    logger.info("faulthandler SIGUSR1 诊断已注册")
+    # （临时定时 dump 已移除——诊断完成；SIGUSR1 按需 dump 保留）
+except Exception:
+    pass
+
 # huggingface — 国内网络可用 hf-mirror.com 镜像
 # os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 

@@ -31,7 +31,8 @@ def current_app_version() -> str:
     """当前 App 版本（Rust spawn sidecar 时经 LATIAO_APP_VERSION 注入）。"""
     return os.environ.get("LATIAO_APP_VERSION", "")
 
-_state_lock = threading.Lock()
+_state_lock = threading.RLock()  # 可重入：worker 持锁时会嵌套调 _save_state，
+                                 # 普通 Lock 会自死锁（真实事故：事件循环整体卡死）
 _state: dict = {}
 
 
@@ -59,23 +60,32 @@ def _load_state() -> dict:
     with _state_lock:
         if _state:
             return _state
-        try:
-            if STATE_FILE.exists():
-                _state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            logger.warning("update state load failed", exc_info=True)
+    # 文件 IO 在锁外（防止写盘慢时阻塞其他线程的锁获取）
+    try:
+        if STATE_FILE.exists():
+            data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            with _state_lock:
+                if not _state:
+                    _state = data
+    except Exception:
+        logger.warning("update state load failed", exc_info=True)
+    with _state_lock:
         return _state or {}
 
 
 def _save_state() -> None:
+    """状态落盘。锁内只取快照（仅基本类型字段，防 mock/对象泄漏进序列化），
+    文件 IO 在锁外——写盘卡顿绝不阻塞其他线程（此前 worker 持锁写盘挂死）。"""
     with _state_lock:
-        try:
-            UPDATE_DIR.mkdir(parents=True, exist_ok=True)
-            tmp = STATE_FILE.with_suffix(".tmp")
-            tmp.write_text(json.dumps(_state, ensure_ascii=False, indent=2), encoding="utf-8")
-            tmp.replace(STATE_FILE)
-        except Exception:
-            logger.warning("update state save failed", exc_info=True)
+        snapshot = {k: v for k, v in _state.items()
+                    if isinstance(v, (str, int, float, bool, list))}
+    try:
+        UPDATE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = STATE_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(STATE_FILE)
+    except Exception:
+        logger.warning("update state save failed", exc_info=True)
 
 
 def get_progress() -> dict:
