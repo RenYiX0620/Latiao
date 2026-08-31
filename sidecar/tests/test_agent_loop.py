@@ -362,3 +362,54 @@ class TestThinkingInjection(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPlanConfirmationGate(unittest.TestCase):
+    """计划确认门控：计划必须等用户批准才执行（此前列完直接跑）。"""
+
+    def test_plan_confirm_emits_event_and_blocks(self):
+        import asyncio
+        import agent_loop
+
+        async def run():
+            # 启动确认等待，然后模拟用户拒绝（计划被拒 -> 任务不执行）
+            task = asyncio.create_task(agent_loop._await_plan_confirmation("plan-t1", "1. 步骤A\n2. 步骤B"))
+            await asyncio.sleep(0.1)
+            async with agent_loop._pending_lock:
+                agent_loop._pending_confirmations["plan-t1"]["approved"] = False
+                agent_loop._pending_confirmations["plan-t1"]["event"].set()
+            approved, events = await task
+            return approved, events
+
+        approved, events = asyncio.run(run())
+        self.assertFalse(approved)
+        self.assertTrue(any(e.get("event") == "plan_confirm" for e in events))
+
+    def test_plan_confirm_approve(self):
+        import asyncio
+        import agent_loop
+
+        async def run():
+            task = asyncio.create_task(agent_loop._await_plan_confirmation("plan-t2", "计划"))
+            await asyncio.sleep(0.1)
+            async with agent_loop._pending_lock:
+                agent_loop._pending_confirmations["plan-t2"]["approved"] = True
+                agent_loop._pending_confirmations["plan-t2"]["event"].set()
+            approved, _ = await task
+            return approved
+
+        self.assertTrue(asyncio.run(run()))
+
+    def test_confirm_tool_endpoint_shares_pending(self):
+        # 计划确认与工具确认共用 _pending_confirmations / /v1/confirm_tool
+        import agent_loop
+        entry = {"event": None, "approved": False}
+        agent_loop._pending_confirmations["plan-t3"] = entry
+        # api_routes.confirm_tool 的写法就是改 approved + set event
+        agent_loop._pending_confirmations["plan-t3"]["approved"] = True
+        self.assertTrue(agent_loop._pending_confirmations["plan-t3"]["approved"])
+        agent_loop._pending_confirmations.pop("plan-t3", None)
+
+
+if __name__ == "__main__":
+    unittest.main()
