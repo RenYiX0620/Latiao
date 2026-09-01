@@ -666,7 +666,7 @@ _create_cron_def = {
     "type": "function",
     "function": {
         "name": "create_cron",
-        "description": "Create a scheduled task with cron expression. Schedule is standard 5-field cron, task is Chinese description.",
+        "description": "创建定时任务。schedule 用标准 5 段 cron 表达式：分 时 日 月 周。示例：每10分钟=*/10 * * * *；每小时=0 * * * *；每天9点=0 9 * * *；每30分钟=*/30 * * * *。task 是要执行的任务描述（中文）。创建后会按时自动执行并把结果推送到会话。",
         "parameters": {
             "type": "object",
             "properties": {
@@ -1055,6 +1055,7 @@ def _extract_last_user_text(messages: list) -> str:
 # ═══════════════════════════════════════════════════════
 
 TOOL_CATEGORIES = {
+    "scheduling": ["create_cron"],
     "file_read": ["read_file", "list_dir", "search_files"],
     "file_write": ["write_file"],
     "command": ["run_cmd"],
@@ -1073,6 +1074,11 @@ TOOL_CATEGORIES = {
 CONTROL_TOOL_NAMES = set(TOOL_CATEGORIES["control"])
 
 INTENT_PATTERNS = [
+    # 定时任务意图：放最前——"每10分钟分析大盘"同时命中 financial，
+    # 但用户首要诉求是建定时任务，先给 create_cron（任务内容由 cron 执行时
+    # 独立跑 agent 循环处理，不受本次过滤影响）
+    (re.compile(r"定时|每\s*\d+\s*(分钟|小时|天|周|秒)|每天|每小时|每周|每分钟|每个小时|cron|计划任务|日程|提醒|周期性", re.IGNORECASE),
+     ["scheduling"]),
     (re.compile(r"读|看|查看|检查|搜索|找|列出|显示|看看|分析|审查|review|check|read|find|list|show|cat|head|tail|grep|ls|dir", re.IGNORECASE),
      ["file_read"]),
     (re.compile(r"写|创建|修改|改|删|新建|保存|生成|write|create|modify|update|delete|save|generate|make", re.IGNORECASE),
@@ -1141,6 +1147,13 @@ def _filter_tools(user_text: str, all_tools: list[dict]) -> list[dict]:
     if not allowed_categories:
         return all_tools  # No match = keep all tools
     allowed_tools: set[str] = set()
+    # 定时意图优先短路：建任务只需 create_cron + read_file，其余工具（金融/
+    # 控制等）对"创建定时任务"是噪音——9B 小模型面对 16 个工具描述会迷失，
+    # 反复"我先查清楚"而不调 create_cron（09-01 10:13 事故）
+    if "scheduling" in allowed_categories:
+        allowed_tools.update({"create_cron", "read_file"})
+        allowed_tools.update({"use_skill", "delegate_task"})
+        return [t for t in all_tools if t.get("function", {}).get("name") in allowed_tools] or all_tools
     for cat in allowed_categories:
         allowed_tools.update(TOOL_CATEGORIES.get(cat, []))
     # Always include read_file as fallback
