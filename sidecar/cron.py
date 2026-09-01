@@ -254,7 +254,7 @@ def _seed_default_cron():
     _save_cron_state()
 
 
-async def _execute_cron_job(job: dict):
+async def _execute_cron_job(job: dict, force_local: bool = False):
     """Execute a due cron job: run the task through the agent loop with tools enabled."""
     # 依赖 agent_loop 的循环/工具符号 → 函数内 lazy import 避免循环依赖
     # SUBAGENT_MODEL 常量由 main.py 门面持有
@@ -304,7 +304,8 @@ async def _execute_cron_job(job: dict):
 
     # Use non-streaming agent loop to execute the task
     # 优先使用云端模型（支持原生 function calling）；仅在无云端时退回本地模型
-    cloud = _get_best_cloud_config()
+    # force_local：云端 429 限流时回退本地引擎重跑
+    cloud = None if force_local else _get_best_cloud_config()
     protocol, api_url, headers, is_local = await _resolve_api_target(cloud)
     if not api_url:
         logger.warning("Cron job skipped: no API target（云端未配置且本地模型未运行）: %s", task[:50])
@@ -467,6 +468,11 @@ async def _execute_cron_job(job: dict):
         ai_content = full_content or "(无输出)"
         _record_cron_result(job, "success", ai_content)
     except Exception as e:
+        # 云端 API 429 限流 → 回退本地引擎完整重跑一次（本地引擎不受
+        # 云端配额限制；重跑也带 force_local 防再回云端）
+        if not force_local and "429" in str(e):
+            logger.warning("云端 API 429 限流，回退本地模型重跑定时任务")
+            return await _execute_cron_job(job, force_local=True)
         # 异常 str 可能为空（如空消息的 TimeoutError/CancelledError）——
         # 前端 ⏰ 会话会显示"(无输出)"，用户完全不知道发生了什么。
         # 兜底为类型名 + 明确失败原因。
