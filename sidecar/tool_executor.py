@@ -612,11 +612,17 @@ async def _delegate_task(agent_type: str, task: str, task_id: str | None = None)
                 if _is_local:
                     # 本地模型不支持原生 function calling（此前无条件发送导致
                     # 400/空响应，P1-5）：改为 prompt-based 工具提示，
-                    # 返回文本用主循环同款解析器提取工具调用
-                    _msgs = _msgs + [{
-                        "role": "system",
-                        "content": _build_local_tools_prompt(sub_tools),
-                    }]
+                    # 返回文本用主循环同款解析器提取工具调用。
+                    # ⚠️ 工具提示必须合并进首条 system 消息，绝不能追加为
+                    # 第二条 system——Qwen3.8 等模板直接报
+                    # "System message must be at the beginning" → 404
+                    # （09-01 explore 子任务批量 ✗ 的根因）
+                    _tools_prompt = _build_local_tools_prompt(sub_tools)
+                    _sys_idx = next((i for i, m in enumerate(_msgs) if m.get("role") == "system"), None)
+                    if _sys_idx is not None:
+                        _msgs[_sys_idx]["content"] = (_msgs[_sys_idx].get("content") or "") + "\n\n" + _tools_prompt
+                    else:
+                        _msgs.insert(0, {"role": "system", "content": _tools_prompt})
                     body["messages"] = _msgs
                 else:
                     body["tools"] = sub_tools
