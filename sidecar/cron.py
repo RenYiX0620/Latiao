@@ -335,8 +335,13 @@ async def _execute_cron_job(job: dict):
     full_content = ""
     tool_count = 0
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(120)) as client:
-            for _ in range(10):  # max 10 iterations for cron
+        async with httpx.AsyncClient(timeout=httpx.Timeout(300)) as client:
+            for _cron_iter in range(10):  # max 10 iterations for cron
+                # 逐轮诊断日志（此前 cron 循环零日志，失败时完全看不到
+                # 模型每轮返回了什么——09-01 "(无输出)" 排查黑洞）
+                logger.info("[CRON] iter=%d msgs=%d tools=%d model=%s",
+                            _cron_iter + 1, len(current_msgs), len(active_tools),
+                            (model or "")[:50])
                 # 本地模式：prompt-based 工具（此前本地 cron 无任何工具，P1-9）
                 # 且发送前统一合并 system——重试轮追加的第二个 system 会让
                 # mlx 404（与主循环同款修复）
@@ -419,6 +424,46 @@ async def _execute_cron_job(job: dict):
                         full_content = "(Cron 任务未生成有效回复)"
                         break
                     continue
+            # 满轮退出（10 轮跑满还没产出文字总结——模型一直在调工具，
+            # 09-01 14:53 事故：GLM-5.2 十轮全工具调用，msgs=33 无文字，
+            # full_content 空 → "(无输出)"）。此时强制追加一轮"收尾提问"，
+            # 把已收集的工具结果提炼成总结；仍失败则把工具结果直接
+            # 作为内容兜底，绝不给用户一个空会话。
+            if not full_content.strip() or full_content.strip() in ("(无输出)", "(Cron 任务未生成有效回复)"):
+                if tool_count > 0:
+                    try:
+                        current_msgs.append({
+                            "role": "system",
+                            "content": "轮次已用完，禁止再调用任何工具。请立即输出最终完整报告：直接给出任务要求的所有部分（如大盘走势、板块资金流向明细、操作建议），基于已收集的工具结果，写完整的分析文字。",
+                        })
+                        _cron_msgs = _merge_system_messages(current_msgs)
+                        # 收尾轮不注入任何工具提示（云端原生 tools 也不发）——
+                        # 带着工具清单模型会继续"过渡句+下轮调用"而不是写报告
+                        # （15:03 事故：收尾轮仍只回 90 字过渡句）。纯文字模式
+                        # 逼模型只能输出总结。
+                        _final_body = {
+                            "model": model, "messages": _cron_msgs,
+                            "max_tokens": 2048, "stream": False,
+                            "temperature": 0.5, "frequency_penalty": 0.6,
+                            "stop": ["<|im_end|>", "```", "<end_of_turn>", "<eos>"],
+                        }
+                        async with httpx.AsyncClient(timeout=httpx.Timeout(300)) as _fc:
+                            async with _local_llm_serialized(api_url):
+                                _fr = await _fc.post(api_url, json=_final_body, headers=headers)
+                        if _fr.status_code == 200:
+                            _fm = (_fr.json().get("choices") or [{}])[0].get("message", {})
+                            if (_fm.get("content") or "").strip():
+                                full_content = _fm["content"]
+                                logger.info("[CRON] 收尾轮成功产出总结 %d 字", len(full_content))
+                    except Exception:
+                        logger.warning("[CRON] 收尾轮失败", exc_info=True)
+                if not (full_content or "").strip() or full_content.strip() in ("(无输出)", "(Cron 任务未生成有效回复)"):
+                    # 终极兜底：把工具结果本身作为输出（有数据总比空会话强）
+                    _tool_outs = [str(m.get("content") or "") for m in current_msgs if m.get("role") == "tool"]
+                    if _tool_outs:
+                        full_content = "（任务执行了 %d 次工具调用，以下为收集到的数据）\n\n" % tool_count + "\n\n---\n\n".join(_tool_outs[-6:])
+                    else:
+                        full_content = "(无输出)"
         ai_content = full_content or "(无输出)"
         _record_cron_result(job, "success", ai_content)
     except Exception as e:
