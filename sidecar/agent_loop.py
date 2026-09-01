@@ -1145,6 +1145,11 @@ def _filter_tools(user_text: str, all_tools: list[dict]) -> list[dict]:
         allowed_tools.update(TOOL_CATEGORIES.get(cat, []))
     # Always include read_file as fallback
     allowed_tools.add("read_file")
+    # 元工具保底：create_cron/delegate_task/use_skill 不属于任何意图分类，
+    # 意图过滤后模型根本看不到它们——"每10分钟分析大盘"被归 financial 后
+    # create_cron 被滤掉，模型只能口嗨"我来搭"而无法真正创建定时任务
+    # （09-01 事故）。这类跨任务元工具始终保留。
+    allowed_tools.update({"create_cron", "delegate_task", "use_skill"})
     # 控制类工具保底：用户意图五花八门（"看看电脑状态"→file_read），
     # 若把控制工具滤掉，模型无法完成进程/鼠标/屏幕操作——有明确控制意图时
     # 保留全部控制工具；无控制意图时仅保留轻量只读控制（list/audit/wait）
