@@ -199,6 +199,8 @@ def _get_due_jobs(now: datetime) -> list[dict]:
             job_id = job["id"]
             if _cron_last_run.get(job_id, "") == now_str:
                 continue  # Already ran this minute
+            if job_id in _running_jobs:
+                continue  # 上次执行还在跑（本地模型一轮可 20 分钟），避免重叠执行
             if _cron_matches(job["schedule"], now):
                 due.append(job)
     return due
@@ -503,11 +505,17 @@ async def run_cron_catchup():
 
 
 async def _run_cron_job_guarded(job: dict):
-    """带超时与异常保护的 cron 任务执行包装（后台任务异常不外抛）。"""
+    """带超时与异常保护的 cron 任务执行包装（后台任务异常不外抛）。
+
+    超时预算：本地小模型（9B GGUF）执行带工具的金融任务，首轮思考即可
+    达 3-6 分钟，600s 只够 1-2 轮迭代 → 任务必超时失败（09-01 10:40
+    事故：首轮 LLM 6 分钟 + 迭代 4 超时）。给 1200s 总预算，配合
+    _execute_cron_job 内迭代上限，够跑完整任务。
+    """
     with _cron_lock:
         _running_jobs.add(job["id"])
     try:
-        await asyncio.wait_for(_execute_cron_job(job), timeout=600)
+        await asyncio.wait_for(_execute_cron_job(job), timeout=1200)
     except Exception:
         logger.warning("Cron job failed/timed out: %s", job.get("task", "")[:50], exc_info=True)
     finally:
