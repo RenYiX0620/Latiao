@@ -303,10 +303,23 @@ async def _execute_cron_job(job: dict, force_local: bool = False):
     messages.append({"role": "user", "content": f"定时任务: {task}"})
 
     # Use non-streaming agent loop to execute the task
-    # 优先使用云端模型（支持原生 function calling）；仅在无云端时退回本地模型
-    # force_local：云端 429 限流时回退本地引擎重跑
-    cloud = None if force_local else _get_best_cloud_config()
+    # 模型选择：本地引擎在跑（用户主动加载了模型）→ 本地优先（免费、
+    # 不占云端配额）；本地没跑 → 云端（GLM-5.2 等）。
+    # force_local：云端 429 限流时强制本地重跑
+    import local_llm as _llm
+    _local_ready = False
+    if not force_local:
+        try:
+            _mid = getattr(_llm._engine, "current_model_id", "")
+            _local_ready = bool(_mid) and _llm._engine.is_running()
+        except Exception:
+            _local_ready = False
+    cloud = None if (force_local or _local_ready) else _get_best_cloud_config()
     protocol, api_url, headers, is_local = await _resolve_api_target(cloud)
+    if is_local and not _local_ready:
+        # 引擎没跑但走了本地分支（cloud 为 None）：触发自动重载，
+        # 请求在 _local_llm_serialized 里排队等引擎就绪
+        _llm.get_api_url()
     if not api_url:
         logger.warning("Cron job skipped: no API target（云端未配置且本地模型未运行）: %s", task[:50])
         _record_cron_result(job, "skipped", "跳过：无可用模型（云端未配置且本地模型未运行）")
