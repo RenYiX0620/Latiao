@@ -381,8 +381,11 @@ async def _execute_cron_job(job: dict, force_local: bool = False):
                         content = _strip_native_tool_calls(content)
                         tc_data = native_tcs
 
-                if is_local and not tc_data and content:
-                    # 本地模式：从文本解析 prompt-based 工具调用（P1-9）
+                if not tc_data and content:
+                    # 本地模式：从文本解析 prompt-based 工具调用（P1-9）。
+                    # 云端也解析：GLM-5.2 等火山 coding 端点不解析 function
+                    # calling，模型在 content 里输出 Hermes XML/栅栏格式工具
+                    # 调用——不解析则原样交付、工具不执行（09-01 16:37 事故）。
                     _clean, tc_data = _parse_prompt_tool_calls(content)
                     if tc_data:
                         content = _clean
