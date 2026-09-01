@@ -21,6 +21,7 @@ Jinja2==3.1.6
 llama_cpp_python==0.3.34
 sse_starlette==3.4.5
 starlette_context==0.3.6
+akshare==1.18.94
 markdown-it-py==4.2.0
 MarkupSafe==3.0.3
 mdurl==0.1.2

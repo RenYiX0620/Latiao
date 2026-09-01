@@ -96,6 +96,10 @@ def execute(args: dict) -> str:
                 detail = result.stderr.strip() or result.stdout.strip() or "无输出"
                 if _is_empty_result(detail):
                     continue  # 措辞不被接口识别 → 换变体重试
+                if "113" in detail or "上限" in detail or "达到" in detail:
+                    return ("Error: mx_query 免费版当日调用次数已用完（150 次/日）。"
+                            "⚠️ 重试本工具无效，当日不会再成功。请立即改用："
+                            "ak_finance（免费行情，指数/个股可用）或 tavily_search（联网搜索板块排行/新闻）。")
                 return f"Error (exit {result.returncode}): {detail}。本工具仅支持 A股/港股/基金/板块/指数，美股等其它市场请改用 tavily_search 重试。"
             except subprocess.TimeoutExpired:
                 return "Error: Query timed out (120s)"
@@ -140,6 +144,10 @@ def execute(args: dict) -> str:
             detail = result.stderr.strip() or result.stdout.strip() or "无输出"
             if _is_empty_result(detail):
                 continue  # 措辞不被接口识别 → 换变体重试
+            if "113" in detail or "上限" in detail or "达到" in detail:
+                return ("Error: mx_query 免费版当日调用次数已用完（150 次/日）。"
+                        "⚠️ 重试本工具无效，当日不会再成功。请立即改用："
+                        "ak_finance（免费行情，指数/个股可用）或 tavily_search（联网搜索板块排行/新闻）。")
             return f"Error (exit {result.returncode}): {detail}。本工具仅支持 A股/港股/基金/板块/指数，美股等其它市场请改用 tavily_search 重试。"
         except subprocess.TimeoutExpired:
             return "Error: Query timed out (120s)"
