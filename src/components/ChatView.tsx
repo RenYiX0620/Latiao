@@ -413,6 +413,19 @@ export default memo(function ChatView({
               <span style={{ fontSize: 11, color: subagentDetail.status === "error" ? "var(--danger)" : subagentDetail.status === "done" ? "var(--success)" : "var(--warning)", marginLeft: "auto" }}>
                 {subagentDetail.status === "running" ? "● 执行中" : subagentDetail.status === "done" ? "✓ 已完成" : "✗ 失败"}
               </span>
+              {subagentDetail.status !== "running" && (
+                <button className="btn btn-sm btn-ghost" style={{ color: "var(--danger)", padding: "2px 8px" }}
+                  onClick={async (e) => {
+                    e.stopPropagation();
+                    try {
+                      const { authFetch } = await import("../utils/api");
+                      const resp = await authFetch(`/v1/subagents/${subagentDetail.id}`, { method: "DELETE" });
+                      const d = await resp.json();
+                      if (d.status === "ok") { showToast("已清除该记录"); setSubagentDetail(null); }
+                      else showToast(d.message || "清除失败", "warn");
+                    } catch { showToast("清除失败", "warn"); }
+                  }} title="从列表中清除这条记录">🗑 清除</button>
+              )}
               <button className="btn btn-sm btn-ghost" style={{ padding: "2px 8px" }} onClick={() => setSubagentDetail(null)}>✕</button>
             </div>
             <div style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 6 }}>任务内容：</div>

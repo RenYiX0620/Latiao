@@ -1314,6 +1314,19 @@ def get_subagent(task_id: str):
     return {"status": "ok", "subagent": {**s, "id": task_id}}
 
 
+@app.delete("/v1/subagents/{task_id}")
+def delete_subagent(task_id: str):
+    """手动清除一条子任务记录（仅限已结束的条目；正在执行的不允许删）。"""
+    from tool_executor import _SUBTASKS
+    s = _SUBTASKS.get(task_id)
+    if not s:
+        return {"status": "error", "message": "task not found"}
+    if s.get("status") == "running":
+        return {"status": "error", "message": "任务正在执行中，无法清除"}
+    _SUBTASKS.pop(task_id, None)
+    return {"status": "ok", "message": "已清除"}
+
+
 @app.post("/v1/confirm_tool")
 async def confirm_tool(request: Request):
     """Frontend sends tool confirmation decision."""
