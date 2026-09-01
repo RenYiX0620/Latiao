@@ -2485,6 +2485,14 @@ _PROMPT_TOOL_FENCE_RE = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 
+# Hermes 风格 XML：Qwen3 系在 prompt-based 模式下常输出
+# <tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>
+_TOOLCALL_XML_RE = re.compile(
+    r'<tool_call>\s*([\w.]+)\s*((?:<arg_key>[^<]*</arg_key>\s*<arg_value>.*?</arg_value>\s*)*)</tool_call>',
+    re.DOTALL,
+)
+_TOOLCALL_KV_RE = re.compile(r'<arg_key>(\w+)</arg_key>\s*<arg_value>(.*?)</arg_value>', re.DOTALL)
+
 _PROMPT_TOOL_RE = re.compile(
     r'(?:\[TOOL:|<tool>|FUNC:)(\w+)\s*(?:\{(.*?)\}|"(.*?)"|(.*?))(?:\]|</tool>|$)',
     re.DOTALL | re.IGNORECASE,
@@ -2534,6 +2542,22 @@ def _parse_prompt_tool_calls(text: str) -> tuple[str, list[dict]]:
             "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
         })
         used_ranges.append((m.start(), m.end()))
+
+    # Priority 1.4: Hermes 风格 XML —— Qwen3 系 prompt-based 模式常输出
+    # <tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>，
+    # 此前不解析 → 工具调用原样交付用户、无工具执行（09-01 22:5x 事故）
+    if not tool_calls:
+        for x_idx, xm in enumerate(_TOOLCALL_XML_RE.finditer(search_text)):
+            _xname = xm.group(1)
+            _xargs = {}
+            for kv in _TOOLCALL_KV_RE.finditer(xm.group(2)):
+                _xargs[kv.group(1)] = kv.group(2)
+            tool_calls.append({
+                "id": f"local_xml_{_xname}_{x_idx}",
+                "type": "function",
+                "function": {"name": _xname, "arguments": json.dumps(_xargs, ensure_ascii=False)},
+            })
+            used_ranges.append((xm.start(), xm.end()))
 
     # Priority 1.5: Bare JSON tool call — 推理模型（Qwen3.8 等）常直接输出
     # "我来查...{"query": "..."}" 的裸 JSON（无 ```tool 栅栏），解析器不认 →
