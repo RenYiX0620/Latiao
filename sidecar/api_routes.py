@@ -1363,9 +1363,14 @@ async def create_cron_job(request: Request):
 
 @app.post("/v1/cron/{job_id}/run")
 async def run_cron_job_now(job_id: str):
-    """立即手动触发一次任务执行（不等待计划时间）。"""
+    """立即手动触发一次任务执行（不等待计划时间）。
+    防重入：同任务已在执行中时拒绝——两个实例并发会互相覆盖结果/抢引擎
+    （09-01 事故：手动触发 + 定时触发并发，后完成的用原始工具调用覆盖了
+    先完成的总结）。"""
     with cron._cron_lock:
         job = next((j for j in cron._cron_jobs if j["id"] == job_id), None)
+        if job and job["id"] in cron._running_jobs:
+            return {"status": "error", "message": "该任务正在执行中，请等待完成后再触发"}
     if not job:
         return {"status": "error", "message": "任务不存在"}
     from agent_loop import _spawn
