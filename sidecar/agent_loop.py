@@ -1136,8 +1136,13 @@ def _check_access(tool_name: str, access: str) -> str | None:
     return None
 
 
-def _filter_tools(user_text: str, all_tools: list[dict]) -> list[dict]:
-    """Return a filtered tool list based on user intent. Falls back to all tools if uncertain."""
+def _filter_tools(user_text: str, all_tools: list[dict], scheduling_shortcut: bool = True) -> list[dict]:
+    """Return a filtered tool list based on user intent. Falls back to all tools if uncertain.
+
+    scheduling_shortcut=False：定时任务执行（cron）时禁用"定时意图短路"——
+    cron 任务文本自带「定时分析」字样，会被短路成只有 create_cron+read_file，
+    金融查询工具全没（09-01 14:00 事故：交易时段无工具可用→空响应放弃）。
+    """
     if not user_text or len(user_text) < 3:
         return all_tools
     allowed_categories: set[str] = set()
@@ -1150,10 +1155,14 @@ def _filter_tools(user_text: str, all_tools: list[dict]) -> list[dict]:
     # 定时意图优先短路：建任务只需 create_cron + read_file，其余工具（金融/
     # 控制等）对"创建定时任务"是噪音——9B 小模型面对 16 个工具描述会迷失，
     # 反复"我先查清楚"而不调 create_cron（09-01 10:13 事故）
-    if "scheduling" in allowed_categories:
+    if scheduling_shortcut and "scheduling" in allowed_categories:
         allowed_tools.update({"create_cron", "read_file"})
         allowed_tools.update({"use_skill", "delegate_task"})
         return [t for t in all_tools if t.get("function", {}).get("name") in allowed_tools] or all_tools
+    if "scheduling" in allowed_categories:
+        # cron 执行场景：去掉 scheduling 分类本身（含 create_cron），
+        # 让金融/文件等真实任务类别决定工具集
+        allowed_categories.discard("scheduling")
     for cat in allowed_categories:
         allowed_tools.update(TOOL_CATEGORIES.get(cat, []))
     # Always include read_file as fallback
@@ -1187,9 +1196,12 @@ def _filter_tools(user_text: str, all_tools: list[dict]) -> list[dict]:
 
 
 
-def _cap_tools(tools: list[dict], cap: int = 8) -> list[dict]:
+def _cap_tools(tools: list[dict], cap: int = 8, keep_first: tuple[str, ...] = ()) -> list[dict]:
     """Cap tool count, keeping essential tools (read_file, write_file, list_dir) first.
-    先去重（DeepSeek 等 API 要求工具名唯一，重复名字直接 400）。"""
+    先去重（DeepSeek 等 API 要求工具名唯一，重复名字直接 400）。
+    keep_first：额外优先保留的工具名（如 cron 金融任务必须保留 mx_query——
+    全局优先级里它排在 read/tavily 之后，cap 5 会被裁掉，任务无金融工具
+    可用 → 空响应放弃，09-01 14:00 事故第二层）。"""
     seen: set[str] = set()
     uniq: list[dict] = []
     for t in tools:
@@ -1197,7 +1209,7 @@ def _cap_tools(tools: list[dict], cap: int = 8) -> list[dict]:
         if n and n not in seen:
             seen.add(n)
             uniq.append(t)
-    essential = {"read_file", "write_file", "list_dir"}
+    essential = {"read_file", "write_file", "list_dir"} | set(keep_first)
     priority = [t for t in uniq if t.get("function", {}).get("name") in essential]
     others = [t for t in uniq if t.get("function", {}).get("name") not in essential]
     return priority + others[:max(0, cap - len(priority))]

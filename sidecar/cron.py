@@ -321,7 +321,7 @@ async def _execute_cron_job(job: dict):
     else:
         model = (cloud or {}).get("model") or SUBAGENT_MODEL
     agent_tools = _get_agent_tools("latiao", TOOLS)
-    active_tools = _filter_tools(task, agent_tools)
+    active_tools = _filter_tools(task, agent_tools, scheduling_shortcut=False)
     # 定时任务禁止 delegate_task：cron 主循环与派生的 explore 子任务会争抢
     # 同一个本地引擎（_local_llm_serialized 串行），主任务 10 轮迭代被
     # 子任务拖到 10 分钟最终 LLM 调用失败（09-01 11:20 事故）。cron 应当
@@ -329,7 +329,7 @@ async def _execute_cron_job(job: dict):
     active_tools = [t for t in active_tools
                     if t.get("function", {}).get("name") != "delegate_task"]
     if len(active_tools) > 5:
-        active_tools = _cap_tools(active_tools, 5)
+        active_tools = _cap_tools(active_tools, 5, keep_first=("mx_query", "ak_finance"))
 
     current_msgs = [dict(m) for m in messages]
     full_content = ""
