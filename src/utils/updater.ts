@@ -21,7 +21,7 @@ export async function getAppVersion(): Promise<string> {
   }
 }
 
-export type UpdateCheckResult = "none" | "error" | "installed";
+export type UpdateCheckResult = "none" | "error" | "installed" | "prepared";
 
 async function sidecarPrepare(version: string): Promise<boolean> {
   try {
@@ -108,6 +108,12 @@ export async function checkForUpdates(
       return "none";
     }
     onStatus(`发现新版本 ${update.version}，正在安装…`);
+    // 静默预下载模式只下不装：启动时自动安装并重启会在用户正聊天时
+    // 强制退出（审计 P1）。下载安装/重启仅限用户显式点「检查更新」。
+    if (!interactive) {
+      onStatus("更新包已准备好，下次手动检查或稍后重启时安装");
+      return "prepared";
+    }
     let finished = false;
     await update.downloadAndInstall((ev) => {
       if (ev.event === "Started") {

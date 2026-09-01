@@ -627,7 +627,13 @@ async def _delegate_task(agent_type: str, task: str, task_id: str | None = None)
                 else:
                     body["tools"] = sub_tools
                     body["tool_choice"] = "auto"
-                _inject_thinking_disabled(body, SUBAGENT_MODEL)
+                # ⚠️ 私有字段必须清除：_inject_thinking_disabled 注入的
+                # _thinking_level/_thinking_unsupported 发给严格 OpenAI 兼容
+                # 提供商会 400（与云端主循环同款处理，审计 P1）；模型名也要
+                # 用解析后的 _sub_model 而非硬编码 SUBAGENT_MODEL
+                _inject_thinking_disabled(body, _sub_model)
+                body.pop("_thinking_level", None)
+                body.pop("_thinking_unsupported", None)
                 async with _local_llm_serialized(api_url):
                     r = await client.post(api_url, json=body, headers=sub_headers)
                 if r.status_code != 200:

@@ -614,24 +614,30 @@ const [timeFilter, setTimeFilter] = useState("all");
   };
 
   const pauseDownload = async (modelId: string) => {
-    await authFetch("/v1/local-llm/download/pause", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model_id: modelId }),
-    });
+    try {
+      await authFetch("/v1/local-llm/download/pause", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model_id: modelId }),
+      });
+    } catch { showToast("操作失败：后端未响应", "warn"); }
   };
 
   const resumeDownload = async (modelId: string) => {
-    await authFetch("/v1/local-llm/download/resume", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model_id: modelId }),
-    });
+    try {
+      await authFetch("/v1/local-llm/download/resume", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model_id: modelId }),
+      });
+    } catch { showToast("操作失败：后端未响应", "warn"); }
   };
 
   const cancelDownload = async (modelId: string) => {
-    await authFetch("/v1/local-llm/download/cancel", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model_id: modelId }),
-    });
+    try {
+      await authFetch("/v1/local-llm/download/cancel", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model_id: modelId }),
+      });
+    } catch { showToast("操作失败：后端未响应", "warn"); }
   };
 
   const startLocalLLM = async (modelId?: string) => {
@@ -1013,7 +1019,10 @@ const [timeFilter, setTimeFilter] = useState("all");
     // concurrent agent loops pile up (msg_count doubles each send), the
     // local model server gets hammered by parallel requests + retry storms,
     // and the sidecar eventually crashes -> "Unhandled Promise Rejection".
-    if (isProcessing) return;
+    // ⚠️ 必须用 ref 同步判断：isProcessing state 更新滞后于渲染，同 tick
+    // 内两次 Enter/双击都在 state 更新前通过 → 双循环（审计 P1）
+    if (isProcessingRef.current) return;
+    isProcessingRef.current = true;
 
     // Guard: block sending images to a local model that lacks vision support.
     // Otherwise the local server (mlx_lm/llama.cpp) hangs or errors on the

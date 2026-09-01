@@ -272,23 +272,18 @@ fn restart_sidecar(state: tauri::State<'_, SidecarProcess>) -> Result<String, St
     if new_child.is_some() {
         println!("[Latiao] Sidecar restarted");
         *guard = new_child;
-        // 同步全局退出清理句柄（RunEvent::Exit 读这里）
-        *APP_SIDECAR.lock().unwrap_or_else(|e| e.into_inner()) = guard.take();
         Ok("ok".to_string())
     } else {
         eprintln!("[Latiao] Failed to restart sidecar");
         *guard = None;
-        *APP_SIDECAR.lock().unwrap_or_else(|e| e.into_inner()) = None;
         Err("Sidecar 启动失败：未找到 main.py 或可用的 Python 运行时。请尝试重启应用。".to_string())
     }
 }
 
 /// Managed state holding the sidecar child process handle.
 /// 注意：Tauri 的 App::run() 以 process::exit 结束、不会 Drop managed state。
-/// 退出清理走 RunEvent::Exit -> kill_sidecar_on_exit()（读 APP_SIDECAR）。
+/// 退出清理走 RunEvent::Exit -> kill_sidecar_on_exit()（读 managed state）。
 struct SidecarProcess(Mutex<Option<Child>>);
-
-static APP_SIDECAR: std::sync::Mutex<Option<Child>> = std::sync::Mutex::new(None);
 
 impl Drop for SidecarProcess {
     fn drop(&mut self) {
@@ -491,8 +486,10 @@ fn main() {
     if !sidecar_ok {
         eprintln!("[Latiao] WARNING: sidecar failed to start — AI features will be unavailable");
     }
-    *APP_SIDECAR.lock().unwrap_or_else(|e| e.into_inner()) = sidecar;
-    let managed_sidecar = SidecarProcess(Mutex::new(None));
+    // 单一来源：sidecar 子进程只存 managed state——此前 managed 恒为 None，
+    // restart_sidecar 的 detach 分支永不执行，每次重启都 SIGTERM 旧 sidecar →
+    // lifespan 关闭钩子杀模型引擎（审计 P1：重启侧车=模型白加载一轮）
+    let managed_sidecar = SidecarProcess(Mutex::new(sidecar));
 
     tauri::Builder::default()
         .plugin(tauri_plugin_http::init())
@@ -523,7 +520,7 @@ fn main() {
             // App::run() 不会返回（内部 process::exit，不跑 Drop），
             // 必须在这里显式清理 sidecar 子进程
             if let tauri::RunEvent::Exit = event {
-                kill_sidecar_on_exit();
+                kill_sidecar_on_exit(_app_handle);
             }
         });
 }
@@ -531,8 +528,12 @@ fn main() {
 /// 应用退出时的进程清理。App::run() 内部以 std::process::exit 结束进程，
 /// 不运行任何 Drop —— 必须在 RunEvent::Exit 显式清理，否则 sidecar 成为
 /// 孤儿：cron 定时任务继续调云端 API（持续烧钱）、模型引擎常驻内存。
-fn kill_sidecar_on_exit() {
-    let mut state = APP_SIDECAR.lock().unwrap_or_else(|e| e.into_inner());
+fn kill_sidecar_on_exit(app_handle: &tauri::AppHandle) {
+    let state = app_handle.state::<SidecarProcess>();
+    let mut state = match state.0.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
     if let Some(mut child) = state.take() {
         eprintln!("[Latiao] App exit: stopping sidecar pid={:?}", child.id());
         // 先优雅终止（sidecar 的 lifespan 会正常关闭），超时再强杀
