@@ -214,6 +214,9 @@ export default memo(function ChatView({
   // 每次工具调用独立成行（活动摘要行 ZCode 式），不再分组折叠
   // minimap 悬停预览：hoverRatio + 对应消息预览
   const [minimapHover, setMinimapHover] = useState<{ ratio: number; idx: number } | null>(null);
+  // 子任务详情弹窗：点 subagent 行看 task 全文 + 结果摘要（✗ 只是状态标记，
+  // 此前无点击入口，用户误以为 ✗ 是删除按钮）
+  const [subagentDetail, setSubagentDetail] = useState<{ id: string; agent: string; task: string; status: string; summary?: string; started_at?: string; updated_at?: string } | null>(null);
 
   // 任务头部"已工作 X 分 X 秒"计时（isProcessing / 工具执行期间显示）
   const [elapsed, setElapsed] = useState(0);
@@ -387,7 +390,7 @@ export default memo(function ChatView({
               .filter(([, n]) => n > 0)
               .map(([cat, n]) => `${cat} · ${n} ${actLabel[cat]?.[0] ?? "次"}`);
             return (
-              <div key={sa.id} className={`subagent-row${sa.status === "running" ? " running" : sa.status === "error" ? " error" : ""}`} title={sa.last_activity || sa.summary || ""}>
+              <div key={sa.id} className={`subagent-row${sa.status === "running" ? " running" : sa.status === "error" ? " error" : ""}`} title={sa.last_activity || sa.summary || ""} style={{ cursor: "pointer" }} onClick={() => setSubagentDetail(sa as typeof subagentDetail)}>
                 <span className={`subagent-icon${isExplore ? " explore" : ""}`}><Icon size={13} /></span>
                 <span className="subagent-name">{sa.agent}</span>
                 <span className="subagent-task">· {sa.task.slice(0, 40)}</span>
@@ -400,6 +403,26 @@ export default memo(function ChatView({
               </div>
             );
           })}
+        </div>
+      )}
+      {subagentDetail && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.35)", backdropFilter: "blur(2px)", WebkitBackdropFilter: "blur(2px)", zIndex: 300, display: "flex", alignItems: "center", justifyContent: "center" }} onClick={() => setSubagentDetail(null)}>
+          <div style={{ width: 520, maxWidth: "92%", maxHeight: "70vh", overflowY: "auto", background: "var(--bg-card)", borderRadius: 14, boxShadow: "0 20px 60px rgba(0,0,0,0.3)", padding: "16px 18px" }} onClick={(e) => e.stopPropagation()}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+              <span style={{ fontWeight: 700, fontSize: 14 }}>{subagentDetail.agent === "explore" ? "🔍" : "🤖"} 子任务详情</span>
+              <span style={{ fontSize: 11, color: subagentDetail.status === "error" ? "var(--danger)" : subagentDetail.status === "done" ? "var(--success)" : "var(--warning)", marginLeft: "auto" }}>
+                {subagentDetail.status === "running" ? "● 执行中" : subagentDetail.status === "done" ? "✓ 已完成" : "✗ 失败"}
+              </span>
+              <button className="btn btn-sm btn-ghost" style={{ padding: "2px 8px" }} onClick={() => setSubagentDetail(null)}>✕</button>
+            </div>
+            <div style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 6 }}>任务内容：</div>
+            <div style={{ fontSize: 12, whiteSpace: "pre-wrap", wordBreak: "break-word", background: "var(--bg-input)", borderRadius: 8, padding: "10px 12px", marginBottom: 10 }}>{subagentDetail.task}</div>
+            {(subagentDetail.summary || "").trim() && <>
+              <div style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 6 }}>执行结果：</div>
+              <div style={{ fontSize: 12, whiteSpace: "pre-wrap", wordBreak: "break-word", background: "var(--bg-input)", borderRadius: 8, padding: "10px 12px" }}>{subagentDetail.summary}</div>
+            </>}
+            {subagentDetail.updated_at && <div style={{ fontSize: 10, color: "var(--text-muted)", marginTop: 10 }}>更新时间：{subagentDetail.updated_at}</div>}
+          </div>
         </div>
       )}
       {messages.length > 8 && (
