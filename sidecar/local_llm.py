@@ -1108,7 +1108,7 @@ class LocalLLMEngine:
         # 是 verify_engine_health 已踩过的同款坑，20:17 事故重演）。
         _model_ref = self.current_model_id or self.current_model_name or ""
         body = json.dumps({
-            "model": _model_ref, "stream": False, "max_tokens": 1,
+            "model": _model_ref, "stream": False, "max_tokens": 16,
             "messages": [{"role": "user", "content": "hi"}],
         }).encode()
         deadline = time.time() + timeout_sec
@@ -1123,11 +1123,17 @@ class LocalLLMEngine:
                     data=body, headers={"Content-Type": "application/json"}, method="POST")
                 with urllib.request.urlopen(req, timeout=10) as resp:
                     data = json.loads(resp.read())
-                # 生成成功 = 就绪。⚠️ 不能要求 content 非空：推理模型
-                # （Ornith/GLM 等）在 max_tokens=1 时 token 全被 <think> 推理
-                # 吃掉，content 恒为空但生成已成功——按 content 判断会永远
-                # 以为在加载（20:33 事故：35B 已就绪却永远 starting）。
-                if resp.status == 200 and (data.get("choices") or [{}])[0].get("message"):
+                # 生成成功 = 就绪。判定标准：content 或 reasoning 任一非空。
+                # 推理模型（Ornith/GLM）max_tokens 小时 token 全进 <think>，
+                # content 空但 reasoning 有字（20:33 事故）；反之坏的量化
+                # 模型（如 LM Studio 下载损坏的 4bit）16 个 token 全空、
+                # content 和 reasoning 都是 None——此时不能判就绪，应报错
+                # 而不是静默空响应（09-01 事故）。
+                _msg = (data.get("choices") or [{}])[0].get("message") or {}
+                _has_output = bool(
+                    (_msg.get("content") or "").strip()
+                    or (_msg.get("reasoning") or "").strip())
+                if resp.status == 200 and _has_output:
                     return True
             except urllib.error.HTTPError as e:
                 if e.code in (404, 503):
