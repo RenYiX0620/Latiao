@@ -1820,10 +1820,17 @@ async def api_update_progress():
 @app.get("/v1/update-latest.json")
 async def api_update_latest_json():
     """Tauri updater 的清单源（本地生成，url 指向本地文件流式端点）。
-    免鉴权：updater 插件请求不带自定义 token（main._check_auth 豁免）。"""
+    免鉴权：updater 插件请求不带自定义 token（main._check_auth 豁免）。
+    无更新时返回 204 No Content——updater 在版本比较之前就查找
+    platforms 条目，返回空 platforms 的 JSON 会直接报错。"""
     import asyncio
     import update_service
-    return await asyncio.to_thread(update_service.get_tauri_manifest, update_service.current_app_version())
+    from starlette.responses import Response
+    manifest = await asyncio.to_thread(
+        update_service.get_tauri_manifest, update_service.current_app_version())
+    if manifest is None:
+        return Response(status_code=204)
+    return JSONResponse(manifest)
 
 
 @app.get("/v1/update-file")
