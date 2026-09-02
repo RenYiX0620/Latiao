@@ -233,6 +233,8 @@ def start_prepare(current_version: str) -> dict:
             with _state_lock:
                 _state.update({"status": "downloading", "version": remote_ver,
                                "url": url, "signature": entry.get("signature", ""),
+                               # pub_date 透传：空串会让 tauri updater 的 RFC3339 解析直接失败
+                               "pub_date": str(manifest.get("pub_date") or ""),
                                "downloaded": 0, "total": 0})
                 _save_state()
             _download_worker(url, dest, remote_ver)
@@ -246,6 +248,14 @@ def start_prepare(current_version: str) -> dict:
     return get_progress()
 
 
+def _pub_date_field(st: dict) -> dict:
+    """pub_date 必须是有效 RFC3339 或整个字段缺失——空字符串会让
+    tauri updater 的 RemoteRelease 反序列化失败（'invalid value for pub_date'），
+    导致"检查更新"永远报错（无论是否有新版本）。"""
+    pd = str(st.get("pub_date", "")).strip()
+    return {"pub_date": pd} if pd else {}
+
+
 def get_tauri_manifest(current_version: str) -> dict:
     """生成 tauri updater 格式清单（供 /v1/update-latest.json 端点）。
 
@@ -257,8 +267,7 @@ def get_tauri_manifest(current_version: str) -> dict:
     done = st.get("status") == "done"
     if not done or not _is_newer(remote_ver, current_version or "0.0.0"):
         return {"version": current_version or "0.0.0",
-                "notes": "", "pub_date": st.get("pub_date", ""),
-                "platforms": {}}
+                "notes": "", "platforms": {}, **_pub_date_field(st)}
     dest = UPDATE_DIR / f"Latiao_{remote_ver}_{_current_platform().replace('-','_')}.pkg"
     # 实际文件名来自 url（跨平台名不同）
     url = st.get("url", "")
@@ -269,13 +278,13 @@ def get_tauri_manifest(current_version: str) -> dict:
     return {
         "version": remote_ver,
         "notes": "Latiao v" + remote_ver,
-        "pub_date": st.get("pub_date", ""),
         "platforms": {
             _current_platform(): {
                 "signature": st.get("signature", ""),
                 "url": "http://127.0.0.1:8765/v1/update-file",
             }
         },
+        **_pub_date_field(st),
     }
 
 
