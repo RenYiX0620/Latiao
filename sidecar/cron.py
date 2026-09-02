@@ -199,6 +199,8 @@ def _get_due_jobs(now: datetime) -> list[dict]:
             job_id = job["id"]
             if _cron_last_run.get(job_id, "") == now_str:
                 continue  # Already ran this minute
+            if job_id in _running_jobs:
+                continue  # 上次执行还在跑（本地模型一轮可 20 分钟），避免重叠执行
             if _cron_matches(job["schedule"], now):
                 due.append(job)
     return due
@@ -252,7 +254,7 @@ def _seed_default_cron():
     _save_cron_state()
 
 
-async def _execute_cron_job(job: dict):
+async def _execute_cron_job(job: dict, force_local: bool = False):
     """Execute a due cron job: run the task through the agent loop with tools enabled."""
     # 依赖 agent_loop 的循环/工具符号 → 函数内 lazy import 避免循环依赖
     # SUBAGENT_MODEL 常量由 main.py 门面持有
@@ -301,9 +303,23 @@ async def _execute_cron_job(job: dict):
     messages.append({"role": "user", "content": f"定时任务: {task}"})
 
     # Use non-streaming agent loop to execute the task
-    # 优先使用云端模型（支持原生 function calling）；仅在无云端时退回本地模型
-    cloud = _get_best_cloud_config()
+    # 模型选择：本地引擎在跑（用户主动加载了模型）→ 本地优先（免费、
+    # 不占云端配额）；本地没跑 → 云端（GLM-5.2 等）。
+    # force_local：云端 429 限流时强制本地重跑
+    import local_llm as _llm
+    _local_ready = False
+    if not force_local:
+        try:
+            _mid = getattr(_llm._engine, "current_model_id", "")
+            _local_ready = bool(_mid) and _llm._engine.is_running()
+        except Exception:
+            _local_ready = False
+    cloud = None if (force_local or _local_ready) else _get_best_cloud_config()
     protocol, api_url, headers, is_local = await _resolve_api_target(cloud)
+    if is_local and not _local_ready:
+        # 引擎没跑但走了本地分支（cloud 为 None）：触发自动重载，
+        # 请求在 _local_llm_serialized 里排队等引擎就绪
+        _llm.get_api_url()
     if not api_url:
         logger.warning("Cron job skipped: no API target（云端未配置且本地模型未运行）: %s", task[:50])
         _record_cron_result(job, "skipped", "跳过：无可用模型（云端未配置且本地模型未运行）")
@@ -319,16 +335,27 @@ async def _execute_cron_job(job: dict):
     else:
         model = (cloud or {}).get("model") or SUBAGENT_MODEL
     agent_tools = _get_agent_tools("latiao", TOOLS)
-    active_tools = _filter_tools(task, agent_tools)
+    active_tools = _filter_tools(task, agent_tools, scheduling_shortcut=False)
+    # 定时任务禁止 delegate_task：cron 主循环与派生的 explore 子任务会争抢
+    # 同一个本地引擎（_local_llm_serialized 串行），主任务 10 轮迭代被
+    # 子任务拖到 10 分钟最终 LLM 调用失败（09-01 11:20 事故）。cron 应当
+    # 自己用 mx_query 等工具完成任务，不派生后台子智能体。
+    active_tools = [t for t in active_tools
+                    if t.get("function", {}).get("name") != "delegate_task"]
     if len(active_tools) > 5:
-        active_tools = _cap_tools(active_tools, 5)
+        active_tools = _cap_tools(active_tools, 5, keep_first=("mx_query", "ak_finance"))
 
     current_msgs = [dict(m) for m in messages]
     full_content = ""
     tool_count = 0
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(120)) as client:
-            for _ in range(10):  # max 10 iterations for cron
+        async with httpx.AsyncClient(timeout=httpx.Timeout(300)) as client:
+            for _cron_iter in range(10):  # max 10 iterations for cron
+                # 逐轮诊断日志（此前 cron 循环零日志，失败时完全看不到
+                # 模型每轮返回了什么——09-01 "(无输出)" 排查黑洞）
+                logger.info("[CRON] iter=%d msgs=%d tools=%d model=%s",
+                            _cron_iter + 1, len(current_msgs), len(active_tools),
+                            (model or "")[:50])
                 # 本地模式：prompt-based 工具（此前本地 cron 无任何工具，P1-9）
                 # 且发送前统一合并 system——重试轮追加的第二个 system 会让
                 # mlx 404（与主循环同款修复）
@@ -367,8 +394,11 @@ async def _execute_cron_job(job: dict):
                         content = _strip_native_tool_calls(content)
                         tc_data = native_tcs
 
-                if is_local and not tc_data and content:
-                    # 本地模式：从文本解析 prompt-based 工具调用（P1-9）
+                if not tc_data and content:
+                    # 本地模式：从文本解析 prompt-based 工具调用（P1-9）。
+                    # 云端也解析：GLM-5.2 等火山 coding 端点不解析 function
+                    # calling，模型在 content 里输出 Hermes XML/栅栏格式工具
+                    # 调用——不解析则原样交付、工具不执行（09-01 16:37 事故）。
                     _clean, tc_data = _parse_prompt_tool_calls(content)
                     if tc_data:
                         content = _clean
@@ -387,7 +417,11 @@ async def _execute_cron_job(job: dict):
                         if perm in ("confirm", "danger", "deny", "blocked"):
                             result = f"⛔ Cron 任务不支持需要确认或被权限规则阻止的操作: {tool_name}（级别 {perm}）"
                         else:
+                            # 与主循环同款工具日志——此前 cron 工具执行零日志，
+                            # "参数传递问题"这类失败完全无从排查（09-01 18:58 事故）
+                            logger.info("Tool executing (cron): %s %s", tool_name, str(tool_args)[:120])
                             result = await execute_tool(tool_name, tool_args)
+                            logger.info("Tool result (cron): %s → %s", tool_name, result[:80].replace("\n", " "))
                         if len(result) > 3000:
                             result = result[:3000] + "\n...(截断)"
                         current_msgs.append({"role": "tool", "tool_call_id": tc.get("id", "cron"), "content": result})
@@ -411,12 +445,61 @@ async def _execute_cron_job(job: dict):
                         full_content = "(Cron 任务未生成有效回复)"
                         break
                     continue
+            # 满轮退出（10 轮跑满还没产出文字总结——模型一直在调工具，
+            # 09-01 14:53 事故：GLM-5.2 十轮全工具调用，msgs=33 无文字，
+            # full_content 空 → "(无输出)"）。此时强制追加一轮"收尾提问"，
+            # 把已收集的工具结果提炼成总结；仍失败则把工具结果直接
+            # 作为内容兜底，绝不给用户一个空会话。
+            if not full_content.strip() or full_content.strip() in ("(无输出)", "(Cron 任务未生成有效回复)"):
+                if tool_count > 0:
+                    try:
+                        current_msgs.append({
+                            "role": "system",
+                            "content": "轮次已用完，禁止再调用任何工具。请立即输出最终完整报告：直接给出任务要求的所有部分（如大盘走势、板块资金流向明细、操作建议），基于已收集的工具结果，写完整的分析文字。",
+                        })
+                        _cron_msgs = _merge_system_messages(current_msgs)
+                        # 收尾轮不注入任何工具提示（云端原生 tools 也不发）——
+                        # 带着工具清单模型会继续"过渡句+下轮调用"而不是写报告
+                        # （15:03 事故：收尾轮仍只回 90 字过渡句）。纯文字模式
+                        # 逼模型只能输出总结。
+                        _final_body = {
+                            "model": model, "messages": _cron_msgs,
+                            "max_tokens": 2048, "stream": False,
+                            "temperature": 0.5, "frequency_penalty": 0.6,
+                            "stop": ["<|im_end|>", "```", "<end_of_turn>", "<eos>"],
+                        }
+                        async with httpx.AsyncClient(timeout=httpx.Timeout(300)) as _fc:
+                            async with _local_llm_serialized(api_url):
+                                _fr = await _fc.post(api_url, json=_final_body, headers=headers)
+                        if _fr.status_code == 200:
+                            _fm = (_fr.json().get("choices") or [{}])[0].get("message", {})
+                            if (_fm.get("content") or "").strip():
+                                full_content = _fm["content"]
+                                logger.info("[CRON] 收尾轮成功产出总结 %d 字", len(full_content))
+                    except Exception:
+                        logger.warning("[CRON] 收尾轮失败", exc_info=True)
+                if not (full_content or "").strip() or full_content.strip() in ("(无输出)", "(Cron 任务未生成有效回复)"):
+                    # 终极兜底：把工具结果本身作为输出（有数据总比空会话强）
+                    _tool_outs = [str(m.get("content") or "") for m in current_msgs if m.get("role") == "tool"]
+                    if _tool_outs:
+                        full_content = "（任务执行了 %d 次工具调用，以下为收集到的数据）\n\n" % tool_count + "\n\n---\n\n".join(_tool_outs[-6:])
+                    else:
+                        full_content = "(无输出)"
         ai_content = full_content or "(无输出)"
         _record_cron_result(job, "success", ai_content)
     except Exception as e:
-        ai_content = f"[Cron 任务执行失败: {e}]"
-        logger.warning("Cron LLM call failed: %s", e)
-        _record_cron_result(job, "error", str(e))
+        # 云端 API 429 限流 → 回退本地引擎完整重跑一次（本地引擎不受
+        # 云端配额限制；重跑也带 force_local 防再回云端）
+        if not force_local and "429" in str(e):
+            logger.warning("云端 API 429 限流，回退本地模型重跑定时任务")
+            return await _execute_cron_job(job, force_local=True)
+        # 异常 str 可能为空（如空消息的 TimeoutError/CancelledError）——
+        # 前端 ⏰ 会话会显示"(无输出)"，用户完全不知道发生了什么。
+        # 兜底为类型名 + 明确失败原因。
+        _err = str(e).strip() or type(e).__name__
+        ai_content = f"[Cron 任务执行失败: {_err}]"
+        logger.warning("Cron LLM call failed: %s (%s)", _err, type(e).__name__)
+        _record_cron_result(job, "error", ai_content)
 
     # Record to memory DB with AI result
     try:
@@ -503,11 +586,17 @@ async def run_cron_catchup():
 
 
 async def _run_cron_job_guarded(job: dict):
-    """带超时与异常保护的 cron 任务执行包装（后台任务异常不外抛）。"""
+    """带超时与异常保护的 cron 任务执行包装（后台任务异常不外抛）。
+
+    超时预算：本地小模型（9B GGUF）执行带工具的金融任务，首轮思考即可
+    达 3-6 分钟，600s 只够 1-2 轮迭代 → 任务必超时失败（09-01 10:40
+    事故：首轮 LLM 6 分钟 + 迭代 4 超时）。给 1200s 总预算，配合
+    _execute_cron_job 内迭代上限，够跑完整任务。
+    """
     with _cron_lock:
         _running_jobs.add(job["id"])
     try:
-        await asyncio.wait_for(_execute_cron_job(job), timeout=600)
+        await asyncio.wait_for(_execute_cron_job(job), timeout=1200)
     except Exception:
         logger.warning("Cron job failed/timed out: %s", job.get("task", "")[:50], exc_info=True)
     finally:

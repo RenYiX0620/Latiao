@@ -101,8 +101,13 @@ async def _verify_llm_health(api_url: str) -> bool:
             })
             resp.raise_for_status()
             data = resp.json()
-            content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
-            if not content.strip():
+            _msg = (data.get("choices") or [{}])[0].get("message", {}) or {}
+            content = (_msg.get("content") or "").strip()
+            reasoning = (_msg.get("reasoning") or _msg.get("reasoning_content") or "").strip()
+            # ⚠️ 推理模型（Ornith/Qwen3.8）max_tokens=4 时 token 全进 <think>，
+            # content 空但 reasoning 有字——按 content 判死会把健康引擎杀了
+            # 重载（与 local_llm.verify_engine_health 同样已修的坑，审计 P1）
+            if not content and not reasoning:
                 logger.warning("引擎返回空响应（%s），标记存疑", api_url)
                 return False  # 空响应=引擎异常（端口活但产出坏了）
             return True
@@ -168,7 +173,15 @@ async def _local_llm_stream(client, api_url: str, body: dict, headers: dict):
             return False
 
         if _local and _llm_suspect_since is not None:
-            ok = await _verify_llm_health(api_url)
+            try:
+                ok = await _verify_llm_health(api_url)
+            finally:
+                # 健康检查抛错也必须配对 enter/exit——否则 _active_local_streams
+                # 永久 +1 → 引擎"永久忙"→ 健康检查永远跳过 → 死引擎永不被发现
+                # （审计 P1）
+                if _local:
+                    engine.mark_stream_exit()
+                    engine.mark_engine_idle()
             _llm_suspect_since = None
             if not ok:
                 # 端口确实死亡或引擎产出异常--先杀残留，再触发自动重载；
@@ -666,7 +679,7 @@ _create_cron_def = {
     "type": "function",
     "function": {
         "name": "create_cron",
-        "description": "Create a scheduled task with cron expression. Schedule is standard 5-field cron, task is Chinese description.",
+        "description": "创建定时任务。schedule 用标准 5 段 cron 表达式：分 时 日 月 周。示例：每10分钟=*/10 * * * *；每小时=0 * * * *；每天9点=0 9 * * *；每30分钟=*/30 * * * *。task 是要执行的任务描述（中文）。创建后会按时自动执行并把结果推送到会话。",
         "parameters": {
             "type": "object",
             "properties": {
@@ -899,7 +912,12 @@ def _record_progress(entry: str):
 
 
 def _rotate_progress_file():
-    """把 PROGRESS.md 截到最近 500KB（保留尾部，即最新进度）。"""
+    """把 PROGRESS.md 截到最近 500KB（保留尾部，即最新进度）。
+
+    切点必须对齐 UTF-8 字符边界：按字节直切会在多字节汉字中间断开，
+    文件从此不再是合法 UTF-8 → read_file 整个拒绝读取 → 断点续作失效
+    （22:46 事故根因："文件编码不是 UTF-8"）。
+    """
     try:
         keep = 500 * 1024
         size = PROGRESS_FILE.stat().st_size
@@ -908,6 +926,15 @@ def _rotate_progress_file():
         with open(PROGRESS_FILE, "rb") as f:
             f.seek(size - keep)
             tail = f.read()
+        # 对齐字符边界：跳过开头的残缺多字节字符（找下一个 UTF-8 合法起始字节）
+        offset = 0
+        while offset < len(tail):
+            b = tail[offset]
+            # 合法起始：ASCII(<0x80) 或 2/3/4 字节前缀(0xC0-0xF7)
+            if b < 0x80 or (0xC0 <= b <= 0xF7):
+                break
+            offset += 1
+        tail = tail[offset:]
         with open(PROGRESS_FILE, "wb") as f:
             f.write("(早期进度已轮转)\n\n".encode("utf-8") + tail)
     except Exception:
@@ -1041,6 +1068,7 @@ def _extract_last_user_text(messages: list) -> str:
 # ═══════════════════════════════════════════════════════
 
 TOOL_CATEGORIES = {
+    "scheduling": ["create_cron"],
     "file_read": ["read_file", "list_dir", "search_files"],
     "file_write": ["write_file"],
     "command": ["run_cmd"],
@@ -1059,6 +1087,11 @@ TOOL_CATEGORIES = {
 CONTROL_TOOL_NAMES = set(TOOL_CATEGORIES["control"])
 
 INTENT_PATTERNS = [
+    # 定时任务意图：放最前——"每10分钟分析大盘"同时命中 financial，
+    # 但用户首要诉求是建定时任务，先给 create_cron（任务内容由 cron 执行时
+    # 独立跑 agent 循环处理，不受本次过滤影响）
+    (re.compile(r"定时|每\s*\d+\s*(分钟|小时|天|周|秒)|每天|每小时|每周|每分钟|每个小时|cron|计划任务|日程|提醒|周期性", re.IGNORECASE),
+     ["scheduling"]),
     (re.compile(r"读|看|查看|检查|搜索|找|列出|显示|看看|分析|审查|review|check|read|find|list|show|cat|head|tail|grep|ls|dir", re.IGNORECASE),
      ["file_read"]),
     (re.compile(r"写|创建|修改|改|删|新建|保存|生成|write|create|modify|update|delete|save|generate|make", re.IGNORECASE),
@@ -1116,8 +1149,13 @@ def _check_access(tool_name: str, access: str) -> str | None:
     return None
 
 
-def _filter_tools(user_text: str, all_tools: list[dict]) -> list[dict]:
-    """Return a filtered tool list based on user intent. Falls back to all tools if uncertain."""
+def _filter_tools(user_text: str, all_tools: list[dict], scheduling_shortcut: bool = True) -> list[dict]:
+    """Return a filtered tool list based on user intent. Falls back to all tools if uncertain.
+
+    scheduling_shortcut=False：定时任务执行（cron）时禁用"定时意图短路"——
+    cron 任务文本自带「定时分析」字样，会被短路成只有 create_cron+read_file，
+    金融查询工具全没（09-01 14:00 事故：交易时段无工具可用→空响应放弃）。
+    """
     if not user_text or len(user_text) < 3:
         return all_tools
     allowed_categories: set[str] = set()
@@ -1127,10 +1165,26 @@ def _filter_tools(user_text: str, all_tools: list[dict]) -> list[dict]:
     if not allowed_categories:
         return all_tools  # No match = keep all tools
     allowed_tools: set[str] = set()
+    # 定时意图优先短路：建任务只需 create_cron + read_file，其余工具（金融/
+    # 控制等）对"创建定时任务"是噪音——9B 小模型面对 16 个工具描述会迷失，
+    # 反复"我先查清楚"而不调 create_cron（09-01 10:13 事故）
+    if scheduling_shortcut and "scheduling" in allowed_categories:
+        allowed_tools.update({"create_cron", "read_file"})
+        allowed_tools.update({"use_skill", "delegate_task"})
+        return [t for t in all_tools if t.get("function", {}).get("name") in allowed_tools] or all_tools
+    if "scheduling" in allowed_categories:
+        # cron 执行场景：去掉 scheduling 分类本身（含 create_cron），
+        # 让金融/文件等真实任务类别决定工具集
+        allowed_categories.discard("scheduling")
     for cat in allowed_categories:
         allowed_tools.update(TOOL_CATEGORIES.get(cat, []))
     # Always include read_file as fallback
     allowed_tools.add("read_file")
+    # 元工具保底：create_cron/delegate_task/use_skill 不属于任何意图分类，
+    # 意图过滤后模型根本看不到它们——"每10分钟分析大盘"被归 financial 后
+    # create_cron 被滤掉，模型只能口嗨"我来搭"而无法真正创建定时任务
+    # （09-01 事故）。这类跨任务元工具始终保留。
+    allowed_tools.update({"create_cron", "delegate_task", "use_skill"})
     # 控制类工具保底：用户意图五花八门（"看看电脑状态"→file_read），
     # 若把控制工具滤掉，模型无法完成进程/鼠标/屏幕操作——有明确控制意图时
     # 保留全部控制工具；无控制意图时仅保留轻量只读控制（list/audit/wait）
@@ -1155,9 +1209,12 @@ def _filter_tools(user_text: str, all_tools: list[dict]) -> list[dict]:
 
 
 
-def _cap_tools(tools: list[dict], cap: int = 8) -> list[dict]:
+def _cap_tools(tools: list[dict], cap: int = 8, keep_first: tuple[str, ...] = ()) -> list[dict]:
     """Cap tool count, keeping essential tools (read_file, write_file, list_dir) first.
-    先去重（DeepSeek 等 API 要求工具名唯一，重复名字直接 400）。"""
+    先去重（DeepSeek 等 API 要求工具名唯一，重复名字直接 400）。
+    keep_first：额外优先保留的工具名（如 cron 金融任务必须保留 mx_query——
+    全局优先级里它排在 read/tavily 之后，cap 5 会被裁掉，任务无金融工具
+    可用 → 空响应放弃，09-01 14:00 事故第二层）。"""
     seen: set[str] = set()
     uniq: list[dict] = []
     for t in tools:
@@ -1165,7 +1222,7 @@ def _cap_tools(tools: list[dict], cap: int = 8) -> list[dict]:
         if n and n not in seen:
             seen.add(n)
             uniq.append(t)
-    essential = {"read_file", "write_file", "list_dir"}
+    essential = {"read_file", "write_file", "list_dir"} | set(keep_first)
     priority = [t for t in uniq if t.get("function", {}).get("name") in essential]
     others = [t for t in uniq if t.get("function", {}).get("name") not in essential]
     return priority + others[:max(0, cap - len(priority))]
@@ -1767,6 +1824,10 @@ async def _handle_tool_execution(tc: dict, current_msgs: list, session_id: str,
     # confirm/plan/full 三档无门控、与默认档完全等价（审计 A2）。
     # danger/deny 规则拦截仍在上方生效，不受此豁免影响。
     _full_bypass = (_access == "full")
+    # 事件列表必须先初始化：confirm 分支的 pre_started 路径（当前两个 SSE
+    # 循环的唯一调用方式）此前从未绑定 events 就 extend → UnboundLocalError
+    # 整个任务崩溃（审计 P0：每次确认弹窗路径必炸）
+    events: list = []
     if _perm_level == "confirm" and not _auto_edit_bypass and not _full_bypass:
         if pre_started is not None and pre_started.get("event_obj") is not None:
             # 事件已由 SSE 调用方提前发出（死锁修复），这里只等待结果
@@ -2112,104 +2173,132 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
             _raw_delta_count = 0  # 复读循环检测节流计数（每 40 个 delta 检查一次）
             _dedup_fired = False  # 去重一次性截断标志（审计 A5）
 
-            async with client.stream("POST", api_url, json=body, headers=headers) as r:
-                if r.status_code != 200:
+            # 流式总超时保护：Qwen3.8 等 27B 推理模型在流式推理时可能让
+            # mlx_lm.server 挂起（端口活、不吐响应头，httpx read timeout 不触发
+            # ——22:27 事故：卡 8 分钟无进展）。响应头等待 + 后续迭代统一受
+            # 180s 硬超时约束，超时抛 TimeoutError 由外层零交付重试接管。
+            stream_ctx = client.stream("POST", api_url, json=body, headers=headers)
+            try:
+                async with asyncio.timeout(180):
+                    async with stream_ctx as r:
+                        if r.status_code != 200:
+                            try:
+                                err_body = (await r.aread()).decode("utf-8", errors="replace")[:800]
+                            except Exception:
+                                err_body = "<read failed>"
+                            logger.error("Agent stream HTTP %d body: %s", r.status_code, err_body)
+                        r.raise_for_status()  # httpx 不自动抛 4xx/5xx，必须显式检查
+                        # 流式停顿检测：连续 180s 无数据视为僵死（大模型可能缓慢滴灌，120s 超时永不触发）
+                        aiter = r.aiter_lines()
+                        while True:
+                            try:
+                                line = await asyncio.wait_for(anext(aiter), timeout=180)
+                            except asyncio.TimeoutError:
+                                raise TimeoutError(f"模型输出停滞超 180 秒（模型可能过大或未加载完）：{model[:60]}")
+                            except StopAsyncIteration:
+                                break
+                            if line and line.startswith("data: "):
+                                data_str = line[6:]
+                                if data_str == "[DONE]":
+                                    break
+                                try:
+                                    event = json.loads(data_str)
+                                    choices = event.get("choices") or []
+                                    if not choices:
+                                        continue  # usage-only chunk（仅 token 统计，无 delta）
+                                    delta = choices[0].get("delta", {})
+                                    _raw_delta_count += 1
+
+                                    content = delta.get("content", "")
+                                    reasoning = delta.get("reasoning", "")
+                                    if content:
+                                        streamed_text += content
+                                        # 复读循环检测（节流）——放在 dedup 过滤之前，
+                                        # 复读被 dedup 过滤时也要能截断
+                                        if _raw_delta_count % 40 == 0 and _detect_text_loop(streamed_text):
+                                            logger.warning("[AGENT] 检测到输出复读循环，截断生成")
+                                            yield {"content": "\n\n⚠️ 检测到输出重复，已自动截断。"}
+                                            raise TimeoutError("输出复读循环，已截断")
+                                        # 自我介绍去重：只截断一次，之后照常流式输出
+                                        # （审计 A5：此前命中后永久吞掉后续真实内容）
+                                        if not _dedup_fired:
+                                            _ded = _deduplicate_response(streamed_text)
+                                            if len(_ded) < len(streamed_text):
+                                                _dedup_fired = True
+                                                streamed_text = _ded + content
+                                        if text_output_delivered:
+                                            # 追问续写轮：替换上一条而非追加（重复堆叠修复）
+                                            if _raw_delta_count % 40 == 0:
+                                                yield {"event": "content_revised", "content": streamed_text}
+                                            continue
+                                        # Filter native control tokens so the UI doesn't show
+                                        # raw <|tool_call|> / <|channel> / <|channel|> markers
+                                        clean = _NATIVE_CONTROL_RE.sub("", content)
+                                        if clean:
+                                            yield {"content": clean}
+                                        if len(streamed_text) < 5:
+                                            _track_progress(session_id, "generating", "text_start")
+                                    elif reasoning:
+                                        # Reasoning model (Qwen3.6, DeepSeek-R1, etc.) — stream thinking as content
+                                        # so the UI doesn't appear frozen during the thinking phase
+                                        reasoning_text += reasoning
+                                        streamed_text += reasoning
+                                        if _raw_delta_count % 40 == 0 and _detect_text_loop(streamed_text):
+                                            logger.warning("[AGENT] 检测到输出复读循环，截断生成")
+                                            yield {"content": "\n\n⚠️ 检测到输出重复，已自动截断。"}
+                                            raise TimeoutError("输出复读循环，已截断")
+                                        if not _dedup_fired:
+                                            _ded = _deduplicate_response(streamed_text)
+                                            if len(_ded) < len(streamed_text):
+                                                _dedup_fired = True
+                                                streamed_text = _ded + reasoning
+                                        if text_output_delivered:
+                                            if _raw_delta_count % 40 == 0:
+                                                yield {"event": "content_revised", "content": streamed_text}
+                                            continue
+                                        yield {"reasoning": reasoning, "ts": int(time.time() * 1000)}
+
+                                    for tc_delta in delta.get("tool_calls", []):
+                                        idx = tc_delta.get("index", 0)
+                                        if idx not in tool_call_bufs:
+                                            tool_call_bufs[idx] = {
+                                                "id": "", "type": "function",
+                                                "function": {"name": "", "arguments": ""},
+                                            }
+                                        buf = tool_call_bufs[idx]
+                                        if "id" in tc_delta:
+                                            buf["id"] = tc_delta["id"]
+                                        if "function" in tc_delta:
+                                            if "name" in tc_delta["function"]:
+                                                buf["function"]["name"] = tc_delta["function"]["name"]
+                                            if "arguments" in tc_delta["function"]:
+                                                buf["function"]["arguments"] += tc_delta["function"]["arguments"]
+                                except (json.JSONDecodeError, KeyError, TypeError, IndexError):
+                                    pass  # Malformed SSE delta — skip this event, try next
+                                except Exception:
+                                    logger.error("SSE tool_call parse error", exc_info=True)
+                                    raise  # Real errors (network, memory) must surface
+            except TimeoutError:
+                # 引擎挂起/超时（22:27 事故：Qwen3.8 端口活但流不出数据，
+                # httpx read timeout 不触发）。不能只抛错——引擎还挂着，
+                # 下一轮还会超时。这里杀进程+触发重载，让后续请求自愈。
+                # ⚠️ 仅本地引擎路径可杀——云端请求超时/复读截断也抛
+                # TimeoutError，若误杀本地引擎会让已加载的模型白重载一轮
+                # （审计 P1：云端 stall 杀死本地引擎 + 内存尖峰）。
+                if _is_local_llm_url(api_url):
+                    logger.warning("本地流 180s 超时，判定引擎挂起，杀进程并触发重载")
                     try:
-                        err_body = (await r.aread()).decode("utf-8", errors="replace")[:800]
+                        import local_llm as _llm_mod
+                        _eng = _llm_mod._engine
+                        if _eng.current_model_id:
+                            _eng._kill_port(_eng.server_port)
+                            _eng.server_status = "stopped"
+                            _eng._request_reload(_eng.current_model_id)
                     except Exception:
-                        err_body = "<read failed>"
-                    logger.error("Agent stream HTTP %d body: %s", r.status_code, err_body)
-                r.raise_for_status()  # httpx 不自动抛 4xx/5xx，必须显式检查
-                # 流式停顿检测：连续 180s 无数据视为僵死（大模型可能缓慢滴灌，120s 超时永不触发）
-                aiter = r.aiter_lines()
-                while True:
-                    try:
-                        line = await asyncio.wait_for(anext(aiter), timeout=180)
-                    except asyncio.TimeoutError:
-                        raise TimeoutError(f"模型输出停滞超 180 秒（模型可能过大或未加载完）：{model[:60]}")
-                    except StopAsyncIteration:
-                        break
-                    if line and line.startswith("data: "):
-                        data_str = line[6:]
-                        if data_str == "[DONE]":
-                            break
-                        try:
-                            event = json.loads(data_str)
-                            choices = event.get("choices") or []
-                            if not choices:
-                                continue  # usage-only chunk（仅 token 统计，无 delta）
-                            delta = choices[0].get("delta", {})
-                            _raw_delta_count += 1
-
-                            content = delta.get("content", "")
-                            reasoning = delta.get("reasoning", "")
-                            if content:
-                                streamed_text += content
-                                # 复读循环检测（节流）——放在 dedup 过滤之前，
-                                # 复读被 dedup 过滤时也要能截断
-                                if _raw_delta_count % 40 == 0 and _detect_text_loop(streamed_text):
-                                    logger.warning("[AGENT] 检测到输出复读循环，截断生成")
-                                    yield {"content": "\n\n⚠️ 检测到输出重复，已自动截断。"}
-                                    raise TimeoutError("输出复读循环，已截断")
-                                # 自我介绍去重：只截断一次，之后照常流式输出
-                                # （审计 A5：此前命中后永久吞掉后续真实内容）
-                                if not _dedup_fired:
-                                    _ded = _deduplicate_response(streamed_text)
-                                    if len(_ded) < len(streamed_text):
-                                        _dedup_fired = True
-                                        streamed_text = _ded + content
-                                if text_output_delivered:
-                                    # 追问续写轮：替换上一条而非追加（重复堆叠修复）
-                                    if _raw_delta_count % 40 == 0:
-                                        yield {"event": "content_revised", "content": streamed_text}
-                                    continue
-                                # Filter native control tokens so the UI doesn't show
-                                # raw <|tool_call|> / <|channel> / <|channel|> markers
-                                clean = _NATIVE_CONTROL_RE.sub("", content)
-                                if clean:
-                                    yield {"content": clean}
-                                if len(streamed_text) < 5:
-                                    _track_progress(session_id, "generating", "text_start")
-                            elif reasoning:
-                                # Reasoning model (Qwen3.6, DeepSeek-R1, etc.) — stream thinking as content
-                                # so the UI doesn't appear frozen during the thinking phase
-                                reasoning_text += reasoning
-                                streamed_text += reasoning
-                                if _raw_delta_count % 40 == 0 and _detect_text_loop(streamed_text):
-                                    logger.warning("[AGENT] 检测到输出复读循环，截断生成")
-                                    yield {"content": "\n\n⚠️ 检测到输出重复，已自动截断。"}
-                                    raise TimeoutError("输出复读循环，已截断")
-                                if not _dedup_fired:
-                                    _ded = _deduplicate_response(streamed_text)
-                                    if len(_ded) < len(streamed_text):
-                                        _dedup_fired = True
-                                        streamed_text = _ded + reasoning
-                                if text_output_delivered:
-                                    if _raw_delta_count % 40 == 0:
-                                        yield {"event": "content_revised", "content": streamed_text}
-                                    continue
-                                yield {"reasoning": reasoning, "ts": int(time.time() * 1000)}
-
-                            for tc_delta in delta.get("tool_calls", []):
-                                idx = tc_delta.get("index", 0)
-                                if idx not in tool_call_bufs:
-                                    tool_call_bufs[idx] = {
-                                        "id": "", "type": "function",
-                                        "function": {"name": "", "arguments": ""},
-                                    }
-                                buf = tool_call_bufs[idx]
-                                if "id" in tc_delta:
-                                    buf["id"] = tc_delta["id"]
-                                if "function" in tc_delta:
-                                    if "name" in tc_delta["function"]:
-                                        buf["function"]["name"] = tc_delta["function"]["name"]
-                                    if "arguments" in tc_delta["function"]:
-                                        buf["function"]["arguments"] += tc_delta["function"]["arguments"]
-                        except (json.JSONDecodeError, KeyError, TypeError, IndexError):
-                            pass  # Malformed SSE delta — skip this event, try next
-                        except Exception:
-                            logger.error("SSE tool_call parse error", exc_info=True)
-                            raise  # Real errors (network, memory) must surface
+                        logger.warning("超时后引擎重载触发失败", exc_info=True)
+                else:
+                    logger.warning("云端流超时/复读截断，不影响本地引擎")
+                raise TimeoutError(f"流式响应超时（180s 无进展）：{model[:60]}")
 
             # 追问续写轮收尾：把本轮完整文本作为最终替换发出去（防节流边界丢失）
             if text_output_delivered and streamed_text.strip():
@@ -2419,6 +2508,23 @@ _PROMPT_TOOL_FENCE_RE = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 
+# OpenAI 风格 json 栅栏：```json {"name": "...", "arguments": {...}} ```
+# Qwen3.8/MoziAI 等 27B 级模型实测输出此格式（工具名在 JSON 内部而非栅栏语言位），
+# 此前 Fenced/XML/Bare/Inline 四层全不认 → 模型反复正确输出工具调用却被当纯文本，
+# nudge 3 次后放弃 → "任务刚开始就停"（09-02 09:14 事故）。
+_PROMPT_JSON_FENCE_RE = re.compile(
+    r'```json\s*(\{.*?\})\s*```',
+    re.DOTALL,
+)
+
+# Hermes 风格 XML：Qwen3 系在 prompt-based 模式下常输出
+# <tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>
+_TOOLCALL_XML_RE = re.compile(
+    r'<tool_call>\s*([\w.]+)\s*((?:<arg_key>[^<]*</arg_key>\s*<arg_value>.*?</arg_value>\s*)*)</tool_call>',
+    re.DOTALL,
+)
+_TOOLCALL_KV_RE = re.compile(r'<arg_key>(\w+)</arg_key>\s*<arg_value>(.*?)</arg_value>', re.DOTALL)
+
 _PROMPT_TOOL_RE = re.compile(
     r'(?:\[TOOL:|<tool>|FUNC:)(\w+)\s*(?:\{(.*?)\}|"(.*?)"|(.*?))(?:\]|</tool>|$)',
     re.DOTALL | re.IGNORECASE,
@@ -2468,6 +2574,73 @@ def _parse_prompt_tool_calls(text: str) -> tuple[str, list[dict]]:
             "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
         })
         used_ranges.append((m.start(), m.end()))
+
+    # Priority 1.2: ```json {"name": ..., "arguments": {...}} ``` —— OpenAI 风格
+    # json 栅栏（Qwen3.8/MoziAI 27B 实测输出格式），此前四层全不认 → 工具调用
+    # 被当纯文本，任务"刚开始就停"
+    if not tool_calls:
+        for idx, jm in enumerate(_PROMPT_JSON_FENCE_RE.finditer(search_text)):
+            try:
+                obj = json.loads(jm.group(1))
+            except json.JSONDecodeError:
+                continue
+            if not (isinstance(obj, dict) and obj.get("name") and "arguments" in obj):
+                continue
+            tool_calls.append({
+                "id": f"local_json_{obj['name']}_{idx}",
+                "type": "function",
+                "function": {"name": str(obj["name"]),
+                             "arguments": json.dumps(obj["arguments"], ensure_ascii=False)},
+            })
+            used_ranges.append((jm.start(), jm.end()))
+
+    # Priority 1.4: Hermes 风格 XML —— Qwen3 系 prompt-based 模式常输出
+    # <tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>，
+    # 此前不解析 → 工具调用原样交付用户、无工具执行（09-01 22:5x 事故）
+    if not tool_calls:
+        for x_idx, xm in enumerate(_TOOLCALL_XML_RE.finditer(search_text)):
+            _xname = xm.group(1)
+            _xargs = {}
+            for kv in _TOOLCALL_KV_RE.finditer(xm.group(2)):
+                _xargs[kv.group(1)] = kv.group(2)
+            tool_calls.append({
+                "id": f"local_xml_{_xname}_{x_idx}",
+                "type": "function",
+                "function": {"name": _xname, "arguments": json.dumps(_xargs, ensure_ascii=False)},
+            })
+            used_ranges.append((xm.start(), xm.end()))
+
+    # Priority 1.5: Bare JSON tool call — 推理模型（Qwen3.8 等）常直接输出
+    # "我来查...{"query": "..."}" 的裸 JSON（无 ```tool 栅栏），解析器不认 →
+    # JSON 残留在文本里 → 模型复读同样内容 → 复读检测误判循环截断（22:06 事故）。
+    # 这里识别"独立 JSON 对象且参数命中文档化工具名"的裸调用，并剥离。
+    if not tool_calls:
+        _bare_json_re = re.compile(r'\{\s*"(?:query|path|cmd|pattern|url|command)"\s*:\s*"[^"]*"\s*[,}]', re.DOTALL)
+        for b_idx, m in enumerate(_bare_json_re.finditer(search_text)):
+            # 往前看 30 字符是否有"动/查/读/搜"等动作词（避免误判正文 JSON）
+            prefix = search_text[max(0, m.start()-40):m.start()]
+            if not re.search(r'[动查读搜取，。]\s*$', prefix) and not re.search(r'[请让我先我再来]', prefix):
+                continue
+            json_obj = m.group(0)
+            try:
+                args = json.loads(json_obj)
+            except Exception:
+                continue
+            # 根据参数推工具名：query→mx_query/tavily_search；path→read_file；cmd→run_cmd
+            key = next((k for k in args if k in ("query", "path", "cmd", "url")), None)
+            if not key:
+                continue
+            tool_name = ("read_file" if key == "path"
+                         else "run_cmd" if key == "cmd"
+                         else "tavily_search" if key == "url"
+                         else "mx_query")
+            tool_calls.append({
+                "id": f"local_bare_{tool_name}_{b_idx}",
+                "type": "function",
+                "function": {"name": tool_name, "arguments": json.dumps(args, ensure_ascii=False)},
+            })
+            used_ranges.append((m.start(), m.end()))
+            break  # 一次只处理一个裸调用（避免误吞多对象）
 
     # Priority 2: Inline format [TOOL:name key=value ...] or <tool>name{json}</tool> or FUNC:name key=value
     if not tool_calls:
@@ -3109,7 +3282,14 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                                      "let me", "i'll", "i will", "让我", "我先", "接下来",
                                      "再分析", "稍后", "马上", "look at", "check the")
                 _is_planning = any(sig in streamed_text.lower() for sig in _planning_signals)
-                if len(streamed_text.strip()) >= 200 and not _is_meta_wrapup(streamed_text):
+                # 模型明确说"我改用/我要调用/我再单独查"但整轮没有实际工具调用
+                # （21:42 事故：模型说"改用联网搜索"却直接收尾，未调 tavily）——
+                # 这类带未执行意图的 ≥200 字符正文不算实质完成，继续 nudge。
+                _pending_intent = any(k in streamed_text.lower() for k in
+                                      ("改用", "我再单独查", "我单独查", "我改", "我要调用",
+                                       "我马上", "我这就", "我先查", "我重新查"))
+                if (len(streamed_text.strip()) >= 200 and not _is_meta_wrapup(streamed_text)
+                        and not _pending_intent):
                     # 模型在工具结果后已给出实质性回答（≥200 字符）——接受为
                     # 最终答案直接收尾，不再追问。此前无差别追问导致模型
                     # 从头再答一遍，UI 里重复堆叠（17:07/17:08 两任务的
@@ -3128,16 +3308,12 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                         current_msgs.append({
                             "role": "system",
                             "content": _get_localized_text(_detect_user_language(_extract_last_user_text(current_msgs)), {
-                                "zh": "不要只发声明或道歉。你刚才说还要继续（读取/查询数据等）——"
-                                       "现在就调用工具去执行；如果数据其实已经足够，就直接把"
-                                       "完整分析写进回复正文（含关键数字与结论）。",
-                                "en": "Don't just announce or apologize. You said you would continue"
-                                      " (read/query data etc.) — call the tool NOW; if the data is"
-                                      " already sufficient, write the full analysis into your reply"
-                                      " body (key numbers and conclusions).",
-                                "ja": "宣言や謝罪だけでなく、続けると言ったなら（データの読み取り・照会など）"
-                                      "今すぐツールを呼び出してください。データが十分なら、主要数値と"
-                                      "結論を含む完全な分析を本文に書いてください。",
+                                "zh": "不要只发声明或道歉。你刚才说还要继续——现在就调用工具去执行；如果数据其实已经足够，就把完整分析写进回复正文（含关键数字与结论）。\n"
+                                       "⚠️ 重要：如果连续两次查询都只返回「全部A股」或「指数」汇总（没有各板块明细），说明本查询词对「各板块汇总」无解——请立即改用 tavily_search 搜索板块资金流向排名，或用 mx_query 查具体板块（如：'半导体板块资金流向'、'人工智能板块资金流向'），不要重复查相同的汇总词。",
+                                "en": "Don't just announce or apologize. You said you would continue — call the tool NOW; if the data is sufficient, write the full analysis in your reply body.\n"
+                                      "IMPORTANT: If two consecutive queries return only 'all A-shares' or 'index' summary (no sector detail), that query is unsolved — immediately switch to tavily_search for sector flows, or mx_query a specific sector (e.g., 'semiconductor sector capital flow'). Do NOT repeat the same summary query.",
+                                "ja": "宣言や謝罪だけでなく、続けると言ったなら今すぐツールを呼び出してください。データが十分なら完全な分析を本文に書いてください。\n"
+                                      "重要：連続2回「全A株」「指数」のみの要約しか返らない場合は、そのクエリは無解です。直ちに tavily_search でセクター資金流を検索するか、mx_query で具体的セクター（例：「半導体セクター資金流」）を検索してください。同じ要約クエリを繰り返さないでください。",
                             }),
                         })
                         logger.info(f"[LOCAL-AGENT] Iteration {iteration}: 意图声明未行动，nudge 立即调用工具（{_intent_nudges + 1}/3）")

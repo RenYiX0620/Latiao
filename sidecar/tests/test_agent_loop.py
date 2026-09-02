@@ -460,3 +460,41 @@ class TestConfirmEventTiming(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestJsonFenceParsing(unittest.TestCase):
+    """```json {"name","arguments"} ``` 解析层（Qwen3.8/MoziAI 27B 实测输出格式，
+    此前四层全不认 → "任务刚开始就停"）。"""
+
+    def test_json_fence_with_think_parsed(self):
+        import agent_loop
+        raw = (
+            "<think>\n\n</think>\n\n"
+            "```json\n"
+            '{"name": "write_file", "arguments": {"path": "/Users/u/Desktop/t.txt", "content": "测试"}}\n'
+            "```"
+        )
+        clean, calls = agent_loop._parse_prompt_tool_calls(raw)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "write_file")
+        args = json.loads(calls[0]["function"]["arguments"])
+        self.assertEqual(args["path"], "/Users/u/Desktop/t.txt")
+        # think 块与工具调用从正文剥离
+        self.assertNotIn("```json", clean)
+
+    def test_json_fence_plain_openai_style(self):
+        import agent_loop
+        raw = '```json\n{"name": "run_cmd", "arguments": {"cmd": "ls /tmp"}}\n```'
+        clean, calls = agent_loop._parse_prompt_tool_calls(raw)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "run_cmd")
+
+    def test_non_tool_json_ignored(self):
+        import agent_loop
+        raw = '```json\n{"result": "普通数据输出"}\n```'
+        clean, calls = agent_loop._parse_prompt_tool_calls(raw)
+        self.assertEqual(len(calls), 0)
+
+
+if __name__ == "__main__":
+    unittest.main()

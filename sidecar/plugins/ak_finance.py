@@ -314,9 +314,15 @@ async def execute(args: dict) -> str:
             if "未找到" not in r:
                 return r
         # 5) A股个股
-        return await _query_a_share_spot(query)
+        r = await _query_a_share_spot(query)
+        if "未找到" in r:
+            r += ("\n\n💡 免费接口提示：ak_finance 只支持具体标的（个股/指数/单板块）。"
+                  "全市场汇总或模糊板块排行请改用 tavily_search；"
+                  "个股请带 6 位代码（如 '600519 今日行情'）。"
+                  "东财接口偶发拒绝连接，重试一次可能成功。")
+        return r
     except Exception as e:
-        return f"Error: 金融数据查询失败: {type(e).__name__}: {e}"
+        return f"Error: 金融数据查询失败: {type(e).__name__}: {e}\n💡 接口偶发拒绝连接（东财风控），重试一次或改用 tavily_search。"
 
 
 if __name__ == "__main__":
