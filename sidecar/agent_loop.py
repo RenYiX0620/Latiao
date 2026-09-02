@@ -2234,6 +2234,9 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                                         # Filter native control tokens so the UI doesn't show
                                         # raw <|tool_call|> / <|channel> / <|channel|> markers
                                         clean = _NATIVE_CONTROL_RE.sub("", content)
+                                        # 剥掉 think 围栏标记（```think>/```think<）——流式渲染时
+                                        # ReactMarkdown 把它当未闭合代码块 → 后续正文灰框
+                                        clean = _THINK_FENCE_RE.sub("", clean)
                                         if clean:
                                             yield {"content": clean}
                                         if len(streamed_text) < 5:
@@ -3128,7 +3131,9 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                                             if _raw_delta_count % 40 == 0:
                                                 yield {"event": "content_revised", "content": _strip_think_fences(streamed_text)}
                                             continue
-                                        yield {"content": content}
+                                        # 剥掉 think 围栏标记（```think>/```think<）——否则
+                                        # ReactMarkdown 把它当未闭合代码块 → 后续正文灰框
+                                        yield {"content": _THINK_FENCE_RE.sub("", content)}
                                     elif reasoning:
                                         _any_output = True
                                         streamed_text += reasoning
