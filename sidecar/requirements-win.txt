@@ -1,4 +1,4 @@
-﻿annotated-doc==0.0.4
+annotated-doc==0.0.4
 annotated-types==0.7.0
 anyio==4.13.0
 av==17.0.1
@@ -45,3 +45,5 @@ typer==0.25.1
 typing-inspection==0.4.2
 typing_extensions==4.15.0
 uvicorn==0.48.0
+pydantic-settings==2.15.0
+tzdata

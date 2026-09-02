@@ -50,17 +50,39 @@ You: "Fix all lint errors in src/"       Latiao:
 
 The agent loop streams its thinking and tool activity in real time via SSE — thinking rows, tool durations, and category-grouped actions ("Explore · 3 searches") render as a ZCode-style timeline. For sensitive operations (file writes, command execution), it asks for confirmation first. You're always in control.
 
-## 📥 Install (macOS)
+## 📥 Install
 
-> ⚠️ **Apple Silicon only** (M1–M4). A Windows port is tracked in [WINDOWS.md](WINDOWS.md).
+| Platform | Requirement | Download |
+|----------|-------------|----------|
+| **macOS (Apple Silicon)** | M1–M4 | `Latiao_*.aarch64.dmg` |
+| **Windows (x64)** | Win10+ | `Latiao_*_x64-setup.exe` / `.msi` |
 
-Download the latest `.dmg` from [GitHub Releases](https://github.com/RenYiX0620/Latiao/releases):
+Get the latest release from [GitHub Releases](https://github.com/RenYiX0620/Latiao/releases) — or the China mirror on [Gitee Releases](https://gitee.com/ryxo00/Latiao/releases) (much faster in mainland China).
 
-1. Double-click the `.dmg` to mount it
-2. Drag `Latiao.app` into your `Applications` folder
-3. Double-click to launch
+**macOS**: double-click the `.dmg`, drag `Latiao.app` into `Applications`, launch. If Gatekeeper blocks the unsigned app: right-click → Open.
+
+**Windows**: run the `setup.exe` installer. If SmartScreen warns: "More info" → "Run anyway".
 
 **That's it. No Python, no Node.js, no setup required. Download and run.**
+
+### 🔄 Auto-Update
+
+Latiao updates itself in-app — silent background download (resumable, survives restarts), then install on your confirmation. Check manually anytime from **Settings → Check for Updates**.
+
+### 📈 Financial Data (built-in, free tier)
+
+Three-layer fallback chain — no API key for the first two:
+
+1. **mx_query** — 东方财富 structured data (indices/sectors/stocks, capital flows, financials). Free tier: 150 calls/day.
+2. **ak_finance** — AKShare open data (unlimited, no key). Index/stock quotes, spot data.
+3. **tavily_search / bing_search** — live web search for news, overseas markets, sector rankings.
+
+When the daily quota runs out, the agent automatically falls through to the next layer.
+
+### 🧠 Local Model Compatibility Tips
+
+- Works out of the box: MLX models (4bit/6bit/8bit), GGUF models (llama.cpp engine) — including LM Studio's folder-style layouts (`Model.gguf/Model.gguf`).
+- New architectures may need a newer engine: very recent model types (e.g. `muse_glimmer`) aren't in the bundled `mlx-lm` yet — prefer mainstream models (Qwen, Ornith, GLM) or run those in LM Studio via the external-engine bridge.
 
 ## 🤖 Sub-Agents
 
@@ -212,13 +234,38 @@ MIT — free to use, modify, and distribute.
 
 Agent 通过 SSE 实时流式输出思考和执行过程——思考行、工具耗时、类别聚合（"探索 · 3 次搜索"）渲染成 ZCode 风格时间线。敏感操作（写文件、执行命令）先征求确认，你始终拥有最终控制权。
 
-## 📥 下载安装（macOS）
+## 📥 下载安装（macOS / Windows）
 
-> ⚠️ **仅支持 Apple Silicon Mac**（M1–M4）。Windows 移植见 [WINDOWS.md](WINDOWS.md)。
+| 平台 | 要求 | 下载 |
+|------|------|------|
+| **macOS（Apple Silicon）** | M1–M4 | `Latiao_*.aarch64.dmg` |
+| **Windows（x64）** | Win10+ | `Latiao_*_x64-setup.exe` / `.msi` |
 
-从 [GitHub Releases](https://github.com/RenYiX0620/Latiao/releases) 下载最新 `.dmg`，双击挂载，把 `Latiao.app` 拖入应用程序即可。
+从 [GitHub Releases](https://github.com/RenYiX0620/Latiao/releases) 下载最新版；国内用户推荐 [Gitee Releases](https://gitee.com/ryxo00/Latiao/releases) 镜像（下载快得多）。
+
+- **macOS**：双击 `.dmg`，拖 `Latiao.app` 进应用程序。未签名应用被拦时：右键 → 打开。
+- **Windows**：运行 `setup.exe` 安装。SmartScreen 提示时选"更多信息 → 仍要运行"。
 
 **不需要装 Python、Node.js 或任何依赖。下载即用。**
+
+### 🔄 自动更新
+
+应用内自动更新——后台静默预下载（断点续传、跨重启），确认后一键安装重启。设置页也可随时手动"检查更新"。
+
+### 📈 金融数据（内置免费链）
+
+三层免费兜底，前两层无需任何 API Key：
+
+1. **mx_query** — 东方财富结构化数据（指数/板块/个股行情、主力资金、财务指标），免费额度 150 次/天；
+2. **ak_finance** — AKShare 公开数据（无限次、免 Key），指数/个股行情；
+3. **tavily_search / bing_search** — 联网搜索兜底（新闻、境外市场、板块排行）。
+
+每日额度用完时 Agent 自动降级到下一层，不中断。
+
+### 🧠 本地模型兼容性提示
+
+- 开箱即用：MLX 模型（4/6/8bit）、GGUF 模型（llama.cpp 引擎），包括 LM Studio 的目录式布局（`模型.gguf/模型.gguf`）；
+- 过新的模型架构可能不被内置引擎支持（如 `muse_glimmer` 这类最新架构还没进 mlx-lm 正式版）——建议选主流模型（Qwen/Ornith/GLM 等），或让这类模型留在 LM Studio 里通过外部引擎使用。
 
 ## 🤖 子智能体
 
