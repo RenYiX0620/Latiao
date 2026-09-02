@@ -742,7 +742,7 @@ TOOL_PERMISSIONS["use_skill"] = "safe"
 # 看到 tavily。按语义优先级只重排一次，保证 tavily 排在搜索组最前、截断时优先保留。
 _TOOL_PRIORITY = (
     "read_file", "write_file", "list_dir", "search_files",
-    "tavily_search", "web_search", "bing_search",
+    "tavily_search", "dokobot_read", "dokobot_search", "web_search", "bing_search",
     "mx_query", "ak_finance",
     "screen_capture", "control_list_processes", "control_process_log", "control_audit",
     "control_wait", "control_launch", "control_mouse_move", "control_mouse_click",
@@ -1073,7 +1073,7 @@ TOOL_CATEGORIES = {
     "file_write": ["write_file"],
     "command": ["run_cmd"],
     "app": ["open_app", "open_folder"],
-    "web": ["tavily_search", "web_search", "bing_search"],
+    "web": ["tavily_search", "web_search", "bing_search", "dokobot_read", "dokobot_search"],
     "financial": ["mx_query", "ak_finance"],
     # 五控：进程/鼠标/屏幕/流程
     "control": [
