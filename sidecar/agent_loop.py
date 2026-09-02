@@ -2229,7 +2229,7 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                                         if text_output_delivered:
                                             # 追问续写轮：替换上一条而非追加（重复堆叠修复）
                                             if _raw_delta_count % 40 == 0:
-                                                yield {"event": "content_revised", "content": streamed_text}
+                                                yield {"event": "content_revised", "content": _strip_think_fences(streamed_text)}
                                             continue
                                         # Filter native control tokens so the UI doesn't show
                                         # raw <|tool_call|> / <|channel> / <|channel|> markers
@@ -2254,7 +2254,7 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                                                 streamed_text = _ded + reasoning
                                         if text_output_delivered:
                                             if _raw_delta_count % 40 == 0:
-                                                yield {"event": "content_revised", "content": streamed_text}
+                                                yield {"event": "content_revised", "content": _strip_think_fences(streamed_text)}
                                             continue
                                         yield {"reasoning": reasoning, "ts": int(time.time() * 1000)}
 
@@ -2302,7 +2302,7 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
 
             # 追问续写轮收尾：把本轮完整文本作为最终替换发出去（防节流边界丢失）
             if text_output_delivered and streamed_text.strip():
-                yield {"event": "content_revised", "content": streamed_text}
+                yield {"event": "content_revised", "content": _strip_think_fences(streamed_text)}
 
             if tool_call_bufs:
                 tool_calls = [tool_call_bufs[i] for i in sorted(tool_call_bufs.keys())]
@@ -2541,6 +2541,14 @@ _BASH_BLOCK_RE = re.compile(
     r'```(?:bash|sh|shell|zsh)\s*\n(.*?)\n```',
     re.DOTALL | re.IGNORECASE,
 )
+
+# 模型输出的 ```think> / ```think< 围栏（Kimi 风格思维链）：围栏标记会让
+# 前端 ReactMarkdown 把它当作未闭合代码块 → 后续正文全部渲染成灰框代码块
+_THINK_FENCE_RE = re.compile(r"```think\s*[<>]")
+
+
+def _strip_think_fences(text: str) -> str:
+    return _THINK_FENCE_RE.sub("", text)
 
 # Common commands in bash blocks
 _LS_CMD_RE = re.compile(r'^\s*ls\s+(?:-\w+\s+)*["\']?([/\~]\S+|\.\S*)\s*$', re.IGNORECASE)
@@ -3118,7 +3126,7 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                                             # 节流：每 40 个 delta 发一次全量累积文本，
                                             # 前端收到后整体替换上一条 assistant 消息。
                                             if _raw_delta_count % 40 == 0:
-                                                yield {"event": "content_revised", "content": streamed_text}
+                                                yield {"event": "content_revised", "content": _strip_think_fences(streamed_text)}
                                             continue
                                         yield {"content": content}
                                     elif reasoning:
@@ -3135,7 +3143,7 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                                                 streamed_text = _ded + reasoning
                                         if text_output_delivered:
                                             if _raw_delta_count % 40 == 0:
-                                                yield {"event": "content_revised", "content": streamed_text}
+                                                yield {"event": "content_revised", "content": _strip_think_fences(streamed_text)}
                                             continue
                                         yield {"reasoning": reasoning, "ts": int(time.time() * 1000)}
                                 except (json.JSONDecodeError, KeyError, TypeError, IndexError):
@@ -3181,7 +3189,7 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
             # 追问续写轮收尾：把本轮完整文本作为最终替换发出去，
             # 防止最后一段落在 40-delta 节流边界内丢失
             if text_output_delivered and streamed_text.strip():
-                yield {"event": "content_revised", "content": streamed_text}
+                yield {"event": "content_revised", "content": _strip_think_fences(streamed_text)}
 
             # Check for tool calls in the streamed text
             clean_text, tool_calls = _parse_prompt_tool_calls(streamed_text)
