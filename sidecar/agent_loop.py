@@ -2508,6 +2508,15 @@ _PROMPT_TOOL_FENCE_RE = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 
+# OpenAI 风格 json 栅栏：```json {"name": "...", "arguments": {...}} ```
+# Qwen3.8/MoziAI 等 27B 级模型实测输出此格式（工具名在 JSON 内部而非栅栏语言位），
+# 此前 Fenced/XML/Bare/Inline 四层全不认 → 模型反复正确输出工具调用却被当纯文本，
+# nudge 3 次后放弃 → "任务刚开始就停"（09-02 09:14 事故）。
+_PROMPT_JSON_FENCE_RE = re.compile(
+    r'```json\s*(\{.*?\})\s*```',
+    re.DOTALL,
+)
+
 # Hermes 风格 XML：Qwen3 系在 prompt-based 模式下常输出
 # <tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>
 _TOOLCALL_XML_RE = re.compile(
@@ -2565,6 +2574,25 @@ def _parse_prompt_tool_calls(text: str) -> tuple[str, list[dict]]:
             "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
         })
         used_ranges.append((m.start(), m.end()))
+
+    # Priority 1.2: ```json {"name": ..., "arguments": {...}} ``` —— OpenAI 风格
+    # json 栅栏（Qwen3.8/MoziAI 27B 实测输出格式），此前四层全不认 → 工具调用
+    # 被当纯文本，任务"刚开始就停"
+    if not tool_calls:
+        for idx, jm in enumerate(_PROMPT_JSON_FENCE_RE.finditer(search_text)):
+            try:
+                obj = json.loads(jm.group(1))
+            except json.JSONDecodeError:
+                continue
+            if not (isinstance(obj, dict) and obj.get("name") and "arguments" in obj):
+                continue
+            tool_calls.append({
+                "id": f"local_json_{obj['name']}_{idx}",
+                "type": "function",
+                "function": {"name": str(obj["name"]),
+                             "arguments": json.dumps(obj["arguments"], ensure_ascii=False)},
+            })
+            used_ranges.append((jm.start(), jm.end()))
 
     # Priority 1.4: Hermes 风格 XML —— Qwen3 系 prompt-based 模式常输出
     # <tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>，

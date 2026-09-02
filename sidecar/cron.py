@@ -417,7 +417,11 @@ async def _execute_cron_job(job: dict, force_local: bool = False):
                         if perm in ("confirm", "danger", "deny", "blocked"):
                             result = f"⛔ Cron 任务不支持需要确认或被权限规则阻止的操作: {tool_name}（级别 {perm}）"
                         else:
+                            # 与主循环同款工具日志——此前 cron 工具执行零日志，
+                            # "参数传递问题"这类失败完全无从排查（09-01 18:58 事故）
+                            logger.info("Tool executing (cron): %s %s", tool_name, str(tool_args)[:120])
                             result = await execute_tool(tool_name, tool_args)
+                            logger.info("Tool result (cron): %s → %s", tool_name, result[:80].replace("\n", " "))
                         if len(result) > 3000:
                             result = result[:3000] + "\n...(截断)"
                         current_msgs.append({"role": "tool", "tool_call_id": tc.get("id", "cron"), "content": result})
