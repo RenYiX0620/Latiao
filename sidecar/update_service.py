@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import re
+import ssl
 import threading
 import time
 import urllib.request
@@ -106,11 +107,39 @@ def get_progress() -> dict:
     return out
 
 
+def _ssl_context() -> "ssl.SSLContext":
+    """HTTPS 上下文：certifi + 系统 keychain CA（Watt Toolkit MITM 证书在
+    keychain 而非 certifi——discovery.py 同款修复，urllib 默认不认会
+    CERTIFICATE_VERIFY_FAILED，预下载因此失败）。"""
+    import ssl
+    ctx = ssl.create_default_context()
+    try:
+        import certifi
+        ctx.load_verify_locations(certifi.where())
+    except Exception:
+        pass
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["security", "find-certificate", "-a", "-p", "/Library/Keychains/System.keychain"],
+            capture_output=True, text=True, timeout=20,
+        )
+        if out.stdout:
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix=".pem", delete=False, mode="w") as f:
+                f.write(out.stdout)
+                f.flush()
+            ctx.load_verify_locations(f.name)
+    except Exception:
+        logger.debug("keychain CA 加载失败", exc_info=True)
+    return ctx
+
+
 def fetch_remote_manifest() -> dict | None:
     """拉 GitHub 最新清单（原样）。失败返回 None。"""
     try:
         req = urllib.request.Request(GITHUB_LATEST, headers={"User-Agent": "Latiao/1.0"})
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        with urllib.request.urlopen(req, timeout=20, context=_ssl_context()) as resp:
             return json.loads(resp.read().decode("utf-8", "ignore"))
     except Exception:
         logger.warning("update manifest fetch failed", exc_info=True)
@@ -130,7 +159,7 @@ def _download_worker(url: str, dest: Path, version: str) -> None:
             with _state_lock:
                 _state.update({"status": "downloading", "part_path": str(part)})
                 _save_state()
-            with urllib.request.urlopen(req, timeout=60) as resp:
+            with urllib.request.urlopen(req, timeout=60, context=_ssl_context()) as resp:
                 total = int(resp.getheader("Content-Length", 0)) + offset
                 with _state_lock:
                     _state["total"] = total
