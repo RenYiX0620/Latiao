@@ -10,8 +10,10 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
   <a href="https://tauri.app"><img src="https://img.shields.io/badge/Tauri-2.0-blue" alt="Tauri 2"></a>
   <a href="https://python.org"><img src="https://img.shields.io/badge/Python-3.11-brightgreen" alt="Python 3.11"></a>
+  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Windows-blueviolet" alt="macOS + Windows">
   <a href="https://github.com/RenYiX0620/Latiao/releases"><img src="https://img.shields.io/github/v/release/RenYiX0620/Latiao" alt="Latest Release"></a>
   <a href="https://github.com/RenYiX0620/Latiao/releases"><img src="https://img.shields.io/github/downloads/RenYiX0620/Latiao/total" alt="Downloads"></a>
+  <a href="https://github.com/RenYiX0620/Latiao/discussions"><img src="https://img.shields.io/badge/discussions-join%20us-9cf" alt="Discussions"></a>
 </p>
 
 ---
