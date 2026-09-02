@@ -3344,7 +3344,39 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                     text_only_streak += 1
                     _intent_nudges += 1
                     continue
-                # 追问到上限仍只有声明/道歉：把最后这句交给用户，避免死循环
+                # 追问到上限仍只有声明/道歉：做一次"终答提取"兜底——不带工具、
+                # 单一指令"写出完整分析"。本地 27B 级模型常被自身思维链卡住：
+                # 思考里已有分析但正文只回意图声明（09-02 09:56 事故：mx_query
+                # 数据到手，3 轮 nudge 模型仍只回 9 字符声明）。
+                final_answer = ""
+                try:
+                    _final_msgs = [m for m in current_msgs if m.get("role") != "system"][-8:]
+                    _final_msgs = _final_msgs + [{
+                        "role": "system",
+                        "content": (
+                            "任务收尾。请现在直接写出对用户的最终回答：把之前工具结果中的关键数据"
+                            "与分析结论完整写进正文。不要再声明意图、不要再道歉、不要再调用任何工具。"
+                            "直接输出分析内容本身。"
+                        ),
+                    }]
+                    _fb = {
+                        "model": model, "messages": _final_msgs,
+                        "max_tokens": 2048, "stream": False,
+                        "temperature": 0.4, "frequency_penalty": 0.6,
+                        "stop": ["<|im_end|>", "</think>", "<eos>"],
+                    }
+                    async with _local_llm_serialized(api_url):
+                        _fr = await client.post(api_url, json=_fb, headers=headers)
+                    if _fr.status_code == 200:
+                        final_answer = ((_fr.json().get("choices") or [{}])[0]
+                                        .get("message", {}).get("content", "") or "").strip()
+                except Exception:
+                    logger.warning("终答提取失败，回退原始文本", exc_info=True)
+                # 终答有效（比原声明长 3 倍以上）→ 交付终答；否则维持原收尾
+                if len(final_answer) > max(200, len(streamed_text.strip()) * 3):
+                    yield {"content": "\n\n" + final_answer}
+                    _track_progress(session_id, "completed", f"final_answer ({len(final_answer)} chars)")
+                    return
                 current_msgs.append({"role": "assistant", "content": streamed_text.strip()})
                 _track_progress(session_id, "completed", f"text_response ({len(streamed_text)} chars)")
                 logger.warning(f"[LOCAL-AGENT] Iteration {iteration}: {_intent_nudges} 轮追问仍无实质回答，收尾返回")
