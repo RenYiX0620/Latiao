@@ -304,7 +304,7 @@ export default memo(function ChatView({
             const bodyText = (localThink ? msg.content.slice(localThink[0].length) : msg.content)
               // 模型输出 ```think> ... ```think< 围栏：剥掉围栏标记、保留内容为正文，
               // 否则未闭合的围栏会让 ReactMarkdown 把后续全部渲染成代码块（灰框）
-              .replace(/```think\s*[<>]/g, "");
+              .replace(/```{3,}\s*think\s*[<>]/g, "");
             return (
               <div key={msg.id || i} className={`msg-row assistant${msg.type === "file" ? " file" : ""}`}>
                 <div className="avatar-small avatar-bot"><Bot size={19} strokeWidth={2} /></div>
