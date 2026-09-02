@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 💬 讨论区 / Discussions
+    url: https://github.com/RenYiX0620/Latiao/discussions
+    about: 提问、分享用法、展示你的技能/插件 → 请到讨论区
+  - name: 📖 文档 / Docs
+    url: https://github.com/RenYiX0620/Latiao#readme
+    about: 安装、使用、开发指南见 README
