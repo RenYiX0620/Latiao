@@ -2190,6 +2190,8 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                         r.raise_for_status()  # httpx 不自动抛 4xx/5xx，必须显式检查
                         # 流式停顿检测：连续 180s 无数据视为僵死（大模型可能缓慢滴灌，120s 超时永不触发）
                         aiter = r.aiter_lines()
+                        _fence_filter = _ThinkFenceFilter()
+                        _body_out = False  # 本轮是否产出过正文增量（收尾全量修正用）
                         while True:
                             try:
                                 line = await asyncio.wait_for(anext(aiter), timeout=180)
@@ -2235,9 +2237,11 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                                         # raw <|tool_call|> / <|channel> / <|channel|> markers
                                         clean = _NATIVE_CONTROL_RE.sub("", content)
                                         # 剥掉 think 围栏标记（```think>/```think<）——流式渲染时
-                                        # ReactMarkdown 把它当未闭合代码块 → 后续正文灰框
-                                        clean = _THINK_FENCE_RE.sub("", clean)
+                                        # ReactMarkdown 把它当未闭合代码块 → 后续正文灰框；
+                                        # 用缓冲过滤器捕获被 tokenizer 拆分的围栏
+                                        clean = _fence_filter.feed(clean)
                                         if clean:
+                                            _body_out = True
                                             yield {"content": clean}
                                         if len(streamed_text) < 5:
                                             _track_progress(session_id, "generating", "text_start")
@@ -2303,8 +2307,9 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                     logger.warning("云端流超时/复读截断，不影响本地引擎")
                 raise TimeoutError(f"流式响应超时（180s 无进展）：{model[:60]}")
 
-            # 追问续写轮收尾：把本轮完整文本作为最终替换发出去（防节流边界丢失）
-            if text_output_delivered and streamed_text.strip():
+            # 收尾修正：本轮产过正文就发一次全量替换（前端支持任意时刻
+            # content_revised），把流中可能残留的围栏在收尾统一剥干净（双保险）
+            if (text_output_delivered or _body_out) and streamed_text.strip():
                 yield {"event": "content_revised", "content": _strip_think_fences(streamed_text)}
 
             if tool_call_bufs:
@@ -2552,6 +2557,47 @@ _THINK_FENCE_RE = re.compile(r"```think\s*[<>]")
 
 def _strip_think_fences(text: str) -> str:
     return _THINK_FENCE_RE.sub("", text)
+
+
+class _ThinkFenceFilter:
+    """逐 delta 清洗 ```think 围栏，能捕获被 tokenizer 拆分的标记。
+
+    LLM 流式输出常把 ```think> 拆成多个 delta（如 ``` / think / >），
+    对单个 delta 做正则永远匹配不到。本过滤器在累积缓存中识别拆分中的
+    标记：尾部可能拼成 ```think 前缀时暂存等待下一 delta，拼完整后整体
+    剥掉；确认是普通代码块（```json 等）再放行（最多延迟 1-2 个 delta）。
+    """
+
+    _MAX_PENDING = 64
+
+    def __init__(self) -> None:
+        self._pending = ""
+
+    def feed(self, text: str) -> str:
+        """输入一个流式增量，返回可安全发送给前端的内容（可为空串）。"""
+        if not text:
+            return ""
+        buf = _THINK_FENCE_RE.sub("", self._pending + text)
+        # 尾部可能是拆分中的 ```think 前缀（``` 本身、反引号、或 ``` 后跟字母）
+        # → 暂存等待下一 delta，拼完整后由上面的正则整体剥掉
+        if re.search(r"```[a-zA-Z]*$", buf) or buf.endswith("`"):
+            self._pending = buf
+            return ""
+        if len(buf) > self._MAX_PENDING:  # 防极端场景卡死，强制放行
+            self._pending = ""
+            return buf
+        self._pending = ""
+        return buf
+
+    def finalize(self) -> str:
+        """流结束时取回缓存。think 标记中间态剥掉；纯反引号残片保留
+        （可能是普通代码块的闭合围栏，丢了会导致代码块不闭合）。"""
+        pending, self._pending = self._pending, ""
+        if not pending:
+            return ""
+        if "```think" in pending:
+            return _THINK_FENCE_RE.sub(r"```+", "", pending)
+        return pending
 
 # Common commands in bash blocks
 _LS_CMD_RE = re.compile(r'^\s*ls\s+(?:-\w+\s+)*["\']?([/\~]\S+|\.\S*)\s*$', re.IGNORECASE)
@@ -3044,6 +3090,7 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                 try:
                     async with _local_llm_stream(client, api_url, body, headers) as r:
                         aiter = r.aiter_lines()
+                        _fence_filter = _ThinkFenceFilter()
                         _silent_secs = 0  # 连续静默秒数（心跳与停滞判定共用，P0-4）
                         while True:
                             try:
@@ -3132,8 +3179,11 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                                                 yield {"event": "content_revised", "content": _strip_think_fences(streamed_text)}
                                             continue
                                         # 剥掉 think 围栏标记（```think>/```think<）——否则
-                                        # ReactMarkdown 把它当未闭合代码块 → 后续正文灰框
-                                        yield {"content": _THINK_FENCE_RE.sub("", content)}
+                                        # ReactMarkdown 把它当未闭合代码块 → 后续正文灰框；
+                                        # 用缓冲过滤器捕获被 tokenizer 拆分的围栏
+                                        _clean = _fence_filter.feed(content)
+                                        if _clean:
+                                            yield {"content": _clean}
                                     elif reasoning:
                                         _any_output = True
                                         streamed_text += reasoning
@@ -3191,9 +3241,10 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                     await asyncio.sleep(10)
                     continue
 
-            # 追问续写轮收尾：把本轮完整文本作为最终替换发出去，
-            # 防止最后一段落在 40-delta 节流边界内丢失
-            if text_output_delivered and streamed_text.strip():
+            # 收尾修正：本轮产过正文就发一次全量替换——前端支持任意时刻
+            # content_revised（App.tsx 893 整体替换最后一条 assistant 消息），
+            # 把流中可能残留的围栏（buffer 未命中）在收尾统一剥干净（双保险）
+            if (text_output_delivered or _any_output) and streamed_text.strip():
                 yield {"event": "content_revised", "content": _strip_think_fences(streamed_text)}
 
             # Check for tool calls in the streamed text
@@ -3387,7 +3438,7 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                     logger.warning("终答提取失败，回退原始文本", exc_info=True)
                 # 终答有效（比原声明长 3 倍以上）→ 交付终答；否则维持原收尾
                 if len(final_answer) > max(200, len(streamed_text.strip()) * 3):
-                    yield {"content": "\n\n" + final_answer}
+                    yield {"content": "\n\n" + _strip_think_fences(final_answer)}
                     _track_progress(session_id, "completed", f"final_answer ({len(final_answer)} chars)")
                     return
                 current_msgs.append({"role": "assistant", "content": streamed_text.strip()})

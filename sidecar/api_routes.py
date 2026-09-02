@@ -61,6 +61,7 @@ from agent_loop import (
     _spawn,
     _strip_native_tool_calls,
     execute_tool,
+    _THINK_FENCE_RE,
 )
 from config import PROGRESS_DIR
 from db import MEMORY_DB, _db_write_lock, _get_db
@@ -435,9 +436,9 @@ async def chat_completion(request: Request):
                                     text = delta.get("content", "")
                                     reasoning = delta.get("reasoning", "")
                                     if reasoning:
-                                        yield f"data: {json.dumps({'content': reasoning})}\n\n"
+                                        yield f"data: {json.dumps({'content': _THINK_FENCE_RE.sub('', reasoning)})}\n\n"
                                     if text:
-                                        yield f"data: {json.dumps({'content': text})}\n\n"
+                                        yield f"data: {json.dumps({'content': _THINK_FENCE_RE.sub('', text)})}\n\n"
                                 except (json.JSONDecodeError, KeyError, IndexError):
                                     pass  # Malformed SSE event — skip, try next
                                 except Exception:
