@@ -199,11 +199,20 @@ def start_prepare(current_version: str) -> dict:
     """启动预下载（后台线程，幂等）。返回当前状态。"""
     platform = _current_platform()
     st = _load_state()
-    if st.get("status") in ("downloading", "done"):
-        # downloading: 已在跑；done: 且版本未变 → 幂等返回
-        if st.get("status") == "done" and _is_newer(st.get("version", ""), current_version or "0.0.0"):
-            pass  # done 但 state 版本仍比当前新 → 复用（文件在磁盘）
-        return get_progress()
+    if st.get("status") == "downloading":
+        return get_progress()  # 已在跑
+
+    if st.get("status") == "done":
+        # 复用已预下载的包仅当它就是 GitHub 当前最新版；否则重新下载
+        remote = fetch_remote_manifest()
+        remote_ver = str((remote or {}).get("version", ""))
+        if remote_ver and st.get("version", "") == remote_ver:
+            if not _is_newer(remote_ver, current_version or "0.0.0"):
+                with _state_lock:
+                    _state.update({"status": "up_to_date", "version": remote_ver, "error": ""})
+                    _save_state()
+            return get_progress()
+        # GitHub 有比已预下载更新的版本 → 继续走下方完整流程
 
     def worker():
         try:
@@ -212,9 +221,13 @@ def start_prepare(current_version: str) -> dict:
                 _save_state()
             manifest = fetch_remote_manifest()
             if not manifest:
-                with _state_lock:
-                    _state.update({"status": "failed", "error": "无法获取更新清单"})
-                    _save_state()
+                # 拉不到清单（网络失败）：保留既有 done 状态——
+                # 已预下载的包仍可用于本机安装，下次检查会重试
+                prev = _load_state()
+                if prev.get("status") != "done":
+                    with _state_lock:
+                        _state.update({"status": "failed", "error": "无法获取更新清单"})
+                        _save_state()
                 return
             remote_ver = str(manifest.get("version", ""))
             if not _is_newer(remote_ver, current_version or "0.0.0"):
@@ -256,25 +269,24 @@ def _pub_date_field(st: dict) -> dict:
     return {"pub_date": pd} if pd else {}
 
 
-def get_tauri_manifest(current_version: str) -> dict:
+def get_tauri_manifest(current_version: str) -> dict | None:
     """生成 tauri updater 格式清单（供 /v1/update-latest.json 端点）。
 
-    - 预下载 done 且版本比当前新 → 返回清单（url 指向本地端点）
-    - 否则返回 current_version（updater 判无更新）
+    返回 None 表示"无更新"（端点须返回 204 No Content——updater 在版本
+    比较之前就查找 platforms 条目，返回空 platforms 的 JSON 会直接报
+    "None of the fallback platforms were found"）。
     """
     st = _load_state()
     remote_ver = str(st.get("version", ""))
     done = st.get("status") == "done"
     if not done or not _is_newer(remote_ver, current_version or "0.0.0"):
-        return {"version": current_version or "0.0.0",
-                "notes": "", "platforms": {}, **_pub_date_field(st)}
-    dest = UPDATE_DIR / f"Latiao_{remote_ver}_{_current_platform().replace('-','_')}.pkg"
-    # 实际文件名来自 url（跨平台名不同）
+        return None
     url = st.get("url", "")
-    if url:
-        dest = UPDATE_DIR / url.split("/")[-1]
+    if not url:
+        return None
+    dest = UPDATE_DIR / url.split("/")[-1]
     if not dest.exists():
-        return {"version": current_version or "0.0.0", "notes": "", "platforms": {}}
+        return None
     return {
         "version": remote_ver,
         "notes": "Latiao v" + remote_ver,
