@@ -742,7 +742,7 @@ TOOL_PERMISSIONS["use_skill"] = "safe"
 # 看到 tavily。按语义优先级只重排一次，保证 tavily 排在搜索组最前、截断时优先保留。
 _TOOL_PRIORITY = (
     "read_file", "write_file", "list_dir", "search_files",
-    "tavily_search", "dokobot_read", "dokobot_search", "web_search", "bing_search",
+    "tavily_search", "dokobot_read", "headless_read", "dokobot_search", "web_search", "bing_search",
     "mx_query", "ak_finance",
     "screen_capture", "control_list_processes", "control_process_log", "control_audit",
     "control_wait", "control_launch", "control_mouse_move", "control_mouse_click",
@@ -1073,7 +1073,7 @@ TOOL_CATEGORIES = {
     "file_write": ["write_file"],
     "command": ["run_cmd"],
     "app": ["open_app", "open_folder"],
-    "web": ["tavily_search", "web_search", "bing_search", "dokobot_read", "dokobot_search"],
+    "web": ["tavily_search", "web_search", "bing_search", "dokobot_read", "headless_read", "dokobot_search"],
     "financial": ["mx_query", "ak_finance"],
     # 五控：进程/鼠标/屏幕/流程
     "control": [
@@ -1102,7 +1102,7 @@ INTENT_PATTERNS = [
      ["file_read", "app"]),
     (re.compile(r"大盘|A股|港股|股票|个股|股价|行情|涨停|跌停|板块|上证|深证|创业板|科创板|沪深|指数|基金|财报|财务|营收|净利润|上市公司|分红|PE|PB|ROE|股息|龙头|K线|成交量|换手率|资金流向|北向资金|龙虎榜|券商研报", re.IGNORECASE),
      ["file_read", "financial"]),
-    (re.compile(r"上网|联网|搜索网络|搜一下|搜一搜|查一下|查询|查一查|了解一下|最新的|最新消息|新闻|热搜|汇率|天气|资料|search|web|online|latest|news|weather|trending", re.IGNORECASE),
+    (re.compile(r"上网|联网|搜索网络|搜一下|搜一搜|查一下|查询|查一查|了解一下|最新的|最新消息|新闻|热搜|汇率|天气|资料|网页|网址|链接|页面|http|url|search|web|online|latest|news|weather|trending", re.IGNORECASE),
      ["file_read", "web"]),
     # 信息询问型问题（“X 是什么/有哪些/对比/评测”）：给出搜索工具，模型按需调用
     (re.compile(r"是什么|什么是|有哪些|有什么|为什么|如何|怎么|怎么样|怎么回事|介绍一下|介绍下|原理|机制|评测|测评|对比|区别|哪款|哪家|哪个|性价比|值不值得", re.IGNORECASE),

@@ -30,10 +30,10 @@ def dokobot_bin() -> str | None:
 
 def run(cmd: list[str], timeout: int = 120) -> tuple[int, str]:
     env = dict(os.environ)
-    node_bin = str(Path.home() / ".nvm" / "versions" / "node")
+    node_bin = Path.home() / ".nvm" / "versions" / "node"
     if node_bin.exists():
         import glob as _g
-        found = _g.glob(node_bin + "/*/bin")
+        found = _g.glob(str(node_bin) + "/*/bin")
         if found:
             env["PATH"] = env.get("PATH", "") + ":" + ":".join(found)
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
