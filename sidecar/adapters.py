@@ -65,9 +65,15 @@ def _jsdelivr_file(repo: str, path: str, ref: str = "main", timeout: float = 20)
     enc = path.lstrip("/").replace(" ", "%20")
     url = f"https://cdn.jsdelivr.net/gh/{repo}@{ref}/{enc}"
     try:
-        resp = httpx.get(url, timeout=httpx.Timeout(timeout), headers={"User-Agent": _UA})
+        resp = httpx.get(url, timeout=httpx.Timeout(timeout), headers={"User-Agent": _UA},
+                         follow_redirects=True)
         resp.raise_for_status()
         return resp.text
+    except httpx.HTTPStatusError as e:
+        # jsDelivr 对未缓存文件返回 301 → raw.githubusercontent（本环境不可达），
+        # 属扫描噪音而非异常：降为 INFO 不刷警告
+        logger.info("jsDelivr file miss for %s@%s (HTTP %s)", repo, path, e.response.status_code)
+        return None
     except Exception:
         logger.warning("jsDelivr file failed for %s@%s", repo, path, exc_info=True)
         return None
