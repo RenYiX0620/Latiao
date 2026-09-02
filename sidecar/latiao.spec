@@ -1,7 +1,7 @@
 # -*- mode: python -*-
 a = Analysis(
     ['main.py'],
-    pathex=[],
+    pathex=['plugins'],
     binaries=[],
     datas=[
         ('agents/*.txt', 'agents'),
@@ -13,7 +13,7 @@ a = Analysis(
         'uvicorn.logging', 'uvicorn.loops', 'uvicorn.protocols',
         'fastapi', 'httpx', 'certifi',
         'sqlite3', 'asyncio',
-        'pyyaml', 'yaml',
+        'yaml',
         # 统一能力模型 + 生态市场（多处函数内动态 import，PyInstaller 静态分析
         # 收集不到，必须显式列出，否则 sidecar.exe 运行时报 ModuleNotFoundError）
         'capability_registry', 'discovery', 'adapters',
@@ -24,6 +24,9 @@ a = Analysis(
         'skills', 'skills.mx_data', 'skills.mx_data.mx_data',
         # 控制类插件（plugins/ 下由 tool_system 动态加载，需随包）
         '_control_common', '_control_mouse_common',
+        # Windows 端运行时被动态 import（fastapi optional extra 路径），环境已装但
+        # 静态分析扫不到，必须显式收集，否则 sidecar.exe 启动即 ModuleNotFoundError
+        'pydantic_settings', 'tzdata',
     ],
     hookspath=[],
     runtime_hooks=[],

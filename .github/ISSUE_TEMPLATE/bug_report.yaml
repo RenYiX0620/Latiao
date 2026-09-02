@@ -1,0 +1,52 @@
+name: 🐛 Bug 报告 / Bug Report
+description: something is broken / 有东西坏了
+labels: ["bug"]
+body:
+  - type: dropdown
+    id: platform
+    attributes:
+      label: 平台 / Platform
+      options:
+        - macOS (Apple Silicon)
+        - Windows (x64)
+        - 其他 / Other
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: 版本 / Version
+      description: 设置页左下角可查看（如 0.3.7）
+      placeholder: "0.3.7"
+    validations:
+      required: true
+  - type: dropdown
+    id: model
+    attributes:
+      label: 使用的模型 / Model in use
+      options:
+        - 本地 MLX 模型（Qwen / Ornith / GLM 等）
+        - 本地 GGUF 模型（llama.cpp）
+        - 云端 API（GLM / DeepSeek / OpenAI 等）
+        - 不确定 / N/A
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 发生了什么 / What happened
+      description: 具体描述——你做了什么、期望发生什么、实际发生了什么。附上界面截图或报错原文最有帮助。
+      placeholder: "我发送了...，然后..."
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 相关日志 / Relevant logs
+      description: 设置 → 日志页可导出；或复制关键报错行（sidecar.log 在 ~/.local-ai-os/）
+      render: shell
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: 确认 / Confirm
+      options:
+        - label: 我已搜索过现有 issues，没有重复报告。
+          required: true
