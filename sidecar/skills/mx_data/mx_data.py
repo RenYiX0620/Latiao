@@ -253,17 +253,6 @@ class MXData:
         search_result = inner_data.get("searchDataResultDTO", {})
         entity_tags = search_result.get("entityTagDTOList", [])
 
-        if entity_tags:
-            output.append("**查询证券**:")
-            entities = []
-            for tag in entity_tags:
-                name = tag.get("fullName", "")
-                code = tag.get("secuCode", "")
-                type_name = tag.get("entityTypeName", "")
-                entities.append(f"- {name} ({code}) - {type_name}")
-            output.append("\n".join(entities))
-            output.append("")
-
         output.append(f"**查询结果**: {len(tables)} 个表，共 {total_rows} 行数据\n")
 
         # Preview EVERY table (not just the first): agent 循环只有工具结果可见，
@@ -292,6 +281,15 @@ class MXData:
                 if len(table["rows"]) > 6:
                     output.append("| ... |")
             output.append("")
+
+        # 证券实体列表（"查询证券"）放在数据表之后 —— 模型先看行情表再看到列表，
+        # 避免"问行情却先见证券代码列表"产生的数据不足疑问（21:13 事故诱因之一）
+        if entity_tags:
+            entities = [
+                f"{tag.get('fullName', '')}({tag.get('secuCode', '')})"
+                for tag in entity_tags
+            ]
+            output.append(f"*证券实体: {'、'.join(entities)}*\n")
 
         question_id = search_result.get("questionId", "")
         if question_id:

@@ -2599,6 +2599,32 @@ class _ThinkFenceFilter:
             return _THINK_FENCE_RE.sub(r"```+", "", pending)
         return pending
 
+
+# 未执行的"规划意图"词形：模型说了要做但整轮没调用工具（21:42 事故的
+# 扩充词表——"让我用/让我先/先看看"等声明式话术不可当实质完成收尾；
+# 注意避免误伤完整回答开头（"让我来整理一下关键数据…"是实质回答）
+_PENDING_INTENT_PATTERNS = (
+    "改用", "我再单独查", "我单独查", "我改", "我要调用",
+    "我马上", "我这就", "我先查", "我重新查",
+    "让我用", "我来用", "让我读取", "让我先", "让我再",
+    "我先做", "先看看",
+)
+
+
+def _extract_think_body(text: str) -> str:
+    """提取思考段内容：```think>…</think> / ```think>…```think< / <think>…</think>。
+
+    27B Q4 模型常把完整分析写进思考段、正文只留半截声明（16:45/19:38/21:13
+    事故）——正文不足时用思考段内容兜底交付。
+    """
+    m = re.search(
+        r"(?:```think\s*[>]|<think>)([\s\S]*?)(?:</think>|```think\s*[<]|```)",
+        text,
+        flags=re.DOTALL,
+    )
+    return m.group(1).strip() if m else ""
+
+
 # Common commands in bash blocks
 _LS_CMD_RE = re.compile(r'^\s*ls\s+(?:-\w+\s+)*["\']?([/\~]\S+|\.\S*)\s*$', re.IGNORECASE)
 _CAT_CMD_RE = re.compile(r'^\s*cat\s+["\']?([/\~]\S+)\s*$', re.IGNORECASE)
@@ -2976,7 +3002,12 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
             "\n\n⚠️⚠️⚠️ 你现在处于任务执行中途！\n"
             f"会话中已有 {tool_result_count} 条工具执行结果，但任务尚未完成。\n"
             "你必须继续使用工具完成用户的原始请求，不能只回复文字说'好的'或'正在处理'。\n"
-            "直接调用工具，不要废话。"
+            "直接调用工具，不要废话。\n"
+            "\n📌 输出纪律（必须遵守）：\n"
+            "1. 不要把思考过程用 ```think> 代码块围栏输出，也不要在正文里描述'我将要做什么'。\n"
+            "2. 思考完成后，把完整分析结论直接写在正文：关键数据、要点、结论。\n"
+            "3. 正文禁止出现'让我用…''我先…''接下来我要…'等待办话术——要么立刻调用工具，要么直接写出完整分析。\n"
+            "4. 工具执行后不要再声明步骤，直接写结论。"
         )
 
     # Inject tools into the first user message context
@@ -3349,9 +3380,7 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                 # 模型明确说"我改用/我要调用/我再单独查"但整轮没有实际工具调用
                 # （21:42 事故：模型说"改用联网搜索"却直接收尾，未调 tavily）——
                 # 这类带未执行意图的 ≥200 字符正文不算实质完成，继续 nudge。
-                _pending_intent = any(k in streamed_text.lower() for k in
-                                      ("改用", "我再单独查", "我单独查", "我改", "我要调用",
-                                       "我马上", "我这就", "我先查", "我重新查"))
+                _pending_intent = any(k in streamed_text.lower() for k in _PENDING_INTENT_PATTERNS)
                 if (len(streamed_text.strip()) >= 200 and not _is_meta_wrapup(streamed_text)
                         and not _pending_intent):
                     # 模型在工具结果后已给出实质性回答（≥200 字符）——接受为
@@ -3365,6 +3394,17 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                     current_msgs.append({"role": "assistant", "content": streamed_text.strip()})
                     _track_progress(session_id, "completed", f"text_response ({len(streamed_text)} chars)")
                     logger.info(f"[LOCAL-AGENT] Iteration {iteration}: no tools, returning text ({len(streamed_text)} chars)")
+                    return
+                # 思考段提取兜底：正文是半截/声明（<200 字符、未执行意图或元评论），
+                # 但思考段里有 ≥200 字符的实质分析（27B 模型把分析全写进思考段，
+                # 21:13 事故）——直接以思考段内容作为最终回答交付，不再追问。
+                _think_body = _extract_think_body(streamed_text)
+                if len(_think_body) >= 200 and not _is_meta_wrapup(_think_body):
+                    _pending_tool_analysis = False
+                    current_msgs.append({"role": "assistant", "content": _think_body})
+                    yield {"event": "content_revised", "content": _think_body}
+                    _track_progress(session_id, "completed", f"think_body ({len(_think_body)} chars)")
+                    logger.info(f"[LOCAL-AGENT] Iteration {iteration}: 正文半截，交付思考段内容 ({len(_think_body)} chars)")
                     return
                 if _intent_nudges < 3:
                     current_msgs.append({"role": "assistant", "content": streamed_text.strip()})
