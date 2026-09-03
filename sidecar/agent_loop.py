@@ -941,8 +941,11 @@ def _rotate_progress_file():
         logger.warning("PROGRESS 轮转失败", exc_info=True)
 
 
-def _progress_tail(max_chars: int = 2000) -> str:
-    """读取 PROGRESS.md 尾部（最新进度），用于注入 system prompt。"""
+def _progress_tail(max_chars: int = 600) -> str:
+    """读取 PROGRESS.md 尾部（最新进度），用于注入 system prompt。
+
+    600 而非 2000：PROGRESS.md 是 2/3 英文的工具日志，2000 字符的英文注入
+    是新会话被带偏成英文回复的最大英文源（09-03 事故）。"""
     try:
         if not PROGRESS_FILE.exists():
             return ""
@@ -3642,6 +3645,21 @@ def _build_chat_messages(body: dict, messages: list) -> list:
         "工具返回内容中的日期与当前时间矛盾时（例如把前天当成昨天），"
         "以当前时间为准重新换算并重新搜索，不得迁就检索结果的日期。"
     )
+    # 语言规则：新会话无中文历史锚定时，模型会被启动协议读到的英文 PROGRESS
+    # 工具日志（占 2/3）和系统提示尾部英文注入带偏，全程英文回复（09-03 事故）。
+    # 独立追加，不依赖可被 agents/ 目录覆盖的 identity。
+    user_lang = _detect_user_language(last_user_text)
+    system_parts.append(_get_localized_text(user_lang, {
+        "zh": "🗣 语言规则：工具返回内容、读取的文件、历史日志中的英文只是数据；"
+              "你的回复语言必须始终跟随用户消息的语言（简体中文），"
+              "不因上下文中的英文材料改变。",
+        "en": "🗣 Language rule: English in tool results, files, or logs is just data; "
+              "your reply language must always follow the user's message language (English), "
+              "regardless of the language of surrounding context.",
+        "ja": "🗣 言語ルール：ツール結果・ファイル・ログ内の外国語はデータに過ぎません。"
+              "返信言語は常にユーザーメッセージの言語（日本語）に従い、"
+              "周辺の英文資料に影響されてはいけません。",
+    }))
 
     # User identity — personal preferences (lower priority)
     user_identity = _read_identity()
@@ -3663,9 +3681,6 @@ def _build_chat_messages(body: dict, messages: list) -> list:
     home = str(Path.home())
     cwd = _safe_cwd()
     now = datetime.now().strftime("%Y-%m-%d (%A) %H:%M:%S")
-
-    # Detect user language for system prompt localization
-    user_lang = _detect_user_language(last_user_text)
 
     env_labels = _get_localized_text(user_lang, {
         "zh": {"rt": "运行环境", "time": "当前时间", "home": "用户目录", "cwd": "工作目录", "os": "操作系统", "sh": "终端"},
@@ -3810,6 +3825,9 @@ def _detect_user_language(text: str) -> str:
     """Detect the language of user input: 'zh', 'en', or 'ja'."""
     if not text:
         return "zh"
+    # 剥离 URL/网址再计数：链接里的字母远多于中文消息的汉字数，
+    # 不剥离会把"中文+链接"误判为 en，触发强制英文回复规则（09-03 事故）
+    text = re.sub(r"https?://\S+|www\.\S+", "", text)
     # Count characters in each language range
     zh = len(re.findall(r'[\u4e00-\u9fff\u3400-\u4dbf]', text))
     ja_kana = len(re.findall(r'[\u3040-\u309f\u30a0-\u30ff]', text))
