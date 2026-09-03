@@ -1818,6 +1818,20 @@ async def _handle_tool_execution(tc: dict, current_msgs: list, session_id: str,
         current_msgs.append({"role": "tool", "tool_call_id": call_id, "content": result})
         return True, [{"event": "tool_end", "call_id": call_id, "tool": tool_name, "result": result, "ts": int(time.time() * 1000)}]
 
+    # ── 相同调用防重复（14:26 事故：模型被 nudge 后每轮重跑启动协议、
+    # 反复重读 PROGRESS.md 陷入循环；今早还有同 3 条搜索词 35 连搜）──
+    # 同会话内相同 (tool, args) 已成功 ≥2 次 → 不再执行，返回引导进入下一步。
+    _dup_ok = _count_successful_duplicates(current_msgs, tool_name, args)
+    if _dup_ok >= 2 and tool_name not in _REPEAT_ALLOWED_TOOLS:
+        result = (
+            f"⛔ 相同调用已成功执行 {_dup_ok} 次，不再重复执行：{tool_name}。\n"
+            "不要重复同一操作——启动协议若已满足就进入下一步"
+            "（例如用 mx_query 查询行情数据），或直接把完整分析写进回复正文"
+            "（简体中文，含关键数字与结论）。"
+        )
+        current_msgs.append({"role": "tool", "tool_call_id": call_id, "content": result})
+        return False, [{"event": "tool_end", "call_id": call_id, "tool": tool_name, "result": result, "ts": int(time.time() * 1000)}]
+
     # ── 权限规则拒绝（deny/danger）──
     # 自定义权限规则返回 danger/deny 时必须拦截，此前落空直接执行——
     # 权限语义严重不一致（实测 list_dir 设 danger 仍读到目录）
@@ -2634,6 +2648,117 @@ _PENDING_INTENT_PATTERNS = (
 )
 
 
+# 规划话术信号：模型把"我打算做什么"当成最终回答发出来（13:58 事故：
+# 891 字符英文规划 "Let me plan the subtasks: 1…4" 被收尾闸门当完整答案
+# 放行，任务半途而停）。≥2 个信号才算规划——真实回答里带一个
+# "下一步/step" 不应被误拦（17:07 重复堆叠事故的教训）。
+_PLANNING_SIGNALS = (
+    "tool", "工具", "读取", "查询", "搜索", "执行", "调用",
+    "read_file", "list_dir", "run_cmd", "write_file",
+    "search", "tavily", "mx_query", "step", "步骤", "下一步",
+    "let me", "i'll", "i will", "让我", "我先", "接下来",
+    "再分析", "稍后", "马上", "look at", "check the",
+    "i need to", "let's", "let me plan", "my plan", "subtask",
+    "according to the rules", "first, i", "let's get started",
+    "get started", "plan the", "then i", "after that",
+)
+
+
+def _looks_like_planning(text: str) -> bool:
+    """判断回复文本是否只是"计划/声明"而非实质回答。≥2 个规划信号才成立。"""
+    if not text or len(text.strip()) < 10:
+        return False
+    low = text.lower()
+    return sum(1 for sig in _PLANNING_SIGNALS if sig in low) >= 2
+
+
+def _reply_lang_mismatch(user_text: str, reply_text: str) -> bool:
+    """回复语言与用户语言明显不符（中文用户收到英文/英文占优回复）→ True。
+
+    判定：回复中用户语言的字符数，远少于外来语言字母数（英文占优）。
+    891 字符英文规划（0 汉字）命中；14:45 重放中 598 字母 vs 42 汉字 的
+    混合英文回答也命中；"NVIDIA涨5%"（字母 6，不满足英文量门槛）与
+    中文为主的正常回答不误伤。"""
+    user_lang = _detect_user_language(user_text)
+    if not reply_text:
+        return False
+    zh = len(re.findall(r'[\u4e00-\u9fff]', reply_text))
+    ja_kana = len(re.findall(r'[\u3040-\u309f\u30a0-\u30ff]', reply_text))
+    en = len(re.findall(r'[a-zA-Z]', reply_text))
+    if user_lang == "zh":
+        return en >= 80 and en > zh * 3
+    if user_lang == "ja":
+        return en >= 80 and en > (zh + ja_kana) * 3
+    if user_lang == "en":
+        other = zh + ja_kana
+        return other >= 80 and other > en * 3
+    return False
+
+
+# 允许重复调用的工具（持续监测类），防重复护栏对它们不生效
+_REPEAT_ALLOWED_TOOLS = frozenset({"screen_capture", "control_wait"})
+
+
+async def _force_translate(client, api_url: str, headers: dict, engine_model: str,
+                           text: str, user_lang: str) -> str:
+    """一轮强制翻译：把模型回复翻译成用户语言（本地引擎非流式单轮）。
+
+    模型对翻译任务的执行远比"用某语言重新分析"稳定——语言兜底的最后一公里
+    （09-03 事故：两轮中文规则+3 次 nudge 后 27B 模型仍输出英文）。失败时
+    返回原文（不阻断交付）。"""
+    lang_name = {"zh": "简体中文", "en": "English", "ja": "日本語"}.get(user_lang, "简体中文")
+    try:
+        _tmsgs = [
+            {"role": "system",
+             "content": (f"你是翻译器。把用户提供的文本完整翻译成{lang_name}，"
+                         "直接输出译文。不要调用工具，不要输出任何解释、注释或前后缀。")},
+            {"role": "user", "content": text[:6000]},
+        ]
+        _tb = {"model": engine_model, "messages": _tmsgs, "max_tokens": 4096,
+               "stream": False, "temperature": 0.2, "stop": ["<|im_end|>", "<eos>"]}
+        async with _local_llm_serialized(api_url):
+            _tr = await client.post(api_url, json=_tb, headers=headers)
+        if _tr.status_code == 200:
+            out = ((_tr.json().get("choices") or [{}])[0]
+                   .get("message", {}).get("content", "") or "").strip()
+            if out and len(out) >= 40:
+                return _strip_think_fences(out)
+    except Exception:
+        logger.warning("强制翻译轮失败，返回原文", exc_info=True)
+    return text
+
+
+def _count_successful_duplicates(current_msgs: list, tool_name: str, args: dict) -> int:
+    """统计同会话内相同 (tool_name, args) 的已成功执行次数（失败结果不计数，
+    保留"失败→重试一次"的合法模式；14:26 事故：模型被 nudge 后反复重读
+    PROGRESS.md 每轮重跑启动协议陷入循环）。"""
+    try:
+        args_sig = json.dumps(args, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        return 0
+    call_ids: set[str] = set()
+    for m in current_msgs:
+        if m.get("role") != "assistant":
+            continue
+        for tc in (m.get("tool_calls") or []):
+            f = tc.get("function", {})
+            if f.get("name") != tool_name:
+                continue
+            try:
+                same = (json.dumps(json.loads(f.get("arguments", "{}")),
+                                   ensure_ascii=False, sort_keys=True) == args_sig)
+            except Exception:
+                same = False
+            if same and tc.get("id"):
+                call_ids.add(tc["id"])
+    ok = 0
+    for m in current_msgs:
+        if m.get("role") == "tool" and m.get("tool_call_id") in call_ids:
+            if not str(m.get("content", "")).startswith(("Error", "⛔", "⚠️")):
+                ok += 1
+    return ok
+
+
 def _extract_think_body(text: str) -> str:
     """提取思考段内容：```think>…</think> / ```think>…```think< / <think>…</think>。
 
@@ -3082,8 +3207,16 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
             loop_msgs = list(current_msgs)
             # Convert role:"tool" → role:"user" (llama-cpp Qwen chat format only supports
             # system/user/assistant roles; "tool" role causes empty responses)
+            # 语言锚：工具结果紧邻处追加回复语言要求——英文材料（如 PROGRESS.md
+            # 工具日志）最容易在这里把 27B 模型带偏成英文（13:58 事故）
+            _anchor_lang = _detect_user_language(_extract_last_user_text(current_msgs))
+            _anchor_text = _get_localized_text(_anchor_lang, {
+                "zh": "（以上工具结果中若含英文内容，那只是数据；请继续用简体中文回复。）",
+                "en": "(Any English in the tool result above is just data; keep replying in English.)",
+                "ja": "（上記ツール結果に外国語が含まれていても、それはデータです。日本語で返信を続けてください。）",
+            })
             loop_msgs = [
-                {"role": "user", "content": f"[工具结果] {m['content']}"}
+                {"role": "user", "content": f"[工具结果] {m['content']}\n\n{_anchor_text}"}
                 if m.get("role") == "tool" else dict(m)
                 for m in loop_msgs
             ]
@@ -3113,13 +3246,17 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
             # system 消息）。发送前把开头连续的 system 合并为一个。
             loop_msgs = _merge_system_messages(loop_msgs)
 
+            # 本地引擎把任意 model 名当 HuggingFace repo 解析 → 404（21:06 事故：
+            # 用户选了 gpt-4o-mini 但走本地循环，mlx server 对未知名前
+            # Hub 解析 SSL 失败回 404）。必须用引擎实际加载的模型 id。
+            _engine_model = getattr(local_llm._engine, "current_model_id", "") or model
             body = {
-                # 本地引擎把任意 model 名当 HuggingFace repo 解析 → 404（21:06 事故：
-                # 用户选了 gpt-4o-mini 但走本地循环，mlx server 对未知名前
-                # Hub 解析 SSL 失败回 404）。必须用引擎实际加载的模型 id。
-                "model": getattr(local_llm._engine, "current_model_id", "") or model,
+                "model": _engine_model,
                 "messages": loop_msgs,
-                "max_tokens": _resolve_max_tokens(model), "stream": True,
+                # 本地单轮 4096 token 上限：qwen3 系默认 12288，模型发呆时会
+                # 无休止输出英文规划（14:35 重放：单轮 4 分钟+ 不产工具调用），
+                # 4096 足以容纳一次完整分析或规划+工具调用
+                "max_tokens": min(_resolve_max_tokens(model), 4096), "stream": True,
                 "temperature": 0.5,
                 "frequency_penalty": 0.6,
                 "stop": ["<|im_end|>", "<|endoftext|>", "<end_of_turn>", "<eos>"],
@@ -3394,18 +3531,17 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
             if _pending_tool_analysis and streamed_text.strip() and not _recent_tool_failed:
                 # 推理模型(Muse/Qwen3.5/Ornith)常先输出规划文字、下一轮才调工具——
                 # 但“只声明不动手”的回复（让我读取/我再查一下…）不能当完成。
-                _planning_signals = ("tool", "工具", "读取", "查询", "搜索", "执行", "调用",
-                                     "read_file", "list_dir", "run_cmd", "write_file",
-                                     "search", "tavily", "mx_query", "step", "步骤", "下一步",
-                                     "let me", "i'll", "i will", "让我", "我先", "接下来",
-                                     "再分析", "稍后", "马上", "look at", "check the")
-                _is_planning = any(sig in streamed_text.lower() for sig in _planning_signals)
+                _is_planning = _looks_like_planning(streamed_text)
                 # 模型明确说"我改用/我要调用/我再单独查"但整轮没有实际工具调用
                 # （21:42 事故：模型说"改用联网搜索"却直接收尾，未调 tavily）——
                 # 这类带未执行意图的 ≥200 字符正文不算实质完成，继续 nudge。
                 _pending_intent = any(k in streamed_text.lower() for k in _PENDING_INTENT_PATTERNS)
+                # 纯外文长回复（如英文规划 891 字符）不算完成（13:58 事故）：
+                # 用户说中文就必须中文交付，拦截后走 nudge 用中文重写。
+                _lang_mismatch = _reply_lang_mismatch(
+                    _extract_last_user_text(current_msgs), streamed_text)
                 if (len(streamed_text.strip()) >= 200 and not _is_meta_wrapup(streamed_text)
-                        and not _pending_intent):
+                        and not _pending_intent and not _is_planning and not _lang_mismatch):
                     # 模型在工具结果后已给出实质性回答（≥200 字符）——接受为
                     # 最终答案直接收尾，不再追问。此前无差别追问导致模型
                     # 从头再答一遍，UI 里重复堆叠（17:07/17:08 两任务的
@@ -3418,11 +3554,28 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                     _track_progress(session_id, "completed", f"text_response ({len(streamed_text)} chars)")
                     logger.info(f"[LOCAL-AGENT] Iteration {iteration}: no tools, returning text ({len(streamed_text)} chars)")
                     return
+                if _lang_mismatch and not _is_planning and not _pending_intent:
+                    # 实质回答（≥200 字、非规划）但语言不符 → 不追问重分析
+                    # （会丢数据），直接翻译轮交付（09-03 事故最后一公里：
+                    # 14:45 重放中 598 字母/42 汉字 的混合英文分析即走此路）
+                    _deliver = await _force_translate(
+                        client, api_url, headers, _engine_model,
+                        streamed_text.strip(),
+                        _detect_user_language(_extract_last_user_text(current_msgs)))
+                    _pending_tool_analysis = False
+                    if _deliver != streamed_text.strip():
+                        yield {"content": "\n\n" + _deliver}
+                    current_msgs.append({"role": "assistant", "content": _deliver})
+                    _track_progress(session_id, "completed", f"translated_response ({len(_deliver)} chars)")
+                    logger.info(f"[LOCAL-AGENT] Iteration {iteration}: 语言不符，翻译轮交付 ({len(_deliver)} chars)")
+                    return
                 # 思考段提取兜底：正文是半截/声明（<200 字符、未执行意图或元评论），
                 # 但思考段里有 ≥200 字符的实质分析（27B 模型把分析全写进思考段，
                 # 21:13 事故）——直接以思考段内容作为最终回答交付，不再追问。
+                # 语言不符（英文思考）不在此交付，走 nudge/翻译兜底（09-03 事故）
                 _think_body = _extract_think_body(streamed_text)
-                if len(_think_body) >= 200 and not _is_meta_wrapup(_think_body):
+                if (len(_think_body) >= 200 and not _is_meta_wrapup(_think_body)
+                        and not _reply_lang_mismatch(_extract_last_user_text(current_msgs), _think_body)):
                     _pending_tool_analysis = False
                     current_msgs.append({"role": "assistant", "content": _think_body})
                     yield {"event": "content_revised", "content": _think_body}
@@ -3435,11 +3588,14 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                         current_msgs.append({
                             "role": "system",
                             "content": _get_localized_text(_detect_user_language(_extract_last_user_text(current_msgs)), {
-                                "zh": "不要只发声明或道歉。你刚才说还要继续——现在就调用工具去执行；如果数据其实已经足够，就把完整分析写进回复正文（含关键数字与结论）。\n"
+                                "zh": "⚠️ 必须用简体中文回复。\n"
+                                       "不要只发声明或道歉。你刚才说还要继续——现在就调用工具去执行；如果数据其实已经足够，就把完整分析写进回复正文（含关键数字与结论）。\n"
                                        "⚠️ 重要：如果连续两次查询都只返回「全部A股」或「指数」汇总（没有各板块明细），说明本查询词对「各板块汇总」无解——请立即改用 tavily_search 搜索板块资金流向排名，或用 mx_query 查具体板块（如：'半导体板块资金流向'、'人工智能板块资金流向'），不要重复查相同的汇总词。",
-                                "en": "Don't just announce or apologize. You said you would continue — call the tool NOW; if the data is sufficient, write the full analysis in your reply body.\n"
+                                "en": "You MUST reply in English.\n"
+                                      "Don't just announce or apologize. You said you would continue — call the tool NOW; if the data is sufficient, write the full analysis in your reply body.\n"
                                       "IMPORTANT: If two consecutive queries return only 'all A-shares' or 'index' summary (no sector detail), that query is unsolved — immediately switch to tavily_search for sector flows, or mx_query a specific sector (e.g., 'semiconductor sector capital flow'). Do NOT repeat the same summary query.",
-                                "ja": "宣言や謝罪だけでなく、続けると言ったなら今すぐツールを呼び出してください。データが十分なら完全な分析を本文に書いてください。\n"
+                                "ja": "必ず日本語で返信してください。\n"
+                                      "宣言や謝罪だけでなく、続けると言ったなら今すぐツールを呼び出してください。データが十分なら完全な分析を本文に書いてください。\n"
                                       "重要：連続2回「全A株」「指数」のみの要約しか返らない場合は、そのクエリは無解です。直ちに tavily_search でセクター資金流を検索するか、mx_query で具体的セクター（例：「半導体セクター資金流」）を検索してください。同じ要約クエリを繰り返さないでください。",
                             }),
                         })
@@ -3448,18 +3604,21 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                         current_msgs.append({
                             "role": "system",
                             "content": _get_localized_text(_detect_user_language(_extract_last_user_text(current_msgs)), {
-                                "zh": "⚠️ 你刚才收到了工具的执行结果，但你的回复里没有给出实质内容"
+                                "zh": "⚠️ 必须用简体中文回复。\n"
+                                       "⚠️ 你刚才收到了工具的执行结果，但你的回复里没有给出实质内容"
                                        "（只有收尾话或道歉，真正的分析还留在你的思考里）。\n"
                                        "如果还需要数据，直接调用工具；否则把完整的分析写进回复正文："
                                        "包含从工具结果中得到的关键数据与结论，让用户直接读到。\n"
                                        "调用工具格式：```tool 工具名\n{\"参数\":\"值\"}\n```",
-                                "en": "⚠️ You received tool results but your reply contained no real content"
+                                "en": "You MUST reply in English.\n"
+                                      "⚠️ You received tool results but your reply contained no real content"
                                       " (only meta-commentary or apologies).\n"
                                       "If you still need data, call a tool directly; otherwise write"
                                       " the FULL analysis into your reply body with key data and"
                                       " conclusions from the tool results.\n"
                                       "Tool format: ```tool tool_name\n{\"param\":\"value\"}\n```",
-                                "ja": "⚠️ ツール実行結果を受け取りましたが、返信に実質的な内容がありません"
+                                "ja": "必ず日本語で返信してください。\n"
+                                      "⚠️ ツール実行結果を受け取りましたが、返信に実質的な内容がありません"
                                       "（メタコメントや謝罪のみ）。\n"
                                       "データがまだ必要なら直接ツールを呼び出し、そうでなければ主要データと"
                                       "結論を含む完全な分析を本文に書いてください。\n"
@@ -3476,18 +3635,22 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                 # 思考里已有分析但正文只回意图声明（09-02 09:56 事故：mx_query
                 # 数据到手，3 轮 nudge 模型仍只回 9 字符声明）。
                 final_answer = ""
+                _user_lang = _detect_user_language(_extract_last_user_text(current_msgs))
+                _lang_name = {"zh": "简体中文", "en": "English", "ja": "日本語"}.get(_user_lang, "简体中文")
                 try:
                     _final_msgs = [m for m in current_msgs if m.get("role") != "system"][-8:]
                     _final_msgs = _final_msgs + [{
                         "role": "system",
                         "content": (
-                            "任务收尾。请现在直接写出对用户的最终回答：把之前工具结果中的关键数据"
+                            f"任务收尾。请现在直接写出对用户的最终回答（必须用{_lang_name}）："
+                            "把之前工具结果中的关键数据"
                             "与分析结论完整写进正文。不要再声明意图、不要再道歉、不要再调用任何工具。"
                             "直接输出分析内容本身。"
                         ),
                     }]
                     _fb = {
-                        "model": model, "messages": _final_msgs,
+                        # 同主循环：必须用引擎实际模型 id，任意名会被当 HF repo 解析 404
+                        "model": _engine_model, "messages": _final_msgs,
                         "max_tokens": 2048, "stream": False,
                         "temperature": 0.4, "frequency_penalty": 0.6,
                         "stop": ["<|im_end|>", "</think>", "<eos>"],
@@ -3499,13 +3662,25 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                                         .get("message", {}).get("content", "") or "").strip()
                 except Exception:
                     logger.warning("终答提取失败，回退原始文本", exc_info=True)
+                # 语言兜底：终答仍为外文时，做一轮强制翻译（模型对翻译任务执行
+                # 稳定，保证用户永远收到母语回复，09-03 事故最后一公里）
+                if final_answer and _reply_lang_mismatch(_extract_last_user_text(current_msgs), final_answer):
+                    final_answer = await _force_translate(
+                        client, api_url, headers, _engine_model, final_answer, _user_lang)
                 # 终答有效（比原声明长 3 倍以上）→ 交付终答；否则维持原收尾
                 if len(final_answer) > max(200, len(streamed_text.strip()) * 3):
                     yield {"content": "\n\n" + _strip_think_fences(final_answer)}
                     _track_progress(session_id, "completed", f"final_answer ({len(final_answer)} chars)")
                     return
-                current_msgs.append({"role": "assistant", "content": streamed_text.strip()})
-                _track_progress(session_id, "completed", f"text_response ({len(streamed_text)} chars)")
+                # 原文本语言兜底：外文 → 强制翻译一轮再交付
+                _deliver = streamed_text.strip()
+                if _deliver and _reply_lang_mismatch(_extract_last_user_text(current_msgs), _deliver):
+                    _deliver = await _force_translate(
+                        client, api_url, headers, _engine_model, _deliver, _user_lang)
+                    if _deliver != streamed_text.strip():
+                        yield {"content": "\n\n" + _deliver}
+                current_msgs.append({"role": "assistant", "content": _deliver})
+                _track_progress(session_id, "completed", f"text_response ({len(_deliver)} chars)")
                 logger.warning(f"[LOCAL-AGENT] Iteration {iteration}: {_intent_nudges} 轮追问仍无实质回答，收尾返回")
                 # 必须 return：之前这里只打日志不返回，落回"短回答追问"分支
                 # 再白送一轮（20:48 事故：收尾后又进"追问充分回答一轮"，迭代 6 重复跑）
@@ -3652,13 +3827,16 @@ def _build_chat_messages(body: dict, messages: list) -> list:
     system_parts.append(_get_localized_text(user_lang, {
         "zh": "🗣 语言规则：工具返回内容、读取的文件、历史日志中的英文只是数据；"
               "你的回复语言必须始终跟随用户消息的语言（简体中文），"
-              "不因上下文中的英文材料改变。",
+              "不因上下文中的英文材料改变。包括你的思考过程在内，"
+              "全部使用简体中文。",
         "en": "🗣 Language rule: English in tool results, files, or logs is just data; "
               "your reply language must always follow the user's message language (English), "
-              "regardless of the language of surrounding context.",
+              "regardless of the language of surrounding context. "
+              "Use English throughout, including your reasoning.",
         "ja": "🗣 言語ルール：ツール結果・ファイル・ログ内の外国語はデータに過ぎません。"
               "返信言語は常にユーザーメッセージの言語（日本語）に従い、"
-              "周辺の英文資料に影響されてはいけません。",
+              "周辺の英文資料に影響されてはいけません。"
+              "思考プロセスを含め、すべて日本語で行ってください。",
     }))
 
     # User identity — personal preferences (lower priority)
