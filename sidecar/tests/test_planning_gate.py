@@ -104,6 +104,17 @@ class TestCountSuccessfulDuplicates(unittest.TestCase):
         ]
         self.assertEqual(_count_successful_duplicates(msgs, "read_file", {"path": "~/.local-ai-os/PROGRESS.md"}), 2)
 
+    def test_tilde_and_absolute_paths_are_same(self):
+        # 17:10 重放：模型用 "~" 与绝对路径交替重读同一文件绕过护栏
+        msgs = [
+            self._assistant_call("c1", "read_file", {"path": "~/.local-ai-os/PROGRESS.md"}),
+            self._msg("tool", tool_call_id="c1", content="(早期进度已轮转) ..."),
+            self._assistant_call("c2", "read_file", {"path": "/Users/langzuxiang/.local-ai-os/PROGRESS.md"}),
+            self._msg("tool", tool_call_id="c2", content="(早期进度已轮转) ..."),
+        ]
+        self.assertEqual(_count_successful_duplicates(msgs, "read_file", {"path": "~/.local-ai-os/PROGRESS.md"}), 2)
+        self.assertEqual(_count_successful_duplicates(msgs, "read_file", {"path": "/Users/langzuxiang/.local-ai-os/PROGRESS.md"}), 2)
+
     def test_failure_not_counted(self):
         msgs = [
             self._assistant_call("c1", "tavily_search", {"query": "q"}),

@@ -2442,14 +2442,21 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                 if len(streamed_text.strip()) >= 200:
                     # 工具结果后已给出实质性回答——接受为最终答案直接收尾
                     # （与 local 循环同口径，防追问后重答堆叠）
-                    current_msgs.append({"role": "assistant", "content": streamed_text.strip()})
-                    if _should_reflect(reflection_mode, streamed_text, _is_local_llm_url(api_url)):
+                    # 语言确保：不符则以 content_revised 整体替换上一条（云端仍直播，
+                    # 遵循度好，属兜底；16:50 事故同款保护）
+                    _deliver = await _ensure_final_language(
+                        client, api_url, headers, model,
+                        streamed_text.strip(), last_user_text)
+                    if _deliver != streamed_text.strip():
+                        yield {"event": "content_revised", "content": _deliver}
+                    current_msgs.append({"role": "assistant", "content": _deliver})
+                    if _should_reflect(reflection_mode, _deliver, _is_local_llm_url(api_url)):
                         _tool_outs = [str(m.get("content") or "") for m in current_msgs if m.get("role") == "tool"]
-                        _revised, _changed = await _reflect_output(streamed_text, model, api_url, headers, reflection_mode, client, _tool_outs)
+                        _revised, _changed = await _reflect_output(_deliver, model, api_url, headers, reflection_mode, client, _tool_outs)
                         if _changed and _revised.strip():
                             streamed_text = _revised
                             yield {"event": "reflection_revised", "content": _revised}
-                    _track_progress(session_id, "completed", f"text_response ({len(streamed_text)} chars)")
+                    _track_progress(session_id, "completed", f"text_response ({len(_deliver)} chars)")
                     return
                 current_msgs.append({
                     "role": "system",
@@ -2477,7 +2484,13 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                         if _changed and _revised.strip():
                             streamed_text = _revised
                             yield {"event": "reflection_revised", "content": _revised}
-                    _track_progress(session_id, "completed", f"text_response ({len(streamed_text)} chars)")
+                    # 语言兜底：不符则以 content_revised 整体替换（同 2448 路径）
+                    _deliver = await _ensure_final_language(
+                        client, api_url, headers, model,
+                        streamed_text.strip(), user_q)
+                    if _deliver != streamed_text.strip():
+                        yield {"event": "content_revised", "content": _deliver}
+                    _track_progress(session_id, "completed", f"text_response ({len(_deliver)} chars)")
                     return
                 # 任务型请求但模型只回文字不调工具 → nudge 促其行动（不再向用户重复流式输出）
                 current_msgs.append({
@@ -2699,6 +2712,24 @@ def _reply_lang_mismatch(user_text: str, reply_text: str) -> bool:
 _REPEAT_ALLOWED_TOOLS = frozenset({"screen_capture", "control_wait"})
 
 
+async def _ensure_final_language(client, api_url: str, headers: dict, engine_model: str,
+                                 text: str, user_text: str) -> str:
+    """交付前语言确保：回复语言与用户消息不符时走翻译轮，返回可交付文本。
+
+    缓冲交付后所有 return 路径统一经过这里——即使收尾闸门被跳过
+    （如工具失败分支），英文也不会原样到达用户（16:55 事故）。
+    翻译轮失败（引擎瞬时故障）时加中文说明前缀再交付，用户不会看到
+    无解释的纯英文。"""
+    if text and _reply_lang_mismatch(user_text, text):
+        translated = await _force_translate(client, api_url, headers, engine_model, text,
+                                            _detect_user_language(user_text))
+        if translated == text:
+            return (f"⚠️ 本地模型本轮生成了英文回复，自动翻译暂不可用"
+                    f"（可回复「继续」让我重新整理）。原文如下：\n\n{text}")
+        return translated
+    return text
+
+
 async def _force_translate(client, api_url: str, headers: dict, engine_model: str,
                            text: str, user_lang: str) -> str:
     """一轮强制翻译：把模型回复翻译成用户语言（本地引擎非流式单轮）。
@@ -2707,24 +2738,30 @@ async def _force_translate(client, api_url: str, headers: dict, engine_model: st
     （09-03 事故：两轮中文规则+3 次 nudge 后 27B 模型仍输出英文）。失败时
     返回原文（不阻断交付）。"""
     lang_name = {"zh": "简体中文", "en": "English", "ja": "日本語"}.get(user_lang, "简体中文")
-    try:
-        _tmsgs = [
-            {"role": "system",
-             "content": (f"你是翻译器。把用户提供的文本完整翻译成{lang_name}，"
-                         "直接输出译文。不要调用工具，不要输出任何解释、注释或前后缀。")},
-            {"role": "user", "content": text[:6000]},
-        ]
-        _tb = {"model": engine_model, "messages": _tmsgs, "max_tokens": 4096,
-               "stream": False, "temperature": 0.2, "stop": ["<|im_end|>", "<eos>"]}
-        async with _local_llm_serialized(api_url):
-            _tr = await client.post(api_url, json=_tb, headers=headers)
-        if _tr.status_code == 200:
-            out = ((_tr.json().get("choices") or [{}])[0]
-                   .get("message", {}).get("content", "") or "").strip()
-            if out and len(out) >= 40:
-                return _strip_think_fences(out)
-    except Exception:
-        logger.warning("强制翻译轮失败，返回原文", exc_info=True)
+    _tmsgs = [
+        {"role": "system",
+         "content": (f"你是翻译器。把用户提供的文本完整翻译成{lang_name}，"
+                     "直接输出译文。不要调用工具，不要输出任何解释、注释或前后缀。")},
+        {"role": "user", "content": text[:6000]},
+    ]
+    _tb = {"model": engine_model, "messages": _tmsgs, "max_tokens": 4096,
+           "stream": False, "temperature": 0.2, "stop": ["<|im_end|>", "<eos>"]}
+    # 引擎长流刚结束时偶发连接重置（17:17 实测 608ms 内 read 失败）——重试一次
+    for _attempt in range(2):
+        try:
+            async with _local_llm_serialized(api_url):
+                _tr = await client.post(api_url, json=_tb, headers=headers)
+            if _tr.status_code == 200:
+                out = ((_tr.json().get("choices") or [{}])[0]
+                       .get("message", {}).get("content", "") or "").strip()
+                if out and len(out) >= 40:
+                    return _strip_think_fences(out)
+            return text
+        except Exception:
+            if _attempt == 0:
+                await asyncio.sleep(2)
+                continue
+            logger.warning("强制翻译轮失败，返回原文", exc_info=True)
     return text
 
 
@@ -2733,7 +2770,13 @@ def _count_successful_duplicates(current_msgs: list, tool_name: str, args: dict)
     保留"失败→重试一次"的合法模式；14:26 事故：模型被 nudge 后反复重读
     PROGRESS.md 每轮重跑启动协议陷入循环）。"""
     try:
-        args_sig = json.dumps(args, ensure_ascii=False, sort_keys=True)
+        _norm_args = dict(args)
+        # 路径归一化：read_file 的 "~" 与绝对路径指向同一文件，
+        # 不归一化时模型交替两种写法就能绕过护栏（17:10 重放实测）
+        if tool_name == "read_file" and _norm_args.get("path"):
+            from pathlib import Path as _P
+            _norm_args["path"] = str(_P(_norm_args["path"]).expanduser())
+        args_sig = json.dumps(_norm_args, ensure_ascii=False, sort_keys=True)
     except Exception:
         return 0
     call_ids: set[str] = set()
@@ -2745,8 +2788,11 @@ def _count_successful_duplicates(current_msgs: list, tool_name: str, args: dict)
             if f.get("name") != tool_name:
                 continue
             try:
-                same = (json.dumps(json.loads(f.get("arguments", "{}")),
-                                   ensure_ascii=False, sort_keys=True) == args_sig)
+                _a = json.loads(f.get("arguments", "{}"))
+                if tool_name == "read_file" and isinstance(_a, dict) and _a.get("path"):
+                    from pathlib import Path as _P
+                    _a["path"] = str(_P(_a["path"]).expanduser())
+                same = (json.dumps(_a, ensure_ascii=False, sort_keys=True) == args_sig)
             except Exception:
                 same = False
             if same and tc.get("id"):
@@ -3361,20 +3407,11 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                                             if len(_ded) < len(streamed_text):
                                                 _dedup_fired = True
                                                 streamed_text = _ded + content
-                                        if text_output_delivered:
-                                            # 追问续写轮：用替换事件更新上一条消息，
-                                            # 不再追加新气泡（17:07/17:08 重复堆叠的修复）。
-                                            # 节流：每 40 个 delta 发一次全量累积文本，
-                                            # 前端收到后整体替换上一条 assistant 消息。
-                                            if _raw_delta_count % 40 == 0:
-                                                yield {"event": "content_revised", "content": _strip_think_fences(streamed_text)}
-                                            continue
-                                        # 剥掉 think 围栏标记（```think>/```think<）——否则
-                                        # ReactMarkdown 把它当未闭合代码块 → 后续正文灰框；
-                                        # 用缓冲过滤器捕获被 tokenizer 拆分的围栏
-                                        _clean = _fence_filter.feed(content)
-                                        if _clean:
-                                            yield {"content": _clean}
+                                        # 缓冲交付（16:50 事故）：本地模型内容不再逐字直播——
+                                        # 英文会在收尾闸门/翻译轮运行之前就漏给用户。
+                                        # 本轮内容全部累积，由各交付 return 路径统一做
+                                        # 语言确保后一次性交付；reasoning 通道仍直播。
+                                        _fence_filter.feed(content)
                                     elif reasoning:
                                         _any_output = True
                                         streamed_text += reasoning
@@ -3387,10 +3424,6 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                                             if len(_ded) < len(streamed_text):
                                                 _dedup_fired = True
                                                 streamed_text = _ded + reasoning
-                                        if text_output_delivered:
-                                            if _raw_delta_count % 40 == 0:
-                                                yield {"event": "content_revised", "content": _strip_think_fences(streamed_text)}
-                                            continue
                                         yield {"reasoning": reasoning, "ts": int(time.time() * 1000)}
                                 except (json.JSONDecodeError, KeyError, TypeError, IndexError):
                                     pass
@@ -3432,11 +3465,9 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                     await asyncio.sleep(10)
                     continue
 
-            # 收尾修正：本轮产过正文就发一次全量替换——前端支持任意时刻
-            # content_revised（App.tsx 893 整体替换最后一条 assistant 消息），
-            # 把流中可能残留的围栏（buffer 未命中）在收尾统一剥干净（双保险）
-            if (text_output_delivered or _any_output) and streamed_text.strip():
-                yield {"event": "content_revised", "content": _strip_think_fences(streamed_text)}
+            # 收尾修正已移除（16:50 事故）：此前每轮流结束都发一次 content_revised
+            # 全量替换，等于把模型文本在闸门/翻译之前直播给用户。缓冲交付下
+            # 文本只由各交付 return 路径一次性 yield。
 
             # Check for tool calls in the streamed text
             clean_text, tool_calls = _parse_prompt_tool_calls(streamed_text)
@@ -3549,10 +3580,15 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                     # 例外：元评论式收尾（"上面的分析已覆盖…任务完成"）不算
                     # 实质回答——分析只在模型思考里，正文从未交付（19:38
                     # 事故），继续走追问轮。
+                    # 缓冲交付：语言确保后一次性交付（16:50 事故后不再直播）
+                    _deliver = await _ensure_final_language(
+                        client, api_url, headers, _engine_model,
+                        streamed_text.strip(), _extract_last_user_text(current_msgs))
                     _pending_tool_analysis = False
-                    current_msgs.append({"role": "assistant", "content": streamed_text.strip()})
-                    _track_progress(session_id, "completed", f"text_response ({len(streamed_text)} chars)")
-                    logger.info(f"[LOCAL-AGENT] Iteration {iteration}: no tools, returning text ({len(streamed_text)} chars)")
+                    current_msgs.append({"role": "assistant", "content": _deliver})
+                    yield {"content": "\n\n" + _strip_think_fences(_deliver)}
+                    _track_progress(session_id, "completed", f"text_response ({len(_deliver)} chars)")
+                    logger.info(f"[LOCAL-AGENT] Iteration {iteration}: no tools, returning text ({len(_deliver)} chars)")
                     return
                 if _lang_mismatch and not _is_planning and not _pending_intent:
                     # 实质回答（≥200 字、非规划）但语言不符 → 不追问重分析
@@ -3563,8 +3599,7 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                         streamed_text.strip(),
                         _detect_user_language(_extract_last_user_text(current_msgs)))
                     _pending_tool_analysis = False
-                    if _deliver != streamed_text.strip():
-                        yield {"content": "\n\n" + _deliver}
+                    yield {"content": "\n\n" + _strip_think_fences(_deliver)}
                     current_msgs.append({"role": "assistant", "content": _deliver})
                     _track_progress(session_id, "completed", f"translated_response ({len(_deliver)} chars)")
                     logger.info(f"[LOCAL-AGENT] Iteration {iteration}: 语言不符，翻译轮交付 ({len(_deliver)} chars)")
@@ -3672,13 +3707,12 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                     yield {"content": "\n\n" + _strip_think_fences(final_answer)}
                     _track_progress(session_id, "completed", f"final_answer ({len(final_answer)} chars)")
                     return
-                # 原文本语言兜底：外文 → 强制翻译一轮再交付
-                _deliver = streamed_text.strip()
-                if _deliver and _reply_lang_mismatch(_extract_last_user_text(current_msgs), _deliver):
-                    _deliver = await _force_translate(
-                        client, api_url, headers, _engine_model, _deliver, _user_lang)
-                    if _deliver != streamed_text.strip():
-                        yield {"content": "\n\n" + _deliver}
+                # 原文本语言兜底：外文 → 强制翻译一轮再交付；缓冲交付下必须
+                # 无条件显式 yield（此前依赖流式直播，16:50 事故后已移除）
+                _deliver = await _ensure_final_language(
+                    client, api_url, headers, _engine_model,
+                    streamed_text.strip(), _extract_last_user_text(current_msgs))
+                yield {"content": "\n\n" + _strip_think_fences(_deliver)}
                 current_msgs.append({"role": "assistant", "content": _deliver})
                 _track_progress(session_id, "completed", f"text_response ({len(_deliver)} chars)")
                 logger.warning(f"[LOCAL-AGENT] Iteration {iteration}: {_intent_nudges} 轮追问仍无实质回答，收尾返回")
@@ -3693,7 +3727,12 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                 user_q = _extract_last_user_text(current_msgs).strip().rstrip("?？") if current_msgs else ""
                 has_task_kw = any(kw in user_q for kw in ["运行", "执行", "做", "帮我", "写", "创建", "查", "搜", "找", "分析", "修复", "构建", "部署", "安装", "配置", "run", "build", "fix", "create", "search", "analyze", "deploy"])
                 if not has_task_kw:
-                    _track_progress(session_id, "completed", f"text_response ({len(streamed_text)} chars)")
+                    # 缓冲交付：语言确保 + 显式 yield（闲聊回复也可能英文）
+                    _deliver = await _ensure_final_language(
+                        client, api_url, headers, _engine_model,
+                        streamed_text.strip(), user_q)
+                    yield {"content": "\n\n" + _strip_think_fences(_deliver)}
+                    _track_progress(session_id, "completed", f"text_response ({len(_deliver)} chars)")
                     return
                 # 任务型请求但模型只回文字不调工具 → nudge 促其行动（不再向用户重复流式输出）
                 logger.info(f"[LOCAL-AGENT] Iteration {iteration}: model planning instead of calling tools, nudging (streak={text_only_streak})")
@@ -3779,8 +3818,15 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                 logger.info(f"[LOCAL-AGENT] Iteration {iteration}: 短回答+有实质资料({_tool_out_total} chars)，追问充分回答一轮")
                 continue
 
-            _track_progress(session_id, "completed", f"text_response ({len(streamed_text)} chars)")
-            logger.info(f"[LOCAL-AGENT] Iteration {iteration}: no tools, returning text ({len(streamed_text)} chars)")
+            # 无检查兜底路径（门控被 _recent_tool_failed 跳过时落在这里，
+            # 16:55 事故英文 425 字符即从此交付）——缓冲交付下必须
+            # 语言确保 + 显式 yield，英文不再原样到达用户
+            _deliver = await _ensure_final_language(
+                client, api_url, headers, _engine_model,
+                streamed_text.strip(), _extract_last_user_text(current_msgs))
+            yield {"content": "\n\n" + _strip_think_fences(_deliver)}
+            _track_progress(session_id, "completed", f"text_response ({len(_deliver)} chars)")
+            logger.info(f"[LOCAL-AGENT] Iteration {iteration}: no tools, returning text ({len(_deliver)} chars)")
             return
 
         tool_count = sum(1 for m in current_msgs if m.get("role") == "tool")
