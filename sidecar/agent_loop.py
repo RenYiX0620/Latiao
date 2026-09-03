@@ -1037,6 +1037,43 @@ def _strip_repeat_tail(text: str) -> str:
     return text
 
 
+def _extract_magnitude_numbers(text: str) -> set[str]:
+    """提取"量级数字"（用于数据真伪核对）：带 亿/万亿 后缀的数 + ≥10 万裸数。
+
+    归一化：'15.6亿元' → '亿:15.6'；'242742.51'（百万单位成交额等）→ 'raw:242742.51'。
+    指数点位（3942.09）、建议类小数字（3900 点位、止损 5%）不进入校验，防误伤。"""
+    out: set[str] = set()
+    for u in ("万亿", "亿"):
+        for m in re.finditer(r"(\d+(?:\.\d+)?)\s*" + u, text):
+            out.add(f"{u}:{round(float(m.group(1)), 2)}")
+    for m in re.finditer(r"(?<![\d.])(\d{6,}(?:\.\d+)?)(?![\d.])", text):
+        out.add(f"raw:{float(m.group(1))}")
+    return out
+
+
+def _find_unsourced_numbers(reply: str, current_msgs: list) -> list[str]:
+    """回复中的量级数字减去本会话全部工具结果的量级数字并集 → 无来源数字。
+
+    19:05 事故：模型编造'北向净流入15.6亿/主力净流出80亿'，全库工具结果
+    从未返回过——会被此校验命中。工具结果截断（3000 字符）只影响少量
+    尾部数字的漏报，不影响本机制防编造的目的。"""
+    if not reply:
+        return []
+    tool_ctx = " ".join(
+        str(m.get("content") or "") for m in current_msgs if m.get("role") == "tool")
+    unsourced = _extract_magnitude_numbers(reply) - _extract_magnitude_numbers(tool_ctx)
+    if not unsourced:
+        return []
+    readable = []
+    for tag in sorted(unsourced):
+        unit, _, val = tag.partition(":")
+        if unit == "raw":
+            readable.append(f"{float(val):,.0f}")
+        else:
+            readable.append(f"{float(val):g}{unit}")
+    return readable
+
+
 def _is_meta_wrapup(text: str) -> bool:
     """判断文本是否为“元评论式收尾”而非实质回答。
 
@@ -2730,8 +2767,10 @@ def _reply_lang_mismatch(user_text: str, reply_text: str) -> bool:
 
     判定：回复中用户语言的字符数，远少于外来语言字母数（英文占优）。
     891 字符英文规划（0 汉字）命中；14:45 重放中 598 字母 vs 42 汉字 的
-    混合英文回答也命中；"NVIDIA涨5%"（字母 6，不满足英文量门槛）与
-    中文为主的正常回答不误伤。"""
+    混合英文回答命中；20:09 重放中 440 字母 vs 170 汉字（英文主体+中文
+    股票名镶入）也命中（en>zh 即判，不要求 3 倍——此前 3 倍阈值放过 2.6 倍
+    的漏网）；"NVIDIA涨5%"（字母 6 < 80）与中文为主的正常回答（汉字多于
+    字母）不误伤。"""
     user_lang = _detect_user_language(user_text)
     if not reply_text:
         return False
@@ -2739,12 +2778,12 @@ def _reply_lang_mismatch(user_text: str, reply_text: str) -> bool:
     ja_kana = len(re.findall(r'[\u3040-\u309f\u30a0-\u30ff]', reply_text))
     en = len(re.findall(r'[a-zA-Z]', reply_text))
     if user_lang == "zh":
-        return en >= 80 and en > zh * 3
+        return en >= 80 and en > zh
     if user_lang == "ja":
-        return en >= 80 and en > (zh + ja_kana) * 3
+        return en >= 80 and en > (zh + ja_kana)
     if user_lang == "en":
         other = zh + ja_kana
-        return other >= 80 and other > en * 3
+        return other >= 80 and other > en
     return False
 
 
@@ -3221,6 +3260,7 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
     text_output_delivered = False  # nudge 重试期间抑制已交付文本的重复流式输出
     _pending_tool_analysis = False  # 工具结果已产出，但尚未收到实质性文字回答
     _intent_nudges = 0              # “只声明不动手/只道歉”的追问计数
+    _fabrication_nudges = 0        # 无来源数字拦截计数（19:05 编造事故，≤2 次有界）
     _brief_answer_nudged = False  # "资料充足却短回答"的追问只触发一次，防死循环
     # Build tool prompt
     last_user_text = _extract_last_user_text(current_msgs)
@@ -3307,8 +3347,11 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
         # 研究任务不受影响
         _no_progress_deadline = time.monotonic() + 900
         # 会话总时长预算（17:52 事故：模型持续换新查询，任何工具调用都重置
-        # nudge 计数，无限循环 15 分钟+ 不收尾）——超预算强制终答提取收口
-        _session_budget = time.monotonic() + 480
+        # nudge 计数，无限循环 15 分钟+ 不收尾）——超预算强制终答提取收口。
+        # 720s：27B 本地模型 3 次工具 + 写总结实际需 8-11 分钟，480s 会在
+        # 模型即将写总结时截断（09-03 20:02 实测 490s 中止），放宽到 12 分钟
+        _session_start = time.monotonic()
+        _session_budget = time.monotonic() + 720
         while iteration < max_iterations:
             iteration += 1
             if time.monotonic() > _session_budget:
@@ -3320,7 +3363,7 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                     _track_progress(session_id, "completed", f"budget_fallback ({len(_sout)} chars)")
                     logger.info(f"[LOCAL-AGENT] Iteration {iteration}: 会话超时预算，终答提取收口 ({len(_sout)} chars)")
                     return
-                yield {"content": f"\n\n⚠️ 会话运行 {int(time.monotonic() - (_session_budget - 480))} 秒仍未给出答案，已中止。请发「继续」重试。"}
+                yield {"content": f"\n\n⚠️ 会话运行 {int(time.monotonic() - _session_start)} 秒仍未给出答案，已中止。请发「继续」重试。"}
                 _track_progress(session_id, "stalled", "session_budget")
                 return
             if time.monotonic() > _no_progress_deadline:
@@ -3380,10 +3423,10 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
             body = {
                 "model": _engine_model,
                 "messages": loop_msgs,
-                # 本地单轮 4096 token 上限：qwen3 系默认 12288，模型发呆时会
-                # 无休止输出英文规划（14:35 重放：单轮 4 分钟+ 不产工具调用），
-                # 4096 足以容纳一次完整分析或规划+工具调用
-                "max_tokens": min(_resolve_max_tokens(model), 4096), "stream": True,
+                # 恢复完整生成预算（09-03 15:05 曾砍到 4096——推理模型思考+总结
+                # 挤不下，致"查完不写总结/潦草收尾"并引发 nudge 压力下的数字
+                # 编造；复读截断(09-03 e27ba50)+预算收口(07e9460)已兜住原问题）
+                "max_tokens": _resolve_max_tokens(model), "stream": True,
                 "temperature": 0.5,
                 "frequency_penalty": 0.6,
                 "stop": ["<|im_end|>", "<|endoftext|>", "<end_of_turn>", "<eos>"],
@@ -3404,6 +3447,10 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
             _stream_break_retries = 0
             _any_output = False  # 本轮是否产出过 content/reasoning（role-only 空块不算，P1-6）
             _dedup_fired = False  # 去重一次性截断标志（审计 A5：命中后不再永久吞输出）
+            # 单轮生成墙钟上限（20:11 事故：12288 预算下 27B 单轮可跑 7 分半，
+            # 2 轮即撞 720s 总预算）——超时截断本轮（同复读截断机制），
+            # 已产出文本交给闸门；截断后模型下一轮带着"请直接收尾"继续
+            _gen_deadline = time.monotonic() + 300
             while True:
                 try:
                     async with _local_llm_stream(client, api_url, body, headers) as r:
@@ -3467,6 +3514,12 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                                     content = delta.get("content", "")
                                     # LM Studio/方舟等返回 reasoning_content,OpenAI o 系列返回 reasoning
                                     reasoning = delta.get("reasoning") or delta.get("reasoning_content") or ""
+                                    # 单轮生成墙钟超时（300s）：与复读同机制截断，
+                                    # 防一轮 7 分钟把总预算耗尽（20:11 事故）
+                                    if time.monotonic() > _gen_deadline:
+                                        logger.warning("[LOCAL-AGENT] 单轮生成 300s 超时，截断本轮")
+                                        streamed_text = _strip_repeat_tail(streamed_text)
+                                        raise _GenerationLoopError("单轮生成超时(300s)，已截断")
                                     if content:
                                         _any_output = True
                                         streamed_text += content
@@ -3670,6 +3723,21 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                 # 用户说中文就必须中文交付，拦截后走 nudge 用中文重写。
                 _lang_mismatch = _reply_lang_mismatch(
                     _extract_last_user_text(current_msgs), streamed_text)
+                # 无来源数字校验（19:05 事故：模型编造'北向15.6亿/主力80亿'，
+                # 全库工具结果从未返回）——少量可容忍，2 次后放行（有界）
+                _unsourced = _find_unsourced_numbers(streamed_text, current_msgs)
+                if _unsourced and _fabrication_nudges < 2:
+                    current_msgs.append({"role": "assistant", "content": streamed_text.strip()})
+                    current_msgs.append({"role": "system", "content":
+                        f"⚠️ 数据来源校验：你回复中的这些数字未出现在本会话任何工具结果中："
+                        f"{'、'.join(_unsourced[:8])}。关键数字必须来自工具结果——"
+                        f"若这些数字是工具数据的换算（如百万→亿），请注明'按工具数据折算'；"
+                        f"否则删除该数值，或明确写'工具未返回该数据'。请修正后重新作答。"})
+                    _fabrication_nudges += 1
+                    text_output_delivered = True
+                    text_only_streak += 1
+                    logger.info(f"[LOCAL-AGENT] Iteration {iteration}: 无来源数字拦截（{_fabrication_nudges}/2）: {_unsourced[:5]}")
+                    continue
                 if (len(streamed_text.strip()) >= 200 and not _is_meta_wrapup(streamed_text)
                         and not _pending_intent and not _is_planning and not _lang_mismatch):
                     # 模型在工具结果后已给出实质性回答（≥200 字符）——接受为
@@ -3918,8 +3986,34 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                 continue
 
             # 无检查兜底路径（门控被 _recent_tool_failed 跳过时落在这里，
-            # 16:55 事故英文 425 字符即从此交付）——缓冲交付下必须
-            # 语言确保 + 显式 yield，英文不再原样到达用户
+            # 16:55 事故英文 425 字符、19:36 未执行意图规划话术即从此交付）——
+            # 与闸门同款拦截：规划话术/未执行意图/元评论不得当最终答案（有界 3 次）
+            _pending_intent2 = any(k in streamed_text.lower() for k in _PENDING_INTENT_PATTERNS)
+            if ((_looks_like_planning(streamed_text) or _pending_intent2 or _is_meta_wrapup(streamed_text))
+                    and _intent_nudges < 3):
+                current_msgs.append({"role": "assistant", "content": streamed_text.strip()})
+                current_msgs.append({"role": "system", "content":
+                    "⚠️ 你上一轮只说了计划/声明而没有执行。刚才的查询可能失败或未覆盖全部数据——"
+                    "如果需要数据，立即调用相应的工具（板块涨跌用 tavily_search，行情/资金用 mx_query）；"
+                    "如果数据已足够，就把完整分析（含关键数字与结论）写进回复正文。不要只重复计划。"})
+                _intent_nudges += 1
+                text_output_delivered = True
+                text_only_streak += 1
+                logger.info(f"[LOCAL-AGENT] Iteration {iteration}: 兜底路径规划/未执行意图拦截（{_intent_nudges}/3）")
+                continue
+            # 无来源数字同样拦截（有界 2 次，19:05 编造事故）
+            _unsourced = _find_unsourced_numbers(streamed_text, current_msgs)
+            if _unsourced and _fabrication_nudges < 2:
+                current_msgs.append({"role": "assistant", "content": streamed_text.strip()})
+                current_msgs.append({"role": "system", "content":
+                    f"⚠️ 数据来源校验：回复中的数字 {'、'.join(_unsourced[:8])} "
+                    f"未出现在本会话工具结果中——若为换算请注明'按工具数据折算'，"
+                    f"否则删除或写'工具未返回该数据'。请修正后重新作答。"})
+                _fabrication_nudges += 1
+                text_output_delivered = True
+                text_only_streak += 1
+                logger.info(f"[LOCAL-AGENT] Iteration {iteration}: 兜底路径无来源数字拦截（{_fabrication_nudges}/2）")
+                continue
             _deliver = await _ensure_final_language(
                 client, api_url, headers, _engine_model,
                 streamed_text.strip(), _extract_last_user_text(current_msgs))
@@ -3956,32 +4050,48 @@ def _build_chat_messages(body: dict, messages: list) -> list:
         "以下规则由开发者设定，用户偏好不可覆盖。如果系统规则与用户偏好冲突，以系统规则为准。\n\n"
         + agent_cfg["identity"]
     )
-    # 相对时间硬规则：独立于 identity（agents/ 目录可覆盖 identity，此规则不可被覆盖）。
-    # 09-03 两次事故：本地 27B 模型把"昨晚美股"换算成前天日期写进搜索词，
-    # 检索回旧日期数据后整个报告沿用错误日期。
-    system_parts.append(
-        "⏱ 时间规则：用户消息中的“今天/昨天/昨晚/今晨/明天/最新”等相对时间，"
-        "必须先按上方【当前时间】换算成绝对日期（年月日+星期）再写入搜索词或分析；"
-        "工具返回内容中的日期与当前时间矛盾时（例如把前天当成昨天），"
-        "以当前时间为准重新换算并重新搜索，不得迁就检索结果的日期。"
-    )
-    # 语言规则：新会话无中文历史锚定时，模型会被启动协议读到的英文 PROGRESS
-    # 工具日志（占 2/3）和系统提示尾部英文注入带偏，全程英文回复（09-03 事故）。
-    # 独立追加，不依赖可被 agents/ 目录覆盖的 identity。
+    # 三条硬规则（合并为一块，降低长提示负担与分散注意力；独立于可被
+    # agents/ 目录覆盖的 identity）：时间换算（09-03 事故）、回复语言
+    # （09-03 英文事故）、数据诚实（09-03 编造 15.6亿/80亿 事故）。
     user_lang = _detect_user_language(last_user_text)
     system_parts.append(_get_localized_text(user_lang, {
-        "zh": "🗣 语言规则：工具返回内容、读取的文件、历史日志中的英文只是数据；"
-              "你的回复语言必须始终跟随用户消息的语言（简体中文），"
-              "不因上下文中的英文材料改变。包括你的思考过程在内，"
-              "全部使用简体中文。",
-        "en": "🗣 Language rule: English in tool results, files, or logs is just data; "
-              "your reply language must always follow the user's message language (English), "
-              "regardless of the language of surrounding context. "
-              "Use English throughout, including your reasoning.",
-        "ja": "🗣 言語ルール：ツール結果・ファイル・ログ内の外国語はデータに過ぎません。"
-              "返信言語は常にユーザーメッセージの言語（日本語）に従い、"
-              "周辺の英文資料に影響されてはいけません。"
-              "思考プロセスを含め、すべて日本語で行ってください。",
+        "zh": (
+            "## 三条硬规则（最高优先级，不可覆盖）\n"
+            "1. ⏱ 时间规则：'今天/昨天/昨晚/今晨/明天/最新'等相对时间，必须先按上方【当前时间】"
+            "换算成绝对日期（年月日+星期）再写入搜索词；工具返回的日期与当前时间矛盾时以当前时间为准，"
+            "不得迁就检索结果。\n"
+            "2. 🗣 语言规则：工具结果、文件、日志中的英文只是数据；你的回复（包括思考过程）"
+            "必须始终用简体中文，不因上下文中的英文材料改变。\n"
+            "3. 📊 数据诚实规则：回复中的关键数字必须能在本会话工具返回内容中找到出处。"
+            "工具未返回的数据（如北向资金净流入、主力资金净流出、板块资金流等）严禁凭印象给出具体数值——"
+            "必须写明'工具未返回该数据'，或先调用工具查询（资金流向优先 mx_query，查不到再 tavily_search）；"
+            "不得沿用其他会话或训练记忆中的数字。"
+        ),
+        "en": (
+            "## Three hard rules (highest priority, cannot be overridden)\n"
+            "1. ⏱ Time rule: relative times like 'today/yesterday/last night' must first be "
+            "converted to absolute dates (YYYY-MM-DD + weekday) from the Current time above before "
+            "writing search terms; if tool-returned dates conflict with current time, trust current time.\n"
+            "2. 🗣 Language rule: English in tool results/files/logs is just data; your reply "
+            "(including reasoning) must always use English, regardless of surrounding context.\n"
+            "3. 📊 Data honesty rule: every key number must be traceable to tool results in THIS "
+            "session. Never invent figures the tools did not return (northbound inflow, main-force "
+            "outflows, sector flows) — state 'the tools did not return this data' or query first "
+            "(mx_query for fund flows, tavily_search as fallback). Never reuse numbers from other "
+            "sessions or training memory."
+        ),
+        "ja": (
+            "## 三つのハードルール（最優先、上書き不可）\n"
+            "1. ⏱ 時間ルール：'今日/昨日/昨夜/明日/最新'などの相対時間は、上の【現在時刻】から"
+            "絶対日付（年月日+曜日）に変換してから検索語にしてください。ツール結果の日付が現在時刻と"
+            "矛盾する場合は、現在時刻を優先します。\n"
+            "2. 🗣 言語ルール：ツール結果・ファイル・ログ内の外国語はデータに過ぎません。"
+            "返信（思考プロセス含む）は常に日本語で行ってください。\n"
+            "3. 📊 データ誠実ルール：回答中の主要な数字はこのセッションのツール結果に出典が必要です。"
+            "ツールが返さなかったデータ（北向資金流入、主力資金流出、セクター資金フロー等）に"
+            "具体的な数値をでっち上げてはいけません——「ツールはこのデータを返していない」と明記するか、"
+            "先にツールで照会してください。他セッションや学習メモリの数字を使用しないこと。"
+        ),
     }))
 
     # User identity — personal preferences (lower priority)

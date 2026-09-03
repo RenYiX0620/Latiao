@@ -75,6 +75,18 @@ class TestReplyLangMismatch(unittest.TestCase):
                 "板块方面半导体领涨，主力净流入 12.3 亿元。结论：缩量反弹，情绪修复中，可轻仓参与。")
         self.assertFalse(_reply_lang_mismatch("分析大盘走势\n", text))
 
+    def test_zh_user_english_body_with_chinese_nouns(self):
+        # 20:09 真实漏网形态：英文主体 + 中文股票名镶入（440 字母 vs 170 汉字，2.6 倍）
+        text = ("The user wants me to analyze capital flows for A-shares on 2026-09-03. "
+                "The mx_query for 行业板块 主力资金净流入 排名 failed because mx_query "
+                "doesn't support 全市场/行业板块 summary queries. "
+                "For 大盘指数资金流向 (上证指数、深证成指、创业板指), mx_query should "
+                "support it since these are specific indices. "
+                "Let me construct the mx_query for 上证指数 深证成指 创业板指 主力资金净流入 "
+                "for 2026-09-03. Actually, for 大盘资金流向, I want to get the 主力资金净流入 "
+                "for 上证指数 first. Let me do mx_query for the 大盘指数 资金流向 now.")
+        self.assertTrue(_reply_lang_mismatch("分析资金流向\n", text))
+
     def test_en_user_chinese_long_reply(self):
         long_zh = "根据最新数据，上证指数今日小幅收涨，成交量较昨日有所放大，市场情绪回暖。" * 3
         self.assertTrue(_reply_lang_mismatch("analyze the US stock market", long_zh))
@@ -183,6 +195,39 @@ class TestStripRepeatTail(unittest.TestCase):
         from agent_loop import _strip_repeat_tail
         text = "今日大盘收涨 0.5%，上证 3961 点。创业板指涨 1.2%。综合判断缩量反弹，可轻仓参与。"
         self.assertEqual(_strip_repeat_tail(text), text)
+
+
+class TestFindUnsourcedNumbers(unittest.TestCase):
+    """无来源数字校验（19:05 编造'15.6亿/80亿'事故）。"""
+
+    def _tool(self, content):
+        return {"role": "tool", "content": content}
+
+    def test_fabricated_magnitude_numbers_flagged(self):
+        from agent_loop import _find_unsourced_numbers
+        reply = ("北向资金净流入 15.6 亿元，主力资金净流出超 80 亿；"
+                 "上证指数 3942.09 点，深证成指 13625.12 点。")
+        msgs = [self._tool("上证指数 3942.09 (+0.0178%)、深证 13625.12 (+0.0997%)、创业板 3312.54。" )]
+        out = _find_unsourced_numbers(reply, msgs)
+        self.assertIn("15.6亿", out)
+        self.assertIn("80亿", out)
+        self.assertNotIn("3942.09", out)  # 指数点位（非量级）不校验
+
+    def test_sourced_numbers_not_flagged(self):
+        from agent_loop import _find_unsourced_numbers
+        reply = "两市成交额 1.2 万亿元，北向资金净流入 15.6 亿元。"
+        msgs = [self._tool("成交额 1.2 万亿，北向资金净流入 15.6 亿元。")]
+        self.assertEqual(_find_unsourced_numbers(reply, msgs), [])
+
+    def test_small_numbers_not_checked(self):
+        from agent_loop import _find_unsourced_numbers
+        reply = "建议在 3900 点附近分批买入，仓位控制在 20%。"
+        self.assertEqual(_find_unsourced_numbers(reply, []), [])
+
+    def test_raw_big_number_checked(self):
+        from agent_loop import _find_unsourced_numbers
+        reply = "北向资金成交总额 242742.51 百万。"
+        self.assertEqual(_find_unsourced_numbers(reply, []), ["242,743"])
 
 
 if __name__ == "__main__":
