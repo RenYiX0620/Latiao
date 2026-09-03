@@ -162,5 +162,28 @@ class TestProgressSummary(unittest.TestCase):
         self.assertEqual(len(out.splitlines()) - 1, 5)
 
 
+class TestStripRepeatTail(unittest.TestCase):
+    """复读截断后裁尾：保留首次出现部分，无重复不动。"""
+
+    def test_repeat_tail_trimmed(self):
+        from agent_loop import _strip_repeat_tail, _detect_text_loop
+        text = ("今日大盘低开高走，上证指数收于 3961.32 点，涨幅 0.5%，量能温和放大。"
+                "创业板指涨 1.2%，半导体板块领涨，主力净流入明显。"
+                "创业板指涨 1.2%，半导体板块领涨，主力净流入明显。"
+                "创业板指涨 1.2%，半导体板块领涨，主力净流入明显。"
+                "创业板指涨 1.2%，半导体板块领涨，主力净流入明显。"
+                "创业板指涨 1.2%，半导体板块领涨，主力净流入明显。")
+        self.assertTrue(_detect_text_loop(text))  # 前置：确实被判为复读
+        out = _strip_repeat_tail(text)
+        self.assertFalse(_detect_text_loop(out))
+        self.assertLess(len(out), len(text))
+        self.assertIn("今日大盘低开高走", out)
+
+    def test_normal_text_untouched(self):
+        from agent_loop import _strip_repeat_tail
+        text = "今日大盘收涨 0.5%，上证 3961 点。创业板指涨 1.2%。综合判断缩量反弹，可轻仓参与。"
+        self.assertEqual(_strip_repeat_tail(text), text)
+
+
 if __name__ == "__main__":
     unittest.main()

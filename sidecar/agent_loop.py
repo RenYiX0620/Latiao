@@ -1012,6 +1012,31 @@ def _detect_text_loop(text: str) -> bool:
     return False
 
 
+class _GenerationLoopError(Exception):
+    """生成复读循环（检测器命中）：本轮生成本地截断，不炸整个会话。
+
+    此前直接 raise TimeoutError 会一路穿到 api_routes 把流收掉——
+    闸门/翻译/终答提取全被跳过，用户只拿到一句"已截断"（18:01 事故）。
+    改为在流式解析层捕获后 break，已产出文本（裁掉重复尾）交给
+    后续工具解析/收尾闸门继续处理。"""
+
+
+def _strip_repeat_tail(text: str) -> str:
+    """复读触发后裁掉尾部重复段，保留首次出现的部分。
+
+    优先用与检测器同款的正则定位重复单元，尾部只留一份（外科手术式）；
+    匹配不到时退化为粗裁 200 字符。"""
+    for _ in range(10):
+        if not _detect_text_loop(text):
+            break
+        m = re.search(r"(.{6,60}?)\1{2,}$", text, re.DOTALL)
+        if m:
+            text = text[: m.start()] + m.group(1)
+        else:
+            text = text[: max(0, len(text) - 200)]
+    return text
+
+
 def _is_meta_wrapup(text: str) -> bool:
     """判断文本是否为“元评论式收尾”而非实质回答。
 
@@ -2266,9 +2291,9 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                                         # 复读循环检测（节流）——放在 dedup 过滤之前，
                                         # 复读被 dedup 过滤时也要能截断
                                         if _raw_delta_count % 40 == 0 and _detect_text_loop(streamed_text):
-                                            logger.warning("[AGENT] 检测到输出复读循环，截断生成")
-                                            yield {"content": "\n\n⚠️ 检测到输出重复，已自动截断。"}
-                                            raise TimeoutError("输出复读循环，已截断")
+                                            logger.warning("[AGENT] 检测到输出复读循环，截断本轮生成")
+                                            streamed_text = _strip_repeat_tail(streamed_text)
+                                            raise _GenerationLoopError("输出复读循环，已截断")
                                         # 自我介绍去重：只截断一次，之后照常流式输出
                                         # （审计 A5：此前命中后永久吞掉后续真实内容）
                                         if not _dedup_fired:
@@ -2299,9 +2324,9 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                                         reasoning_text += reasoning
                                         streamed_text += reasoning
                                         if _raw_delta_count % 40 == 0 and _detect_text_loop(streamed_text):
-                                            logger.warning("[AGENT] 检测到输出复读循环，截断生成")
-                                            yield {"content": "\n\n⚠️ 检测到输出重复，已自动截断。"}
-                                            raise TimeoutError("输出复读循环，已截断")
+                                            logger.warning("[AGENT] 检测到输出复读循环，截断本轮生成")
+                                            streamed_text = _strip_repeat_tail(streamed_text)
+                                            raise _GenerationLoopError("输出复读循环，已截断")
                                         if not _dedup_fired:
                                             _ded = _deduplicate_response(streamed_text)
                                             if len(_ded) < len(streamed_text):
@@ -2330,6 +2355,10 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                                                 buf["function"]["arguments"] += tc_delta["function"]["arguments"]
                                 except (json.JSONDecodeError, KeyError, TypeError, IndexError):
                                     pass  # Malformed SSE delta — skip this event, try next
+                                except _GenerationLoopError:
+                                    # 复读截断：停止消费本轮流，已产出（裁尾后）文本
+                                    # 交给后续工具解析/收尾闸门，会话继续（18:01 事故）
+                                    break
                                 except Exception:
                                     logger.error("SSE tool_call parse error", exc_info=True)
                                     raise  # Real errors (network, memory) must surface
@@ -3447,9 +3476,9 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                                         # 无截断、引擎 100% CPU 转到 max_tokens
                                         # （16:29 任务"停在尾端没反应"的帮凶之一）
                                         if _raw_delta_count % 40 == 0 and _detect_text_loop(streamed_text):
-                                            logger.warning("[LOCAL-AGENT] 检测到输出复读循环，截断生成")
-                                            yield {"content": "\n\n⚠️ 检测到输出重复，已自动截断。"}
-                                            raise TimeoutError("输出复读循环，已截断")
+                                            logger.warning("[LOCAL-AGENT] 检测到输出复读循环，截断本轮生成")
+                                            streamed_text = _strip_repeat_tail(streamed_text)
+                                            raise _GenerationLoopError("输出复读循环，已截断")
                                         # 自我介绍去重：只截断一次，保留首段后继续流式
                                         # 输出——此前命中后永久 continue，模型第二次
                                         # "我是辣条"之后的所有真实内容被静默丢弃
@@ -3468,9 +3497,9 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                                         _any_output = True
                                         streamed_text += reasoning
                                         if _raw_delta_count % 40 == 0 and _detect_text_loop(streamed_text):
-                                            logger.warning("[LOCAL-AGENT] 检测到输出复读循环，截断生成")
-                                            yield {"content": "\n\n⚠️ 检测到输出重复，已自动截断。"}
-                                            raise TimeoutError("输出复读循环，已截断")
+                                            logger.warning("[LOCAL-AGENT] 检测到输出复读循环，截断本轮生成")
+                                            streamed_text = _strip_repeat_tail(streamed_text)
+                                            raise _GenerationLoopError("输出复读循环，已截断")
                                         if not _dedup_fired:
                                             _ded = _deduplicate_response(streamed_text)
                                             if len(_ded) < len(streamed_text):
@@ -3479,6 +3508,10 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                                         yield {"reasoning": reasoning, "ts": int(time.time() * 1000)}
                                 except (json.JSONDecodeError, KeyError, TypeError, IndexError):
                                     pass
+                                except _GenerationLoopError:
+                                    # 复读截断：停止消费本轮流，已产出（裁尾后）文本
+                                    # 交给后续工具解析/收尾闸门，会话继续（18:01 事故）
+                                    break
                                 except Exception:
                                     logger.error("Local agent SSE parse error", exc_info=True)
                                     raise
