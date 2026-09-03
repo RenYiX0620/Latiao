@@ -1767,6 +1767,24 @@ def _check_pre_hooks(tool_name: str, args: dict) -> tuple[bool, list[dict], str]
     return False, [], ""
 
 
+# 时间敏感工具：结果自带日期数据，模型易把"昨晚/今天"等相对时间换算错后
+# 被检索结果的旧日期锚定（09-03 两次事故：08:25 老会话、08:57 全新会话，
+# 均把"昨晚美股"搜成 9月1日）。
+_TIME_SENSITIVE_TOOLS = frozenset({
+    "tavily_search", "bing_search", "dokobot_search", "dokobot_read",
+    "headless_read", "mx_query", "ak_finance",
+})
+
+_WEEK_ZH = "一二三四五六日"
+
+
+def _stamp_time_sensitive() -> str:
+    """生成当前时刻锚行，注入时间敏感工具结果头部（截断后追加，不会被截掉）。"""
+    now = datetime.now()
+    return (f"⏱ [数据时刻] {now.strftime('%Y-%m-%d')} (周{_WEEK_ZH[now.weekday()]}) "
+            f"{now.strftime('%H:%M:%S')} —— 下方结果内日期若与此矛盾，以当前时间为准\n\n")
+
+
 async def _handle_tool_execution(tc: dict, current_msgs: list, session_id: str,
                                   agent_id: str, access_mode: str = "full",
                                   pre_started: dict | None = None) -> tuple[bool, list[dict]]:
@@ -1915,7 +1933,9 @@ async def _handle_tool_execution(tc: dict, current_msgs: list, session_id: str,
             + "如需查看特定部分请用 read_file 分段读取对应文件。)\n\n"
             + tool_content[-800:]
         )
-    current_msgs.append({"role": "tool", "tool_call_id": call_id, "content": tool_content})
+    current_msgs.append({"role": "tool", "tool_call_id": call_id,
+                         "content": (_stamp_time_sensitive() + tool_content
+                                     if tool_name in _TIME_SENSITIVE_TOOLS else tool_content)})
     return verify_failed, events
 
 
@@ -3612,6 +3632,15 @@ def _build_chat_messages(body: dict, messages: list) -> list:
         "## 系统规则 (最高优先级)\n"
         "以下规则由开发者设定，用户偏好不可覆盖。如果系统规则与用户偏好冲突，以系统规则为准。\n\n"
         + agent_cfg["identity"]
+    )
+    # 相对时间硬规则：独立于 identity（agents/ 目录可覆盖 identity，此规则不可被覆盖）。
+    # 09-03 两次事故：本地 27B 模型把"昨晚美股"换算成前天日期写进搜索词，
+    # 检索回旧日期数据后整个报告沿用错误日期。
+    system_parts.append(
+        "⏱ 时间规则：用户消息中的“今天/昨天/昨晚/今晨/明天/最新”等相对时间，"
+        "必须先按上方【当前时间】换算成绝对日期（年月日+星期）再写入搜索词或分析；"
+        "工具返回内容中的日期与当前时间矛盾时（例如把前天当成昨天），"
+        "以当前时间为准重新换算并重新搜索，不得迁就检索结果的日期。"
     )
 
     # User identity — personal preferences (lower priority)
