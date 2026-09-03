@@ -4160,7 +4160,21 @@ def _build_chat_messages(body: dict, messages: list) -> list:
     if goal_mode:
         extra_prompts.append(GOAL_MODE_PROMPT)
     if progressive:
-        extra_prompts.append(PROGRESSIVE_DELIVERY_PROMPT)
+        # P0 语境分流：渐进式交付协议（"阶段1骨架/阶段2核心/阶段3完善/每阶段≤30% token"）
+        # 是纯写代码的分步规范，对"查行情/分析/聊天"类任务只会诱导模型先写一堆"我将分几步做"
+        # 的声明话术，正是"意图声明未行动/8 分钟空转"的帮凶（09-03 事故）。只有任务含明显
+        # 代码/文件构建语义时才注入，其余任务改为提示"直接产出完整结果，不要分步声明"。
+        _detect_code_task = any(
+            k in (last_user_text or "").lower() for k in
+            ("代码", "编程", "写函数", "实现", "重构", "类 ", "模块", "接口",
+             "compile", "refactor", "implement", "typescript", "python", "function",
+             "class ", "module", "api ", "bugfix", "lint", "改代码", "修 bug")
+        )
+        extra_prompts.append(PROGRESSIVE_DELIVERY_PROMPT if _detect_code_task else
+            "## 交付纪律\n"
+            "用户等待的是完整结果。不要声明\"你将分几步/我接下来要做什么/让我先查一下\"之类的话术——"
+            "要么立即调用工具，要么直接写出包含关键数据与结论的完整回答。"
+            "若已有足够工具数据，直接把分析结论写入正文，不要再描述计划。")
     if extra_prompts:
         system_parts.append("\n".join(extra_prompts))
 

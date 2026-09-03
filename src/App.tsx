@@ -219,6 +219,7 @@ const [timeFilter, setTimeFilter] = useState("all");
   const [autoCheckUpdate, setAutoCheckUpdate] = useState(() => localStorage.getItem("latiao_auto_check_update") !== "false");
   const [recentLearnings, setRecentLearnings] = useState<{topic: string; content: string; confidence: number}[]>([]);
   const [agentPhase, setAgentPhase] = useState<string>("");
+  const [, setRouteInfo] = useState<{ engine: string; declaredModel: string } | null>(null);
   const [activeAgent, setActiveAgent] = useState<string>("latiao");
   const [capabilities, setCapabilities] = useState<Capability[]>([]);
   const [localLLMStatus, setLocalLLMStatus] = useState<LLMStatus>({ backend: "", status: "checking", model_id: "", model_name: "", port: 1235, message: "", has_image_support: false, token_limit: 32768 });
@@ -831,6 +832,27 @@ const [timeFilter, setTimeFilter] = useState("all");
             // ❌ error display) instead of being swallowed as "malformed event".
             if (parsed.error) throw new Error(parsed.error);
             try {
+              if (parsed.event === "engine_route") {
+                // P0 路由透明化：如实告知用户本请求实际落地的引擎，
+                // 避免"选了云端模型名却静默跑本地最慢路径"的误导。
+                const declared = String(parsed.declared_model || "");
+                const ended = parsed.engine === "cloud" ? "云端" : "本地";
+                const isLocalEngine = parsed.engine === "local";
+                // sendMessage 里云配置已由 opts.cloudConfig 传递；模型名虽被选择但
+                // 未匹配到云端配置 → 实际跑本地，正是要提醒用户的情形
+                const cloudCfgPre = opts?.model
+                  ? cloudModels.find((m) => m.name === opts.model)
+                  : undefined;
+                setAgentPhase(t("agent.phase_analyze"));
+                if (isLocalEngine && declared && !cloudCfgPre) {
+                  showToast(
+                    `⚠️ 模型「${declared}」未在云端配置中，本请求实际运行在本地引擎（较慢）。`,
+                    "warn"
+                  );
+                }
+                setRouteInfo({ engine: ended, declaredModel: declared });
+                continue;
+              }
               if (parsed.event === "tool_confirm") {
                 flushStream();
                 setAgentPhase(t("agent.phase_confirm", { tool: parsed.tool || "" }));

@@ -199,6 +199,10 @@ async def chat_completion(request: Request):
                     _reflection_mode = body.get("reflection_mode", "off")
                     _access_mode = body.get("access_mode", "full")
                     _thinking_level = body.get("thinking_level", "high")
+                    # P0 路由透明化：把实际落地的引擎与模型名在流开头回传给前端，
+                    # 消除"选了云端模型名却静默跑本地最慢路径"的欺骗（08-25 事故根因）。
+                    # model 名若不在云端配置里，会落到本地引擎；这里如实上报，用户可见。
+                    yield f"data: {json.dumps({'event': 'engine_route', 'is_local': is_local, 'engine': 'local' if is_local else 'cloud', 'declared_model': model, 'resolved_endpoint': api_url}, ensure_ascii=False)}\n\n"
                     if is_local:
                         # 本地模型：用 prompt-based tool calling（不依赖 OpenAI function calling API）
                         async for event in _local_agent_loop_stream(messages, model, api_url, headers, session_id, agent_id, _reflection_mode, _access_mode, _thinking_level):
