@@ -1194,7 +1194,13 @@ _LEGACY_ACCESS_MAP = {"workspace": "auto_edit"}
 
 
 def _normalize_access(mode: str) -> str:
-    return _LEGACY_ACCESS_MAP.get(mode, mode) if mode in _LEGACY_ACCESS_MAP or mode in ACCESS_LEVELS else "full"
+    """归一化权限档位。未知值拒绝升格（审计 H2：此前 else "full" 静默
+    升权——`confirm` 是产品承诺的默认档：高点操作每次确认）。"""
+    if mode in _LEGACY_ACCESS_MAP:
+        return _LEGACY_ACCESS_MAP[mode]
+    if mode in ACCESS_LEVELS:
+        return mode
+    return "confirm"
 
 
 def _filter_tools_by_access(tools: list[dict], access: str) -> list[dict]:

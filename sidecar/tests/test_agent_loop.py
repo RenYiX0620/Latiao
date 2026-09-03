@@ -223,7 +223,8 @@ class TestAccessMode(unittest.TestCase):
         from agent_loop import _normalize_access
         self.assertEqual(_normalize_access("workspace"), "auto_edit")
         self.assertEqual(_normalize_access("full"), "full")
-        self.assertEqual(_normalize_access("bogus"), "full")
+        # 审计 H2：未知值拒绝升格——此前 "bogus" 静默落 full（免确认执行高风险工具）
+        self.assertEqual(_normalize_access("bogus"), "confirm")
 
     def test_auto_edit_tools_defined(self):
         from agent_loop import AUTO_EDIT_TOOLS
