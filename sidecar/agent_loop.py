@@ -1953,6 +1953,17 @@ async def _handle_tool_execution(tc: dict, current_msgs: list, session_id: str,
     current_msgs.append({"role": "tool", "tool_call_id": call_id,
                          "content": (_stamp_time_sensitive() + tool_content
                                      if tool_name in _TIME_SENSITIVE_TOOLS else tool_content)})
+    # 启动协议防循环（17:21 事故）：read_file 成功读取 PROGRESS.md 且本会话
+    # 尚未注入过该提示时，追加"协议已完成"——阻止模型每轮重跑启动协议、
+    # 反复重读同一文件（本地循环由 _merge_system_messages 合并进首条 system）
+    if (tool_name == "read_file"
+            and not str(result).startswith(("Error", "⛔", "⚠️"))
+            and str(args.get("path", "")).endswith("PROGRESS.md")
+            and not any("启动协议已完成" in str(m.get("content", "")) for m in current_msgs)):
+        current_msgs.append({"role": "system", "content":
+            "✅ 启动协议已完成：你已了解最近工作记录（见上方摘要）。"
+            "现在直接执行用户的任务（例如用 mx_query 查询行情数据），"
+            "不要再读取 PROGRESS.md。"})
     return verify_failed, events
 
 
@@ -3541,8 +3552,36 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                 else:
                     stagnation += 1
                 if stagnation >= max_stagnation:
-                        yield {"content": f"\n\n⚠️ 连续 {stagnation} 轮无新进展，Agent 停止。如需继续请发新消息。"}
-                        return
+                    # 停滞兜底（17:21 事故：模型重读文件后空转 3 轮直接停止，
+                    # 用户等了 6 分钟拿不到任何答案）：先做一次非流式"终答提取"——
+                    # 强制基于已有工具结果直接写出最终回答；成功即中文交付，
+                    # 失败才给停止提示。
+                    try:
+                        _slang = _detect_user_language(_extract_last_user_text(current_msgs))
+                        _sname = {"zh": "简体中文", "en": "English", "ja": "日本語"}.get(_slang, "简体中文")
+                        _smsgs = [m for m in current_msgs if m.get("role") != "system"][-8:]
+                        _smsgs = _smsgs + [{"role": "system", "content":
+                            f"任务收尾：用户还在等待回答。请基于上方已有的工具结果直接写出最终回答"
+                            f"（必须用{_sname}，包含关键数字与结论）。不要再调用任何工具，"
+                            f"直接输出回答内容本身。"}]
+                        _sb = {"model": _engine_model, "messages": _smsgs, "max_tokens": 2048,
+                               "stream": False, "temperature": 0.4,
+                               "stop": ["<|im_end|>", "</think>", "<eos>"]}
+                        async with _local_llm_serialized(api_url):
+                            _sr = await client.post(api_url, json=_sb, headers=headers)
+                        _sout = ""
+                        if _sr.status_code == 200:
+                            _sout = ((_sr.json().get("choices") or [{}])[0]
+                                     .get("message", {}).get("content", "") or "").strip()
+                        if len(_sout) >= 120:
+                            yield {"content": "\n\n" + _strip_think_fences(_sout)}
+                            _track_progress(session_id, "completed", f"stagnation_fallback ({len(_sout)} chars)")
+                            logger.info(f"[LOCAL-AGENT] Iteration {iteration}: 停滞兜底终答交付 ({len(_sout)} chars)")
+                            return
+                    except Exception:
+                        logger.warning("停滞兜底终答失败，返回停止提示", exc_info=True)
+                    yield {"content": f"\n\n⚠️ 连续 {stagnation} 轮无新进展，Agent 停止。如需继续请发新消息。"}
+                    return
                 continue
 
             # No tool calls — pure text response done

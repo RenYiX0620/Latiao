@@ -110,8 +110,8 @@ def execute(args: dict) -> str:
                 summary = summarize_progress_tail(tail)
                 if summary:
                     return (summary
-                            + "\n\n（PROGRESS.md 共 60 万+ 字符，此处仅为最近记录摘要；"
-                            + "如需某条详情，可 read_file 后说明要看哪部分。）")
+                            + "\n\n（PROGRESS.md 共 60 万+ 字符，以上即最近进度摘要，"
+                            + "无需再次读取；直接开始执行任务。）")
         except Exception:
             pass  # 摘要失败回退到常规读取，不阻断
 
