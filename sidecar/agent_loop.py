@@ -2723,6 +2723,32 @@ def _reply_lang_mismatch(user_text: str, reply_text: str) -> bool:
 _REPEAT_ALLOWED_TOOLS = frozenset({"screen_capture", "control_wait"})
 
 
+async def _final_answer_extraction(client, api_url: str, headers: dict, engine_model: str,
+                                   current_msgs: list, user_lang: str) -> str:
+    """非流式单轮"终答提取"：基于已有工具结果强制直接输出最终回答。
+
+    本地 27B 模型被自身思维链卡住、只声明不动手时的强制收口（09-02 09:56、
+    17:21 事故）。不带工具、单一指令，产出由调用方判断是否交付；失败返回空串。"""
+    try:
+        _name = {"zh": "简体中文", "en": "English", "ja": "日本語"}.get(user_lang, "简体中文")
+        _smsgs = [m for m in current_msgs if m.get("role") != "system"][-8:]
+        _smsgs = _smsgs + [{"role": "system", "content":
+            f"任务收尾：用户还在等待回答。请基于上方已有的工具结果直接写出最终回答"
+            f"（必须用{_name}，包含关键数字与结论）。不要再调用任何工具，"
+            f"直接输出回答内容本身。"}]
+        _sb = {"model": engine_model, "messages": _smsgs, "max_tokens": 2048,
+               "stream": False, "temperature": 0.4,
+               "stop": ["<|im_end|>", "</think>", "<eos>"]}
+        async with _local_llm_serialized(api_url):
+            _sr = await client.post(api_url, json=_sb, headers=headers)
+        if _sr.status_code == 200:
+            return ((_sr.json().get("choices") or [{}])[0]
+                    .get("message", {}).get("content", "") or "").strip()
+    except Exception:
+        logger.warning("终答提取失败", exc_info=True)
+    return ""
+
+
 async def _ensure_final_language(client, api_url: str, headers: dict, engine_model: str,
                                  text: str, user_text: str) -> str:
     """交付前语言确保：回复语言与用户消息不符时走翻译轮，返回可交付文本。
@@ -3251,8 +3277,23 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
         # 无进展（未产出内容/未执行工具）才中止；正常推进的长时间
         # 研究任务不受影响
         _no_progress_deadline = time.monotonic() + 900
+        # 会话总时长预算（17:52 事故：模型持续换新查询，任何工具调用都重置
+        # nudge 计数，无限循环 15 分钟+ 不收尾）——超预算强制终答提取收口
+        _session_budget = time.monotonic() + 480
         while iteration < max_iterations:
             iteration += 1
+            if time.monotonic() > _session_budget:
+                _sout = await _final_answer_extraction(
+                    client, api_url, headers, _engine_model, current_msgs,
+                    _detect_user_language(_extract_last_user_text(current_msgs)))
+                if len(_sout) >= 120:
+                    yield {"content": "\n\n" + _strip_think_fences(_sout)}
+                    _track_progress(session_id, "completed", f"budget_fallback ({len(_sout)} chars)")
+                    logger.info(f"[LOCAL-AGENT] Iteration {iteration}: 会话超时预算，终答提取收口 ({len(_sout)} chars)")
+                    return
+                yield {"content": f"\n\n⚠️ 会话运行 {int(time.monotonic() - (_session_budget - 480))} 秒仍未给出答案，已中止。请发「继续」重试。"}
+                _track_progress(session_id, "stalled", "session_budget")
+                return
             if time.monotonic() > _no_progress_deadline:
                 logger.error("[LOCAL-AGENT] 连续 15 分钟无进展，中止任务")
                 yield {"content": "\n\n⚠️ 任务连续 15 分钟无进展，已中止。模型服务可能异常（如响应停滞）。可重试或检查网络。"}
@@ -3547,8 +3588,10 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                         # 工具产出了新结果：在收到实质性文字回答（≥200 字符）
                         # 之前，不允许用一句话收尾（“让我读取数据再分析”式
                         # 声明/道歉不算完成）。
+                        # 注意：不重置 _intent_nudges——此前任何新工具调用都
+                        # 重置计数，模型不断换查询即可无限拖延（17:52 事故），
+                        # 改为全会话累计：3 次"声明不动手"后强制终答提取收口。
                         _pending_tool_analysis = True
-                        _intent_nudges = 0
                 else:
                     stagnation += 1
                 if stagnation >= max_stagnation:
@@ -3556,30 +3599,14 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                     # 用户等了 6 分钟拿不到任何答案）：先做一次非流式"终答提取"——
                     # 强制基于已有工具结果直接写出最终回答；成功即中文交付，
                     # 失败才给停止提示。
-                    try:
-                        _slang = _detect_user_language(_extract_last_user_text(current_msgs))
-                        _sname = {"zh": "简体中文", "en": "English", "ja": "日本語"}.get(_slang, "简体中文")
-                        _smsgs = [m for m in current_msgs if m.get("role") != "system"][-8:]
-                        _smsgs = _smsgs + [{"role": "system", "content":
-                            f"任务收尾：用户还在等待回答。请基于上方已有的工具结果直接写出最终回答"
-                            f"（必须用{_sname}，包含关键数字与结论）。不要再调用任何工具，"
-                            f"直接输出回答内容本身。"}]
-                        _sb = {"model": _engine_model, "messages": _smsgs, "max_tokens": 2048,
-                               "stream": False, "temperature": 0.4,
-                               "stop": ["<|im_end|>", "</think>", "<eos>"]}
-                        async with _local_llm_serialized(api_url):
-                            _sr = await client.post(api_url, json=_sb, headers=headers)
-                        _sout = ""
-                        if _sr.status_code == 200:
-                            _sout = ((_sr.json().get("choices") or [{}])[0]
-                                     .get("message", {}).get("content", "") or "").strip()
-                        if len(_sout) >= 120:
-                            yield {"content": "\n\n" + _strip_think_fences(_sout)}
-                            _track_progress(session_id, "completed", f"stagnation_fallback ({len(_sout)} chars)")
-                            logger.info(f"[LOCAL-AGENT] Iteration {iteration}: 停滞兜底终答交付 ({len(_sout)} chars)")
-                            return
-                    except Exception:
-                        logger.warning("停滞兜底终答失败，返回停止提示", exc_info=True)
+                    _sout = await _final_answer_extraction(
+                        client, api_url, headers, _engine_model, current_msgs,
+                        _detect_user_language(_extract_last_user_text(current_msgs)))
+                    if len(_sout) >= 120:
+                        yield {"content": "\n\n" + _strip_think_fences(_sout)}
+                        _track_progress(session_id, "completed", f"stagnation_fallback ({len(_sout)} chars)")
+                        logger.info(f"[LOCAL-AGENT] Iteration {iteration}: 停滞兜底终答交付 ({len(_sout)} chars)")
+                        return
                     yield {"content": f"\n\n⚠️ 连续 {stagnation} 轮无新进展，Agent 停止。如需继续请发新消息。"}
                     return
                 continue
