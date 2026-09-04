@@ -58,6 +58,12 @@ _OBFUSCATION_PATTERNS = [
     r"\$\([^)]+\)",  # $() subshell
     r"\\x[0-9a-fA-F]{2}",  # hex-encoded chars in command
     r"\bcurl\b.*\|\s*(ba)?sh\b", r"\bwget\b.*\|\s*(ba)?sh\b",  # curl | sh
+    # 解释器内联代码（审计 H3：黑名单可被 python3 -c / node -e / bash -c 绕过——
+    # shell=False 不拦这些，内联脚本可执行任意操作）。显式命令/脚本文件仍放行
+    # （如 python3 script.py、node app.js、bash deploy.sh）。
+    r"\b(python|python3|python3\.\d+[0-9]*|node|nodejs|deno|bun|ruby|perl|php|lua|nu|pwsh|powershell)\s+(-[a-zA-Z]*[ce]\b|--command\b|--eval\b)",
+    r"\b(ba|z|k|d)?sh\s+(-[a-zA-Z]*[ce]\b|--command\b)",
+    r"\bfish\s+(-c\b|--command\b)",
 ]
 
 # Commands that are always allowed (whitelist override for common dev tools)

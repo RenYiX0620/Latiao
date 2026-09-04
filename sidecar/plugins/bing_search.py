@@ -1,9 +1,14 @@
 """bing_search - 免 API Key 的网页搜索（抓取必应中国版 cn.bing.com）"""
 import asyncio
 import re
+import sys as _sys
+from pathlib import Path
 from urllib.parse import quote_plus
 
 import httpx
+
+# 插件目录加入 sys.path：execute() 里懒加载兄弟模块 _time_guard 用
+_sys.path.insert(0, str(Path(__file__).parent))
 
 NAME = "bing_search"
 PERMISSION = "safe"
@@ -89,7 +94,13 @@ async def execute(args: dict) -> str:
 
     if len(lines) == 1:
         return "未找到相关结果。"
-    return "\n".join(lines)
+    out = "\n".join(lines)
+    # 搜索词日期滑差自检：query 带旧日期时提示核对相对时间换算（防锚定）
+    from _time_guard import check_query_date
+    guard = check_query_date(query)
+    if guard:
+        out += "\n\n" + guard
+    return out
 
 
 if __name__ == "__main__":

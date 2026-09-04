@@ -2,9 +2,13 @@
 import json
 import os
 import subprocess
+import sys as _sys
 from pathlib import Path
 
 import httpx
+
+# 插件目录加入 sys.path：execute() 里懒加载兄弟模块 _time_guard 用
+_sys.path.insert(0, str(Path(__file__).parent))
 
 NAME = "tavily_search"
 PERMISSION = "safe"
@@ -121,7 +125,13 @@ async def execute(args: dict) -> str:
                     lines.append(f"   {url}")
                     lines.append(f"   {content}\n")
 
-            return "\n".join(lines)
+            out = "\n".join(lines)
+            # 搜索词日期滑差自检：query 带旧日期时提示核对相对时间换算（防锚定）
+            from _time_guard import check_query_date
+            guard = check_query_date(query)
+            if guard:
+                out += "\n\n" + guard
+            return out
 
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 401:

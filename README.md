@@ -1,6 +1,6 @@
 # 🌶️ Latiao — Your Local AI Agent
 
-> **An AI agent that lives on your Mac. No cloud, no data leaks, your own models, your rules.**
+> **An AI agent that lives on your computer — macOS & Windows. No cloud, no data leaks, your own models, your rules.**
 
 <p align="center">
   <img src="assets/screenshot.png" alt="Latiao Screenshot" width="700">
@@ -200,7 +200,7 @@ MIT — free to use, modify, and distribute.
 
 # 🌶️ 辣条 Latiao — 你的本地 AI 智能助手
 
-> **跑在你 Mac 上的 AI 助手。不上传数据、不偷代码、用你自己的模型、听你自己的规则。**
+> **跑在你电脑上的 AI 助手（macOS / Windows）。不上传数据、不偷代码、用你自己的模型、听你自己的规则。**
 
 辣条（Latiao）是一个桌面 AI Agent 应用，基于 Tauri + React + Python FastAPI 构建。它能像人一样在你的电脑上自主工作——**读写文件、执行命令、联网搜索、查询行情、调度子智能体、定时干活**，所有数据都在本地，完全隐私。
 

@@ -1,6 +1,7 @@
 """Read the contents of a file at the given path. Supports ~ expansion."""
 
 import os
+import re
 
 _BLOCKED_SUBSTRINGS = ("/.ssh", "/.aws", "/.gnupg", "/Library/Keychains", "/.kube", "/.docker")
 _BLOCKED_FILE_NAMES = (".env", "id_rsa", "id_ed25519", "id_ecdsa", "known_hosts")
@@ -24,6 +25,26 @@ DEFINITION = {
         }
     }
 }
+
+
+def summarize_progress_tail(text: str, limit: int = 10) -> str:
+    """从 PROGRESS.md 尾部提取最近条目，生成中文摘要（可测纯函数）。
+
+    PROGRESS.md 600KB+ 且 2/3 是英文工具日志，直接读会把本地模型带偏成
+    英文（09-03 新会话英文事故）。启动协议只需要"了解最近进度"，摘要即可。
+    """
+    entries = []
+    for ln in text.splitlines():
+        m = re.match(r"^###\s+(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2})\S*\s+(\w+)", ln)
+        if m:
+            entries.append((f"{m.group(1)[5:]} {m.group(2)}", m.group(3)))
+    entries = entries[-limit:]
+    if not entries:
+        return ""
+    out = ["最近工作记录（自动摘要）："]
+    for ts, tool in entries:
+        out.append(f"- {ts} {tool}")
+    return "\n".join(out)
 
 
 def _safe_path(path: str) -> str | None:
@@ -78,6 +99,21 @@ def execute(args: dict) -> str:
             return (f"⚠️ 这是二进制文件({ext or '未知格式'}),无法作为文本读取。\n"
                     f"文件: {p}\n"
                     f"如需查看数据,请读取对应的文本格式文件(如 _raw.json / _description.txt)。")
+
+        # PROGRESS.md 特例：返回最近条目中文摘要而非原始内容
+        try:
+            from config import PROGRESS_DIR
+            if os.path.realpath(p) == os.path.realpath(str(PROGRESS_DIR / "PROGRESS.md")):
+                with open(p, "rb") as pf:
+                    pf.seek(max(0, os.path.getsize(p) - 8192))
+                    tail = pf.read().decode("utf-8", errors="replace")
+                summary = summarize_progress_tail(tail)
+                if summary:
+                    return (summary
+                            + "\n\n（PROGRESS.md 共 60 万+ 字符，以上即最近进度摘要，"
+                            + "无需再次读取；直接开始执行任务。）")
+        except Exception:
+            pass  # 摘要失败回退到常规读取，不阻断
 
         with open(p, "r", encoding="utf-8") as f:
             content = f.read(MAX_READ_SIZE + 1)

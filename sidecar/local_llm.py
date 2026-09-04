@@ -62,7 +62,8 @@ def _resolve_mlx_path(model_id: str, models_dir: Path = MODELS_DIR, hf_hub: Path
     """把模型 id 解析成 mlx_lm 可加载的本地 MLX 目录/路径。
 
     优先级：直接路径 → ~/Models 下的 MLX 目录（含 config.json + 权重）
-    → HF hub 缓存 snapshots → 原样返回（当作 HF repo id，由 mlx_lm 下载）。
+    → LM Studio / Ollama 管理器目录 → HF hub 缓存 snapshots
+    → 原样返回（当作 HF repo id，由 mlx_lm 下载）。
     MLX 模型是目录结构（config.json + model.safetensors/weights.npz），
     没有通用的"单个 .mlx 文件"，因此不能只按文件名匹配。
     """
@@ -77,6 +78,25 @@ def _resolve_mlx_path(model_id: str, models_dir: Path = MODELS_DIR, hf_hub: Path
         try:
             if cand.is_dir() and (cand / "config.json").exists():
                 return str(cand)
+        except OSError:
+            continue
+    # LM Studio / Ollama 管理器目录（.lmstudio/models/<org>/<name> 或平铺）。
+    # GGUF 的查找（_find_gguf）一直搜这里，MLX 目录此前不搜——用户在
+    # LM Studio 下载的 MLX 模型明明在盘上，加载却回落 HF 联网下载。
+    _name = model_id.split("/")[-1]
+    for _mgr_root in (Path.home() / ".lmstudio" / "models", Path.home() / ".ollama" / "models"):
+        try:
+            if not _mgr_root.is_dir():
+                continue
+            for _org in _mgr_root.iterdir():
+                if not _org.is_dir():
+                    continue
+                _cand = _org / _name
+                if _cand.is_dir() and (_cand / "config.json").exists():
+                    return str(_cand)
+            _direct = _mgr_root / _name
+            if _direct.is_dir() and (_direct / "config.json").exists():
+                return str(_direct)
         except OSError:
             continue
     # HF hub 缓存（models--owner--name/snapshots/<hash>/config.json）
@@ -1513,6 +1533,7 @@ class LocalLLMEngine:
             if model_path != model_id and Path(model_path).is_dir():
                 # 本地 MLX 目录：权重缺失时提前给出明确错误
                 has_w = (Path(model_path) / "model.safetensors").exists() \
+                    or (Path(model_path) / "model.safetensors.index.json").exists() \
                     or (Path(model_path) / "weights.npz").exists() \
                     or any(Path(model_path).glob("weights*.npz"))
                 if not has_w:
@@ -2268,6 +2289,7 @@ def list_local_models() -> list[dict]:
             if not (d / "config.json").exists():
                 continue
             has_w = (d / "model.safetensors").exists() \
+                or (d / "model.safetensors.index.json").exists() \
                 or (d / "weights.npz").exists() \
                 or any(d.glob("weights*.npz"))
             if not has_w:
@@ -2278,8 +2300,17 @@ def list_local_models() -> list[dict]:
                 "size": f"{_dir_size_gb(d):.1f}GB", "format": "mlx",
             })
 
-    # MLX 目录扫描：~/Models 首层 + HF hub 快照（repo id 为模型 id）
+    # MLX 目录扫描：~/Models 首层 + LM Studio/Ollama 管理器目录 + HF hub 快照
+    # （repo id 为模型 id）。管理器目录是 <org>/<name> 两层，需逐 org 扫。
     _scan_mlx_dirs(MODELS_DIR)
+    for _mgr_root in (Path.home() / ".lmstudio" / "models", Path.home() / ".ollama" / "models"):
+        try:
+            if _mgr_root.is_dir():
+                for _org in _mgr_root.iterdir():
+                    if _org.is_dir():
+                        _scan_mlx_dirs(_org)
+        except OSError:
+            continue
     hf_scan = Path.home() / ".cache" / "huggingface" / "hub"
     if hf_scan.exists():
         for dl_info in hf_scan.glob("models--*"):

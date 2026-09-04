@@ -239,13 +239,15 @@ def _check_auth(request: Request) -> None:
     """本地 token 认证依赖（应用级，覆盖全部路由）。
 
     - 校验 X-Latiao-Token，兼容 Authorization: Bearer <token>
-    - LATIAO_AUTH_TOKEN 未设置 → 直接放行（无鉴权模式）
+    - LATIAO_AUTH_TOKEN 未设置 → 拒绝全部非豁免端点（审计 H2：此前
+      无鉴权放行 = 手动启动 sidecar 时删模型/装扩展等端点全部裸奔；
+      应用启动路径由 Rust 注入 token，不受影响；开发请显式设置该变量）
     - /health 豁免：前端启动探测用，且不返回敏感信息
     - /v1/update-latest.json、/v1/update-file 豁免：Tauri updater 插件的
       请求不携带自定义 token（本地回环 + 安装包经 minisign 签名验证，安全）
     """
     if not AUTH_TOKEN:
-        return
+        raise _UnauthorizedError("sidecar 鉴权未初始化：请通过应用启动（Rust 注入 LATIAO_AUTH_TOKEN），或设置该环境变量后手动启动")
     if request.url.path in ("/health", "/v1/update-latest.json", "/v1/update-file"):
         return
     token = request.headers.get("x-latiao-token", "") or ""

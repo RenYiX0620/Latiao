@@ -260,6 +260,8 @@ async def _execute_cron_job(job: dict, force_local: bool = False):
     # SUBAGENT_MODEL 常量由 main.py 门面持有
     from agent_loop import (
         _NATIVE_TOOL_RE,
+        _TIME_SENSITIVE_TOOLS,
+        _stamp_time_sensitive,
         TOOLS,
         _build_local_tools_prompt,
         _cap_tools,
@@ -291,6 +293,11 @@ async def _execute_cron_job(job: dict, force_local: bool = False):
 
     messages = [{"role": "system", "content": (
         f"## 系统规则\n{agent_cfg['identity']}\n\n"
+        f"⏱ 时间规则：任务文本中的“今天/昨天/昨晚/今晨/明天/最新”等相对时间，"
+        f"必须先按下方 Current time 换算成绝对日期（年月日+星期）再写入搜索词或分析；"
+        f"工具返回内容中的日期与当前时间矛盾时，以当前时间为准重新换算并重新搜索。\n"
+        f"📊 数据诚实规则：回复中的关键数字必须能在本会话工具结果中找到出处；"
+        f"工具未返回的数据严禁编造具体数值——写明'工具未返回该数据'或先查询（资金流向优先 mx_query，查不到再 tavily_search）。\n\n"
         f"Runtime environment:\n"
         f"- Current time: {now}\n"
         f"- User home directory: {home}\n"
@@ -424,6 +431,9 @@ async def _execute_cron_job(job: dict, force_local: bool = False):
                             logger.info("Tool result (cron): %s → %s", tool_name, result[:80].replace("\n", " "))
                         if len(result) > 3000:
                             result = result[:3000] + "\n...(截断)"
+                        # 与主循环同款时间锚：截断后追加，防模型被检索结果旧日期锚定
+                        if tool_name in _TIME_SENSITIVE_TOOLS:
+                            result = _stamp_time_sensitive() + result
                         current_msgs.append({"role": "tool", "tool_call_id": tc.get("id", "cron"), "content": result})
                     continue
 

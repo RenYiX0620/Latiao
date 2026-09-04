@@ -742,7 +742,7 @@ TOOL_PERMISSIONS["use_skill"] = "safe"
 # 看到 tavily。按语义优先级只重排一次，保证 tavily 排在搜索组最前、截断时优先保留。
 _TOOL_PRIORITY = (
     "read_file", "write_file", "list_dir", "search_files",
-    "tavily_search", "web_search", "bing_search",
+    "tavily_search", "dokobot_read", "headless_read", "dokobot_search", "web_search", "bing_search",
     "mx_query", "ak_finance",
     "screen_capture", "control_list_processes", "control_process_log", "control_audit",
     "control_wait", "control_launch", "control_mouse_move", "control_mouse_click",
@@ -941,8 +941,11 @@ def _rotate_progress_file():
         logger.warning("PROGRESS 轮转失败", exc_info=True)
 
 
-def _progress_tail(max_chars: int = 2000) -> str:
-    """读取 PROGRESS.md 尾部（最新进度），用于注入 system prompt。"""
+def _progress_tail(max_chars: int = 600) -> str:
+    """读取 PROGRESS.md 尾部（最新进度），用于注入 system prompt。
+
+    600 而非 2000：PROGRESS.md 是 2/3 英文的工具日志，2000 字符的英文注入
+    是新会话被带偏成英文回复的最大英文源（09-03 事故）。"""
     try:
         if not PROGRESS_FILE.exists():
             return ""
@@ -1009,6 +1012,68 @@ def _detect_text_loop(text: str) -> bool:
     return False
 
 
+class _GenerationLoopError(Exception):
+    """生成复读循环（检测器命中）：本轮生成本地截断，不炸整个会话。
+
+    此前直接 raise TimeoutError 会一路穿到 api_routes 把流收掉——
+    闸门/翻译/终答提取全被跳过，用户只拿到一句"已截断"（18:01 事故）。
+    改为在流式解析层捕获后 break，已产出文本（裁掉重复尾）交给
+    后续工具解析/收尾闸门继续处理。"""
+
+
+def _strip_repeat_tail(text: str) -> str:
+    """复读触发后裁掉尾部重复段，保留首次出现的部分。
+
+    优先用与检测器同款的正则定位重复单元，尾部只留一份（外科手术式）；
+    匹配不到时退化为粗裁 200 字符。"""
+    for _ in range(10):
+        if not _detect_text_loop(text):
+            break
+        m = re.search(r"(.{6,60}?)\1{2,}$", text, re.DOTALL)
+        if m:
+            text = text[: m.start()] + m.group(1)
+        else:
+            text = text[: max(0, len(text) - 200)]
+    return text
+
+
+def _extract_magnitude_numbers(text: str) -> set[str]:
+    """提取"量级数字"（用于数据真伪核对）：带 亿/万亿 后缀的数 + ≥10 万裸数。
+
+    归一化：'15.6亿元' → '亿:15.6'；'242742.51'（百万单位成交额等）→ 'raw:242742.51'。
+    指数点位（3942.09）、建议类小数字（3900 点位、止损 5%）不进入校验，防误伤。"""
+    out: set[str] = set()
+    for u in ("万亿", "亿"):
+        for m in re.finditer(r"(\d+(?:\.\d+)?)\s*" + u, text):
+            out.add(f"{u}:{round(float(m.group(1)), 2)}")
+    for m in re.finditer(r"(?<![\d.])(\d{6,}(?:\.\d+)?)(?![\d.])", text):
+        out.add(f"raw:{float(m.group(1))}")
+    return out
+
+
+def _find_unsourced_numbers(reply: str, current_msgs: list) -> list[str]:
+    """回复中的量级数字减去本会话全部工具结果的量级数字并集 → 无来源数字。
+
+    19:05 事故：模型编造'北向净流入15.6亿/主力净流出80亿'，全库工具结果
+    从未返回过——会被此校验命中。工具结果截断（3000 字符）只影响少量
+    尾部数字的漏报，不影响本机制防编造的目的。"""
+    if not reply:
+        return []
+    tool_ctx = " ".join(
+        str(m.get("content") or "") for m in current_msgs if m.get("role") == "tool")
+    unsourced = _extract_magnitude_numbers(reply) - _extract_magnitude_numbers(tool_ctx)
+    if not unsourced:
+        return []
+    readable = []
+    for tag in sorted(unsourced):
+        unit, _, val = tag.partition(":")
+        if unit == "raw":
+            readable.append(f"{float(val):,.0f}")
+        else:
+            readable.append(f"{float(val):g}{unit}")
+    return readable
+
+
 def _is_meta_wrapup(text: str) -> bool:
     """判断文本是否为“元评论式收尾”而非实质回答。
 
@@ -1073,7 +1138,7 @@ TOOL_CATEGORIES = {
     "file_write": ["write_file"],
     "command": ["run_cmd"],
     "app": ["open_app", "open_folder"],
-    "web": ["tavily_search", "web_search", "bing_search"],
+    "web": ["tavily_search", "web_search", "bing_search", "dokobot_read", "headless_read", "dokobot_search"],
     "financial": ["mx_query", "ak_finance"],
     # 五控：进程/鼠标/屏幕/流程
     "control": [
@@ -1102,7 +1167,7 @@ INTENT_PATTERNS = [
      ["file_read", "app"]),
     (re.compile(r"大盘|A股|港股|股票|个股|股价|行情|涨停|跌停|板块|上证|深证|创业板|科创板|沪深|指数|基金|财报|财务|营收|净利润|上市公司|分红|PE|PB|ROE|股息|龙头|K线|成交量|换手率|资金流向|北向资金|龙虎榜|券商研报", re.IGNORECASE),
      ["file_read", "financial"]),
-    (re.compile(r"上网|联网|搜索网络|搜一下|搜一搜|查一下|查询|查一查|了解一下|最新的|最新消息|新闻|热搜|汇率|天气|资料|search|web|online|latest|news|weather|trending", re.IGNORECASE),
+    (re.compile(r"上网|联网|搜索网络|搜一下|搜一搜|查一下|查询|查一查|了解一下|最新的|最新消息|新闻|热搜|汇率|天气|资料|网页|网址|链接|页面|http|url|search|web|online|latest|news|weather|trending", re.IGNORECASE),
      ["file_read", "web"]),
     # 信息询问型问题（“X 是什么/有哪些/对比/评测”）：给出搜索工具，模型按需调用
     (re.compile(r"是什么|什么是|有哪些|有什么|为什么|如何|怎么|怎么样|怎么回事|介绍一下|介绍下|原理|机制|评测|测评|对比|区别|哪款|哪家|哪个|性价比|值不值得", re.IGNORECASE),
@@ -1129,7 +1194,13 @@ _LEGACY_ACCESS_MAP = {"workspace": "auto_edit"}
 
 
 def _normalize_access(mode: str) -> str:
-    return _LEGACY_ACCESS_MAP.get(mode, mode) if mode in _LEGACY_ACCESS_MAP or mode in ACCESS_LEVELS else "full"
+    """归一化权限档位。未知值拒绝升格（审计 H2：此前 else "full" 静默
+    升权——`confirm` 是产品承诺的默认档：高点操作每次确认）。"""
+    if mode in _LEGACY_ACCESS_MAP:
+        return _LEGACY_ACCESS_MAP[mode]
+    if mode in ACCESS_LEVELS:
+        return mode
+    return "confirm"
 
 
 def _filter_tools_by_access(tools: list[dict], access: str) -> list[dict]:
@@ -1767,6 +1838,24 @@ def _check_pre_hooks(tool_name: str, args: dict) -> tuple[bool, list[dict], str]
     return False, [], ""
 
 
+# 时间敏感工具：结果自带日期数据，模型易把"昨晚/今天"等相对时间换算错后
+# 被检索结果的旧日期锚定（09-03 两次事故：08:25 老会话、08:57 全新会话，
+# 均把"昨晚美股"搜成 9月1日）。
+_TIME_SENSITIVE_TOOLS = frozenset({
+    "tavily_search", "bing_search", "dokobot_search", "dokobot_read",
+    "headless_read", "mx_query", "ak_finance",
+})
+
+_WEEK_ZH = "一二三四五六日"
+
+
+def _stamp_time_sensitive() -> str:
+    """生成当前时刻锚行，注入时间敏感工具结果头部（截断后追加，不会被截掉）。"""
+    now = datetime.now()
+    return (f"⏱ [数据时刻] {now.strftime('%Y-%m-%d')} (周{_WEEK_ZH[now.weekday()]}) "
+            f"{now.strftime('%H:%M:%S')} —— 下方结果内日期若与此矛盾，以当前时间为准\n\n")
+
+
 async def _handle_tool_execution(tc: dict, current_msgs: list, session_id: str,
                                   agent_id: str, access_mode: str = "full",
                                   pre_started: dict | None = None) -> tuple[bool, list[dict]]:
@@ -1796,6 +1885,20 @@ async def _handle_tool_execution(tc: dict, current_msgs: list, session_id: str,
         )
         current_msgs.append({"role": "tool", "tool_call_id": call_id, "content": result})
         return True, [{"event": "tool_end", "call_id": call_id, "tool": tool_name, "result": result, "ts": int(time.time() * 1000)}]
+
+    # ── 相同调用防重复（14:26 事故：模型被 nudge 后每轮重跑启动协议、
+    # 反复重读 PROGRESS.md 陷入循环；今早还有同 3 条搜索词 35 连搜）──
+    # 同会话内相同 (tool, args) 已成功 ≥2 次 → 不再执行，返回引导进入下一步。
+    _dup_ok = _count_successful_duplicates(current_msgs, tool_name, args)
+    if _dup_ok >= 2 and tool_name not in _REPEAT_ALLOWED_TOOLS:
+        result = (
+            f"⛔ 相同调用已成功执行 {_dup_ok} 次，不再重复执行：{tool_name}。\n"
+            "不要重复同一操作——启动协议若已满足就进入下一步"
+            "（例如用 mx_query 查询行情数据），或直接把完整分析写进回复正文"
+            "（简体中文，含关键数字与结论）。"
+        )
+        current_msgs.append({"role": "tool", "tool_call_id": call_id, "content": result})
+        return False, [{"event": "tool_end", "call_id": call_id, "tool": tool_name, "result": result, "ts": int(time.time() * 1000)}]
 
     # ── 权限规则拒绝（deny/danger）──
     # 自定义权限规则返回 danger/deny 时必须拦截，此前落空直接执行——
@@ -1915,7 +2018,20 @@ async def _handle_tool_execution(tc: dict, current_msgs: list, session_id: str,
             + "如需查看特定部分请用 read_file 分段读取对应文件。)\n\n"
             + tool_content[-800:]
         )
-    current_msgs.append({"role": "tool", "tool_call_id": call_id, "content": tool_content})
+    current_msgs.append({"role": "tool", "tool_call_id": call_id,
+                         "content": (_stamp_time_sensitive() + tool_content
+                                     if tool_name in _TIME_SENSITIVE_TOOLS else tool_content)})
+    # 启动协议防循环（17:21 事故）：read_file 成功读取 PROGRESS.md 且本会话
+    # 尚未注入过该提示时，追加"协议已完成"——阻止模型每轮重跑启动协议、
+    # 反复重读同一文件（本地循环由 _merge_system_messages 合并进首条 system）
+    if (tool_name == "read_file"
+            and not str(result).startswith(("Error", "⛔", "⚠️"))
+            and str(args.get("path", "")).endswith("PROGRESS.md")
+            and not any("启动协议已完成" in str(m.get("content", "")) for m in current_msgs)):
+        current_msgs.append({"role": "system", "content":
+            "✅ 启动协议已完成：你已了解最近工作记录（见上方摘要）。"
+            "现在直接执行用户的任务（例如用 mx_query 查询行情数据），"
+            "不要再读取 PROGRESS.md。"})
     return verify_failed, events
 
 
@@ -2189,14 +2305,29 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                             logger.error("Agent stream HTTP %d body: %s", r.status_code, err_body)
                         r.raise_for_status()  # httpx 不自动抛 4xx/5xx，必须显式检查
                         # 流式停顿检测：连续 180s 无数据视为僵死（大模型可能缓慢滴灌，120s 超时永不触发）
+                        # 60s 分片等待 + 静默期心跳（P0-4，与本地循环 3465-3480 对齐）：
+                        # 推理模型（DeepSeek 等）长思考时流中无字节，前端 180s 看门狗会
+                        # 掐断连接——每 60s 静默推一个 heartbeat 续命，累计达到停滞阈值
+                        # （首 token 90s / 之后 180s）才判僵死。此前云端循环无任何心跳，
+                        # 长静默期前端必然断流（09-04 云端"执行一半停"根因）。
                         aiter = r.aiter_lines()
                         _fence_filter = _ThinkFenceFilter()
                         _body_out = False  # 本轮是否产出过正文增量（收尾全量修正用）
+                        _silent_secs = 0  # 连续静默秒数（心跳与停滞判定共用，P0-4）
                         while True:
                             try:
-                                line = await asyncio.wait_for(anext(aiter), timeout=180)
+                                # 60s 分片：静默超 60s 发一次心跳保活，累计静默达
+                                # 停滞阈值（首 token 90s / 之后 180s）才判僵死
+                                _stall_timeout = 90 if (not _body_out and _raw_delta_count == 0) else 180
+                                line = await asyncio.wait_for(anext(aiter), timeout=60)
+                                _silent_secs = 0
                             except asyncio.TimeoutError:
-                                raise TimeoutError(f"模型输出停滞超 180 秒（模型可能过大或未加载完）：{model[:60]}")
+                                _silent_secs += 60
+                                if _silent_secs < _stall_timeout:
+                                    # 尚未到停滞阈值：发心跳，前端看门狗续命
+                                    yield {"event": "heartbeat"}
+                                    continue
+                                raise TimeoutError(f"模型输出停滞超 {_stall_timeout:.0f} 秒（模型可能过大或未加载完）：{model[:60]}")
                             except StopAsyncIteration:
                                 break
                             if line and line.startswith("data: "):
@@ -2218,9 +2349,9 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                                         # 复读循环检测（节流）——放在 dedup 过滤之前，
                                         # 复读被 dedup 过滤时也要能截断
                                         if _raw_delta_count % 40 == 0 and _detect_text_loop(streamed_text):
-                                            logger.warning("[AGENT] 检测到输出复读循环，截断生成")
-                                            yield {"content": "\n\n⚠️ 检测到输出重复，已自动截断。"}
-                                            raise TimeoutError("输出复读循环，已截断")
+                                            logger.warning("[AGENT] 检测到输出复读循环，截断本轮生成")
+                                            streamed_text = _strip_repeat_tail(streamed_text)
+                                            raise _GenerationLoopError("输出复读循环，已截断")
                                         # 自我介绍去重：只截断一次，之后照常流式输出
                                         # （审计 A5：此前命中后永久吞掉后续真实内容）
                                         if not _dedup_fired:
@@ -2251,9 +2382,9 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                                         reasoning_text += reasoning
                                         streamed_text += reasoning
                                         if _raw_delta_count % 40 == 0 and _detect_text_loop(streamed_text):
-                                            logger.warning("[AGENT] 检测到输出复读循环，截断生成")
-                                            yield {"content": "\n\n⚠️ 检测到输出重复，已自动截断。"}
-                                            raise TimeoutError("输出复读循环，已截断")
+                                            logger.warning("[AGENT] 检测到输出复读循环，截断本轮生成")
+                                            streamed_text = _strip_repeat_tail(streamed_text)
+                                            raise _GenerationLoopError("输出复读循环，已截断")
                                         if not _dedup_fired:
                                             _ded = _deduplicate_response(streamed_text)
                                             if len(_ded) < len(streamed_text):
@@ -2282,6 +2413,10 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                                                 buf["function"]["arguments"] += tc_delta["function"]["arguments"]
                                 except (json.JSONDecodeError, KeyError, TypeError, IndexError):
                                     pass  # Malformed SSE delta — skip this event, try next
+                                except _GenerationLoopError:
+                                    # 复读截断：停止消费本轮流，已产出（裁尾后）文本
+                                    # 交给后续工具解析/收尾闸门，会话继续（18:01 事故）
+                                    break
                                 except Exception:
                                     logger.error("SSE tool_call parse error", exc_info=True)
                                     raise  # Real errors (network, memory) must surface
@@ -2405,14 +2540,21 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                 if len(streamed_text.strip()) >= 200:
                     # 工具结果后已给出实质性回答——接受为最终答案直接收尾
                     # （与 local 循环同口径，防追问后重答堆叠）
-                    current_msgs.append({"role": "assistant", "content": streamed_text.strip()})
-                    if _should_reflect(reflection_mode, streamed_text, _is_local_llm_url(api_url)):
+                    # 语言确保：不符则以 content_revised 整体替换上一条（云端仍直播，
+                    # 遵循度好，属兜底；16:50 事故同款保护）
+                    _deliver = await _ensure_final_language(
+                        client, api_url, headers, model,
+                        streamed_text.strip(), last_user_text)
+                    if _deliver != streamed_text.strip():
+                        yield {"event": "content_revised", "content": _deliver}
+                    current_msgs.append({"role": "assistant", "content": _deliver})
+                    if _should_reflect(reflection_mode, _deliver, _is_local_llm_url(api_url)):
                         _tool_outs = [str(m.get("content") or "") for m in current_msgs if m.get("role") == "tool"]
-                        _revised, _changed = await _reflect_output(streamed_text, model, api_url, headers, reflection_mode, client, _tool_outs)
+                        _revised, _changed = await _reflect_output(_deliver, model, api_url, headers, reflection_mode, client, _tool_outs)
                         if _changed and _revised.strip():
                             streamed_text = _revised
                             yield {"event": "reflection_revised", "content": _revised}
-                    _track_progress(session_id, "completed", f"text_response ({len(streamed_text)} chars)")
+                    _track_progress(session_id, "completed", f"text_response ({len(_deliver)} chars)")
                     return
                 current_msgs.append({
                     "role": "system",
@@ -2440,7 +2582,13 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                         if _changed and _revised.strip():
                             streamed_text = _revised
                             yield {"event": "reflection_revised", "content": _revised}
-                    _track_progress(session_id, "completed", f"text_response ({len(streamed_text)} chars)")
+                    # 语言兜底：不符则以 content_revised 整体替换（同 2448 路径）
+                    _deliver = await _ensure_final_language(
+                        client, api_url, headers, model,
+                        streamed_text.strip(), user_q)
+                    if _deliver != streamed_text.strip():
+                        yield {"event": "content_revised", "content": _deliver}
+                    _track_progress(session_id, "completed", f"text_response ({len(_deliver)} chars)")
                     return
                 # 任务型请求但模型只回文字不调工具 → nudge 促其行动（不再向用户重复流式输出）
                 current_msgs.append({
@@ -2609,6 +2757,178 @@ _PENDING_INTENT_PATTERNS = (
     "让我用", "我来用", "让我读取", "让我先", "让我再",
     "我先做", "先看看",
 )
+
+
+# 规划话术信号：模型把"我打算做什么"当成最终回答发出来（13:58 事故：
+# 891 字符英文规划 "Let me plan the subtasks: 1…4" 被收尾闸门当完整答案
+# 放行，任务半途而停）。≥2 个信号才算规划——真实回答里带一个
+# "下一步/step" 不应被误拦（17:07 重复堆叠事故的教训）。
+_PLANNING_SIGNALS = (
+    "tool", "工具", "读取", "查询", "搜索", "执行", "调用",
+    "read_file", "list_dir", "run_cmd", "write_file",
+    "search", "tavily", "mx_query", "step", "步骤", "下一步",
+    "let me", "i'll", "i will", "让我", "我先", "接下来",
+    "再分析", "稍后", "马上", "look at", "check the",
+    "i need to", "let's", "let me plan", "my plan", "subtask",
+    "according to the rules", "first, i", "let's get started",
+    "get started", "plan the", "then i", "after that",
+)
+
+
+def _looks_like_planning(text: str) -> bool:
+    """判断回复文本是否只是"计划/声明"而非实质回答。≥2 个规划信号才成立。"""
+    if not text or len(text.strip()) < 10:
+        return False
+    low = text.lower()
+    return sum(1 for sig in _PLANNING_SIGNALS if sig in low) >= 2
+
+
+def _reply_lang_mismatch(user_text: str, reply_text: str) -> bool:
+    """回复语言与用户语言明显不符（中文用户收到英文/英文占优回复）→ True。
+
+    判定：回复中用户语言的字符数，远少于外来语言字母数（英文占优）。
+    891 字符英文规划（0 汉字）命中；14:45 重放中 598 字母 vs 42 汉字 的
+    混合英文回答命中；20:09 重放中 440 字母 vs 170 汉字（英文主体+中文
+    股票名镶入）也命中（en>zh 即判，不要求 3 倍——此前 3 倍阈值放过 2.6 倍
+    的漏网）；"NVIDIA涨5%"（字母 6 < 80）与中文为主的正常回答（汉字多于
+    字母）不误伤。"""
+    user_lang = _detect_user_language(user_text)
+    if not reply_text:
+        return False
+    zh = len(re.findall(r'[\u4e00-\u9fff]', reply_text))
+    ja_kana = len(re.findall(r'[\u3040-\u309f\u30a0-\u30ff]', reply_text))
+    en = len(re.findall(r'[a-zA-Z]', reply_text))
+    if user_lang == "zh":
+        return en >= 80 and en > zh
+    if user_lang == "ja":
+        return en >= 80 and en > (zh + ja_kana)
+    if user_lang == "en":
+        other = zh + ja_kana
+        return other >= 80 and other > en
+    return False
+
+
+# 允许重复调用的工具（持续监测类），防重复护栏对它们不生效
+_REPEAT_ALLOWED_TOOLS = frozenset({"screen_capture", "control_wait"})
+
+
+async def _final_answer_extraction(client, api_url: str, headers: dict, engine_model: str,
+                                   current_msgs: list, user_lang: str) -> str:
+    """非流式单轮"终答提取"：基于已有工具结果强制直接输出最终回答。
+
+    本地 27B 模型被自身思维链卡住、只声明不动手时的强制收口（09-02 09:56、
+    17:21 事故）。不带工具、单一指令，产出由调用方判断是否交付；失败返回空串。"""
+    try:
+        _name = {"zh": "简体中文", "en": "English", "ja": "日本語"}.get(user_lang, "简体中文")
+        _smsgs = [m for m in current_msgs if m.get("role") != "system"][-8:]
+        _smsgs = _smsgs + [{"role": "system", "content":
+            f"任务收尾：用户还在等待回答。请基于上方已有的工具结果直接写出最终回答"
+            f"（必须用{_name}，包含关键数字与结论）。不要再调用任何工具，"
+            f"直接输出回答内容本身。"}]
+        _sb = {"model": engine_model, "messages": _smsgs, "max_tokens": 2048,
+               "stream": False, "temperature": 0.4,
+               "stop": ["<|im_end|>", "</think>", "<eos>"]}
+        async with _local_llm_serialized(api_url):
+            _sr = await client.post(api_url, json=_sb, headers=headers)
+        if _sr.status_code == 200:
+            return ((_sr.json().get("choices") or [{}])[0]
+                    .get("message", {}).get("content", "") or "").strip()
+    except Exception:
+        logger.warning("终答提取失败", exc_info=True)
+    return ""
+
+
+async def _ensure_final_language(client, api_url: str, headers: dict, engine_model: str,
+                                 text: str, user_text: str) -> str:
+    """交付前语言确保：回复语言与用户消息不符时走翻译轮，返回可交付文本。
+
+    缓冲交付后所有 return 路径统一经过这里——即使收尾闸门被跳过
+    （如工具失败分支），英文也不会原样到达用户（16:55 事故）。
+    翻译轮失败（引擎瞬时故障）时加中文说明前缀再交付，用户不会看到
+    无解释的纯英文。"""
+    if text and _reply_lang_mismatch(user_text, text):
+        translated = await _force_translate(client, api_url, headers, engine_model, text,
+                                            _detect_user_language(user_text))
+        if translated == text:
+            return (f"⚠️ 本地模型本轮生成了英文回复，自动翻译暂不可用"
+                    f"（可回复「继续」让我重新整理）。原文如下：\n\n{text}")
+        return translated
+    return text
+
+
+async def _force_translate(client, api_url: str, headers: dict, engine_model: str,
+                           text: str, user_lang: str) -> str:
+    """一轮强制翻译：把模型回复翻译成用户语言（本地引擎非流式单轮）。
+
+    模型对翻译任务的执行远比"用某语言重新分析"稳定——语言兜底的最后一公里
+    （09-03 事故：两轮中文规则+3 次 nudge 后 27B 模型仍输出英文）。失败时
+    返回原文（不阻断交付）。"""
+    lang_name = {"zh": "简体中文", "en": "English", "ja": "日本語"}.get(user_lang, "简体中文")
+    _tmsgs = [
+        {"role": "system",
+         "content": (f"你是翻译器。把用户提供的文本完整翻译成{lang_name}，"
+                     "直接输出译文。不要调用工具，不要输出任何解释、注释或前后缀。")},
+        {"role": "user", "content": text[:6000]},
+    ]
+    _tb = {"model": engine_model, "messages": _tmsgs, "max_tokens": 4096,
+           "stream": False, "temperature": 0.2, "stop": ["<|im_end|>", "<eos>"]}
+    # 引擎长流刚结束时偶发连接重置（17:17 实测 608ms 内 read 失败）——重试一次
+    for _attempt in range(2):
+        try:
+            async with _local_llm_serialized(api_url):
+                _tr = await client.post(api_url, json=_tb, headers=headers)
+            if _tr.status_code == 200:
+                out = ((_tr.json().get("choices") or [{}])[0]
+                       .get("message", {}).get("content", "") or "").strip()
+                if out and len(out) >= 40:
+                    return _strip_think_fences(out)
+            return text
+        except Exception:
+            if _attempt == 0:
+                await asyncio.sleep(2)
+                continue
+            logger.warning("强制翻译轮失败，返回原文", exc_info=True)
+    return text
+
+
+def _count_successful_duplicates(current_msgs: list, tool_name: str, args: dict) -> int:
+    """统计同会话内相同 (tool_name, args) 的已成功执行次数（失败结果不计数，
+    保留"失败→重试一次"的合法模式；14:26 事故：模型被 nudge 后反复重读
+    PROGRESS.md 每轮重跑启动协议陷入循环）。"""
+    try:
+        _norm_args = dict(args)
+        # 路径归一化：read_file 的 "~" 与绝对路径指向同一文件，
+        # 不归一化时模型交替两种写法就能绕过护栏（17:10 重放实测）
+        if tool_name == "read_file" and _norm_args.get("path"):
+            from pathlib import Path as _P
+            _norm_args["path"] = str(_P(_norm_args["path"]).expanduser())
+        args_sig = json.dumps(_norm_args, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        return 0
+    call_ids: set[str] = set()
+    for m in current_msgs:
+        if m.get("role") != "assistant":
+            continue
+        for tc in (m.get("tool_calls") or []):
+            f = tc.get("function", {})
+            if f.get("name") != tool_name:
+                continue
+            try:
+                _a = json.loads(f.get("arguments", "{}"))
+                if tool_name == "read_file" and isinstance(_a, dict) and _a.get("path"):
+                    from pathlib import Path as _P
+                    _a["path"] = str(_P(_a["path"]).expanduser())
+                same = (json.dumps(_a, ensure_ascii=False, sort_keys=True) == args_sig)
+            except Exception:
+                same = False
+            if same and tc.get("id"):
+                call_ids.add(tc["id"])
+    ok = 0
+    for m in current_msgs:
+        if m.get("role") == "tool" and m.get("tool_call_id") in call_ids:
+            if not str(m.get("content", "")).startswith(("Error", "⛔", "⚠️")):
+                ok += 1
+    return ok
 
 
 def _extract_think_body(text: str) -> str:
@@ -2961,6 +3281,7 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
     text_output_delivered = False  # nudge 重试期间抑制已交付文本的重复流式输出
     _pending_tool_analysis = False  # 工具结果已产出，但尚未收到实质性文字回答
     _intent_nudges = 0              # “只声明不动手/只道歉”的追问计数
+    _fabrication_nudges = 0        # 无来源数字拦截计数（19:05 编造事故，≤2 次有界）
     _brief_answer_nudged = False  # "资料充足却短回答"的追问只触发一次，防死循环
     # Build tool prompt
     last_user_text = _extract_last_user_text(current_msgs)
@@ -3046,8 +3367,26 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
         # 无进展（未产出内容/未执行工具）才中止；正常推进的长时间
         # 研究任务不受影响
         _no_progress_deadline = time.monotonic() + 900
+        # 会话总时长预算（17:52 事故：模型持续换新查询，任何工具调用都重置
+        # nudge 计数，无限循环 15 分钟+ 不收尾）——超预算强制终答提取收口。
+        # 720s：27B 本地模型 3 次工具 + 写总结实际需 8-11 分钟，480s 会在
+        # 模型即将写总结时截断（09-03 20:02 实测 490s 中止），放宽到 12 分钟
+        _session_start = time.monotonic()
+        _session_budget = time.monotonic() + 720
         while iteration < max_iterations:
             iteration += 1
+            if time.monotonic() > _session_budget:
+                _sout = await _final_answer_extraction(
+                    client, api_url, headers, _engine_model, current_msgs,
+                    _detect_user_language(_extract_last_user_text(current_msgs)))
+                if len(_sout) >= 120:
+                    yield {"content": "\n\n" + _strip_think_fences(_sout)}
+                    _track_progress(session_id, "completed", f"budget_fallback ({len(_sout)} chars)")
+                    logger.info(f"[LOCAL-AGENT] Iteration {iteration}: 会话超时预算，终答提取收口 ({len(_sout)} chars)")
+                    return
+                yield {"content": f"\n\n⚠️ 会话运行 {int(time.monotonic() - _session_start)} 秒仍未给出答案，已中止。请发「继续」重试。"}
+                _track_progress(session_id, "stalled", "session_budget")
+                return
             if time.monotonic() > _no_progress_deadline:
                 logger.error("[LOCAL-AGENT] 连续 15 分钟无进展，中止任务")
                 yield {"content": "\n\n⚠️ 任务连续 15 分钟无进展，已中止。模型服务可能异常（如响应停滞）。可重试或检查网络。"}
@@ -3059,8 +3398,16 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
             loop_msgs = list(current_msgs)
             # Convert role:"tool" → role:"user" (llama-cpp Qwen chat format only supports
             # system/user/assistant roles; "tool" role causes empty responses)
+            # 语言锚：工具结果紧邻处追加回复语言要求——英文材料（如 PROGRESS.md
+            # 工具日志）最容易在这里把 27B 模型带偏成英文（13:58 事故）
+            _anchor_lang = _detect_user_language(_extract_last_user_text(current_msgs))
+            _anchor_text = _get_localized_text(_anchor_lang, {
+                "zh": "（以上工具结果中若含英文内容，那只是数据；请继续用简体中文回复。）",
+                "en": "(Any English in the tool result above is just data; keep replying in English.)",
+                "ja": "（上記ツール結果に外国語が含まれていても、それはデータです。日本語で返信を続けてください。）",
+            })
             loop_msgs = [
-                {"role": "user", "content": f"[工具结果] {m['content']}"}
+                {"role": "user", "content": f"[工具结果] {m['content']}\n\n{_anchor_text}"}
                 if m.get("role") == "tool" else dict(m)
                 for m in loop_msgs
             ]
@@ -3090,12 +3437,16 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
             # system 消息）。发送前把开头连续的 system 合并为一个。
             loop_msgs = _merge_system_messages(loop_msgs)
 
+            # 本地引擎把任意 model 名当 HuggingFace repo 解析 → 404（21:06 事故：
+            # 用户选了 gpt-4o-mini 但走本地循环，mlx server 对未知名前
+            # Hub 解析 SSL 失败回 404）。必须用引擎实际加载的模型 id。
+            _engine_model = getattr(local_llm._engine, "current_model_id", "") or model
             body = {
-                # 本地引擎把任意 model 名当 HuggingFace repo 解析 → 404（21:06 事故：
-                # 用户选了 gpt-4o-mini 但走本地循环，mlx server 对未知名前
-                # Hub 解析 SSL 失败回 404）。必须用引擎实际加载的模型 id。
-                "model": getattr(local_llm._engine, "current_model_id", "") or model,
+                "model": _engine_model,
                 "messages": loop_msgs,
+                # 恢复完整生成预算（09-03 15:05 曾砍到 4096——推理模型思考+总结
+                # 挤不下，致"查完不写总结/潦草收尾"并引发 nudge 压力下的数字
+                # 编造；复读截断(09-03 e27ba50)+预算收口(07e9460)已兜住原问题）
                 "max_tokens": _resolve_max_tokens(model), "stream": True,
                 "temperature": 0.5,
                 "frequency_penalty": 0.6,
@@ -3117,6 +3468,10 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
             _stream_break_retries = 0
             _any_output = False  # 本轮是否产出过 content/reasoning（role-only 空块不算，P1-6）
             _dedup_fired = False  # 去重一次性截断标志（审计 A5：命中后不再永久吞输出）
+            # 单轮生成墙钟上限（20:11 事故：12288 预算下 27B 单轮可跑 7 分半，
+            # 2 轮即撞 720s 总预算）——超时截断本轮（同复读截断机制），
+            # 已产出文本交给闸门；截断后模型下一轮带着"请直接收尾"继续
+            _gen_deadline = time.monotonic() + 300
             while True:
                 try:
                     async with _local_llm_stream(client, api_url, body, headers) as r:
@@ -3180,6 +3535,12 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                                     content = delta.get("content", "")
                                     # LM Studio/方舟等返回 reasoning_content,OpenAI o 系列返回 reasoning
                                     reasoning = delta.get("reasoning") or delta.get("reasoning_content") or ""
+                                    # 单轮生成墙钟超时（300s）：与复读同机制截断，
+                                    # 防一轮 7 分钟把总预算耗尽（20:11 事故）
+                                    if time.monotonic() > _gen_deadline:
+                                        logger.warning("[LOCAL-AGENT] 单轮生成 300s 超时，截断本轮")
+                                        streamed_text = _strip_repeat_tail(streamed_text)
+                                        raise _GenerationLoopError("单轮生成超时(300s)，已截断")
                                     if content:
                                         _any_output = True
                                         streamed_text += content
@@ -3189,9 +3550,9 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                                         # 无截断、引擎 100% CPU 转到 max_tokens
                                         # （16:29 任务"停在尾端没反应"的帮凶之一）
                                         if _raw_delta_count % 40 == 0 and _detect_text_loop(streamed_text):
-                                            logger.warning("[LOCAL-AGENT] 检测到输出复读循环，截断生成")
-                                            yield {"content": "\n\n⚠️ 检测到输出重复，已自动截断。"}
-                                            raise TimeoutError("输出复读循环，已截断")
+                                            logger.warning("[LOCAL-AGENT] 检测到输出复读循环，截断本轮生成")
+                                            streamed_text = _strip_repeat_tail(streamed_text)
+                                            raise _GenerationLoopError("输出复读循环，已截断")
                                         # 自我介绍去重：只截断一次，保留首段后继续流式
                                         # 输出——此前命中后永久 continue，模型第二次
                                         # "我是辣条"之后的所有真实内容被静默丢弃
@@ -3201,39 +3562,30 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                                             if len(_ded) < len(streamed_text):
                                                 _dedup_fired = True
                                                 streamed_text = _ded + content
-                                        if text_output_delivered:
-                                            # 追问续写轮：用替换事件更新上一条消息，
-                                            # 不再追加新气泡（17:07/17:08 重复堆叠的修复）。
-                                            # 节流：每 40 个 delta 发一次全量累积文本，
-                                            # 前端收到后整体替换上一条 assistant 消息。
-                                            if _raw_delta_count % 40 == 0:
-                                                yield {"event": "content_revised", "content": _strip_think_fences(streamed_text)}
-                                            continue
-                                        # 剥掉 think 围栏标记（```think>/```think<）——否则
-                                        # ReactMarkdown 把它当未闭合代码块 → 后续正文灰框；
-                                        # 用缓冲过滤器捕获被 tokenizer 拆分的围栏
-                                        _clean = _fence_filter.feed(content)
-                                        if _clean:
-                                            yield {"content": _clean}
+                                        # 缓冲交付（16:50 事故）：本地模型内容不再逐字直播——
+                                        # 英文会在收尾闸门/翻译轮运行之前就漏给用户。
+                                        # 本轮内容全部累积，由各交付 return 路径统一做
+                                        # 语言确保后一次性交付；reasoning 通道仍直播。
+                                        _fence_filter.feed(content)
                                     elif reasoning:
                                         _any_output = True
                                         streamed_text += reasoning
                                         if _raw_delta_count % 40 == 0 and _detect_text_loop(streamed_text):
-                                            logger.warning("[LOCAL-AGENT] 检测到输出复读循环，截断生成")
-                                            yield {"content": "\n\n⚠️ 检测到输出重复，已自动截断。"}
-                                            raise TimeoutError("输出复读循环，已截断")
+                                            logger.warning("[LOCAL-AGENT] 检测到输出复读循环，截断本轮生成")
+                                            streamed_text = _strip_repeat_tail(streamed_text)
+                                            raise _GenerationLoopError("输出复读循环，已截断")
                                         if not _dedup_fired:
                                             _ded = _deduplicate_response(streamed_text)
                                             if len(_ded) < len(streamed_text):
                                                 _dedup_fired = True
                                                 streamed_text = _ded + reasoning
-                                        if text_output_delivered:
-                                            if _raw_delta_count % 40 == 0:
-                                                yield {"event": "content_revised", "content": _strip_think_fences(streamed_text)}
-                                            continue
                                         yield {"reasoning": reasoning, "ts": int(time.time() * 1000)}
                                 except (json.JSONDecodeError, KeyError, TypeError, IndexError):
                                     pass
+                                except _GenerationLoopError:
+                                    # 复读截断：停止消费本轮流，已产出（裁尾后）文本
+                                    # 交给后续工具解析/收尾闸门，会话继续（18:01 事故）
+                                    break
                                 except Exception:
                                     logger.error("Local agent SSE parse error", exc_info=True)
                                     raise
@@ -3272,11 +3624,9 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                     await asyncio.sleep(10)
                     continue
 
-            # 收尾修正：本轮产过正文就发一次全量替换——前端支持任意时刻
-            # content_revised（App.tsx 893 整体替换最后一条 assistant 消息），
-            # 把流中可能残留的围栏（buffer 未命中）在收尾统一剥干净（双保险）
-            if (text_output_delivered or _any_output) and streamed_text.strip():
-                yield {"event": "content_revised", "content": _strip_think_fences(streamed_text)}
+            # 收尾修正已移除（16:50 事故）：此前每轮流结束都发一次 content_revised
+            # 全量替换，等于把模型文本在闸门/翻译之前直播给用户。缓冲交付下
+            # 文本只由各交付 return 路径一次性 yield。
 
             # Check for tool calls in the streamed text
             clean_text, tool_calls = _parse_prompt_tool_calls(streamed_text)
@@ -3345,13 +3695,27 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                         # 工具产出了新结果：在收到实质性文字回答（≥200 字符）
                         # 之前，不允许用一句话收尾（“让我读取数据再分析”式
                         # 声明/道歉不算完成）。
+                        # 注意：不重置 _intent_nudges——此前任何新工具调用都
+                        # 重置计数，模型不断换查询即可无限拖延（17:52 事故），
+                        # 改为全会话累计：3 次"声明不动手"后强制终答提取收口。
                         _pending_tool_analysis = True
-                        _intent_nudges = 0
                 else:
                     stagnation += 1
                 if stagnation >= max_stagnation:
-                        yield {"content": f"\n\n⚠️ 连续 {stagnation} 轮无新进展，Agent 停止。如需继续请发新消息。"}
+                    # 停滞兜底（17:21 事故：模型重读文件后空转 3 轮直接停止，
+                    # 用户等了 6 分钟拿不到任何答案）：先做一次非流式"终答提取"——
+                    # 强制基于已有工具结果直接写出最终回答；成功即中文交付，
+                    # 失败才给停止提示。
+                    _sout = await _final_answer_extraction(
+                        client, api_url, headers, _engine_model, current_msgs,
+                        _detect_user_language(_extract_last_user_text(current_msgs)))
+                    if len(_sout) >= 120:
+                        yield {"content": "\n\n" + _strip_think_fences(_sout)}
+                        _track_progress(session_id, "completed", f"stagnation_fallback ({len(_sout)} chars)")
+                        logger.info(f"[LOCAL-AGENT] Iteration {iteration}: 停滞兜底终答交付 ({len(_sout)} chars)")
                         return
+                    yield {"content": f"\n\n⚠️ 连续 {stagnation} 轮无新进展，Agent 停止。如需继续请发新消息。"}
+                    return
                 continue
 
             # No tool calls — pure text response done
@@ -3371,18 +3735,39 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
             if _pending_tool_analysis and streamed_text.strip() and not _recent_tool_failed:
                 # 推理模型(Muse/Qwen3.5/Ornith)常先输出规划文字、下一轮才调工具——
                 # 但“只声明不动手”的回复（让我读取/我再查一下…）不能当完成。
-                _planning_signals = ("tool", "工具", "读取", "查询", "搜索", "执行", "调用",
-                                     "read_file", "list_dir", "run_cmd", "write_file",
-                                     "search", "tavily", "mx_query", "step", "步骤", "下一步",
-                                     "let me", "i'll", "i will", "让我", "我先", "接下来",
-                                     "再分析", "稍后", "马上", "look at", "check the")
-                _is_planning = any(sig in streamed_text.lower() for sig in _planning_signals)
+                _is_planning = _looks_like_planning(streamed_text)
                 # 模型明确说"我改用/我要调用/我再单独查"但整轮没有实际工具调用
                 # （21:42 事故：模型说"改用联网搜索"却直接收尾，未调 tavily）——
                 # 这类带未执行意图的 ≥200 字符正文不算实质完成，继续 nudge。
                 _pending_intent = any(k in streamed_text.lower() for k in _PENDING_INTENT_PATTERNS)
+                # 纯外文长回复（如英文规划 891 字符）不算完成（13:58 事故）：
+                # 用户说中文就必须中文交付，拦截后走 nudge 用中文重写。
+                _lang_mismatch = _reply_lang_mismatch(
+                    _extract_last_user_text(current_msgs), streamed_text)
+                # 无来源数字校验（19:05 事故：模型编造'北向15.6亿/主力80亿'，
+                # 全库工具结果从未返回）——少量可容忍，2 次后放行（有界）
+                # 本地弱模型过分依赖数字换算/转写，这道防幻觉门比云端更易
+                # 误触发 → 本地引擎只打回 1 次即放行，避免把"帮它兜底"的门
+                # 变成"把它拖进 180s 空转断流"的门（09-04 美股事故根因）。
+                _unsourced = _find_unsourced_numbers(streamed_text, current_msgs)
+                _fab_cap = 1 if _is_local_llm_url(api_url) else 2
+                if _unsourced and _fabrication_nudges < _fab_cap:
+                    current_msgs.append({"role": "assistant", "content": streamed_text.strip()})
+                    current_msgs.append({"role": "system", "content":
+                        f"⚠️ 数据来源校验：你回复中的这些数字未出现在本会话任何工具结果中："
+                        f"{'、'.join(_unsourced[:8])}。关键数字必须来自工具结果——"
+                        f"若这些数字是工具数据的换算（如百万→亿），请注明'按工具数据折算'；"
+                        f"否则删除该数值，或明确写'工具未返回该数据'。请修正后重新作答。"})
+                    _fabrication_nudges += 1
+                    text_output_delivered = True
+                    text_only_streak += 1
+                    logger.info(f"[LOCAL-AGENT] Iteration {iteration}: 无来源数字拦截（{_fabrication_nudges}/2）: {_unsourced[:5]}")
+                    # 空转打回 → 下一轮重生成期间前端收不到任何字节，180s 看门狗会
+                    # 误断流（09-04 美股事故）：先推一个心跳给前端续命（P0-4 根治）。
+                    yield {"event": "heartbeat"}
+                    continue
                 if (len(streamed_text.strip()) >= 200 and not _is_meta_wrapup(streamed_text)
-                        and not _pending_intent):
+                        and not _pending_intent and not _is_planning and not _lang_mismatch):
                     # 模型在工具结果后已给出实质性回答（≥200 字符）——接受为
                     # 最终答案直接收尾，不再追问。此前无差别追问导致模型
                     # 从头再答一遍，UI 里重复堆叠（17:07/17:08 两任务的
@@ -3390,33 +3775,60 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                     # 例外：元评论式收尾（"上面的分析已覆盖…任务完成"）不算
                     # 实质回答——分析只在模型思考里，正文从未交付（19:38
                     # 事故），继续走追问轮。
+                    # 缓冲交付：语言确保后一次性交付（16:50 事故后不再直播）
+                    _deliver = await _ensure_final_language(
+                        client, api_url, headers, _engine_model,
+                        streamed_text.strip(), _extract_last_user_text(current_msgs))
                     _pending_tool_analysis = False
-                    current_msgs.append({"role": "assistant", "content": streamed_text.strip()})
-                    _track_progress(session_id, "completed", f"text_response ({len(streamed_text)} chars)")
-                    logger.info(f"[LOCAL-AGENT] Iteration {iteration}: no tools, returning text ({len(streamed_text)} chars)")
+                    current_msgs.append({"role": "assistant", "content": _deliver})
+                    yield {"content": "\n\n" + _strip_think_fences(_deliver)}
+                    _track_progress(session_id, "completed", f"text_response ({len(_deliver)} chars)")
+                    logger.info(f"[LOCAL-AGENT] Iteration {iteration}: no tools, returning text ({len(_deliver)} chars)")
+                    return
+                if _lang_mismatch and not _is_planning and not _pending_intent:
+                    # 实质回答（≥200 字、非规划）但语言不符 → 不追问重分析
+                    # （会丢数据），直接翻译轮交付（09-03 事故最后一公里：
+                    # 14:45 重放中 598 字母/42 汉字 的混合英文分析即走此路）
+                    _deliver = await _force_translate(
+                        client, api_url, headers, _engine_model,
+                        streamed_text.strip(),
+                        _detect_user_language(_extract_last_user_text(current_msgs)))
+                    _pending_tool_analysis = False
+                    yield {"content": "\n\n" + _strip_think_fences(_deliver)}
+                    current_msgs.append({"role": "assistant", "content": _deliver})
+                    _track_progress(session_id, "completed", f"translated_response ({len(_deliver)} chars)")
+                    logger.info(f"[LOCAL-AGENT] Iteration {iteration}: 语言不符，翻译轮交付 ({len(_deliver)} chars)")
                     return
                 # 思考段提取兜底：正文是半截/声明（<200 字符、未执行意图或元评论），
                 # 但思考段里有 ≥200 字符的实质分析（27B 模型把分析全写进思考段，
                 # 21:13 事故）——直接以思考段内容作为最终回答交付，不再追问。
+                # 语言不符（英文思考）不在此交付，走 nudge/翻译兜底（09-03 事故）
                 _think_body = _extract_think_body(streamed_text)
-                if len(_think_body) >= 200 and not _is_meta_wrapup(_think_body):
+                if (len(_think_body) >= 200 and not _is_meta_wrapup(_think_body)
+                        and not _reply_lang_mismatch(_extract_last_user_text(current_msgs), _think_body)):
                     _pending_tool_analysis = False
                     current_msgs.append({"role": "assistant", "content": _think_body})
                     yield {"event": "content_revised", "content": _think_body}
                     _track_progress(session_id, "completed", f"think_body ({len(_think_body)} chars)")
                     logger.info(f"[LOCAL-AGENT] Iteration {iteration}: 正文半截，交付思考段内容 ({len(_think_body)} chars)")
                     return
-                if _intent_nudges < 3:
+                # 意图声明未行动 nudge（本地弱模型常反复声明不动手）：云端 3 次、
+                # 本地 1 次即收尾，避免把"帮它兜底"变成"拖进 180s 空转断流"（09-04 事故）。
+                _intent_cap = 1 if _is_local_llm_url(api_url) else 3
+                if _intent_nudges < _intent_cap:
                     current_msgs.append({"role": "assistant", "content": streamed_text.strip()})
                     if _is_planning:
                         current_msgs.append({
                             "role": "system",
                             "content": _get_localized_text(_detect_user_language(_extract_last_user_text(current_msgs)), {
-                                "zh": "不要只发声明或道歉。你刚才说还要继续——现在就调用工具去执行；如果数据其实已经足够，就把完整分析写进回复正文（含关键数字与结论）。\n"
+                                "zh": "⚠️ 必须用简体中文回复。\n"
+                                       "不要只发声明或道歉。你刚才说还要继续——现在就调用工具去执行；如果数据其实已经足够，就把完整分析写进回复正文（含关键数字与结论）。\n"
                                        "⚠️ 重要：如果连续两次查询都只返回「全部A股」或「指数」汇总（没有各板块明细），说明本查询词对「各板块汇总」无解——请立即改用 tavily_search 搜索板块资金流向排名，或用 mx_query 查具体板块（如：'半导体板块资金流向'、'人工智能板块资金流向'），不要重复查相同的汇总词。",
-                                "en": "Don't just announce or apologize. You said you would continue — call the tool NOW; if the data is sufficient, write the full analysis in your reply body.\n"
+                                "en": "You MUST reply in English.\n"
+                                      "Don't just announce or apologize. You said you would continue — call the tool NOW; if the data is sufficient, write the full analysis in your reply body.\n"
                                       "IMPORTANT: If two consecutive queries return only 'all A-shares' or 'index' summary (no sector detail), that query is unsolved — immediately switch to tavily_search for sector flows, or mx_query a specific sector (e.g., 'semiconductor sector capital flow'). Do NOT repeat the same summary query.",
-                                "ja": "宣言や謝罪だけでなく、続けると言ったなら今すぐツールを呼び出してください。データが十分なら完全な分析を本文に書いてください。\n"
+                                "ja": "必ず日本語で返信してください。\n"
+                                      "宣言や謝罪だけでなく、続けると言ったなら今すぐツールを呼び出してください。データが十分なら完全な分析を本文に書いてください。\n"
                                       "重要：連続2回「全A株」「指数」のみの要約しか返らない場合は、そのクエリは無解です。直ちに tavily_search でセクター資金流を検索するか、mx_query で具体的セクター（例：「半導体セクター資金流」）を検索してください。同じ要約クエリを繰り返さないでください。",
                             }),
                         })
@@ -3425,18 +3837,21 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                         current_msgs.append({
                             "role": "system",
                             "content": _get_localized_text(_detect_user_language(_extract_last_user_text(current_msgs)), {
-                                "zh": "⚠️ 你刚才收到了工具的执行结果，但你的回复里没有给出实质内容"
+                                "zh": "⚠️ 必须用简体中文回复。\n"
+                                       "⚠️ 你刚才收到了工具的执行结果，但你的回复里没有给出实质内容"
                                        "（只有收尾话或道歉，真正的分析还留在你的思考里）。\n"
                                        "如果还需要数据，直接调用工具；否则把完整的分析写进回复正文："
                                        "包含从工具结果中得到的关键数据与结论，让用户直接读到。\n"
                                        "调用工具格式：```tool 工具名\n{\"参数\":\"值\"}\n```",
-                                "en": "⚠️ You received tool results but your reply contained no real content"
+                                "en": "You MUST reply in English.\n"
+                                      "⚠️ You received tool results but your reply contained no real content"
                                       " (only meta-commentary or apologies).\n"
                                       "If you still need data, call a tool directly; otherwise write"
                                       " the FULL analysis into your reply body with key data and"
                                       " conclusions from the tool results.\n"
                                       "Tool format: ```tool tool_name\n{\"param\":\"value\"}\n```",
-                                "ja": "⚠️ ツール実行結果を受け取りましたが、返信に実質的な内容がありません"
+                                "ja": "必ず日本語で返信してください。\n"
+                                      "⚠️ ツール実行結果を受け取りましたが、返信に実質的な内容がありません"
                                       "（メタコメントや謝罪のみ）。\n"
                                       "データがまだ必要なら直接ツールを呼び出し、そうでなければ主要データと"
                                       "結論を含む完全な分析を本文に書いてください。\n"
@@ -3447,24 +3862,31 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                     text_output_delivered = True  # 文本已交付，nudge 重试不再重复输出
                     text_only_streak += 1
                     _intent_nudges += 1
+                    # 空转 nudge → 下一轮重生成期间前端收不到字节，180s 看门狗会误断流：
+                    # 先推心跳续命（P0-4 根治），语义同"无来源数字拦截"分支。
+                    yield {"event": "heartbeat"}
                     continue
                 # 追问到上限仍只有声明/道歉：做一次"终答提取"兜底——不带工具、
                 # 单一指令"写出完整分析"。本地 27B 级模型常被自身思维链卡住：
                 # 思考里已有分析但正文只回意图声明（09-02 09:56 事故：mx_query
                 # 数据到手，3 轮 nudge 模型仍只回 9 字符声明）。
                 final_answer = ""
+                _user_lang = _detect_user_language(_extract_last_user_text(current_msgs))
+                _lang_name = {"zh": "简体中文", "en": "English", "ja": "日本語"}.get(_user_lang, "简体中文")
                 try:
                     _final_msgs = [m for m in current_msgs if m.get("role") != "system"][-8:]
                     _final_msgs = _final_msgs + [{
                         "role": "system",
                         "content": (
-                            "任务收尾。请现在直接写出对用户的最终回答：把之前工具结果中的关键数据"
+                            f"任务收尾。请现在直接写出对用户的最终回答（必须用{_lang_name}）："
+                            "把之前工具结果中的关键数据"
                             "与分析结论完整写进正文。不要再声明意图、不要再道歉、不要再调用任何工具。"
                             "直接输出分析内容本身。"
                         ),
                     }]
                     _fb = {
-                        "model": model, "messages": _final_msgs,
+                        # 同主循环：必须用引擎实际模型 id，任意名会被当 HF repo 解析 404
+                        "model": _engine_model, "messages": _final_msgs,
                         "max_tokens": 2048, "stream": False,
                         "temperature": 0.4, "frequency_penalty": 0.6,
                         "stop": ["<|im_end|>", "</think>", "<eos>"],
@@ -3476,13 +3898,24 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                                         .get("message", {}).get("content", "") or "").strip()
                 except Exception:
                     logger.warning("终答提取失败，回退原始文本", exc_info=True)
+                # 语言兜底：终答仍为外文时，做一轮强制翻译（模型对翻译任务执行
+                # 稳定，保证用户永远收到母语回复，09-03 事故最后一公里）
+                if final_answer and _reply_lang_mismatch(_extract_last_user_text(current_msgs), final_answer):
+                    final_answer = await _force_translate(
+                        client, api_url, headers, _engine_model, final_answer, _user_lang)
                 # 终答有效（比原声明长 3 倍以上）→ 交付终答；否则维持原收尾
                 if len(final_answer) > max(200, len(streamed_text.strip()) * 3):
                     yield {"content": "\n\n" + _strip_think_fences(final_answer)}
                     _track_progress(session_id, "completed", f"final_answer ({len(final_answer)} chars)")
                     return
-                current_msgs.append({"role": "assistant", "content": streamed_text.strip()})
-                _track_progress(session_id, "completed", f"text_response ({len(streamed_text)} chars)")
+                # 原文本语言兜底：外文 → 强制翻译一轮再交付；缓冲交付下必须
+                # 无条件显式 yield（此前依赖流式直播，16:50 事故后已移除）
+                _deliver = await _ensure_final_language(
+                    client, api_url, headers, _engine_model,
+                    streamed_text.strip(), _extract_last_user_text(current_msgs))
+                yield {"content": "\n\n" + _strip_think_fences(_deliver)}
+                current_msgs.append({"role": "assistant", "content": _deliver})
+                _track_progress(session_id, "completed", f"text_response ({len(_deliver)} chars)")
                 logger.warning(f"[LOCAL-AGENT] Iteration {iteration}: {_intent_nudges} 轮追问仍无实质回答，收尾返回")
                 # 必须 return：之前这里只打日志不返回，落回"短回答追问"分支
                 # 再白送一轮（20:48 事故：收尾后又进"追问充分回答一轮"，迭代 6 重复跑）
@@ -3495,7 +3928,12 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                 user_q = _extract_last_user_text(current_msgs).strip().rstrip("?？") if current_msgs else ""
                 has_task_kw = any(kw in user_q for kw in ["运行", "执行", "做", "帮我", "写", "创建", "查", "搜", "找", "分析", "修复", "构建", "部署", "安装", "配置", "run", "build", "fix", "create", "search", "analyze", "deploy"])
                 if not has_task_kw:
-                    _track_progress(session_id, "completed", f"text_response ({len(streamed_text)} chars)")
+                    # 缓冲交付：语言确保 + 显式 yield（闲聊回复也可能英文）
+                    _deliver = await _ensure_final_language(
+                        client, api_url, headers, _engine_model,
+                        streamed_text.strip(), user_q)
+                    yield {"content": "\n\n" + _strip_think_fences(_deliver)}
+                    _track_progress(session_id, "completed", f"text_response ({len(_deliver)} chars)")
                     return
                 # 任务型请求但模型只回文字不调工具 → nudge 促其行动（不再向用户重复流式输出）
                 logger.info(f"[LOCAL-AGENT] Iteration {iteration}: model planning instead of calling tools, nudging (streak={text_only_streak})")
@@ -3581,8 +4019,41 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                 logger.info(f"[LOCAL-AGENT] Iteration {iteration}: 短回答+有实质资料({_tool_out_total} chars)，追问充分回答一轮")
                 continue
 
-            _track_progress(session_id, "completed", f"text_response ({len(streamed_text)} chars)")
-            logger.info(f"[LOCAL-AGENT] Iteration {iteration}: no tools, returning text ({len(streamed_text)} chars)")
+            # 无检查兜底路径（门控被 _recent_tool_failed 跳过时落在这里，
+            # 16:55 事故英文 425 字符、19:36 未执行意图规划话术即从此交付）——
+            # 与闸门同款拦截：规划话术/未执行意图/元评论不得当最终答案（有界 3 次）
+            _pending_intent2 = any(k in streamed_text.lower() for k in _PENDING_INTENT_PATTERNS)
+            if ((_looks_like_planning(streamed_text) or _pending_intent2 or _is_meta_wrapup(streamed_text))
+                    and _intent_nudges < 3):
+                current_msgs.append({"role": "assistant", "content": streamed_text.strip()})
+                current_msgs.append({"role": "system", "content":
+                    "⚠️ 你上一轮只说了计划/声明而没有执行。刚才的查询可能失败或未覆盖全部数据——"
+                    "如果需要数据，立即调用相应的工具（板块涨跌用 tavily_search，行情/资金用 mx_query）；"
+                    "如果数据已足够，就把完整分析（含关键数字与结论）写进回复正文。不要只重复计划。"})
+                _intent_nudges += 1
+                text_output_delivered = True
+                text_only_streak += 1
+                logger.info(f"[LOCAL-AGENT] Iteration {iteration}: 兜底路径规划/未执行意图拦截（{_intent_nudges}/3）")
+                continue
+            # 无来源数字同样拦截（有界 2 次，19:05 编造事故）
+            _unsourced = _find_unsourced_numbers(streamed_text, current_msgs)
+            if _unsourced and _fabrication_nudges < 2:
+                current_msgs.append({"role": "assistant", "content": streamed_text.strip()})
+                current_msgs.append({"role": "system", "content":
+                    f"⚠️ 数据来源校验：回复中的数字 {'、'.join(_unsourced[:8])} "
+                    f"未出现在本会话工具结果中——若为换算请注明'按工具数据折算'，"
+                    f"否则删除或写'工具未返回该数据'。请修正后重新作答。"})
+                _fabrication_nudges += 1
+                text_output_delivered = True
+                text_only_streak += 1
+                logger.info(f"[LOCAL-AGENT] Iteration {iteration}: 兜底路径无来源数字拦截（{_fabrication_nudges}/2）")
+                continue
+            _deliver = await _ensure_final_language(
+                client, api_url, headers, _engine_model,
+                streamed_text.strip(), _extract_last_user_text(current_msgs))
+            yield {"content": "\n\n" + _strip_think_fences(_deliver)}
+            _track_progress(session_id, "completed", f"text_response ({len(_deliver)} chars)")
+            logger.info(f"[LOCAL-AGENT] Iteration {iteration}: no tools, returning text ({len(_deliver)} chars)")
             return
 
         tool_count = sum(1 for m in current_msgs if m.get("role") == "tool")
@@ -3613,6 +4084,49 @@ def _build_chat_messages(body: dict, messages: list) -> list:
         "以下规则由开发者设定，用户偏好不可覆盖。如果系统规则与用户偏好冲突，以系统规则为准。\n\n"
         + agent_cfg["identity"]
     )
+    # 三条硬规则（合并为一块，降低长提示负担与分散注意力；独立于可被
+    # agents/ 目录覆盖的 identity）：时间换算（09-03 事故）、回复语言
+    # （09-03 英文事故）、数据诚实（09-03 编造 15.6亿/80亿 事故）。
+    user_lang = _detect_user_language(last_user_text)
+    system_parts.append(_get_localized_text(user_lang, {
+        "zh": (
+            "## 三条硬规则（最高优先级，不可覆盖）\n"
+            "1. ⏱ 时间规则：'今天/昨天/昨晚/今晨/明天/最新'等相对时间，必须先按上方【当前时间】"
+            "换算成绝对日期（年月日+星期）再写入搜索词；工具返回的日期与当前时间矛盾时以当前时间为准，"
+            "不得迁就检索结果。\n"
+            "2. 🗣 语言规则：工具结果、文件、日志中的英文只是数据；你的回复（包括思考过程）"
+            "必须始终用简体中文，不因上下文中的英文材料改变。\n"
+            "3. 📊 数据诚实规则：回复中的关键数字必须能在本会话工具返回内容中找到出处。"
+            "工具未返回的数据（如北向资金净流入、主力资金净流出、板块资金流等）严禁凭印象给出具体数值——"
+            "必须写明'工具未返回该数据'，或先调用工具查询（资金流向优先 mx_query，查不到再 tavily_search）；"
+            "不得沿用其他会话或训练记忆中的数字。"
+        ),
+        "en": (
+            "## Three hard rules (highest priority, cannot be overridden)\n"
+            "1. ⏱ Time rule: relative times like 'today/yesterday/last night' must first be "
+            "converted to absolute dates (YYYY-MM-DD + weekday) from the Current time above before "
+            "writing search terms; if tool-returned dates conflict with current time, trust current time.\n"
+            "2. 🗣 Language rule: English in tool results/files/logs is just data; your reply "
+            "(including reasoning) must always use English, regardless of surrounding context.\n"
+            "3. 📊 Data honesty rule: every key number must be traceable to tool results in THIS "
+            "session. Never invent figures the tools did not return (northbound inflow, main-force "
+            "outflows, sector flows) — state 'the tools did not return this data' or query first "
+            "(mx_query for fund flows, tavily_search as fallback). Never reuse numbers from other "
+            "sessions or training memory."
+        ),
+        "ja": (
+            "## 三つのハードルール（最優先、上書き不可）\n"
+            "1. ⏱ 時間ルール：'今日/昨日/昨夜/明日/最新'などの相対時間は、上の【現在時刻】から"
+            "絶対日付（年月日+曜日）に変換してから検索語にしてください。ツール結果の日付が現在時刻と"
+            "矛盾する場合は、現在時刻を優先します。\n"
+            "2. 🗣 言語ルール：ツール結果・ファイル・ログ内の外国語はデータに過ぎません。"
+            "返信（思考プロセス含む）は常に日本語で行ってください。\n"
+            "3. 📊 データ誠実ルール：回答中の主要な数字はこのセッションのツール結果に出典が必要です。"
+            "ツールが返さなかったデータ（北向資金流入、主力資金流出、セクター資金フロー等）に"
+            "具体的な数値をでっち上げてはいけません——「ツールはこのデータを返していない」と明記するか、"
+            "先にツールで照会してください。他セッションや学習メモリの数字を使用しないこと。"
+        ),
+    }))
 
     # User identity — personal preferences (lower priority)
     user_identity = _read_identity()
@@ -3634,9 +4148,6 @@ def _build_chat_messages(body: dict, messages: list) -> list:
     home = str(Path.home())
     cwd = _safe_cwd()
     now = datetime.now().strftime("%Y-%m-%d (%A) %H:%M:%S")
-
-    # Detect user language for system prompt localization
-    user_lang = _detect_user_language(last_user_text)
 
     env_labels = _get_localized_text(user_lang, {
         "zh": {"rt": "运行环境", "time": "当前时间", "home": "用户目录", "cwd": "工作目录", "os": "操作系统", "sh": "终端"},
@@ -3683,7 +4194,21 @@ def _build_chat_messages(body: dict, messages: list) -> list:
     if goal_mode:
         extra_prompts.append(GOAL_MODE_PROMPT)
     if progressive:
-        extra_prompts.append(PROGRESSIVE_DELIVERY_PROMPT)
+        # P0 语境分流：渐进式交付协议（"阶段1骨架/阶段2核心/阶段3完善/每阶段≤30% token"）
+        # 是纯写代码的分步规范，对"查行情/分析/聊天"类任务只会诱导模型先写一堆"我将分几步做"
+        # 的声明话术，正是"意图声明未行动/8 分钟空转"的帮凶（09-03 事故）。只有任务含明显
+        # 代码/文件构建语义时才注入，其余任务改为提示"直接产出完整结果，不要分步声明"。
+        _detect_code_task = any(
+            k in (last_user_text or "").lower() for k in
+            ("代码", "编程", "写函数", "实现", "重构", "类 ", "模块", "接口",
+             "compile", "refactor", "implement", "typescript", "python", "function",
+             "class ", "module", "api ", "bugfix", "lint", "改代码", "修 bug")
+        )
+        extra_prompts.append(PROGRESSIVE_DELIVERY_PROMPT if _detect_code_task else
+            "## 交付纪律\n"
+            "用户等待的是完整结果。不要声明\"你将分几步/我接下来要做什么/让我先查一下\"之类的话术——"
+            "要么立即调用工具，要么直接写出包含关键数据与结论的完整回答。"
+            "若已有足够工具数据，直接把分析结论写入正文，不要再描述计划。")
     if extra_prompts:
         system_parts.append("\n".join(extra_prompts))
 
@@ -3781,6 +4306,9 @@ def _detect_user_language(text: str) -> str:
     """Detect the language of user input: 'zh', 'en', or 'ja'."""
     if not text:
         return "zh"
+    # 剥离 URL/网址再计数：链接里的字母远多于中文消息的汉字数，
+    # 不剥离会把"中文+链接"误判为 en，触发强制英文回复规则（09-03 事故）
+    text = re.sub(r"https?://\S+|www\.\S+", "", text)
     # Count characters in each language range
     zh = len(re.findall(r'[\u4e00-\u9fff\u3400-\u4dbf]', text))
     ja_kana = len(re.findall(r'[\u3040-\u309f\u30a0-\u30ff]', text))

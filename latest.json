@@ -1,11 +1,15 @@
 {
-  "version": "0.3.1",
-  "notes": "",
-  "pub_date": "2026-08-30T06:58:06+00:00",
+  "version": "0.3.15",
+  "notes": "Latiao v0.3.15",
+  "pub_date": "2026-09-04T02:25:04Z",
   "platforms": {
     "darwin-aarch64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSNlJGdmtETXY3WkRLOEdybnlDeVhoRUttZ2ZJUHhBZkNjOUs2M3NIazQ2MFd5dlBOWjBxZ3E3ZWpjeGsySDRhWGwwUnJZNUdJTFBUeEFIZXE1OFVINy95ak9BdzhwTUFvPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg4MDczMDg2CWZpbGU6TGF0aWFvXzAuMy4xX2FhcmNoNjQuYXBwLnRhci5negp3amxRZTFqdWFSQXZkaFRZS0c5M1d0aFdBWmFad1NnN3dtMUo0Wi9pamJPMFhEMllOZFpkdVhKRWpnUW5uWHl0S2RIRGxMWVpmSWRGS0pTcDVDN2hDdz09Cg==",
-      "url": "https://github.com/RenYiX0620/Latiao/releases/download/v0.3.1/Latiao_0.3.1_aarch64.app.tar.gz"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSNlJGdmtETXY3WkdDTzFSNDhPMHNobENMbXZEaDUwTHBhTW5PNVdFMkNTQTJkR24reTB6YURNd09ZRFBoUDhyWGVYYmUvUll4UEVGQ0l4cVhqMS8rSzRDaVdBWnMraWdzPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg4NDg4NzAzCWZpbGU6TGF0aWFvXzAuMy4xNV9hYXJjaDY0LmFwcC50YXIuZ3oKTzlaQjZBTTNCbkdHNitkQzRtZVpyclVBMjNOVmFjckNnSW1naDFNeE9qRFRxenlzNnJoZklrQUZmM0Yva29EQnA0THdtdE0vcElwMThTYXNuSTlCRFE9PQo=",
+      "url": "https://github.com/RenYiX0620/Latiao/releases/download/v0.3.15/Latiao_0.3.15_aarch64.app.tar.gz"
+    },
+    "windows-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSNlJGdmtETXY3Wks5L2VUbGdxbFlkV1IrMy9YN280V1FlbUsrRno4SEgvQ1RRVlFKbUJRZmhxODNCOUJXbTZuVUE5LzBDM2o0aXVVMUo0aHozczZVdUFGRmg2Z2tkNlFnPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg4NDg5ODQ5CWZpbGU6TGF0aWFvXzAuMy4xNV94NjQtc2V0dXAuZXhlCnVFdzZzUGRQS1JIQTN6dkdNZ1RaZ0FIeUtCZlo4dUYrbzQwT25nKzhPaGJNVVJYdlVLdGhXaDJXSnhRQWQ0R0tZWUZwN1hiS0VoaUl4eXkzdWUxaERRPT0K",
+      "url": "https://github.com/RenYiX0620/Latiao/releases/download/v0.3.15/Latiao_0.3.15_x64-setup.exe"
     }
   }
 }
