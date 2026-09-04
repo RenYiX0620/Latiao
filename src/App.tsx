@@ -845,10 +845,9 @@ const [timeFilter, setTimeFilter] = useState("all");
                   : undefined;
                 setAgentPhase(t("agent.phase_analyze"));
                 if (isLocalEngine && declared && !cloudCfgPre) {
-                  showToast(
-                    `⚠️ 模型「${declared}」未在云端配置中，本请求实际运行在本地引擎（较慢）。`,
-                    "warn"
-                  );
+                  // 本地模型选择是常态，不再弹窗打扰（09-04 用户反馈）——
+                  // 路由信息保留在日志/routeInfo 中以便排查
+                  console.info(`[route] 模型「${declared}」未在云端配置，实际运行在本地引擎`);
                 }
                 setRouteInfo({ engine: ended, declaredModel: declared });
                 continue;
