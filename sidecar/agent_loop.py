@@ -3371,8 +3371,12 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
         # nudge 计数，无限循环 15 分钟+ 不收尾）——超预算强制终答提取收口。
         # 720s：27B 本地模型 3 次工具 + 写总结实际需 8-11 分钟，480s 会在
         # 模型即将写总结时截断（09-03 20:02 实测 490s 中止），放宽到 12 分钟
+        # 09-04 实测 MLX 27B 每轮生成 2-4 分钟，3 轮 + 总结逼近 13 分钟仍被
+        # 720s 预算截断（15:34 任务 788s 中止）——本地模型放宽到 30 分钟；
+        # 无限循环/僵死由 _no_progress_deadline（15 分钟无进展）看门狗兜底，
+        # 有进展的长时间研究任务不应被总时长预算掐断。
         _session_start = time.monotonic()
-        _session_budget = time.monotonic() + 720
+        _session_budget = time.monotonic() + 1800
         while iteration < max_iterations:
             iteration += 1
             if time.monotonic() > _session_budget:
@@ -3471,7 +3475,11 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
             # 单轮生成墙钟上限（20:11 事故：12288 预算下 27B 单轮可跑 7 分半，
             # 2 轮即撞 720s 总预算）——超时截断本轮（同复读截断机制），
             # 已产出文本交给闸门；截断后模型下一轮带着"请直接收尾"继续
-            _gen_deadline = time.monotonic() + 300
+            # 09-04 实测：Qwen3.8-27B-MLX-4bit 一轮完整分析（1-2 千字）需
+            # 4-8 分钟，300s 截断导致分析永远写不完（15:34 任务三轮全被
+            # 300s 截断后 788s 预算中止）——放宽到 600s；总时长由
+            # _session_budget（1800s）与 15 分钟无进展看门狗兜底
+            _gen_deadline = time.monotonic() + 600
             while True:
                 try:
                     async with _local_llm_stream(client, api_url, body, headers) as r:
