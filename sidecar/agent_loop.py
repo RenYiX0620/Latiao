@@ -4029,10 +4029,14 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
 
             # 无检查兜底路径（门控被 _recent_tool_failed 跳过时落在这里，
             # 16:55 事故英文 425 字符、19:36 未执行意图规划话术即从此交付）——
-            # 与闸门同款拦截：规划话术/未执行意图/元评论不得当最终答案（有界 3 次）
+            # 与闸门同款拦截：规划话术/未执行意图/元评论不得当最终答案。
+            # 本地模型只打回 1 次即放行（09-04 美股/15:34 事故：打回越多，
+            # 模型空转重写越久，反而拖进 788s/817s 预算中止——打回 1 次
+            # 后放行，内容至少到手，必要时用户可点"继续"再要更多）
             _pending_intent2 = any(k in streamed_text.lower() for k in _PENDING_INTENT_PATTERNS)
+            _fb_cap = 1 if _is_local_llm_url(api_url) else 3
             if ((_looks_like_planning(streamed_text) or _pending_intent2 or _is_meta_wrapup(streamed_text))
-                    and _intent_nudges < 3):
+                    and _intent_nudges < _fb_cap):
                 current_msgs.append({"role": "assistant", "content": streamed_text.strip()})
                 current_msgs.append({"role": "system", "content":
                     "⚠️ 你上一轮只说了计划/声明而没有执行。刚才的查询可能失败或未覆盖全部数据——"
@@ -4041,11 +4045,12 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                 _intent_nudges += 1
                 text_output_delivered = True
                 text_only_streak += 1
-                logger.info(f"[LOCAL-AGENT] Iteration {iteration}: 兜底路径规划/未执行意图拦截（{_intent_nudges}/3）")
+                logger.info(f"[LOCAL-AGENT] Iteration {iteration}: 兜底路径规划/未执行意图拦截（{_intent_nudges}/{_fb_cap}）")
                 continue
-            # 无来源数字同样拦截（有界 2 次，19:05 编造事故）
+            # 无来源数字同样拦截（19:05 编造事故；本地 1 次即放行，云端 2 次）
             _unsourced = _find_unsourced_numbers(streamed_text, current_msgs)
-            if _unsourced and _fabrication_nudges < 2:
+            _fab_cap2 = 1 if _is_local_llm_url(api_url) else 2
+            if _unsourced and _fabrication_nudges < _fab_cap2:
                 current_msgs.append({"role": "assistant", "content": streamed_text.strip()})
                 current_msgs.append({"role": "system", "content":
                     f"⚠️ 数据来源校验：回复中的数字 {'、'.join(_unsourced[:8])} "
