@@ -2962,6 +2962,23 @@ def _count_successful_duplicates(current_msgs: list, tool_name: str, args: dict)
     return ok
 
 
+
+def _append_unique_system(current_msgs: list, content: str) -> None:
+    """nudge 性质的多轮系统提醒只保留最新一条。
+
+    此前每条 nudge 都追加一条 system 消息，3 轮打回后上下文里堆积多条
+    "任务尚未完成/你必须继续"——27B 模型据此判定"用户在同一问题上反复
+    发消息，对话被循环构造"，陷入元认知死循环（09-04 23:02 事故）：
+    模型在思考段里与"循环"搏斗 3 分钟，正文只给出 30 字。同文案只留
+    最新一条，模型看到的是"一次提醒"，不再产生"重复模式"解读。
+    """
+    for i in range(len(current_msgs) - 1, -1, -1):
+        m = current_msgs[i]
+        if m.get("role") == "system" and isinstance(m.get("content"), str)                 and m["content"][:40] == content[:40]:
+            current_msgs[i] = {"role": "system", "content": content}
+            return
+    current_msgs.append({"role": "system", "content": content})
+
 def _extract_think_body(text: str) -> str:
     """提取思考段内容：```think>…</think> / ```think>…```think< / <think>…</think>。
 
@@ -3354,10 +3371,11 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
     is_continuation = tool_result_count >= 1 and not has_final_answer
     if is_continuation:
         tools_prompt += (
-            "\n\n⚠️⚠️⚠️ 你现在处于任务执行中途！\n"
-            f"会话中已有 {tool_result_count} 条工具执行结果，但任务尚未完成。\n"
-            "你必须继续使用工具完成用户的原始请求，不能只回复文字说'好的'或'正在处理'。\n"
-            "直接调用工具，不要废话。\n"
+            "\n\n⚠️⚠️⚠️ 注意：这不是用户的新消息，而是系统提醒（你的上一轮回复未完成）！\n"
+            f"会话中已有 {tool_result_count} 条工具执行结果，但你尚未给出实质回答。\n"
+            "用户只需要一次完整回答——不要再声明将要做什么：若需要更多数据就立即调用工具；"
+            "若数据已足够，直接把完整分析（关键数字与结论）写进回复正文。\n"
+            "不要重复已经给过的段落，也不要分析'为什么系统在重复提问'。\n"
             "\n📌 输出纪律（必须遵守）：\n"
             "1. 不要把思考过程用 ```think> 代码块围栏输出，也不要在正文里描述'我将要做什么'。\n"
             "2. 思考完成后，把完整分析结论直接写在正文：关键数据、要点、结论。\n"
@@ -3867,46 +3885,45 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                 if _intent_nudges < _intent_cap:
                     current_msgs.append({"role": "assistant", "content": streamed_text.strip()})
                     if _is_planning:
-                        current_msgs.append({
-                            "role": "system",
-                            "content": _get_localized_text(_detect_user_language(_extract_last_user_text(current_msgs)), {
-                                "zh": "⚠️ 必须用简体中文回复。\n"
+                        _append_unique_system(current_msgs,
+                            _get_localized_text(_detect_user_language(_extract_last_user_text(current_msgs)), {
+                                "zh": "⚠️ 这不是用户的新消息，而是系统提醒（上一轮回复未完成）：\n"
+                                       "必须用简体中文回复。\n"
                                        "不要只发声明或道歉。你刚才说还要继续——现在就调用工具去执行；如果数据其实已经足够，就把完整分析写进回复正文（含关键数字与结论）。\n"
                                        "⚠️ 重要：如果连续两次查询都只返回「全部A股」或「指数」汇总（没有各板块明细），说明本查询词对「各板块汇总」无解——请立即改用 tavily_search 搜索板块资金流向排名，或用 mx_query 查具体板块（如：'半导体板块资金流向'、'人工智能板块资金流向'），不要重复查相同的汇总词。",
                                 "en": "You MUST reply in English.\n"
+                                      "⚠️ This is a system reminder (your previous reply was incomplete), NOT a new user message.\n"
                                       "Don't just announce or apologize. You said you would continue — call the tool NOW; if the data is sufficient, write the full analysis in your reply body.\n"
                                       "IMPORTANT: If two consecutive queries return only 'all A-shares' or 'index' summary (no sector detail), that query is unsolved — immediately switch to tavily_search for sector flows, or mx_query a specific sector (e.g., 'semiconductor sector capital flow'). Do NOT repeat the same summary query.",
                                 "ja": "必ず日本語で返信してください。\n"
+                                      "⚠️ これはユーザーの新規メッセージではなく、システム通知です（前の回答が未完了）。\n"
                                       "宣言や謝罪だけでなく、続けると言ったなら今すぐツールを呼び出してください。データが十分なら完全な分析を本文に書いてください。\n"
                                       "重要：連続2回「全A株」「指数」のみの要約しか返らない場合は、そのクエリは無解です。直ちに tavily_search でセクター資金流を検索するか、mx_query で具体的セクター（例：「半導体セクター資金流」）を検索してください。同じ要約クエリを繰り返さないでください。",
-                            }),
-                        })
+                            }))
                         logger.info(f"[LOCAL-AGENT] Iteration {iteration}: 意图声明未行动，nudge 立即调用工具（{_intent_nudges + 1}/3）")
                     else:
-                        current_msgs.append({
-                            "role": "system",
-                            "content": _get_localized_text(_detect_user_language(_extract_last_user_text(current_msgs)), {
+                        _append_unique_system(current_msgs,
+                            _get_localized_text(_detect_user_language(_extract_last_user_text(current_msgs)), {
                                 "zh": "⚠️ 必须用简体中文回复。\n"
-                                       "⚠️ 你刚才收到了工具的执行结果，但你的回复里没有给出实质内容"
+                                       "⚠️ 这不是用户的新消息，而是系统提醒：你刚才收到了工具的执行结果，但你的回复里没有给出实质内容"
                                        "（只有收尾话或道歉，真正的分析还留在你的思考里）。\n"
                                        "如果还需要数据，直接调用工具；否则把完整的分析写进回复正文："
                                        "包含从工具结果中得到的关键数据与结论，让用户直接读到。\n"
                                        "调用工具格式：```tool 工具名\n{\"参数\":\"值\"}\n```",
                                 "en": "You MUST reply in English.\n"
-                                      "⚠️ You received tool results but your reply contained no real content"
+                                      "⚠️ This is a system reminder, NOT a new user message: you received tool results but your reply contained no real content"
                                       " (only meta-commentary or apologies).\n"
                                       "If you still need data, call a tool directly; otherwise write"
                                       " the FULL analysis into your reply body with key data and"
                                       " conclusions from the tool results.\n"
                                       "Tool format: ```tool tool_name\n{\"param\":\"value\"}\n```",
                                 "ja": "必ず日本語で返信してください。\n"
-                                      "⚠️ ツール実行結果を受け取りましたが、返信に実質的な内容がありません"
+                                      "⚠️ これはユーザーの新規メッセージではなく、システム通知です：ツール実行結果を受け取りましたが、返信に実質的な内容がありません"
                                       "（メタコメントや謝罪のみ）。\n"
                                       "データがまだ必要なら直接ツールを呼び出し、そうでなければ主要データと"
                                       "結論を含む完全な分析を本文に書いてください。\n"
                                       "形式：```tool ツール名\n{\"パラメータ\":\"値\"}\n```",
-                            }),
-                        })
+                            }))
                         logger.info(f"[LOCAL-AGENT] Iteration {iteration}: model returned text after tool result, pushing for continuation（{_intent_nudges + 1}/3）")
                     text_output_delivered = True  # 文本已交付，nudge 重试不再重复输出
                     text_only_streak += 1
