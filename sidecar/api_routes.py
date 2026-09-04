@@ -155,7 +155,7 @@ async def chat_completion(request: Request):
             if user_selected_model not in _names:
                 # 属正常路由信息（本地模型选择是常态），INFO 级即可——
                 # 实况日志默认只看 WARNING+，不刷屏（0.3.14 起降级）
-                logger.info(
+                logger.debug(
                     "模型 %r 不在云端配置中（已配置: %s），本请求将使用本地模型引擎",
                     user_selected_model, ", ".join(sorted(n for n in _names if n)) or "无")
         except Exception:
