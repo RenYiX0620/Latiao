@@ -3731,8 +3731,12 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                     _extract_last_user_text(current_msgs), streamed_text)
                 # 无来源数字校验（19:05 事故：模型编造'北向15.6亿/主力80亿'，
                 # 全库工具结果从未返回）——少量可容忍，2 次后放行（有界）
+                # 本地弱模型过分依赖数字换算/转写，这道防幻觉门比云端更易
+                # 误触发 → 本地引擎只打回 1 次即放行，避免把"帮它兜底"的门
+                # 变成"把它拖进 180s 空转断流"的门（09-04 美股事故根因）。
                 _unsourced = _find_unsourced_numbers(streamed_text, current_msgs)
-                if _unsourced and _fabrication_nudges < 2:
+                _fab_cap = 1 if _is_local_llm_url(api_url) else 2
+                if _unsourced and _fabrication_nudges < _fab_cap:
                     current_msgs.append({"role": "assistant", "content": streamed_text.strip()})
                     current_msgs.append({"role": "system", "content":
                         f"⚠️ 数据来源校验：你回复中的这些数字未出现在本会话任何工具结果中："
@@ -3743,6 +3747,9 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                     text_output_delivered = True
                     text_only_streak += 1
                     logger.info(f"[LOCAL-AGENT] Iteration {iteration}: 无来源数字拦截（{_fabrication_nudges}/2）: {_unsourced[:5]}")
+                    # 空转打回 → 下一轮重生成期间前端收不到任何字节，180s 看门狗会
+                    # 误断流（09-04 美股事故）：先推一个心跳给前端续命（P0-4 根治）。
+                    yield {"event": "heartbeat"}
                     continue
                 if (len(streamed_text.strip()) >= 200 and not _is_meta_wrapup(streamed_text)
                         and not _pending_intent and not _is_planning and not _lang_mismatch):
@@ -3790,7 +3797,10 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                     _track_progress(session_id, "completed", f"think_body ({len(_think_body)} chars)")
                     logger.info(f"[LOCAL-AGENT] Iteration {iteration}: 正文半截，交付思考段内容 ({len(_think_body)} chars)")
                     return
-                if _intent_nudges < 3:
+                # 意图声明未行动 nudge（本地弱模型常反复声明不动手）：云端 3 次、
+                # 本地 1 次即收尾，避免把"帮它兜底"变成"拖进 180s 空转断流"（09-04 事故）。
+                _intent_cap = 1 if _is_local_llm_url(api_url) else 3
+                if _intent_nudges < _intent_cap:
                     current_msgs.append({"role": "assistant", "content": streamed_text.strip()})
                     if _is_planning:
                         current_msgs.append({
@@ -3837,6 +3847,9 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                     text_output_delivered = True  # 文本已交付，nudge 重试不再重复输出
                     text_only_streak += 1
                     _intent_nudges += 1
+                    # 空转 nudge → 下一轮重生成期间前端收不到字节，180s 看门狗会误断流：
+                    # 先推心跳续命（P0-4 根治），语义同"无来源数字拦截"分支。
+                    yield {"event": "heartbeat"}
                     continue
                 # 追问到上限仍只有声明/道歉：做一次"终答提取"兜底——不带工具、
                 # 单一指令"写出完整分析"。本地 27B 级模型常被自身思维链卡住：
