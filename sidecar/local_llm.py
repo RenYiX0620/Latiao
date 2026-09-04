@@ -1529,7 +1529,10 @@ class LocalLLMEngine:
         self.current_model_id = model_id
         self.current_model_name = model_id.split("/")[-1] if "/" in model_id else model_id
         self.server_status = "starting"
-        self.status_message = f"正在加载 {self.current_model_name} (首次需下载)..."
+        self.status_message = f"正在加载 {self.current_model_name}..."
+        # ⚠️ 不要在此加"首次需下载"：本地文件存在时走的是本地加载（不联网），
+        # 该文案会让用户误以为在消费流量（09-04 事故）。只有未解析到本地路径
+        # 且后续真正走 HuggingFace 拉取时才提示下载。
 
         try:
             model_path = _resolve_mlx_path(model_id)
@@ -1640,10 +1643,16 @@ class LocalLLMEngine:
             self._engine_started_at = time.monotonic()
 
             # ── External engine mode (LM Studio / Ollama) ──
-            # 默认关闭：辣条自启引擎加载模型。仅当环境变量
-            # LATIAO_EXTERNAL_ENGINE=1 时才探测外部服务（用于 llama-cpp-python
-            # 暂不支持的模型架构，如 muse-glimmer）。
-            if os.environ.get("LATIAO_EXTERNAL_ENGINE", ""):
+            # 默认关闭：辣条自启引擎加载模型（冷加载 MoE 大模型需 5-8 分钟）。
+            # 开启方式：环境变量 LATIAO_EXTERNAL_ENGINE=1 或 config.json
+            # "external_engine": true —— 后者用于"模型已在 LM Studio 内存中、
+            # 希望秒级就绪"的场景（8 月底此前用户即体验此模式）。
+            _ext_cfg = ""
+            try:
+                _ext_cfg = json.loads(CONFIG_FILE.read_text("utf-8")).get("external_engine", "")
+            except Exception:
+                pass
+            if os.environ.get("LATIAO_EXTERNAL_ENGINE", "") or _ext_cfg:
                 external = self._probe_external_engine()
                 if external:
                     eng_name, eng_url, eng_model = external
