@@ -1557,6 +1557,17 @@ class LocalLLMEngine:
             ]
             env = os.environ.copy()
             env.pop("HF_ENDPOINT", None)
+            # mlx_lm.server 的 GET /v1/models 会调 scan_cache_dir()：HF hub
+            # 缓存目录缺失时抛 CacheNotFound → 该请求必崩 → 就绪/健康探测
+            # 永远失败 → sidecar 误判"正在加载"直到超时杀引擎（09-04 事故：
+            # 15 分钟"假加载"的根因——模型实际 15 秒即可就绪）。确保目录存在。
+            _hf_cache = Path.home() / ".cache" / "huggingface" / "hub"
+            try:
+                _hf_cache.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                pass
+            if not env.get("HF_HUB_CACHE"):
+                env["HF_HUB_CACHE"] = str(_hf_cache.parent)
             # 端口残留兜底：前一个引擎刚被杀（冻结/崩溃/残留），socket 可能短暂
             # 滞留，直接 bind 会 "Address already in use" 秒崩（14:41 事故）。
             # 先清场并等端口真正释放（probe 从"能连"变为"拒绝"即已释放）。
