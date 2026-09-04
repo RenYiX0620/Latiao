@@ -91,3 +91,24 @@ class StripThinkFencesTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TextLoopDetectorTest(unittest.TestCase):
+    """09-04 元认知死循环：180 字段落 ×10 重复必须命中（旧上限 100 为盲区）。"""
+
+    def test_long_paragraph_loop(self):
+        from agent_loop import _detect_text_loop
+        para = ("实际上，打破循环的最干净方式是实际去做一些新的事情——查询特定板块的主力资金流。"
+                "但用户并未指定是哪个板块。\n\n"
+                "让我这么做——查询几个关键板块的主力资金流（比如上一轮会话上下文中提到的板块：房地产、医药生物）。"
+                "或者我可以查询按主力资金流排列的前几个板块。\n\n")
+        text = "开头分析。" + para * 10
+        self.assertTrue(_detect_text_loop(text), "180 字段落循环未命中")
+
+    def test_normal_long_text_not_flagged(self):
+        from agent_loop import _detect_text_loop
+        text = ("今天大盘三大指数低开高走。\n\n上证指数收盘 3930 点，跌 0.97%，成交 8300 亿。\n\n"
+                "深证成指收 13516 点，跌 1.2%。\n\n创业板指收 3286 点，跌 1.5%，跌幅最大。\n\n"
+                "资金面上，主力净流出集中于半导体与白酒板块。\n\n"
+                "操作建议：短期观望为主，关注 3900 点支撑。")
+        self.assertFalse(_detect_text_loop(text), "正常分析被误判循环")

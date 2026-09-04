@@ -1005,13 +1005,16 @@ def _detect_text_loop(text: str) -> bool:
     本地小模型长生成时偶发：最后两三句话无限重复直到 max_tokens。
     判定：取尾部窗口，若存在长度 ≥12 字符的片段在尾部连续重复 ≥3 次
     （或尾部 200 字符内同一片段出现 ≥4 次），判为循环。
+    09-04 扩充：27B 模型的"元认知死循环"重复段落约 180 字（自我对话
+    "打破循环→但用户未指定→让我查询"整段循环），旧上限 100 字符成
+    盲区——片段长度上限扩到 400 字符。
     性能：只在流式累积每 ~2KB 时调用一次，非逐 token。"""
     if not text or len(text) < 120:
         return False
-    tail = text[-600:]
+    tail = text[-1200:]
     n = len(tail)
-    # 尝试所有可能的循环片段长度（12 ~ 100 字符）
-    for plen in range(12, min(100, n // 3) + 1):
+    # 尝试所有可能的循环片段长度（12 ~ 400 字符）
+    for plen in range(12, min(400, n // 3) + 1):
         piece = tail[-plen:]
         if piece.strip() != piece or len(piece.strip()) < 12:
             continue
@@ -1023,10 +1026,10 @@ def _detect_text_loop(text: str) -> bool:
             pos -= plen
         if count >= 3:
             return True
-    # 兜底：短片段高频重复（如"好的，"×8）。注意 \1 是反向引用——
-    # 此前误写成字面 \x01 控制字符，兜底永远不匹配（P1-10）
+    # 兜底：短/中片段高频重复（如"好的，"×8，或 180 字段落×5）。注意 \1
+    # 是反向引用——此前误写成字面 \x01 控制字符，兜底永远不匹配（P1-10）
     import re as _re
-    m = _re.search(r"(.{6,40}?)\1{3,}$", tail, _re.DOTALL)
+    m = _re.search(r"(.{6,400}?)\1{3,}$", tail, _re.DOTALL)
     if m:
         return True
     return False
