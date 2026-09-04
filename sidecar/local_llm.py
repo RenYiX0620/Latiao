@@ -43,6 +43,22 @@ MODELS_DIR.mkdir(parents=True, exist_ok=True)
 # KV cache precision should never exceed model weight precision.
 # Q2/Q3/Q4 model → Q4_0 KV; Q5+ model → Q8_0 KV
 
+def _fix_tokenizer_alias(model_dir) -> None:
+    """修复 HF 下载重名产物：tokenizer.json 缺失但有 tokenizer-2.json 时自动补。
+
+    tokenizer.json 缺失 → tokenizer 退化 → 模型生成的 token 无法解码成文本
+    → "全空输出"（09-04 Ornith-4bit 事故：生成 60 token 但 content 恒空，
+    触发就绪探测失败/agent 判定无实质内容/任务中止的整条链路）。
+    """
+    try:
+        model_dir = Path(model_dir)
+        if not (model_dir / "tokenizer.json").exists() and (model_dir / "tokenizer-2.json").exists():
+            (model_dir / "tokenizer-2.json").rename(model_dir / "tokenizer.json")
+            logger.info("tokenizer.json 缺失，已从 tokenizer-2.json 补齐: %s", model_dir.name)
+    except OSError:
+        pass
+
+
 def _detect_model_bits(model_path: str) -> int:
     """Detect model quantization bits from filename. Returns 4, 5, 6, 8, or 16."""
     import re
@@ -93,9 +109,11 @@ def _resolve_mlx_path(model_id: str, models_dir: Path = MODELS_DIR, hf_hub: Path
                     continue
                 _cand = _org / _name
                 if _cand.is_dir() and (_cand / "config.json").exists():
+                    _fix_tokenizer_alias(_cand)
                     return str(_cand)
             _direct = _mgr_root / _name
             if _direct.is_dir() and (_direct / "config.json").exists():
+                _fix_tokenizer_alias(_direct)
                 return str(_direct)
         except OSError:
             continue
