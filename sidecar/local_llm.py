@@ -1406,7 +1406,10 @@ class LocalLLMEngine:
             t.start()
 
             # Poll HTTP immediately — returns as soon as model is ready (no dead-wait)
-            if not self._wait_for_http(port, timeout_sec=300, process=proc, cancel=self._cancel_load):
+            # 就绪超时 15 分钟：MoE 大模型冷加载（Ornith-35B-A3B-MLX 18GB）需 5-8 分钟，
+            # 300s 会在临近就绪时误杀引擎（09-04 事故）→ UI 卡死无反应。
+            # _wait_for_http 是轮询，就绪即返回，不会真的等满 15 分钟。
+            if not self._wait_for_http(port, timeout_sec=900, process=proc, cancel=self._cancel_load):
                 t.join(timeout=1)
                 err_lines = list(stderr_lines)[-50:] if stderr_lines else []
                 err_text = "".join(err_lines)
@@ -1497,7 +1500,7 @@ class LocalLLMEngine:
         t = threading.Thread(target=_drain, daemon=True)
         t.start()
 
-        if not self._wait_for_http(port, timeout_sec=300, process=proc, cancel=self._cancel_load):
+        if not self._wait_for_http(port, timeout_sec=900, process=proc, cancel=self._cancel_load):
             t.join(timeout=1)
             err_lines = list(stderr_lines)[-50:] if stderr_lines else []
             err_summary = ""
@@ -1579,7 +1582,7 @@ class LocalLLMEngine:
             t.start()
 
             # Poll HTTP immediately — returns as soon as model is ready (no dead-wait)
-            if not self._wait_for_http(port, timeout_sec=300, process=proc, cancel=self._cancel_load):
+            if not self._wait_for_http(port, timeout_sec=900, process=proc, cancel=self._cancel_load):
                 t.join(timeout=1)
                 err_lines = list(stderr_lines)[-50:] if stderr_lines else []
                 err_text = "".join(err_lines)
