@@ -727,8 +727,8 @@ const [timeFilter, setTimeFilter] = useState("all");
   }, [checkingUpdate, showToast]);
   useEffect(() => {
     import("./utils/updater").then(({ getAppVersion }) => {
-      getAppVersion().then(setAppVersion).catch(() => setAppVersion("0.3.16"));
-    }).catch(() => setAppVersion("0.3.16"));
+      getAppVersion().then(setAppVersion).catch(() => setAppVersion("0.3.17"));
+    }).catch(() => setAppVersion("0.3.17"));
     if (autoCheckUpdate) runUpdateCheck(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
