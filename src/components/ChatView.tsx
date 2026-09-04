@@ -620,7 +620,6 @@ export default memo(function ChatView({
               }
             }}
             placeholder={t("chat.placeholder")}
-            disabled={isProcessing}
             rows={1}
             style={{ resize: "none", minHeight: 52, maxHeight: 150 }}
           />

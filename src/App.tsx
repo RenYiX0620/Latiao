@@ -1065,7 +1065,11 @@ const [timeFilter, setTimeFilter] = useState("all");
     // and the sidecar eventually crashes -> "Unhandled Promise Rejection".
     // ⚠️ 必须用 ref 同步判断：isProcessing state 更新滞后于渲染，同 tick
     // 内两次 Enter/双击都在 state 更新前通过 → 双循环（审计 P1）
-    if (isProcessingRef.current) return;
+    if (isProcessingRef.current) {
+      // 任务执行中发送新消息 = 中止当前任务再发（用户可随时插话/纠正方向；
+      // 后端取消由 stopGeneration 同步触发 /v1/chat/cancel，循环不残留）
+      stopGeneration();
+    }
     isProcessingRef.current = true;
 
     // Guard: block sending images to a local model that lacks vision support.
