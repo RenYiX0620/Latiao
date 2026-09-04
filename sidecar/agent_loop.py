@@ -2305,14 +2305,29 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                             logger.error("Agent stream HTTP %d body: %s", r.status_code, err_body)
                         r.raise_for_status()  # httpx 不自动抛 4xx/5xx，必须显式检查
                         # 流式停顿检测：连续 180s 无数据视为僵死（大模型可能缓慢滴灌，120s 超时永不触发）
+                        # 60s 分片等待 + 静默期心跳（P0-4，与本地循环 3465-3480 对齐）：
+                        # 推理模型（DeepSeek 等）长思考时流中无字节，前端 180s 看门狗会
+                        # 掐断连接——每 60s 静默推一个 heartbeat 续命，累计达到停滞阈值
+                        # （首 token 90s / 之后 180s）才判僵死。此前云端循环无任何心跳，
+                        # 长静默期前端必然断流（09-04 云端"执行一半停"根因）。
                         aiter = r.aiter_lines()
                         _fence_filter = _ThinkFenceFilter()
                         _body_out = False  # 本轮是否产出过正文增量（收尾全量修正用）
+                        _silent_secs = 0  # 连续静默秒数（心跳与停滞判定共用，P0-4）
                         while True:
                             try:
-                                line = await asyncio.wait_for(anext(aiter), timeout=180)
+                                # 60s 分片：静默超 60s 发一次心跳保活，累计静默达
+                                # 停滞阈值（首 token 90s / 之后 180s）才判僵死
+                                _stall_timeout = 90 if (not _body_out and _raw_delta_count == 0) else 180
+                                line = await asyncio.wait_for(anext(aiter), timeout=60)
+                                _silent_secs = 0
                             except asyncio.TimeoutError:
-                                raise TimeoutError(f"模型输出停滞超 180 秒（模型可能过大或未加载完）：{model[:60]}")
+                                _silent_secs += 60
+                                if _silent_secs < _stall_timeout:
+                                    # 尚未到停滞阈值：发心跳，前端看门狗续命
+                                    yield {"event": "heartbeat"}
+                                    continue
+                                raise TimeoutError(f"模型输出停滞超 {_stall_timeout:.0f} 秒（模型可能过大或未加载完）：{model[:60]}")
                             except StopAsyncIteration:
                                 break
                             if line and line.startswith("data: "):
