@@ -254,6 +254,16 @@ def _seed_default_cron():
     _save_cron_state()
 
 
+def _convert_tool_messages_for_local(msgs: list[dict]) -> list[dict]:
+    """本地 llama.cpp/mlx 只接受 system/user/assistant 角色，role:"tool"
+    会导致空响应（与主循环 agent_loop.py 的同款转换对齐，L5）。"""
+    return [
+        {"role": "user", "content": f"[工具结果] {m['content']}"}
+        if m.get("role") == "tool" else m
+        for m in msgs
+    ]
+
+
 async def _execute_cron_job(job: dict, force_local: bool = False):
     """Execute a due cron job: run the task through the agent loop with tools enabled."""
     # 依赖 agent_loop 的循环/工具符号 → 函数内 lazy import 避免循环依赖
@@ -373,6 +383,9 @@ async def _execute_cron_job(job: dict, force_local: bool = False):
                         "content": _build_local_tools_prompt(active_tools),
                     }]
                     _cron_msgs = _merge_system_messages(_cron_msgs)
+                    # 本地引擎只认 system/user/assistant——role:"tool" 会致空
+                    # 响应（主循环已做同款转换，cron 此前漏修，L5）
+                    _cron_msgs = _convert_tool_messages_for_local(_cron_msgs)
                 req_body = {
                     "model": model, "messages": _cron_msgs,
                     "max_tokens": 2048, "stream": False,
@@ -384,9 +397,25 @@ async def _execute_cron_job(job: dict, force_local: bool = False):
                     # 本地模型不支持原生 function calling，只对云端发送 tools
                     req_body["tools"] = active_tools
                     req_body["tool_choice"] = "auto"
-                async with _local_llm_serialized(api_url):
-                    resp = await client.post(api_url, json=req_body, headers=headers)
-                resp.raise_for_status()  # httpx 不自动抛 4xx/5xx，必须显式检查
+                # 与主循环对齐的有限重试：引擎重载窗口（35B 权重可达数分钟）
+                # 内触发的任务此前一次瞬时 404/连接错误即整任务失败（L6）
+                _last_err: Exception | None = None
+                resp = None
+                for _cron_try in range(3):
+                    try:
+                        async with _local_llm_serialized(api_url):
+                            resp = await client.post(api_url, json=req_body, headers=headers)
+                        resp.raise_for_status()  # httpx 不自动抛 4xx/5xx，必须显式检查
+                        break
+                    except (httpx.TransportError, httpx.HTTPStatusError) as _e:
+                        _last_err = _e
+                        if _cron_try < 2:
+                            logger.warning("[CRON] 模型请求失败（%s），5s 后重试 %d/3",
+                                           type(_e).__name__, _cron_try + 2)
+                            await asyncio.sleep(5)
+                if resp is None:
+                    raise (_last_err if _last_err is not None
+                           else RuntimeError("cron 模型请求失败"))
                 resp_data = resp.json()
                 choices = resp_data.get("choices", [])
                 if not choices:

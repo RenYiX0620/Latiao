@@ -126,6 +126,9 @@ function App() {
     sessions, setSessions, currentIdx, setCurrentIdx,
     session, messages, setSelectedModel, setMessages, newSession,
   } = useSessions();
+  // 停止按钮服务端取消用（P0 修复）：会话 id 经 ref 取最新值，避免闭包过期
+  const sessionIdRef = useRef<string>("");
+  sessionIdRef.current = session.id;
   const { t, lang } = useTranslation();
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
 const [timeFilter, setTimeFilter] = useState("all");
@@ -150,11 +153,12 @@ const [timeFilter, setTimeFilter] = useState("all");
     if (!saved) {
       // 迁移旧版独立"计划模式"开关
       try { if (JSON.parse(localStorage.getItem("local_ai_os_plan_mode") || "false")) return "plan"; } catch { /* ignore */ }
-      return "full";
+      // 默认 confirm（与后端 api_routes/agent_loop 默认值一致）：高风险操作每次确认
+      return "confirm";
     }
     // 旧版本值迁移：workspace → auto_edit
     if (saved === "workspace") return "auto_edit";
-    return (["read_only", "confirm", "auto_edit", "plan", "full"].includes(saved) ? saved : "full") as "read_only" | "confirm" | "auto_edit" | "plan" | "full";
+    return (["read_only", "confirm", "auto_edit", "plan", "full"].includes(saved) ? saved : "confirm") as "read_only" | "confirm" | "auto_edit" | "plan" | "full";
   });
   useEffect(() => { localStorage.setItem("latiao_access", accessMode); }, [accessMode]);
 
@@ -258,21 +262,32 @@ const [timeFilter, setTimeFilter] = useState("all");
 
   // Save sessions to localStorage with quota-exceeded fallback
   const saveSessions = useCallback((data: string) => {
+    const trySave = (s: string): boolean => {
+      try { localStorage.setItem("local_ai_os_sessions", s); return true; }
+      catch { return false; }
+    };
+    if (trySave(data)) return;
+    // 配额超限：对同一份 data 逐级降级重试——此前修剪的是已存旧数据、
+    // 写回的仍是同一份超限 data，二次写必然再抛异常 → 全部会话静默丢失（P0）。
     try {
-      localStorage.setItem("local_ai_os_sessions", data);
+      let arr = JSON.parse(data);
+      if (!Array.isArray(arr)) return;
+      // Level 1: 剥掉全部图片字段（stripForStorage 已做，此处兜底）
+      arr = arr.map((s: SessionInfo) => ({
+        ...s,
+        messages: s.messages.map(m => ({ ...m, imageBase64: undefined, imagePreview: undefined })),
+      }));
+      if (trySave(JSON.stringify(arr))) return;
+      // Level 2: 只保留最近 2 个会话
+      if (arr.length > 1 && trySave(JSON.stringify(arr.slice(-2)))) return;
+      // Level 3: 只保留最近 1 个会话的最后 20 条消息
+      const last = arr[arr.length - 1];
+      if (last && trySave(JSON.stringify([{ ...last, messages: last.messages.slice(-20) }]))) return;
+      // 仍失败：清空旧数据后保住本次会话的最后 10 条
+      try { localStorage.removeItem("local_ai_os_sessions"); } catch { /* ignore */ }
+      if (last) trySave(JSON.stringify([{ ...last, messages: last.messages.slice(-10) }]));
     } catch {
-      // Quota exceeded — prune oldest sessions and retry
-      try {
-        const current = JSON.parse(localStorage.getItem("local_ai_os_sessions") || "[]");
-        if (Array.isArray(current) && current.length > 1) {
-          localStorage.setItem("local_ai_os_sessions", JSON.stringify(current.slice(-2)));
-        } else {
-          localStorage.removeItem("local_ai_os_sessions");
-        }
-        localStorage.setItem("local_ai_os_sessions", data);
-      } catch {
-        // Still failing — data will be lost for this session
-      }
+      // data 解析失败（不应发生）——放弃本次持久化
     }
   }, []);
 
@@ -712,8 +727,8 @@ const [timeFilter, setTimeFilter] = useState("all");
   }, [checkingUpdate, showToast]);
   useEffect(() => {
     import("./utils/updater").then(({ getAppVersion }) => {
-      getAppVersion().then(setAppVersion).catch(() => setAppVersion("0.3.15"));
-    }).catch(() => setAppVersion("0.3.15"));
+      getAppVersion().then(setAppVersion).catch(() => setAppVersion("0.3.17"));
+    }).catch(() => setAppVersion("0.3.17"));
     if (autoCheckUpdate) runUpdateCheck(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -1023,6 +1038,14 @@ const [timeFilter, setTimeFilter] = useState("all");
       abortControllerRef.current.abort();
       abortControllerRef.current = null;
     }
+    // 服务端取消：仅断前端流时 agent 循环会继续烧 GPU/执行工具/扣云端
+    // 费用（P0）。置位 sidecar 会话级取消标记，循环在每轮迭代/工具执行前
+    // 检查并中止。
+    authFetch("/v1/chat/cancel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: sessionIdRef.current }),
+    }).catch(() => { /* sidecar 不可达时仅靠 abort 兜底 */ });
     activeTaskStackRef.current = [];
     setActiveTask(null);
     setTaskStartAt(null);

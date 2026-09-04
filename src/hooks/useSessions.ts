@@ -2,7 +2,9 @@ import { useState } from "react";
 import type { SessionInfo, Message } from "../types";
 
 const newSession = (): SessionInfo => ({
-  id: `session_${Math.random().toString(36).substring(7)}`,
+  // crypto.randomUUID()：熵充足。此前 Math.random().toString(36).substring(7)
+  // 熵仅约 20-30 bit，setMessages 按 id 精确定位，碰撞即跨会话串话（P2）。
+  id: `session_${crypto.randomUUID()}`,
   name: "session.default",
   messages: [],
   selectedModel: "",
@@ -13,7 +15,7 @@ export function useSessions() {
   const [sessions, setSessions] = useState<SessionInfo[]>(() => {
     try {
       const saved = localStorage.getItem("local_ai_os_sessions");
-      if (saved) { const parsed = JSON.parse(saved); if (Array.isArray(parsed) && parsed.length > 0) return parsed.map((s: any) => ({ ...s, lastActive: s.lastActive || Date.now(), messages: (s.messages || []).map((m: Message) => ({ ...m, id: m.id || `msg_${Math.random().toString(36).slice(2)}` })) })); }
+      if (saved) { const parsed = JSON.parse(saved); if (Array.isArray(parsed) && parsed.length > 0) return parsed.map((s: any) => ({ ...s, lastActive: s.lastActive || Date.now(), messages: (s.messages || []).map((m: Message) => ({ ...m, id: m.id || `msg_${crypto.randomUUID()}` })) })); }
     } catch { /* ignore */ }
     return [newSession()];
   });

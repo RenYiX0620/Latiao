@@ -480,6 +480,26 @@ TOOL_HOOKS: dict[str, dict] = {}
 _pending_confirmations: dict[str, dict] = {}
 _pending_lock = asyncio.Lock()
 
+# 会话级取消注册表：POST /v1/chat/cancel 置位。两个循环在每轮迭代开头与
+# 每次工具执行前检查——停止按钮此前只断前端流，服务端循环继续烧 GPU/
+# 执行工具/扣云端费用（P0）。set 的 add/discard/contains 原子，无需锁。
+_session_cancelled: set[str] = set()
+
+
+def _request_session_cancel(session_id: str) -> None:
+    """置位会话取消标记（/v1/chat/cancel 调用）。"""
+    if session_id:
+        _session_cancelled.add(session_id)
+
+
+def _clear_session_cancel(session_id: str) -> None:
+    """新请求开始时清除标记（重发消息不应被上一次停止影响）。"""
+    _session_cancelled.discard(session_id)
+
+
+def _session_cancel_requested(session_id: str) -> bool:
+    return session_id in _session_cancelled
+
 # PROGRESS_DIR is imported from config
 PROGRESS_FILE = PROGRESS_DIR / "PROGRESS.md"
 AGENTS_FILE = PROGRESS_DIR / "agents.json"
@@ -1857,7 +1877,7 @@ def _stamp_time_sensitive() -> str:
 
 
 async def _handle_tool_execution(tc: dict, current_msgs: list, session_id: str,
-                                  agent_id: str, access_mode: str = "full",
+                                  agent_id: str, access_mode: str = "confirm",
                                   pre_started: dict | None = None) -> tuple[bool, list[dict]]:
     """Execute a single tool call within the agent loop. Returns (verify_failed, events).
 
@@ -2145,7 +2165,7 @@ def _append_loop_log(line: str):
         pass  # 调试日志写失败不影响主流程
 
 
-async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: dict, session_id: str = "", agent_id: str = "latiao", reflection_mode: str = "off", access_mode: str = "full", thinking_level: str = "high"):
+async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: dict, session_id: str = "", agent_id: str = "latiao", reflection_mode: str = "off", access_mode: str = "confirm", thinking_level: str = "high"):
     """Agent loop: call LLM with tools. If tool_calls → execute → loop. If text → yield & done."""
     current_msgs = [dict(m) for m in messages]
     # Two-level compression: keep head + tail, prune middle (MUSE-Autoskill style)
@@ -2233,6 +2253,10 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
 
         while iteration < 50:  # hard cap at 50, dynamic exit via stagnation
             iteration += 1
+            if _session_cancel_requested(session_id):
+                _track_progress(session_id, "cancelled", "user_stop")
+                yield {"content": "\n\n⏹️ 任务已停止。"}
+                return
             if time.monotonic() > loop_deadline:
                 logger.error("[AGENT] 连续 15 分钟无进展，中止任务")
                 yield {"content": "\n\n⚠️ 任务连续 15 分钟无进展（未产出内容或执行工具），已中止。模型服务可能异常（如响应停滞）。可重试或检查网络。"}
@@ -2491,6 +2515,10 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                     if sig not in recent_tool_calls:
                         recent_tool_calls.add(sig)
                         any_new = True
+                    if _session_cancel_requested(session_id):
+                        _track_progress(session_id, "cancelled", "user_stop")
+                        yield {"content": "\n\n⏹️ 任务已停止。"}
+                        return
                     # 先发确认事件再等待（死锁修复）：confirm 级工具的
                     # tool_confirm 必须在执行前到达前端，弹窗才会出现
                     if not tc.get("id"):
@@ -3221,7 +3249,7 @@ def _build_local_tools_prompt(active_tools: list[dict]) -> str:
 
 
 async def _local_agent_loop_stream(messages: list, model: str, api_url: str, headers: dict,
-                                    session_id: str = "", agent_id: str = "latiao", reflection_mode: str = "off", access_mode: str = "full", thinking_level: str = "high"):
+                                    session_id: str = "", agent_id: str = "latiao", reflection_mode: str = "off", access_mode: str = "confirm", thinking_level: str = "high"):
     """Local model agent loop: inject tools as prompt, parse tool calls from text."""
     global _llm_suspect_since  # 引擎存疑标记（本函数内多处置位/清除）
     current_msgs = [dict(m) for m in messages]
@@ -3282,6 +3310,9 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
     _pending_tool_analysis = False  # 工具结果已产出，但尚未收到实质性文字回答
     _intent_nudges = 0              # “只声明不动手/只道歉”的追问计数
     _fabrication_nudges = 0        # 无来源数字拦截计数（19:05 编造事故，≤2 次有界）
+    # 编造拦截上限：闸门与兜底路径共用同一口径（此前两处不一致：闸门本地=1、
+    # 兜底无条件=2——同一回复走不同分支行为不同）
+    _fab_cap = 1 if _is_local_llm_url(api_url) else 2
     _brief_answer_nudged = False  # "资料充足却短回答"的追问只触发一次，防死循环
     # Build tool prompt
     last_user_text = _extract_last_user_text(current_msgs)
@@ -3379,6 +3410,10 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
         _session_budget = time.monotonic() + 1800
         while iteration < max_iterations:
             iteration += 1
+            if _session_cancel_requested(session_id):
+                _track_progress(session_id, "cancelled", "user_stop")
+                yield {"content": "\n\n⏹️ 任务已停止。"}
+                return
             if time.monotonic() > _session_budget:
                 _sout = await _final_answer_extraction(
                     client, api_url, headers, _engine_model, current_msgs,
@@ -3668,6 +3703,10 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                     if sig not in recent_tool_calls:
                         recent_tool_calls.add(sig)
                         any_new = True
+                    if _session_cancel_requested(session_id):
+                        _track_progress(session_id, "cancelled", "user_stop")
+                        yield {"content": "\n\n⏹️ 任务已停止。"}
+                        return
                     # 先发确认事件再等待（死锁修复）：confirm 级工具的
                     # tool_confirm 必须在执行前到达前端，弹窗才会出现
                     if not tc.get("id"):
@@ -3758,7 +3797,6 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                 # 误触发 → 本地引擎只打回 1 次即放行，避免把"帮它兜底"的门
                 # 变成"把它拖进 180s 空转断流"的门（09-04 美股事故根因）。
                 _unsourced = _find_unsourced_numbers(streamed_text, current_msgs)
-                _fab_cap = 1 if _is_local_llm_url(api_url) else 2
                 if _unsourced and _fabrication_nudges < _fab_cap:
                     current_msgs.append({"role": "assistant", "content": streamed_text.strip()})
                     current_msgs.append({"role": "system", "content":
@@ -4049,8 +4087,7 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                 continue
             # 无来源数字同样拦截（19:05 编造事故；本地 1 次即放行，云端 2 次）
             _unsourced = _find_unsourced_numbers(streamed_text, current_msgs)
-            _fab_cap2 = 1 if _is_local_llm_url(api_url) else 2
-            if _unsourced and _fabrication_nudges < _fab_cap2:
+            if _unsourced and _fabrication_nudges < _fab_cap:
                 current_msgs.append({"role": "assistant", "content": streamed_text.strip()})
                 current_msgs.append({"role": "system", "content":
                     f"⚠️ 数据来源校验：回复中的数字 {'、'.join(_unsourced[:8])} "

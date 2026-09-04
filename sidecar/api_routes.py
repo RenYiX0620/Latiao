@@ -54,6 +54,8 @@ from agent_loop import (
     _pending_confirmations,
     _pending_lock,
     _record_tool_call_db,
+    _clear_session_cancel,
+    _request_session_cancel,
     _resolve_api_target,
     _resolve_max_tokens,
     _save_custom_agents,
@@ -199,8 +201,10 @@ async def chat_completion(request: Request):
             async def agent_loop_wrapper():
                 try:
                     _reflection_mode = body.get("reflection_mode", "off")
-                    _access_mode = body.get("access_mode", "full")
+                    _access_mode = body.get("access_mode", "confirm")
                     _thinking_level = body.get("thinking_level", "high")
+                    # 新请求清除上一次停止的取消标记（重发消息不受影响）
+                    _clear_session_cancel(session_id)
                     # P0 路由透明化：把实际落地的引擎与模型名在流开头回传给前端，
                     # 消除"选了云端模型名却静默跑本地最慢路径"的欺骗（08-25 事故根因）。
                     # model 名若不在云端配置里，会落到本地引擎；这里如实上报，用户可见。
@@ -1352,6 +1356,19 @@ async def confirm_tool(request: Request):
             entry["event"].set()
             return {"status": "ok", "call_id": call_id, "approved": approved}
     return {"status": "not_found", "message": f"No pending confirmation for call_id: {call_id}"}
+
+
+@app.post("/v1/chat/cancel")
+async def cancel_chat(request: Request):
+    """停止按钮：置位会话级取消标记。前端 abort 的同时调用本端点，
+    agent 循环在每轮迭代与每次工具执行前检查并中止——此前停止按钮只断
+    前端流，服务端循环继续烧 GPU/执行工具/扣云端费用（P0）。"""
+    body = await _json_body(request)
+    session_id = str(body.get("session_id") or "").strip()
+    if not session_id:
+        return {"status": "error", "message": "missing session_id"}
+    _request_session_cancel(session_id)
+    return {"status": "ok", "session_id": session_id}
 
 
 # ── Cron API endpoints ──

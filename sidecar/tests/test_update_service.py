@@ -60,11 +60,10 @@ class TestUpdateService(unittest.TestCase):
         elif sys.platform.startswith("win"):
             self.assertEqual(key, "windows-x86_64")
 
-    def test_manifest_not_done_returns_current(self):
+    def test_manifest_not_done_returns_none(self):
+        # 状态未完成（无可用更新）→ None（端点返回 204），与当前实现契约一致
         us._save_state()
-        m = us.get_tauri_manifest("0.3.4")
-        self.assertEqual(m["version"], "0.3.4")
-        self.assertEqual(m.get("platforms", {}), {})
+        self.assertIsNone(us.get_tauri_manifest("0.3.4"))
 
     def test_manifest_done_returns_local_url(self):
         us._save_state({
@@ -83,15 +82,15 @@ class TestUpdateService(unittest.TestCase):
         self.assertEqual(entry["url"], "http://127.0.0.1:8765/v1/update-file")
         self.assertEqual(entry["signature"], "sig123")
 
-    def test_manifest_done_but_old_version_returns_current(self):
+    def test_manifest_done_but_old_version_returns_none(self):
         us._save_state({
             "status": "done", "version": "0.3.3",
             "url": "https://x/Latiao_0.3.3_x64-setup.exe", "signature": "s",
         })
         us.UPDATE_DIR.mkdir(parents=True, exist_ok=True)
         (us.UPDATE_DIR / "Latiao_0.3.3_x64-setup.exe").write_bytes(b"x")
-        m = us.get_tauri_manifest("0.3.4")  # 当前 0.3.4 > 远端 0.3.3
-        self.assertEqual(m["version"], "0.3.4")
+        # 远端 0.3.3 ≤ 当前 0.3.4 → 无更新，返回 None（端点 204）
+        self.assertIsNone(us.get_tauri_manifest("0.3.4"))
 
     @mock.patch("threading.Thread")
     def test_prepare_skips_when_up_to_date(self, mock_thread):
