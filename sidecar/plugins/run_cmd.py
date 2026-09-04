@@ -1,11 +1,21 @@
 """Run a shell command and return its output. ⚠️ Requires user confirmation."""
-import platform
 import re
 import shlex
 import subprocess
 
-_IS_WINDOWS = platform.system() == "Windows"
-_WIN_CMDS = r"|dir|cd|where|ver|type|find|findstr" if _IS_WINDOWS else ""
+# 安全不变量单点定义（破坏/混淆/白名单/敏感路径），
+# fallback 与 seed 共用同一模块，消除三处漂移（审计 P0）。
+from cmd_safety import (
+    DESTRUCTIVE_PATTERNS,
+    OBFUSCATION_PATTERNS,
+    SAFE_CMD_RE,
+    check_cmd,
+)
+
+# 保留旧名字导出：test_security 等引用这些名字
+_DESTRUCTIVE_PATTERNS = DESTRUCTIVE_PATTERNS
+_OBFUSCATION_PATTERNS = OBFUSCATION_PATTERNS
+_ALWAYS_ALLOWED = SAFE_CMD_RE
 
 NAME = "run_cmd"
 PERMISSION = "confirm"
@@ -24,54 +34,6 @@ DEFINITION = {
         }
     }
 }
-
-# ── Blocked patterns (checked case-insensitive) ──
-_DESTRUCTIVE_PATTERNS = [
-    # File system destruction
-    r"rm\s+(-[a-z]*[rf]|--recursive|--force)",
-    r">\s*/dev/(sd|nvme|hd|disk|dm-)",
-    r"dd\s+if=",
-    r"mkfs",
-    r"mkswap",
-    r"wipefs",
-    # Privilege escalation / system control
-    r"\bsudo\b", r"\bdoas\b", r"\bsu\s",
-    r"\bshutdown\b", r"\breboot\b", r"\bhalt\b", r"\bpoweroff\b",
-    r"\binit\s+[0-6]",
-    r"\bsystemctl\s+(shutdown|reboot|halt|poweroff|suspend)",
-    r"\blaunchctl\s+(unload|remove)",
-    # Fork bomb / resource exhaustion
-    r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;",
-    r"\bperl\s+-e\b",  # often used for obfuscation
-    # Network dangerous
-    r"\biptables\s+-F\b", r"\bpfctl\s+-d\b",
-    # Write to critical paths
-    r">\s*/etc/", r">>\s*/etc/",
-    r">\s*/System/", r">>\s*/System/",
-    r"chmod\s+[0-7]*7[0-7]*\s+/",
-    r"chown\s+-R\s+",
-]
-
-_OBFUSCATION_PATTERNS = [
-    r"\beval\s", r"\bbase64\s+(-d|--decode)", r"\bxxd\s+-r",
-    r"`[^`]+`",  # backtick subshell
-    r"\$\([^)]+\)",  # $() subshell
-    r"\\x[0-9a-fA-F]{2}",  # hex-encoded chars in command
-    r"\bcurl\b.*\|\s*(ba)?sh\b", r"\bwget\b.*\|\s*(ba)?sh\b",  # curl | sh
-    # 解释器内联代码（审计 H3：黑名单可被 python3 -c / node -e / bash -c 绕过——
-    # shell=False 不拦这些，内联脚本可执行任意操作）。显式命令/脚本文件仍放行
-    # （如 python3 script.py、node app.js、bash deploy.sh）。
-    r"\b(python|python3|python3\.\d+[0-9]*|node|nodejs|deno|bun|ruby|perl|php|lua|nu|pwsh|powershell)\s+(-[a-zA-Z]*[ce]\b|--command\b|--eval\b)",
-    r"\b(ba|z|k|d)?sh\s+(-[a-zA-Z]*[ce]\b|--command\b)",
-    r"\bfish\s+(-c\b|--command\b)",
-]
-
-# Commands that are always allowed (whitelist override for common dev tools)
-_ALWAYS_ALLOWED = re.compile(
-    r"^(ls|pwd|echo|cat|head|tail|wc|file|which|whoami|uname|date|env|printenv"
-    + _WIN_CMDS
-    + r")$"
-)
 
 # Shell operators that are NOT supported because we run with shell=False.
 # If these slip through, shlex.split() passes them as literal arguments and the
@@ -97,16 +59,20 @@ def _reject_shell_operators(cmd: str) -> str | None:
 
 def execute(args: dict) -> str:
     cmd = (args.get("cmd") or args.get("command", "")).strip()
-    cmd_lower = cmd.lower()
 
     # ── Reject unsupported shell syntax FIRST (before whitelist shortcut) ──
     rejected = _reject_shell_operators(cmd)
     if rejected:
         return rejected
 
-    # ── Whitelist check for simple safe commands ──
-    base_cmd = cmd_lower.split()[0] if cmd_lower.split() else ""
-    if _ALWAYS_ALLOWED.match(base_cmd) and len(cmd) < 200:
+    # ── Whitelist fast path for simple safe commands ──
+    # 整条命令必须完全匹配白名单形态，且命中后仍走完整安全检查——
+    # 此前只校验首 token 且命中即整条直行，"env curl ..." 可绕过全部
+    # 黑名单执行任意命令（P0）。env/printenv 已从白名单移除。
+    if SAFE_CMD_RE.match(cmd) and len(cmd) < 200:
+        denied = check_cmd(cmd)
+        if denied:
+            return denied
         try:
             r = subprocess.run(shlex.split(cmd), shell=False, capture_output=True, text=True, timeout=10)
             return r.stdout.strip() or r.stderr.strip() or "(无输出)"
@@ -115,15 +81,10 @@ def execute(args: dict) -> str:
         except Exception as e:
             return f"错误：{e}"
 
-    # ── Block destructive patterns ──
-    for pattern in _DESTRUCTIVE_PATTERNS:
-        if re.search(pattern, cmd_lower):
-            return f"⛔ Blocked destructive command: {cmd}"
-
-    # ── Block obfuscation attempts ──
-    for pattern in _OBFUSCATION_PATTERNS:
-        if re.search(pattern, cmd_lower):
-            return f"⛔ Blocked potentially unsafe command: {cmd}"
+    # ── Full safety check for everything else ──
+    denied = check_cmd(cmd)
+    if denied:
+        return denied
 
     # ── Length limit ──
     if len(cmd) > 1000:

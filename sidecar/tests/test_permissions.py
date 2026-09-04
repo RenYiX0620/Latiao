@@ -26,15 +26,17 @@ class TestResolvePermission(unittest.TestCase):
         main.TOOL_PERMISSIONS.update(self._saved_table)
 
     # ── default permission table (TOOL_PERMISSIONS) ──
-    def test_unknown_tool_defaults_to_safe(self):
-        self.assertEqual(main._resolve_permission("no_such_tool", {}), "safe")
+    def test_unknown_tool_defaults_to_confirm(self):
+        # 未知工具 fail-close（审计 P0）：此前默认 "safe" 使拼写错误/未注册
+        # 工具免确认执行——未知必须降级为 confirm。
+        self.assertEqual(main._resolve_permission("no_such_tool", {}), "confirm")
 
     def test_tool_permissions_table_honored(self):
         main.TOOL_PERMISSIONS["mock_editor"] = "confirm"
         main.TOOL_PERMISSIONS["mock_deleter"] = "danger"
         self.assertEqual(main._resolve_permission("mock_editor", {}), "confirm")
         self.assertEqual(main._resolve_permission("mock_deleter", {}), "danger")
-        self.assertEqual(main._resolve_permission("mock_unknown", {}), "safe")
+        self.assertEqual(main._resolve_permission("mock_unknown", {}), "confirm")
 
     # ── custom rule matching (safe / confirm / danger) ──
     def test_custom_rule_safe(self):

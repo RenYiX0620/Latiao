@@ -15,6 +15,10 @@ from pathlib import Path
 
 import httpx
 
+# 命令安全不变量单点定义（审计 P0）：插件、本 fallback、插件 seed 共用，
+# 消除三处漂移——fallback 此前缺解释器内联拦截（python3 -c / node -e）。
+from cmd_safety import check_cmd, reject_sensitive_read
+
 logger = logging.getLogger("latiao-sidecar")
 
 # ═══════════════════════════════════════════════════════
@@ -72,7 +76,9 @@ def _resolve_permission(tool_name: str, args: dict) -> str:
             return table_perm
     except Exception:
         logger.debug("capability registry lookup failed for %s", tool_name, exc_info=True)
-    return TOOL_PERMISSIONS.get(tool_name, "safe")
+    # 未知工具 fail-close（审计 P0）：此前默认 "safe"——任何拼写错误/未注册
+    # 工具都免确认执行。未知应降级为 confirm，由用户把关。
+    return TOOL_PERMISSIONS.get(tool_name, "confirm")
 
 
 #  工具执行函数
@@ -152,34 +158,6 @@ def list_dir(path: str) -> str:
         return f"错误：{e}"
 
 
-# Reusable command safety patterns (used by run_cmd fallback + plugin-style execute)
-_DANGEROUS = [
-    # File destruction
-    r"rm\s+(-[a-z]*[rf]|--recursive|--force)", r">\s*/dev/(sd|nvme|hd|disk|dm-)",
-    r">\s*/etc/", r"chmod\s+[0-7]*7", r"chown\s+-R",
-    r"chattr\s+[+-]=*i", r"mv\s+/.*\s*/dev/null",
-    # System modification
-    r"dd\s+if=", r"mkfs", r"\bsudo\b", r"\bshutdown\b", r"\breboot\b",
-    r"\bpoweroff\b", r"\binit\s+0\b", r"\binit\s+6\b",
-    r"systemctl\s+(stop|disable|mask|kill)",
-    r"launchctl\s+(unload|remove|bootout)",
-    # Code execution
-    r"\beval\s", r"\bbase64\s+(-d|--decode|--wrap)", r"`[^`]+`", r"\$\([^)]+\)",
-    r"python\s+-c\s+['\"]", r"python3\s+-c\s+['\"]",
-    r"perl\s+-e\s+['\"]", r"ruby\s+-e\s+['\"]",
-    r"node\s+-e\s+['\"]",
-    # Pipe to shell
-    r"\bcurl\b.*\|\s*(ba)?sh\b", r"\bwget\b.*\|\s*(ba)?sh\b",
-    r"echo.*\b\|\s*(ba)?sh\b", r"cat.*\b\|\s*(ba)?sh\b",
-    r"\bbase64.*\|\b.*sh", r"openssl.*\|\b.*sh",
-    # Dangerous xargs/nohup combos
-    r"xargs\s+rm", r"xargs\s+kill",
-    r"nohup.*rm\s", r"nohup.*kill\s",
-    # Fork bomb
-    r":\(\)\s*\{", r":\|:&",
-]
-
-
 def run_cmd(cmd: str) -> str:
     # Strip shell comment lines (models sometimes prepend "# comment\n")
     cmd = "\n".join(line for line in cmd.split("\n") if not line.strip().startswith("#")).strip()
@@ -194,14 +172,14 @@ def run_cmd(cmd: str) -> str:
             "复合命令会静默失败。请拆成多次调用，每次只运行一条命令"
             "（不要用 && | ; > < 等）。"
         )
-    # Safety check before execution (fallback version — plugin has fuller check)
-    cmd_lower = cmd.lower().strip()
-    for pattern in _DANGEROUS:
-        if re.search(pattern, cmd_lower):
-            return f"⛔ Blocked unsafe command: {cmd}"
+    # 统一安全检查（cmd_safety 单点定义——插件/fallback/seed 共用）
+    denied = check_cmd(cmd)
+    if denied:
+        return denied
     if len(cmd) > 1000:
         return f"⛔ Command too long ({len(cmd)} chars, max 1000)"
     # Redirect: if the model is trying to do web search via Python code, tell it to use the tool
+    cmd_lower = cmd.lower().strip()
     if re.search(r'(tavily|requests\.|urllib|httpx|aiohttp)', cmd_lower) and re.search(r'(search|api|get|post)', cmd_lower):
         return (
             "⛔ 不要用 Python 代码做网络搜索或 API 请求！\n"
@@ -398,15 +376,17 @@ _SUBAGENT_TOOLS: dict[str, list[str]] = {
     "explore": ["read_file", "list_dir", "search_files", "run_cmd", "tavily_search"],
 }
 
-# 子智能体可免确认执行的只读命令白名单（ZCode 式 Explore：能跑只读命令探查，
-# 但没有任何写副作用）。run_cmd 本身是 confirm 级且子智能体没有用户确认通道，
-# 此前 debugger 配置里的 run_cmd 实际永远被拦——是死配置。白名单让 explore/
-# debugger 能跑 ls/grep/find 这类纯查询命令，复杂/未列命令仍被拦下。
+# 子智能体可免确认执行的只读命令白名单（ZCode 式 Explore）。
+# 审计 P0：此前只校验首 token 且含 env——"env curl ..." 可执行任意命令、
+# "cat ~/.ssh/id_rsa" 可读私钥。现在校验完整 token 序列：命令名必须在
+# 白名单内、参数只能是简单选项/路径形态、敏感路径拒绝。
 _READONLY_CMD_WORDS = {
     "ls", "cat", "head", "tail", "find", "grep", "rg", "wc", "file",
     "stat", "du", "df", "ps", "which", "whoami", "uname", "pwd",
-    "echo", "env", "date",
+    "echo", "date",
 }
+
+_READONLY_ARG_RE = re.compile(r"-{1,2}[A-Za-z0-9][A-Za-z0-9_-]*|[\w./@+~:-]+")
 
 
 def _is_readonly_cmd(cmd: str) -> bool:
@@ -416,8 +396,20 @@ def _is_readonly_cmd(cmd: str) -> bool:
         return False
     if re.match(r"git\s+(log|status|diff|show|branch|remote|tag|blame)\b", cmd):
         return True
-    first = cmd.split()[0].rsplit("/", 1)[-1]
-    return first in _READONLY_CMD_WORDS
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        return False
+    if not tokens:
+        return False
+    first = tokens[0].rsplit("/", 1)[-1]
+    if first not in _READONLY_CMD_WORDS:
+        return False
+    # 参数必须是简单选项/路径形态——拦截一切嵌套命令与引用花活
+    if not all(_READONLY_ARG_RE.fullmatch(t) for t in tokens[1:]):
+        return False
+    # 读取类命令的敏感路径拒绝（与 read_file 插件黑名单对齐）
+    return reject_sensitive_read(" ".join(tokens)) is None
 
 
 # ── 后台子任务注册表（ZCode 式：fire-and-forget + 进度事件 + 结果查询） ──
