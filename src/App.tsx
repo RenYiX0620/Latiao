@@ -1230,12 +1230,10 @@ const [timeFilter, setTimeFilter] = useState("all");
     let unlisten: (() => void) | undefined;
     (async () => {
       try {
-        // 官方文档/社区验证的 macOS 稳定路径是 webviewWindow 模块
-        // （webview 模块在部分版本事件不触发；#14055 文件路径事件两模块
-        // 行为有差异）。同时保留防抖：macOS 存在一次拖放重复触发
-        //（tauri#14134），同一路径 1.5s 内只处理一次。
-        const { getCurrentWebviewWindow } = await import("@tauri-apps/api/webviewWindow");
-        unlisten = await getCurrentWebviewWindow().onDragDropEvent(async (event: { payload?: { type?: string; paths?: string[] } }) => {
+        // 双监听兜底：webview 与 webviewWindow 两个模块的事件源在不同
+        // Tauri 版本/平台上行为不一致（#14055），两个都挂，共享 handler；
+        // 防抖（tauri#14134 macOS 重复触发）确保同一路径 1.5s 内只处理一次。
+        const handler = async (event: { payload?: { type?: string; paths?: string[] } }) => {
           const payload = event?.payload;
           if (!payload || payload.type !== "drop") return;
           const path = (payload.paths || [])[0];
@@ -1261,8 +1259,22 @@ const [timeFilter, setTimeFilter] = useState("all");
           } catch {
             showToast("文件上传失败", "warn");
           }
-        });
-        console.info("[drag-drop] 原生拖放监听已挂载");
+        };
+        const unlisteners: (() => void)[] = [];
+        try {
+          const { getCurrentWebviewWindow } = await import("@tauri-apps/api/webviewWindow");
+          unlisteners.push(await getCurrentWebviewWindow().onDragDropEvent(handler));
+        } catch (e) {
+          console.warn("[drag-drop] webviewWindow 监听失败", e);
+        }
+        try {
+          const { getCurrentWebview } = await import("@tauri-apps/api/webview");
+          unlisteners.push(await getCurrentWebview().onDragDropEvent(handler));
+        } catch (e) {
+          console.warn("[drag-drop] webview 监听失败", e);
+        }
+        unlisten = () => unlisteners.forEach((u) => { try { u(); } catch { /* noop */ } });
+        console.info("[drag-drop] 原生拖放监听已挂载（双通道）");
         showToast("✅ 拖放监听已就绪", "info");
       } catch (e) {
         console.error("[drag-drop] 挂载失败", e);
