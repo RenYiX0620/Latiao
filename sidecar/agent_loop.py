@@ -2286,6 +2286,45 @@ def _append_loop_log(line: str):
         pass  # 调试日志写失败不影响主流程
 
 
+def _parse_delta_line(line: str) -> tuple[bool, dict | None]:
+    """统一 SSE 行解析（阶段 4 增量收敛点）：云/本地两循环共用唯一实现。
+
+    语义对齐旧的"json.loads + choices[0].get('delta')"块（逐行为等价）：
+    - (True, None)          → [DONE]
+    - (False, None)         → usage-only / 坏行 → 调用方 continue（旧: continue/pass）
+    - (False, {})           → choices 存在但 delta 空 → 调用方照旧计数（旧行为保持）
+    - (False, delta_dict)   → 规范化 delta（content/reasoning/tool_calls 同旧形状）
+    工具调用增量按旧结构重建（{index,id,function:{name,arguments}}），
+    下游 tool_call_bufs 累积逻辑一行不改。
+    """
+    from model_adapters import OpenAICompatAdapter
+    parsed = OpenAICompatAdapter.parse_sse_data_line(line)
+    if parsed.done:
+        return True, None
+    if parsed.parse_error:
+        return False, None
+    chunks = parsed.chunks
+    if not chunks:
+        return False, {}
+    if all(c.kind == "usage" for c in chunks):
+        return False, None  # usage-only chunk（旧: if not choices: continue）
+    delta: dict = {}
+    texts = [c.text for c in chunks if c.kind == "text" and c.text]
+    reasons = [c.reasoning for c in chunks if c.kind == "reasoning" and c.reasoning]
+    tcs = [c.tool_call for c in chunks if c.kind == "tool_call" and c.tool_call]
+    if texts:
+        delta["content"] = "".join(texts)
+    if reasons:
+        delta["reasoning"] = "".join(reasons)
+    if tcs:
+        delta["tool_calls"] = [
+            {"index": t.index, "id": t.id,
+             "function": {"name": t.name, "arguments": t.arguments}}
+            for t in tcs
+        ]
+    return False, delta
+
+
 async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: dict, session_id: str = "", agent_id: str = "latiao", reflection_mode: str = "off", access_mode: str = "confirm", thinking_level: str = "high"):
     """Agent loop: call LLM with tools. If tool_calls → execute → loop. If text → yield & done."""
     current_msgs = [dict(m) for m in messages]
@@ -2476,15 +2515,12 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                             except StopAsyncIteration:
                                 break
                             if line and line.startswith("data: "):
-                                data_str = line[6:]
-                                if data_str == "[DONE]":
-                                    break
                                 try:
-                                    event = json.loads(data_str)
-                                    choices = event.get("choices") or []
-                                    if not choices:
+                                    _done, delta = _parse_delta_line(line)
+                                    if _done:
+                                        break
+                                    if delta is None:
                                         continue  # usage-only chunk（仅 token 统计，无 delta）
-                                    delta = choices[0].get("delta", {})
                                     _raw_delta_count += 1
 
                                     content = delta.get("content", "")
@@ -3728,15 +3764,12 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                             except StopAsyncIteration:
                                 break
                             if line and line.startswith("data: "):
-                                data_str = line[6:]
-                                if data_str == "[DONE]":
-                                    break
                                 try:
-                                    event = json.loads(data_str)
-                                    choices = event.get("choices") or []
-                                    if not choices:
+                                    _done, delta = _parse_delta_line(line)
+                                    if _done:
+                                        break
+                                    if delta is None:
                                         continue  # usage-only chunk（仅 token 统计，无 delta）
-                                    delta = choices[0].get("delta", {})
                                     _raw_delta_count += 1
                                     content = delta.get("content", "")
                                     # LM Studio/方舟等返回 reasoning_content,OpenAI o 系列返回 reasoning
