@@ -18,7 +18,7 @@
         "width": 1200,
         "height": 800,
         "useHttpsScheme": false,
-        "dragDropEnabled": false
+        "dragDropEnabled": true
       }
     ],
     "security": {
