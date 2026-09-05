@@ -47,7 +47,7 @@ class Engine:
                 body = await req.json()
             except Exception:
                 pass
-            self.requests.append({"path": p, "stream": body.get("stream") if isinstance(body, dict) else None})
+            self.requests.append({"path": p, "stream": body.get("stream") if isinstance(body, dict) else None, "body": body})
             if p == "v1/chat/completions" and isinstance(body, dict) and not body.get("stream"):
                 return JSONResponse(self.plan_response)
             try:
@@ -174,7 +174,62 @@ def main():
     if not ok2:
         print("   events:", json.dumps(evs2[:4], ensure_ascii=False)[:400])
 
+    scenario_parallel_empty_names(base, engine)
     engine.stop()
+
+
+
+def scenario_parallel_empty_names(base: str, engine: Engine):
+    """09-21 22:15 复现场景：并行两个空名 tool_calls → 守卫反馈 →
+    第二轮请求应带 parallel_tool_calls: false → 完成。"""
+    body = dict(BODY)
+    body["access_mode"] = "full"          # 本场景专测空名重试，绕过计划门
+    body["messages"] = [{"role": "user", "content": "帮我找到这个xlsx文件"}]
+    body["session_id"] = f"e2e-par-{uuid.uuid4().hex[:10]}"
+    req_start = len(engine.requests)
+    # 并行双空名（path 多候选不可恢复 → 走守卫反馈）
+    dual_payload = {"choices": [{"delta": {"tool_calls": [
+        {"index": 0, "id": "c1", "function": {"name": "", "arguments": json.dumps({"path": "/tmp"})}},
+        {"index": 1, "id": "c2", "function": {"name": "", "arguments": json.dumps({"path": "/tmp"})}},
+    ]}, "index": 0}]}
+    dual = [f"data: {json.dumps(dual_payload, ensure_ascii=False)}\n\n",
+            "data: [DONE]\n\n"]
+    engine.stream_script.put(dual)
+    engine.stream_script.put([
+        f"data: {json.dumps({'choices': [{'delta': {'content': '好的，已按计划完成。' * 8}, 'index': 0}]}, ensure_ascii=False)}\n\n",
+        "data: [DONE]\n\n"])
+    events = []
+    try:
+        with httpx.Client(timeout=45) as c:
+            with c.stream("POST", base + "/v1/chat/completions", json=body, headers=HEADERS) as r:
+                for line in r.iter_lines():
+                    if line.startswith("data: "):
+                        p2 = line[6:]
+                        if p2 == "[DONE]":
+                            break
+                        try:
+                            events.append(json.loads(p2))
+                        except json.JSONDecodeError:
+                            pass
+    except Exception as exc:
+        print("   [场景3读取异常]", type(exc).__name__, str(exc)[:120])
+        print("   engine requests:", [(q.get('stream'), (q.get('body') or {}).get('parallel_tool_calls')) for q in engine.requests[req_start:]][:6])
+        print("   events so far:", [ev.get("event") for ev in events][:6])
+        return False
+    kinds = [ev.get("event", "?") for ev in events]
+    # 服务端第二轮请求（stream 请求中寻找 parallel_tool_calls 键）
+    stream_reqs = [q for q in engine.requests[req_start:] if q.get("stream")]
+    second_has_flag = any((q.get("body") or {}).get("parallel_tool_calls") is False for q in stream_reqs)
+    ev_text = " ".join(str(ev.get("content", "")) + " " + str(ev.get("result", "")) for ev in events)
+    ok = ("工具名为空" in ev_text
+          and second_has_flag
+          and any("已按计划完成" in str(ev.get("content", "")) or "已按计划完成" in str(ev.get("result", "")) for ev in events))
+    print(f"== 场景3: 并行空名→parallel=false ==")
+    print(f"   事件: {kinds[:6]} | parallel_flag: {second_has_flag} | 结果: {'✅' if ok else '❌'}")
+    if not ok:
+        print("   engine bodies:", [(q.get('stream'), (q.get('body') or {}).get('parallel_tool_calls')) for q in engine.requests[req_start:]][:5])
+    return ok
+
 
 
 if __name__ == "__main__":

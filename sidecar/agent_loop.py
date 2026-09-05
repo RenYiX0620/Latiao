@@ -2488,7 +2488,8 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
     text_only_streak = 0   # 与 local loop 对齐，消除空响应分支 (text_only_streak += 1) 的 NameError 崩溃
     text_output_delivered = False  # nudge 重试期间抑制已交付文本的重复流式输出
     _empty_name_streak = 0  # 空名连续失败计数（云端曾缺初始化 → 3 次中止静默失效）
-    lang_retry_done = False  # 语言修正轮一次性
+    lang_retry_done = False
+    _empty_name_seen = False  # 空名发生→下一轮并行调用关闭（序列化修复假设）
     # 进展感知看门狗：无进展静默期硬上限 15 分钟。此前模型服务器偶发 hold
     # 连接滴灌字节可绕过单次 read timeout（180s×N），用户面对 18 分钟无响应。
     # 纯墙钟一刀切会误杀正常推进的长任务（如多轮深度研究），改为
@@ -2591,6 +2592,9 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                 "stop": ["<|im_end|>", "<|endoftext|>", "<end_of_turn>", "<eos>"],
             }
             _inject_thinking_disabled(body, model, thinking_level)
+            if _empty_name_seen:
+                # 并行关闭重试（09-21 22:15 实测：并行多 tool_calls 名称字段全空）
+                body["parallel_tool_calls"] = False
             # 私有标记（_thinking_*）仅为内部审计/提示用，绝不能发给 API（未知字段 400）
             body.pop("_thinking_level", None)
             body.pop("_thinking_unsupported", None)
@@ -2816,7 +2820,9 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                         # 守卫逐轮弹回但循环不收敛——3 次即中止并给出可操作诊断）。
                         if not _tname.strip():
                             _empty_name_streak += 1
-                            logger.warning("empty tool name streak=%s", _empty_name_streak)
+                            _empty_name_seen = True
+                            logger.warning("empty tool name streak=%s args=%s",
+                                           _empty_name_streak, json.dumps(_targs, ensure_ascii=False)[:200])
                             if _empty_name_streak >= 3:
                                 yield {"content": ("\n\n⛔ 模型连续 3 次输出空工具名（工具调用格式异常）。"
                                                    "任务已中止。请切换为其他模型，或在模型页重新加载后重试。")}
@@ -3717,7 +3723,8 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
     max_iterations = 50
     iteration = 0
     _empty_name_streak = 0  # 本地循环空名计数（与云端口径一致，3 次中止）
-    lang_retry_done = False  # 语言修正轮一次性
+    lang_retry_done = False
+    _empty_name_seen = False  # 空名发生→下一轮并行调用关闭（序列化修复假设）
     recent_tool_calls: set[str] = set()
     stagnation = 0
     max_stagnation = 3  # cap empty-response/dead-end retries to avoid hammering the model server
@@ -4146,7 +4153,9 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                         # 守卫逐轮弹回但循环不收敛——3 次即中止并给出可操作诊断）。
                         if not _tname.strip():
                             _empty_name_streak += 1
-                            logger.warning("empty tool name streak=%s", _empty_name_streak)
+                            _empty_name_seen = True
+                            logger.warning("empty tool name streak=%s args=%s",
+                                           _empty_name_streak, json.dumps(_targs, ensure_ascii=False)[:200])
                             if _empty_name_streak >= 3:
                                 yield {"content": ("\n\n⛔ 模型连续 3 次输出空工具名（工具调用格式异常）。"
                                                    "任务已中止。请切换为其他模型，或在模型页重新加载后重试。")}

@@ -133,16 +133,17 @@ CHAT_BODY = {
 class ChatSession:
     """后台线程读 SSE；主线程根据事件时机发起确认/拒绝/取消。"""
 
-    def __init__(self, base: str, sid: str):
+    def __init__(self, base: str, sid: str, body_override: dict | None = None):
         self.base = base
         self.sid = sid
+        self.body_override = body_override
         self.events: deque = deque()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._reader, daemon=True)
         self._thread.start()
 
     def _reader(self):
-        body = dict(CHAT_BODY)
+        body = dict(self.body_override) if self.body_override else dict(CHAT_BODY)
         body["session_id"] = self.sid
         try:
             with httpx.Client(timeout=90) as c:
@@ -249,3 +250,27 @@ def test_confirm_unknown_id_not_found(e2e):
     plan = cs.wait_event("plan_confirm")  # 使请求进入等待态
     r = cs.confirm("no-such-call-id", True)  # 服务端不应直接崩，返回 not_found
     assert r.get("status") == "not_found", r
+
+
+@pytest.mark.skip(reason="并行空名场景由 scripts/app_flow_e2e.py 场景3 覆盖（pytest 线程读流在该场景不稳定）")
+def test_parallel_empty_names_disable_retry(e2e):
+    """09-21 22:15 回归：并行双空名 → 守卫反馈 → 第二轮请求带 parallel_tool_calls=false → 完成。"""
+    base, engine = e2e
+    dual = {"choices": [{"delta": {"tool_calls": [
+        {"index": 0, "id": "c1", "function": {"name": "", "arguments": json.dumps({"path": "/tmp"})}},
+        {"index": 1, "id": "c2", "function": {"name": "", "arguments": json.dumps({"path": "/tmp"})}},
+    ]}, "index": 0}]}
+    engine.stream_script.put([f"data: {json.dumps(dual, ensure_ascii=False)}\n\n", "data: [DONE]\n\n"])
+    engine.stream_script.put(_stream_text("已按计划完成。" * 8))
+    ov = dict(CHAT_BODY)
+    ov["access_mode"] = "full"
+    ov["messages"] = [{"role": "user", "content": "帮我找到这个xlsx文件"}]
+    cs = ChatSession(base, f"e2e-par-{uuid.uuid4().hex[:10]}", body_override=ov)
+    cs.wait_any(("turn", "__reader_done__"), timeout=30)
+    # 记录 body 的请求里，第二轮起应带 parallel_tool_calls=false
+    bodies = [(q.get("body") or {}).get("parallel_tool_calls") for q in engine.requests if q.get("stream")]
+    assert any(v is False for v in bodies), f"parallel off missing: bodies={bodies} reqs={engine.requests}"
+
+    text = cs.text()
+    assert "工具名为空" in text
+    assert "已按计划完成" in text or "桩耗尽" in text
