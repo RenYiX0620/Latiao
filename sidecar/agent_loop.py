@@ -1036,6 +1036,10 @@ def _deduplicate_response(text: str) -> str:
     """Remove repeated identity introductions. Keeps only the first complete one."""
     if not text:
         return text
+    # 性能护栏（09-21 实测 4.2M 字符累积流 → 锚定正则 O(n) 每次×每 40 delta
+    # = CPU 爆炸 100% 挂死）：介绍去重只关心开头，超长文本截到 2 万字符。
+    if len(text) > 20_000:
+        text = text[:20_000]
     # Pattern: text starts with "我是辣条...", then finds "我是辣条" again
     import re
     for prefix in ["我是辣条", "我是 LaTiao", "我是LaTiao", "我是Latiao", "我叫辣条", "我是拉条"]:
@@ -1098,7 +1102,10 @@ def _strip_repeat_tail(text: str) -> str:
     """复读触发后裁掉尾部重复段，保留首次出现的部分。
 
     优先用与检测器同款的正则定位重复单元，尾部只留一份（外科手术式）；
-    匹配不到时退化为粗裁 200 字符。"""
+    匹配不到时退化为粗裁 200 字符。
+    性能护栏（同 dedup）：只处理尾部 2 万字符（该函数只操作尾部）。"""
+    if len(text) > 20_000:
+        text = text[-20_000:]
     for _ in range(10):
         if not _detect_text_loop(text):
             break
