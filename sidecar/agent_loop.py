@@ -1808,6 +1808,7 @@ async def _await_tool_confirmation(call_id: str, tool_name: str, args: dict) -> 
         await event.wait()
         async with _pending_lock:
             approved = _pending_confirmations.get(call_id, {}).get("approved", False)
+        logger.info("tool confirmation resolved: %s approved=%s", call_id, approved)
     except asyncio.TimeoutError:
         approved = False
         events.append({
@@ -1853,6 +1854,7 @@ async def _wait_tool_confirmation(call_id: str, tool_name: str,
             await event_obj.wait()
         async with _pending_lock:
             approved = _pending_confirmations.get(call_id, {}).get("approved", False)
+        logger.info("tool confirmation resolved: %s approved=%s", call_id, approved)
     except asyncio.TimeoutError:
         approved = False
         events.append({
@@ -1911,6 +1913,7 @@ async def _wait_plan_confirmation(plan_id: str, event_obj: asyncio.Event,
             await event_obj.wait()
         async with _pending_lock:
             approved = _pending_confirmations.get(plan_id, {}).get("approved", False)
+        logger.info("plan confirmation resolved: %s approved=%s", plan_id, approved)
     except asyncio.TimeoutError:
         approved = False
         events.append({
@@ -2710,6 +2713,18 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                     try:
                         _tname = tc.get("function", {}).get("name", "unknown")
                         _targs = json.loads(tc.get("function", {}).get("arguments", "{}") or "{}")
+                        # 空名快速中止（09-21 实测：云端模型连续 11 轮输出空工具名，
+                        # 守卫逐轮弹回但循环不收敛——3 次即中止并给出可操作诊断）。
+                        if not _tname.strip():
+                            _empty_name_streak += 1
+                            logger.warning("empty tool name streak=%s", _empty_name_streak)
+                            if _empty_name_streak >= 3:
+                                yield {"content": ("\n\n⛔ 模型连续 3 次输出空工具名（工具调用格式异常）。"
+                                                   "任务已中止。请切换为其他模型，或在模型页重新加载后重试。")}
+                                _track_progress(session_id, "stalled", f"empty_tool_name x{_empty_name_streak}")
+                                return
+                            # 1-2 次不 continue：守卫反馈（空名提示）必须进模型上下文，
+                            # 让模型下一轮改格式；只有第 3 次才中止。
                         if _resolve_permission(_tname, _targs) == "confirm" \
                                 and not _confirm_bypassed(_tname, access_mode) \
                                 and not _check_access(_tname, access_mode):
@@ -2731,6 +2746,8 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                 # 新的调用签名，或本轮有工具失败（模型正在尝试修复）都算实质推进，不计停滞
                 if any_new or round_failed:
                     stagnation = 0
+                    if any_new:
+                        _empty_name_streak = 0  # 合法工具调用复位空名计数
                 else:
                     stagnation += 1
                     if stagnation >= max_stagnation:
@@ -3535,6 +3552,7 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
 
     max_iterations = 50
     iteration = 0
+    _empty_name_streak = 0  # 本地循环空名计数（与云端口径一致，3 次中止）
     recent_tool_calls: set[str] = set()
     stagnation = 0
     max_stagnation = 3  # cap empty-response/dead-end retries to avoid hammering the model server
@@ -3956,6 +3974,18 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                     try:
                         _tname = tc.get("function", {}).get("name", "unknown")
                         _targs = json.loads(tc.get("function", {}).get("arguments", "{}") or "{}")
+                        # 空名快速中止（09-21 实测：云端模型连续 11 轮输出空工具名，
+                        # 守卫逐轮弹回但循环不收敛——3 次即中止并给出可操作诊断）。
+                        if not _tname.strip():
+                            _empty_name_streak += 1
+                            logger.warning("empty tool name streak=%s", _empty_name_streak)
+                            if _empty_name_streak >= 3:
+                                yield {"content": ("\n\n⛔ 模型连续 3 次输出空工具名（工具调用格式异常）。"
+                                                   "任务已中止。请切换为其他模型，或在模型页重新加载后重试。")}
+                                _track_progress(session_id, "stalled", f"empty_tool_name x{_empty_name_streak}")
+                                return
+                            # 1-2 次不 continue：守卫反馈（空名提示）必须进模型上下文，
+                            # 让模型下一轮改格式；只有第 3 次才中止。
                         if _resolve_permission(_tname, _targs) == "confirm" \
                                 and not _confirm_bypassed(_tname, access_mode) \
                                 and not _check_access(_tname, access_mode):
@@ -3978,6 +4008,8 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                 # 新的调用签名，或本轮有工具失败（模型正在尝试修复）都算实质推进，不计停滞
                 if any_new or round_failed:
                     stagnation = 0
+                    if any_new:
+                        _empty_name_streak = 0  # 合法工具调用复位空名计数
                     text_only_streak = 0
                     if any_new:
                         # 工具产出了新结果：在收到实质性文字回答（≥200 字符）

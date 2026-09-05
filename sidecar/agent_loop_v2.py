@@ -219,6 +219,7 @@ class AgentLoop:
         recent_tool_calls: set[str] = set()
         stagnation = 0
         streak = 0
+        empty_name_streak = 0  # 空名连续失败计数（3 次中止，09-21 实测）
         has_called_tool = False
         text_output_delivered = False
         pending_tool_analysis = False
@@ -303,6 +304,17 @@ class AgentLoop:
                     try:
                         tname = tc.get("function", {}).get("name", "unknown")
                         targs = json.loads(tc.get("function", {}).get("arguments", "{}") or "{}")
+                        # 空名快速中止（与 v1 同口径：3 次即中止并给可操作诊断）
+                        if not tname.strip():
+                            empty_name_streak += 1
+                            logger.warning("v2 empty tool name streak=%s", empty_name_streak)
+                            if empty_name_streak >= 3:
+                                yield {"content": ("\n\n⛔ 模型连续 3 次输出空工具名（工具调用格式异常）。"
+                                                   "任务已中止。请切换为其他模型，或在模型页重新加载后重试。")}
+                                _track_progress(self.session_id, "stalled",
+                                                f"empty_tool_name x{empty_name_streak}")
+                                return
+                            # 1-2 次不 continue：守卫反馈（空名提示）进上下文，第 3 次才中止
                         if _resolve_permission(tname, targs) == "confirm" \
                                 and not _confirm_bypassed(tname, self.access_mode) \
                                 and not _check_access(tname, self.access_mode):
