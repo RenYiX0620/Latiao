@@ -111,6 +111,21 @@ def test_persist_replay_roundtrip(conn):
     assert replayed[1].data["message"]["content"] == "hello"
 
 
+def test_restart_continues_seq_not_conflict(conn):
+    """P1-2：重启（新实例）后 append 必须从已持久化 seq 之后继续——否则
+    INSERT OR IGNORE 会静默丢弃新事件。"""
+    first = SessionLog("restart-session", conn=conn, persist=True)
+    first.append("turn/start", {"turn": 1})
+    first.append("step/start", {"turn": 1, "step": 1})
+    # 模拟 sidecar 重启：同连接新建实例
+    second = SessionLog("restart-session", conn=conn, persist=True)
+    assert [e.seq for e in second._events] == [0, 1]  # 已恢复既有事件
+    ev = second.append("step/end", {"turn": 1, "step": 1})
+    assert ev.seq == 2  # 连续，不再与 DB 冲突
+    rows = SessionLog.load("restart-session", conn=conn)
+    assert [e.seq for e in rows] == [0, 1, 2]  # 三条都落库（无人被 OR IGNORE）
+
+
 def test_replay_missing_session_empty(conn):
     assert SessionLog.load("no-such-session", conn=conn) == []
 

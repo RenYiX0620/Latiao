@@ -255,6 +255,15 @@ async def chat_completion(request: Request):
             _thinking_level = body.get("thinking_level", "high")
 
             async def _run_agent(_protocol, _api_url, _headers, _is_local, _model):
+                if os.environ.get("LATIAO_AGENT_LOOP_V2", "") == "1":
+                    from agent_loop_v2 import AgentLoop
+                    engine_kind = "local" if _is_local else "cloud"
+                    async for event in AgentLoop(
+                        engine_kind, messages, _model, _api_url, _headers, session_id,
+                        agent_id, _reflection_mode, _access_mode, _thinking_level,
+                    ).run():
+                        yield event
+                    return
                 if _is_local:
                     # 本地模型：用 prompt-based tool calling（不依赖 OpenAI function calling API）
                     async for event in _local_agent_loop_stream(messages, _model, _api_url, _headers, session_id, agent_id, _reflection_mode, _access_mode, _thinking_level):
@@ -269,8 +278,6 @@ async def chat_completion(request: Request):
             async def agent_loop_wrapper():
                 _fb_used = False  # 429 降级只允许一次，防循环
                 try:
-                    # 新请求清除上一次停止的取消标记（重发消息不受影响）
-                    _clear_session_cancel(session_id)
                     # P0 路由透明化：把实际落地的引擎与模型名在流开头回传给前端，
                     # 消除"选了云端模型名却静默跑本地最慢路径"的欺骗（08-25 事故根因）。
                     # model 名若不在云端配置里，会落到本地引擎；这里如实上报，用户可见。
@@ -369,6 +376,10 @@ async def chat_completion(request: Request):
                     logger.error("Agent loop unexpected error", exc_info=True)
                     yield f"data: {json.dumps({'error': 'Agent 循环内部错误，请查看日志。'})}\n\n"
                     yield "data: [DONE]\n\n"
+            # 顺序契约（P1-1 修复）：clear 必须先于 _logged_agent_turn 的 begin_turn
+            # ——否则新开幕令牌会被 abandon() 作废，停止语义丢失。
+            # 新请求清除上一次停止的取消标记（重发消息不受影响）
+            _clear_session_cancel(session_id)
             return StreamingResponse(
                 _logged_agent_turn(session_id, messages, agent_loop_wrapper()),
                 media_type="text/event-stream",

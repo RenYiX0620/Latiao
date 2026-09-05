@@ -75,6 +75,35 @@ async def test_error_turn_propagates(logged_turn, conn):
     assert log[-1].data == {"reason": "error"}
 
 
+@pytest.mark.asyncio
+async def test_clear_before_begin_order_contract(logged_turn, conn):
+    """P1-1 顺序契约回归：api_routes 的契约是 clear→begin→run。
+
+    若 clear 发生在 begin 之后（旧 bug），abandon 会把新令牌作废，
+    后续取消 request_stop 无活动可停 → turn/end 谎报 completed。
+    本测试模拟正确顺序（clear 先于 begin），验证停止语义完整。
+    """
+    from agent_loop import _clear_session_cancel, _request_session_cancel, _session_cancel_requested
+    from loop_state import turn_state_for
+    from loop_state import Phase
+
+    sid = "sess-order-contract"
+
+    async def inner():
+        yield {"event": "content", "content": "partial"}
+        _request_session_cancel(sid)   # 流中停止
+
+    # 模拟 api_routes 修正后的顺序：clear（放弃残留）→ logged turn（begin）
+    _clear_session_cancel(sid)
+    await _collect(logged_turn(sid, [{"role": "user", "content": "go"}], inner()))
+
+    log = SessionLog.load(sid, conn=conn)
+    assert log[-1].data == {"reason": "aborted"}, [e.data for e in log]
+    state = turn_state_for(sid)
+    assert state.phase is Phase.IDLE
+    assert state.end_reason == "aborted"
+
+
 def test_event_log_for_cached_keeps_seq_contiguous(conn):
     from agent_loop import _event_log_for
     log_a = _event_log_for("sess-cache")

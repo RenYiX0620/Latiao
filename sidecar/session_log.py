@@ -141,6 +141,18 @@ class SessionLog:
         self._lock = threading.Lock()   # append 幂等/并发（代理层是 asyncio，但 SQLite 写是同步）
         if self._persist and self._conn is not None:
             self._ensure_table()
+            # P1-2 修复：以已持久化事件为基准恢复内存日志——否则重启后
+            # seq 从 0 起步与 DB 冲突，INSERT OR IGNORE 静默丢弃新事件
+            # （审计完整性静默失真；LRU 逐出后回归同理会复现）。
+            try:
+                self._events = SessionLog.load(session_id, conn=self._conn)
+                if self._events:
+                    logger.debug(
+                        "session log %s restored %d events (seq 0..%d)",
+                        session_id, len(self._events), self._events[-1].seq,
+                    )
+            except Exception:
+                logger.warning("failed to restore session log state", exc_info=True)
 
     # ── 公共 API ────────────────────────────────────────────────────────
 

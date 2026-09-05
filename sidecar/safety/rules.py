@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -29,12 +30,24 @@ try:  # tree-sitter 为可选依赖：缺失时语义层不可用，调用方会
     import tree_sitter_bash
 
     _LANGUAGE = Language(tree_sitter_bash.language())
-    _PARSER = Parser(_LANGUAGE)
     _TS_AVAILABLE = True
 except Exception:  # pragma: no cover — 依赖缺失路径
     _LANGUAGE = None
-    _PARSER = None
     _TS_AVAILABLE = False
+
+# P2-1 修复：py-tree-sitter 明确 Parser 非线程安全；check_cmd/readonly_safe
+# 可能被工具线程调用（同步工具经线程池）与事件循环并发——线程局部实例化。
+_TS_LOCAL = threading.local()
+
+
+def _parser() -> "Parser | None":
+    if not _TS_AVAILABLE:
+        return None
+    parser = getattr(_TS_LOCAL, "parser", None)
+    if parser is None:
+        parser = Parser(_LANGUAGE)
+        _TS_LOCAL.parser = parser
+    return parser
 
 
 class Verdict(str, Enum):
@@ -191,7 +204,7 @@ def analyze(cmd: str) -> Analysis:
     if not _TS_AVAILABLE:
         return analysis
     try:
-        tree = _PARSER.parse(cmd.encode("utf-8", errors="replace"))
+        tree = _parser().parse(cmd.encode("utf-8", errors="replace"))  # type: ignore[union-attr]
         _walk(tree.root_node, analysis)
         _unwrap_wrappers(analysis)
     except Exception as exc:  # pragma: no cover — 解析器异常不应击穿调用方
