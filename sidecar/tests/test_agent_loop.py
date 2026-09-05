@@ -532,3 +532,38 @@ class TestSingleFlight:
         assert sid in _running_turns
         _running_turns.discard(sid)
         assert sid not in _running_turns
+
+
+class TestConfirmationWait:
+    """确认不限时（09-21 用户反馈）：timeout=0 无限等待；显式超时保持暂停语义。"""
+
+    def test_infinite_wait_approved(self):
+        import asyncio
+        from agent_loop import _pending_confirmations, _pending_lock, _wait_tool_confirmation
+
+        async def runner():
+            event = asyncio.Event()
+            async def _approve():
+                async with _pending_lock:
+                    _pending_confirmations["wait-1"] = {"event": event, "approved": True}
+                await asyncio.sleep(0.01)
+                event.set()  # 模拟 confirm_tool API 触发
+            asyncio.create_task(_approve())
+            return await _wait_tool_confirmation("wait-1", "run_cmd", event, timeout=0)
+
+        approved, events = asyncio.run(runner())
+        assert approved is True and events == []
+
+    def test_explicit_timeout_still_pauses(self):
+        import asyncio
+        from agent_loop import _pending_confirmations, _pending_lock, _wait_tool_confirmation
+
+        async def runner():
+            event = asyncio.Event()
+            async with _pending_lock:
+                _pending_confirmations["wait-2"] = {"event": event, "approved": False}
+            return await _wait_tool_confirmation("wait-2", "run_cmd", event, timeout=0.05)
+
+        approved, events = asyncio.run(runner())
+        assert approved is False and len(events) == 1
+        assert "超时" in events[0]["content"]

@@ -1799,13 +1799,13 @@ async def _await_tool_confirmation(call_id: str, tool_name: str, args: dict) -> 
     """Wait for user to approve/deny a confirm-level tool. Returns (approved, events).
 
     超时不再静默当拒绝（P2-14）：保留 pending 状态并给用户明确提示事件，
-    任务暂停而不是以 User denied 收场。"""
+    任务暂停而不是以 User denied 收场。默认不限时（09-21 用户反馈）。"""
     events = [{"event": "tool_confirm", "call_id": call_id, "tool": tool_name, "args": args}]
     event = asyncio.Event()
     async with _pending_lock:
         _pending_confirmations[call_id] = {"event": event, "approved": False}
     try:
-        await asyncio.wait_for(event.wait(), timeout=120)
+        await event.wait()
         async with _pending_lock:
             approved = _pending_confirmations.get(call_id, {}).get("approved", False)
     except asyncio.TimeoutError:
@@ -1836,13 +1836,21 @@ async def _start_tool_confirmation(call_id: str, tool_name: str, args: dict) -> 
 
 
 async def _wait_tool_confirmation(call_id: str, tool_name: str,
-                                  event_obj: asyncio.Event, timeout: float = 120) -> tuple[bool, list[dict]]:
+                                  event_obj: asyncio.Event, timeout: float = 0) -> tuple[bool, list[dict]]:
     """等待已启动（_start_tool_confirmation）的确认结果。
     返回 (approved, events)——events 只含超时提示等补充事件（初始
-    tool_confirm 已由调用方发出）。超时保持暂停，不默认执行。"""
+    tool_confirm 已由调用方发出）。
+
+    默认不限时（timeout=0）：确认由用户点击决定下一步，任务在等待期间
+    保持暂停；停止/取消可中断（生成器取消 → finally 清理 pending）。
+    09-21 用户反馈："确认超时 30 秒，改成不限时间，我点了再操作下一步"。
+    """
     events = []
     try:
-        await asyncio.wait_for(event_obj.wait(), timeout=timeout)
+        if timeout and timeout > 0:
+            await asyncio.wait_for(event_obj.wait(), timeout=timeout)
+        else:
+            await event_obj.wait()
         async with _pending_lock:
             approved = _pending_confirmations.get(call_id, {}).get("approved", False)
     except asyncio.TimeoutError:
@@ -1893,11 +1901,14 @@ async def _start_plan_confirmation(plan_id: str, plan: str) -> dict:
 
 
 async def _wait_plan_confirmation(plan_id: str, event_obj: asyncio.Event,
-                                  timeout: float = 300) -> tuple[bool, list[dict]]:
-    """等待计划确认结果（给用户 5 分钟阅读计划）。超时保持暂停。"""
+                                  timeout: float = 0) -> tuple[bool, list[dict]]:
+    """等待计划确认结果（默认不限时，用户点击后继续；09-21 用户反馈）。"""
     events = []
     try:
-        await asyncio.wait_for(event_obj.wait(), timeout=timeout)
+        if timeout and timeout > 0:
+            await asyncio.wait_for(event_obj.wait(), timeout=timeout)
+        else:
+            await event_obj.wait()
         async with _pending_lock:
             approved = _pending_confirmations.get(plan_id, {}).get("approved", False)
     except asyncio.TimeoutError:
