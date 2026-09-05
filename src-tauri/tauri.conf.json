@@ -14,10 +14,11 @@
       {
         "fullscreen": false,
         "resizable": true,
-        "title": "\u8fa3\u6761 Latiao",
+        "title": "辣条 Latiao",
         "width": 1200,
         "height": 800,
-        "useHttpsScheme": false
+        "useHttpsScheme": false,
+        "dragDropEnabled": false
       }
     ],
     "security": {
