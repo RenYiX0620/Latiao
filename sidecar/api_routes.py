@@ -91,6 +91,10 @@ logger = logging.getLogger("latiao-sidecar")
 # 单飞守卫（双发防御）：同会话同时允许一个回合在跑。add/discard 原子，无需锁。
 _running_turns: set[str] = set()
 
+# 已处理确认的 LRU（双击去重：第二次点击不再误报"确认已过期"）
+import collections as _collections
+_recently_confirmed: "collections.deque[str]" = _collections.deque(maxlen=200)
+
 
 async def _logged_agent_turn(session_id: str, messages: list, inner):
     """阶段 1/2a 接线：turn 边界事件 + 相位状态机（灰度，见 session_log.py）。
@@ -1575,7 +1579,11 @@ async def confirm_tool(request: Request):
         if entry:
             entry["approved"] = approved
             entry["event"].set()
+            _recently_confirmed.add(call_id)
             return {"status": "ok", "call_id": call_id, "approved": approved}
+    # 双击去重（09-21 实测：第一次批准并移除注册，第二次点击触发误报）
+    if call_id in _recently_confirmed:
+        return {"status": "already", "call_id": call_id, "approved": approved}
     return {"status": "not_found", "message": f"No pending confirmation for call_id: {call_id}"}
 
 

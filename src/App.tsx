@@ -1013,17 +1013,23 @@ const [timeFilter, setTimeFilter] = useState("all");
     }
   };
 
+  const confirmInFlightRef = useRef<Set<string>>(new Set());
   const confirmTool = useCallback(async (callId: string, approved: boolean) => {
+    // 双击/重复点击去重：同 callId 在途只发一次（09-21 实测：双击触发误报过期）
+    if (confirmInFlightRef.current.has(callId)) return;
+    confirmInFlightRef.current.add(callId);
     try {
       const resp = await authFetch("/v1/confirm_tool", {
         method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ call_id: callId, approved }),
       });
       const data = await resp.json();
+      if (data.status === "already") return;  // 服务端幂等：已处理不重复提示
       if (data.status === "not_found") {
         showToast(t("toast.timeout"));
         setMessages(prev => prev.map(m => m.callId === callId && m.toolStatus === "confirming" ? { ...m, toolStatus: "error" as const, toolResult: t("toast.timeout_detail") } : m));
       }
     } catch (e) { console.error(e); showToast(t("toast.confirm_fail")); }
+    finally { confirmInFlightRef.current.delete(callId); }
   }, [showToast, setMessages, t]);
 
   const stopGeneration = useCallback(() => {
