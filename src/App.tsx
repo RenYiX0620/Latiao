@@ -1295,7 +1295,7 @@ const [timeFilter, setTimeFilter] = useState("all");
         }
         unlisten = () => unlisteners.forEach((u) => { try { u(); } catch { /* noop */ } });
         console.info("[drag-drop] 原生拖放监听已挂载（双通道）");
-        showToast("✅ 拖放监听已就绪", "info");
+        // 去掉启动 toast（09-21 用户反馈：状态类提示不进右下角弹窗）
       } catch (e) {
         console.error("[drag-drop] 挂载失败", e);
         showToast("拖放初始化失败: " + String((e as { message?: string })?.message || e), "warn");
