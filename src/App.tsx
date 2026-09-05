@@ -798,8 +798,14 @@ const [timeFilter, setTimeFilter] = useState("all");
             if (text) updated.content = text;
             msgs[msgs.length - 1] = updated;
           }
-        } else if (text || th) {
-          msgs.push({ id: msgId(), role: "assistant", content: text, thinking: th || undefined, ts: Date.now() });
+        } else if (text || th || livePreview) {
+          // 思考预览也创建消息（正文未到时可先占位；09-21 22:48：仅预览时
+          // 无 assistant 消息 → 预览无处挂载，前端 3 分钟无反应）
+          msgs.push({
+            id: msgId(), role: "assistant", content: text,
+            thinking: th || (livePreview ? (pendingThinking.slice(0, 120) + " …") : undefined),
+            ts: Date.now(),
+          });
         }
         return msgs;
       });
