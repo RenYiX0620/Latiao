@@ -536,6 +536,71 @@ async def chat_completion(request: Request):
 
 
 
+def _translate_to_english(text: str) -> str:
+    """用户偏好（config.upload_text_en=true）：上传的文字部分以英文上传。
+
+    检测到中文时，用已配置的云端模型依次尝试翻译（如 GLM 配额耗尽 429
+    自动换 deepseek）；未配置云端/全部失败/无中文时保留原文（fail-open）。
+    """
+    if not text or not re.search(r"[\u4e00-\u9fff]", text):
+        return text
+    try:
+        cfg = json.loads((Path.home() / ".local-ai-os" / "config.json").read_text(encoding="utf-8"))
+        if not cfg.get("upload_text_en"):
+            return text
+        models = cfg.get("cloud_models", []) or []
+        prompt = (
+            "Translate the following text into English. Keep code blocks, tables and "
+            "formatting unchanged. Do NOT change any numbers, dates or units. "
+            "Output only the translation:\n\n" + text[:6000]
+        )
+        for m in models:
+            try:
+                url = (m.get("endpoint") or "").rstrip("/") + "/chat/completions"
+                resp = httpx.post(
+                    url,
+                    headers={"Authorization": "Bearer " + str(m.get("key") or "")},
+                    json={"model": m.get("name"),
+                          "messages": [{"role": "user", "content": prompt}],
+                          "max_tokens": 4096},
+                    timeout=120, follow_redirects=True,
+                )
+                if resp.status_code != 200:
+                    logger.info("upload translate: %s -> HTTP %s, try next", m.get("name"), resp.status_code)
+                    continue
+                out = (resp.json().get("choices") or [{}])[0].get("message", {}).get("content", "")
+                if out and out.strip():
+                    return out.strip()
+            except Exception as e:
+                logger.warning("upload translate via %s failed: %s", m.get("name"), e)
+                continue
+        return text
+    except Exception as e:
+        logger.warning("upload translate failed, keep original: %s", e)
+        return text
+
+
+def _extract_xlsx_text(content: bytes) -> str:
+    """Excel（xlsx/xls）→ 表格文本（按 sheet 分行、tab 分隔）。
+
+    上传的 xlsx 是 zip 二进制，直接 decode 会产生乱码（09-05 事故），
+    必须解析为表格文本再交给模型。
+    """
+    from openpyxl import load_workbook
+    wb = load_workbook(io.BytesIO(content), data_only=True, read_only=True)
+    out: list[str] = []
+    try:
+        for ws in wb.worksheets:
+            out.append("### Sheet: " + ws.title)
+            for row in ws.iter_rows(values_only=True):
+                cells = [("" if v is None else str(v)) for v in row]
+                if any(c.strip() for c in cells):
+                    out.append("\t".join(cells))
+    finally:
+        wb.close()
+    return "\n".join(out)
+
+
 def _process_upload_bytes(content: bytes, filename: str, content_type: str) -> dict:
     """统一处理上传字节：图片→base64；PDF→提取文字；xlsx→表格；文本→读取。
     content 统一经 _translate_to_english（用户偏好：文字部分英化）。"""
