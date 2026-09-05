@@ -1201,6 +1201,8 @@ const [timeFilter, setTimeFilter] = useState("all");
     }
   };
 
+  const lastDropRef = useRef<{ path: string; ts: number }>({ path: "", ts: 0 });
+
   const handleDrop = useCallback(async (e: React.DragEvent) => {
     e.preventDefault();
     // HTML5 拖放（保底路径）：多数情况下 Tauri 原生 onDragDropEvent 已处理
@@ -1228,12 +1230,19 @@ const [timeFilter, setTimeFilter] = useState("all");
     let unlisten: (() => void) | undefined;
     (async () => {
       try {
-        const { getCurrentWebview } = await import("@tauri-apps/api/webview");
-        unlisten = await getCurrentWebview().onDragDropEvent(async (event: { payload?: { type?: string; paths?: string[] } }) => {
+        // 官方文档/社区验证的 macOS 稳定路径是 webviewWindow 模块
+        // （webview 模块在部分版本事件不触发；#14055 文件路径事件两模块
+        // 行为有差异）。同时保留防抖：macOS 存在一次拖放重复触发
+        //（tauri#14134），同一路径 1.5s 内只处理一次。
+        const { getCurrentWebviewWindow } = await import("@tauri-apps/api/webviewWindow");
+        unlisten = await getCurrentWebviewWindow().onDragDropEvent(async (event: { payload?: { type?: string; paths?: string[] } }) => {
           const payload = event?.payload;
-          if (!payload || payload.type === "over") return;
+          if (!payload || payload.type !== "drop") return;
           const path = (payload.paths || [])[0];
           if (!path) return;
+          const now = Date.now();
+          if (lastDropRef.current.path === path && now - lastDropRef.current.ts < 1500) return;
+          lastDropRef.current = { path, ts: now };
           try {
             const data = await uploadLocalPath(path);
             if (data?.status !== "success") {
