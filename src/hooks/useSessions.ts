@@ -1,5 +1,6 @@
 import { useState } from "react";
 import type { SessionInfo, Message } from "../types";
+import { sanitizeSessions } from "../utils/storage";
 
 const newSession = (): SessionInfo => ({
   // crypto.randomUUID()：熵充足。此前 Math.random().toString(36).substring(7)
@@ -15,7 +16,10 @@ export function useSessions() {
   const [sessions, setSessions] = useState<SessionInfo[]>(() => {
     try {
       const saved = localStorage.getItem("local_ai_os_sessions");
-      if (saved) { const parsed = JSON.parse(saved); if (Array.isArray(parsed) && parsed.length > 0) return parsed.map((s: any) => ({ ...s, lastActive: s.lastActive || Date.now(), messages: (s.messages || []).map((m: Message) => ({ ...m, id: m.id || `msg_${crypto.randomUUID()}` })) })); }
+      if (saved) {
+        const parsed = sanitizeSessions(saved, () => `msg_${crypto.randomUUID()}`);
+        if (parsed) return parsed as unknown as SessionInfo[];
+      }
     } catch { /* ignore */ }
     return [newSession()];
   });
