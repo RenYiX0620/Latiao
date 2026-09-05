@@ -7,6 +7,7 @@ defined here and re-exported by main.py.
 """
 import asyncio
 import contextvars
+import inspect
 import json
 import logging
 import os
@@ -918,7 +919,8 @@ async def execute_tool(tool_name: str, arguments: dict) -> str:
     if not fn:
         return f"Error: Unknown tool '{tool_name}'"
     try:
-        if asyncio.iscoroutinefunction(fn):
+        # inspect 代替 asyncio.iscoroutinefunction：后者 3.16 移除（弃用告警）
+        if inspect.iscoroutinefunction(fn):
             result = await fn(arguments)
         else:
             # 同步工具函数（如 mx_query 内含 120s subprocess）放到线程执行，

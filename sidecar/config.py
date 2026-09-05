@@ -12,4 +12,7 @@ SUBAGENT_MODEL = os.environ.get("LATIAO_SUBAGENT_MODEL", "latiao-local-default")
 SKILLS_DIR = Path(__file__).parent / "skills"
 
 # Application paths
-PROGRESS_DIR = Path.home() / ".local-ai-os"
+# LATIAO_TEST_PROGRESS_DIR：测试专用覆盖——假引擎场景会真实执行循环并写入
+# 进度等文件，不覆盖时会把真机 ~/.local-ai-os/PROGRESS.md 越写越大。
+PROGRESS_DIR = Path(os.environ.get("LATIAO_TEST_PROGRESS_DIR", "")) \
+    if os.environ.get("LATIAO_TEST_PROGRESS_DIR") else Path.home() / ".local-ai-os"
