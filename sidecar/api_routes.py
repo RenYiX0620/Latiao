@@ -88,6 +88,9 @@ from tool_executor import _resolve_permission
 
 logger = logging.getLogger("latiao-sidecar")
 
+# 单飞守卫（双发防御）：同会话同时允许一个回合在跑。add/discard 原子，无需锁。
+_running_turns: set[str] = set()
+
 
 async def _logged_agent_turn(session_id: str, messages: list, inner):
     """阶段 1/2a 接线：turn 边界事件 + 相位状态机（灰度，见 session_log.py）。
@@ -376,6 +379,22 @@ async def chat_completion(request: Request):
                     logger.error("Agent loop unexpected error", exc_info=True)
                     yield f"data: {json.dumps({'error': 'Agent 循环内部错误，请查看日志。'})}\n\n"
                     yield "data: [DONE]\n\n"
+                finally:
+                    # 单飞守卫释放：无论正常/异常/停止路径，回合结束即放行下一回合
+                    _running_turns.discard(session_id)
+            # 单飞守卫（双发防御）：同会话已有回合在跑时拒绝新回合，防止
+            # 双击发送/重复发包导致并行双答（17:30 观测：同窗口两条完整回复）。
+            # 停止后的重发不受影响（停止走 turn/end，回合已释放）。
+            if session_id in _running_turns:
+                return StreamingResponse(
+                    iter([
+                        f"data: {json.dumps({'content': '⏳ 上一轮任务仍在运行中，请稍候或先停止。'}, ensure_ascii=False)}\n\n",
+                        "data: [DONE]\n\n",
+                    ]),
+                    media_type="text/event-stream",
+                    headers={"Cache-Control": "no-cache"},
+                )
+            _running_turns.add(session_id)
             # 顺序契约（P1-1 修复）：clear 必须先于 _logged_agent_turn 的 begin_turn
             # ——否则新开幕令牌会被 abandon() 作废，停止语义丢失。
             # 新请求清除上一次停止的取消标记（重发消息不受影响）

@@ -2342,7 +2342,7 @@ def _parse_delta_line(line: str) -> tuple[bool, dict | None]:
 
 async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: dict, session_id: str = "", agent_id: str = "latiao", reflection_mode: str = "off", access_mode: str = "confirm", thinking_level: str = "high"):
     """Agent loop: call LLM with tools. If tool_calls → execute → loop. If text → yield & done."""
-    current_msgs = [dict(m) for m in messages]
+    current_msgs = _strip_transient_reminders([dict(m) for m in messages])
     # Two-level compression: keep head + tail, prune middle (MUSE-Autoskill style)
     if len(current_msgs) > 30:
         system_msgs = [m for m in current_msgs if m.get("role") == "system"]
@@ -3475,7 +3475,7 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                                     session_id: str = "", agent_id: str = "latiao", reflection_mode: str = "off", access_mode: str = "confirm", thinking_level: str = "high"):
     """Local model agent loop: inject tools as prompt, parse tool calls from text."""
     global _llm_suspect_since  # 引擎存疑标记（本函数内多处置位/清除）
-    current_msgs = [dict(m) for m in messages]
+    current_msgs = _strip_transient_reminders([dict(m) for m in messages])
     # Truncate long history to prevent context overflow.
     # Keeps system messages + last 20 user/assistant pairs.
     # Also estimates token count to warn before overflow.
@@ -4695,6 +4695,36 @@ def _is_chat_query(text: str) -> bool:
     if not t:
         return True
     return any(m in t for m in _CHAT_MARKERS)
+
+
+def _strip_transient_reminders(messages: list) -> list:
+    """新回合到达时清除上一轮注入的一次性系统提醒。
+
+    这些提醒是 nudge 指令（"这不是用户的新消息""你上一轮的回复是空的"等），
+    只对注入的那一轮有效；留在历史里会让模型在新回合产生"用户没发新消息"
+    的自我怀疑（09-20 实测：英文思考反复纠结 The user hasn't sent a new
+    message yet 后才生成回复）。一次性指令不该作为永久上下文存在。
+    """
+    return [
+        m for m in messages
+        if not (isinstance(m, dict) and m.get("role") == "system"
+                and any(mk in str(m.get("content", "")) for mk in _TRANSIENT_REMINDER_MARKERS))
+    ]
+
+
+_TRANSIENT_REMINDER_MARKERS = (
+    "这不是用户的新消息",
+    "这是系统提醒",
+    "你上一轮的回复是空的",
+    "你刚才收到了工具的执行结果，但只回复了文字",
+    "你刚才收到了工具的执行结果，但你的回复里没有给出实质内容",
+    "不要写执行计划，直接行动",
+    "你之前只回复了文字而没有继续调用工具",
+    "你已通过工具获得了实质数据",
+    "上一个工具调用失败了",
+    "你上一轮只说了计划/声明而没有执行",
+    "数据来源校验",
+)
 
 
 def _detect_user_language(text: str) -> str:

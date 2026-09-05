@@ -499,3 +499,36 @@ class TestJsonFenceParsing(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTransientReminders:
+    """历史污染修复：新回合到达时清除上一轮一次性系统提醒。"""
+
+    def test_strips_transient_reminders(self):
+        from agent_loop import _strip_transient_reminders
+        msgs = [
+            {"role": "system", "content": "可用工具…"},
+            {"role": "user", "content": "你能做什么"},
+            {"role": "assistant", "content": "我可以…"},
+            {"role": "system", "content": "⚠️ 这不是用户的新消息，而是系统提醒（上一轮回复未完成）"},
+            {"role": "user", "content": "测试"},
+            {"role": "system", "content": "你上一轮的回复是空的。请直接回复用户。"},
+            {"role": "assistant", "content": "测试正常"},
+        ]
+        stripped = _strip_transient_reminders(msgs)
+        roles = [m.get("role") for m in stripped]
+        assert roles == ["system", "user", "assistant", "user", "assistant"], roles
+        # 真系统提示（非提醒）必须保留
+        assert stripped[0]["content"].startswith("可用工具")
+
+
+class TestSingleFlight:
+    """双发防御：_running_turns 认领/释放语义。"""
+
+    def test_claim_and_release(self):
+        from api_routes import _running_turns
+        sid = "sf-test-session"
+        _running_turns.add(sid)
+        assert sid in _running_turns
+        _running_turns.discard(sid)
+        assert sid not in _running_turns

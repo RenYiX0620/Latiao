@@ -47,6 +47,7 @@ from agent_loop import (
     _handle_tool_execution,
     _is_chat_query,
     _is_local_llm_url,
+    _strip_transient_reminders,
     _is_meta_wrapup,
     _looks_like_planning,
     _looks_like_tool_fantasy,
@@ -198,7 +199,7 @@ class AgentLoop:
         self.access_mode = access_mode
         self.thinking_level = thinking_level
         self.mode = (_CloudMode(self) if engine_kind == "cloud" else _LocalMode(self))
-        self.current_msgs = [dict(m) for m in messages]
+        self.current_msgs = _strip_transient_reminders([dict(m) for m in messages])
         self.last_user_text = _extract_last_user_text(self.current_msgs)
         self.lang = _detect_user_language(self.last_user_text)
         self.agent_tools = _get_agent_tools(agent_id, TOOLS)
