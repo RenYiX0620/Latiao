@@ -60,7 +60,6 @@ from agent_loop import (
     _resolve_api_target,
     _resolve_max_tokens,
     _save_custom_agents,
-    _session_cancel_requested,
     _session_states,
     _spawn,
     _strip_native_tool_calls,
@@ -78,6 +77,7 @@ from main import (
     _save_permissions,
     app,
 )
+from loop_state import turn_state_for
 from memory import (
     _extract_learnings_heuristic,
     _get_recent_learnings,
@@ -90,15 +90,24 @@ logger = logging.getLogger("latiao-sidecar")
 
 
 async def _logged_agent_turn(session_id: str, messages: list, inner):
-    """阶段 1 事件日志接线：turn 边界 + 用户消息 + 结束原因（灰度，见 session_log.py）。
+    """阶段 1/2a 接线：turn 边界事件 + 相位状态机（灰度，见 session_log.py）。
 
     事件记录放在 SSE 消费层（而非两个生成器内部），零侵入地拿到完整 turn
-    生命周期：进场记 turn/start + user/message，finally 记 turn/end。
+    生命周期：进场记 turn/start + user/message（并 begin_turn），finally
+    记 turn/end（并 end_turn）。
 
-    结束原因与取消注册表保持一致——停止按钮是唯一的中断语义（0.3.14 审计
-    P0 修复后的语义），事件日志与运行时行为同源，回放/审计能还原"用户何时
-    按过停止"。
+    结束原因与相位令牌同源（token.stop_requested）——停止按钮是唯一的中断
+    语义（0.3.14 审计 P0 修复后的语义），事件日志与运行时行为同源，回放/
+    审计能还原"用户何时按过停止"。
     """
+    state = turn_state_for(session_id) if session_id else None
+    token = None
+    if state is not None:
+        try:
+            token = state.begin_turn()
+        except Exception:
+            logger.warning("turn begin rejected for %s", session_id, exc_info=True)
+            token = None
     log = _event_log_for(session_id) if session_id else None
     if log is not None:
         try:
@@ -117,12 +126,17 @@ async def _logged_agent_turn(session_id: str, messages: list, inner):
         raise
     finally:
         if log is not None:
-            if reason == "completed" and _session_cancel_requested(session_id):
+            if reason == "completed" and (token is not None and token.stop_requested):
                 reason = "aborted"
             try:
                 log.append("turn/end", {"reason": reason})
             except Exception:
                 logger.warning("failed to log turn/end", exc_info=True)
+        if state is not None:
+            try:
+                state.end_turn(reason)
+            except Exception:
+                logger.warning("failed to end turn state for %s", session_id, exc_info=True)
 
 
 def _get_cloud_model_names() -> list[dict]:

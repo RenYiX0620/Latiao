@@ -28,6 +28,7 @@ from cron import _create_cron
 from db import _db_write_lock, _get_db
 from identity import _load_agent_identity, _process_identity_intents, _read_identity
 from session_log import SessionLog
+from loop_state import turn_state_for
 from memory import (
     _extract_learnings_heuristic,
     _get_high_confidence_preferences,
@@ -518,6 +519,11 @@ def _request_session_cancel(session_id: str) -> None:
     """置位会话取消标记（/v1/chat/cancel 调用）。"""
     if session_id:
         _session_cancelled.add(session_id)
+        # 相位状态机镜像（阶段 2a，与事件日志同源）：stopping 相位 + 先行原因
+        try:
+            turn_state_for(session_id).request_stop("user", "button")
+        except Exception:
+            logger.warning("failed to mirror cancel to turn state", exc_info=True)
         log = _event_log_for(session_id)
         if log is not None:
             try:
@@ -529,6 +535,11 @@ def _request_session_cancel(session_id: str) -> None:
 def _clear_session_cancel(session_id: str) -> None:
     """新请求开始时清除标记（重发消息不应被上一次停止影响）。"""
     _session_cancelled.discard(session_id)
+    # 上一次停止若因断连/异常未结算，新请求强制放弃旧 turn（产品语义：重发必须可用）
+    try:
+        turn_state_for(session_id).abandon()
+    except Exception:
+        logger.warning("failed to abandon turn state", exc_info=True)
 
 
 def _session_cancel_requested(session_id: str) -> bool:

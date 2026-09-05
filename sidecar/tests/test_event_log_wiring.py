@@ -87,6 +87,49 @@ def test_event_log_for_cached_keeps_seq_contiguous(conn):
 
 
 @pytest.mark.asyncio
+async def test_turn_state_paired_with_boundary(logged_turn, conn):
+    """相位状态机与 turn 边界配对：结束回到 IDLE，end_reason 与事件一致。"""
+    from loop_state import Phase, turn_state_for
+
+    async def inner():
+        yield {"event": "content", "content": "hi"}
+
+    await _collect(logged_turn("sess-state", [{"role": "user", "content": "hi"}], inner()))
+    state = turn_state_for("sess-state")
+    assert state.phase is Phase.IDLE
+    assert state.end_reason == "completed"
+
+
+@pytest.mark.asyncio
+async def test_turn_state_aborted_via_cancel(logged_turn, conn):
+    from agent_loop import _request_session_cancel, _clear_session_cancel
+    from loop_state import Phase, turn_state_for
+
+    async def inner():
+        yield {"event": "content", "content": "partial"}
+        _request_session_cancel("sess-state-cancel")
+
+    await _collect(logged_turn("sess-state-cancel", [], inner()))
+    state = turn_state_for("sess-state-cancel")
+    assert state.phase is Phase.IDLE
+    assert state.end_reason == "aborted"
+    _clear_session_cancel("sess-state-cancel")
+
+
+@pytest.mark.asyncio
+async def test_new_request_abandons_stale_turn(logged_turn, conn):
+    """重发前 _clear_session_cancel 强制放弃遗留 turn——重发路径总是可用。"""
+    from loop_state import Phase, turn_state_for
+
+    state = turn_state_for("sess-stale")
+    state.begin_turn()  # 模拟断连遗留的活动 turn
+    assert state.phase is Phase.RUNNING
+    from agent_loop import _clear_session_cancel
+    _clear_session_cancel("sess-stale")
+    assert state.phase is Phase.IDLE
+
+
+@pytest.mark.asyncio
 async def test_tool_call_and_result_paired(monkeypatch, conn):
     import agent_loop
 
