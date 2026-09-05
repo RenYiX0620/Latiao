@@ -1230,12 +1230,10 @@ const [timeFilter, setTimeFilter] = useState("all");
     let unlisten: (() => void) | undefined;
     (async () => {
       try {
-        // 官方文档/社区验证的 macOS 稳定路径是 webviewWindow 模块
-        // （webview 模块在部分版本事件不触发；#14055 文件路径事件两模块
-        // 行为有差异）。同时保留防抖：macOS 存在一次拖放重复触发
-        //（tauri#14134），同一路径 1.5s 内只处理一次。
-        const { getCurrentWebviewWindow } = await import("@tauri-apps/api/webviewWindow");
-        unlisten = await getCurrentWebviewWindow().onDragDropEvent(async (event: { payload?: { type?: string; paths?: string[] } }) => {
+        // 双监听兜底：webview 与 webviewWindow 两个模块的事件源在不同
+        // Tauri 版本/平台上行为不一致（#14055），两个都挂，共享 handler；
+        // 防抖（tauri#14134 macOS 重复触发）确保同一路径 1.5s 内只处理一次。
+        const handler = async (event: { payload?: { type?: string; paths?: string[] } }) => {
           const payload = event?.payload;
           if (!payload || payload.type !== "drop") return;
           const path = (payload.paths || [])[0];
@@ -1243,9 +1241,14 @@ const [timeFilter, setTimeFilter] = useState("all");
           const now = Date.now();
           if (lastDropRef.current.path === path && now - lastDropRef.current.ts < 1500) return;
           lastDropRef.current = { path, ts: now };
+          // 预览秒出：先显示"解析中"，后端解析+英化完成后更新内容
+          //（翻译是云端调用，大文件可达 1-2 分钟——预览框不能等它）
+          const name0 = path.split("/").pop() || "文件";
+          setPendingFile({ name: name0, preview: "📄", type: "file", content: "⏳ 正在解析文件内容…" });
           try {
             const data = await uploadLocalPath(path);
             if (data?.status !== "success") {
+              setPendingFile(null);
               showToast(String((data as { message?: string })?.message || "文件解析失败"), "warn");
               return;
             }
@@ -1261,8 +1264,27 @@ const [timeFilter, setTimeFilter] = useState("all");
           } catch {
             showToast("文件上传失败", "warn");
           }
-        });
-      } catch { /* Tauri 环境不可用（如浏览器调试）时静默 */ }
+        };
+        const unlisteners: (() => void)[] = [];
+        try {
+          const { getCurrentWebviewWindow } = await import("@tauri-apps/api/webviewWindow");
+          unlisteners.push(await getCurrentWebviewWindow().onDragDropEvent(handler));
+        } catch (e) {
+          console.warn("[drag-drop] webviewWindow 监听失败", e);
+        }
+        try {
+          const { getCurrentWebview } = await import("@tauri-apps/api/webview");
+          unlisteners.push(await getCurrentWebview().onDragDropEvent(handler));
+        } catch (e) {
+          console.warn("[drag-drop] webview 监听失败", e);
+        }
+        unlisten = () => unlisteners.forEach((u) => { try { u(); } catch { /* noop */ } });
+        console.info("[drag-drop] 原生拖放监听已挂载（双通道）");
+        showToast("✅ 拖放监听已就绪", "info");
+      } catch (e) {
+        console.error("[drag-drop] 挂载失败", e);
+        showToast("拖放初始化失败: " + String((e as { message?: string })?.message || e), "warn");
+      }
     })();
     return () => { unlisten?.(); };
   }, [showToast]);
