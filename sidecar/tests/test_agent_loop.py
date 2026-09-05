@@ -567,3 +567,48 @@ class TestConfirmationWait:
         approved, events = asyncio.run(runner())
         assert approved is False and len(events) == 1
         assert "超时" in events[0]["content"]
+
+
+class TestLanguageEnsure:
+    """语言确保兜底（09-21 实测修复）：翻译失败不得粘贴整段英文原文。"""
+
+    EN_TEXT = ("The user wants me to analyze a financial data file, a board sector capital flow "
+               "analysis spreadsheet. This is a Chinese A-share sector analysis and this particular "
+               "sheet tracks sector performance and capital flows over several trading days. "
+               "The main line is the AI computing chain and capital rotated heavily this week.")
+
+    def test_translate_failure_returns_short_hint(self, monkeypatch):
+        import asyncio
+        import agent_loop
+
+        async def _fail(*a, **k):
+            return self.EN_TEXT  # 翻译失败 = 返回原文；必须与入参完全一致
+
+        monkeypatch.setattr(agent_loop, "_force_translate", _fail)
+        delivered = asyncio.run(agent_loop._ensure_final_language(
+            None, "http://x", {}, "model", self.EN_TEXT, "分析这个文件"
+        ))
+        assert delivered.startswith("⚠️ 模型本次生成了英文回复")
+        assert "原文如下" not in delivered
+        assert "The user wants" not in delivered  # 英文原文不再出现
+
+    def test_translate_success_returns_translation(self, monkeypatch):
+        import asyncio
+        import agent_loop
+
+        async def _ok(*a, **k):
+            return "中文翻译结果"
+
+        monkeypatch.setattr(agent_loop, "_force_translate", _ok)
+        delivered = asyncio.run(agent_loop._ensure_final_language(
+            None, "http://x", {}, "model", self.EN_TEXT, "中文用户"
+        ))
+        assert delivered == "中文翻译结果"
+
+    def test_language_already_ok_passthrough(self):
+        import asyncio
+        import agent_loop
+        delivered = asyncio.run(agent_loop._ensure_final_language(
+            None, "http://x", {}, "model", "中文回答", "中文用户"
+        ))
+        assert delivered == "中文回答"

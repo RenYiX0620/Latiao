@@ -2394,6 +2394,8 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
     iteration = 0
     text_only_streak = 0   # 与 local loop 对齐，消除空响应分支 (text_only_streak += 1) 的 NameError 崩溃
     text_output_delivered = False  # nudge 重试期间抑制已交付文本的重复流式输出
+    _empty_name_streak = 0  # 空名连续失败计数（云端曾缺初始化 → 3 次中止静默失效）
+    lang_retry_done = False  # 语言修正轮一次性
     # 进展感知看门狗：无进展静默期硬上限 15 分钟。此前模型服务器偶发 hold
     # 连接滴灌字节可绕过单次 read timeout（180s×N），用户面对 18 分钟无响应。
     # 纯墙钟一刀切会误杀正常推进的长任务（如多轮深度研究），改为
@@ -2771,9 +2773,13 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                 "run", "build", "fix", "create", "search", "analyze", "deploy")) \
                 and not _is_chat_query(last_user_text)
             if has_recent_tool_result and not _has_task_kw and streamed_text.strip():
-                _deliver = await _ensure_final_language(
-                    client, api_url, headers, model,
-                    streamed_text.strip(), last_user_text)
+                _deliver, _lang_retry = await _ensure_final_language_with_retry(client, api_url, headers, model, streamed_text.strip(), last_user_text, current_msgs, lang_retry_done=lang_retry_done)
+                if _lang_retry and not lang_retry_done:
+                    lang_retry_done = True
+                    text_output_delivered = True
+                    text_only_streak += 1
+                    yield {"event": "heartbeat"}
+                    continue
                 current_msgs.append({"role": "assistant", "content": _deliver})
                 if _deliver != streamed_text.strip():
                     yield {"event": "content_revised", "content": _deliver}
@@ -2785,9 +2791,13 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                     # （与 local 循环同口径，防追问后重答堆叠）
                     # 语言确保：不符则以 content_revised 整体替换上一条（云端仍直播，
                     # 遵循度好，属兜底；16:50 事故同款保护）
-                    _deliver = await _ensure_final_language(
-                        client, api_url, headers, model,
-                        streamed_text.strip(), last_user_text)
+                    _deliver, _lang_retry = await _ensure_final_language_with_retry(client, api_url, headers, model, streamed_text.strip(), last_user_text, current_msgs, lang_retry_done=lang_retry_done)
+                    if _lang_retry and not lang_retry_done:
+                        lang_retry_done = True
+                        text_output_delivered = True
+                        text_only_streak += 1
+                        yield {"event": "heartbeat"}
+                        continue
                     if _deliver != streamed_text.strip():
                         yield {"event": "content_revised", "content": _deliver}
                     current_msgs.append({"role": "assistant", "content": _deliver})
@@ -2816,9 +2826,13 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                 # ≥200 字符视为实质回答直接交付（09-21 实测：任务词 nudge 会让
                 # R2 正文被抑制、用户看不到分析——本地同口径的 ≥200 规则）
                 if len(streamed_text.strip()) >= 200:
-                    _deliver = await _ensure_final_language(
-                        client, api_url, headers, model,
-                        streamed_text.strip(), last_user_text)
+                    _deliver, _lang_retry = await _ensure_final_language_with_retry(client, api_url, headers, model, streamed_text.strip(), last_user_text, current_msgs, lang_retry_done=lang_retry_done)
+                    if _lang_retry and not lang_retry_done:
+                        lang_retry_done = True
+                        text_output_delivered = True
+                        text_only_streak += 1
+                        yield {"event": "heartbeat"}
+                        continue
                     current_msgs.append({"role": "assistant", "content": _deliver})
                     if _deliver != streamed_text.strip():
                         yield {"event": "content_revised", "content": _deliver}
@@ -2837,9 +2851,13 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                             streamed_text = _revised
                             yield {"event": "reflection_revised", "content": _revised}
                     # 语言兜底：不符则以 content_revised 整体替换（同 2448 路径）
-                    _deliver = await _ensure_final_language(
-                        client, api_url, headers, model,
-                        streamed_text.strip(), user_q)
+                    _deliver, _lang_retry = await _ensure_final_language_with_retry(client, api_url, headers, model, streamed_text.strip(), user_q, current_msgs, lang_retry_done=lang_retry_done)
+                    if _lang_retry and not lang_retry_done:
+                        lang_retry_done = True
+                        text_output_delivered = True
+                        text_only_streak += 1
+                        yield {"event": "heartbeat"}
+                        continue
                     if _deliver != streamed_text.strip():
                         yield {"event": "content_revised", "content": _deliver}
                     _track_progress(session_id, "completed", f"text_response ({len(_deliver)} chars)")
@@ -3111,22 +3129,42 @@ async def _final_answer_extraction(client, api_url: str, headers: dict, engine_m
     return ""
 
 
+_LANG_RETRY_HINT = "⚠️ 模型本次生成了英文回复（翻译暂不可用）。"
+
+
 async def _ensure_final_language(client, api_url: str, headers: dict, engine_model: str,
                                  text: str, user_text: str) -> str:
     """交付前语言确保：回复语言与用户消息不符时走翻译轮，返回可交付文本。
 
     缓冲交付后所有 return 路径统一经过这里——即使收尾闸门被跳过
     （如工具失败分支），英文也不会原样到达用户（16:55 事故）。
-    翻译轮失败（引擎瞬时故障）时加中文说明前缀再交付，用户不会看到
-    无解释的纯英文。"""
+    翻译轮失败时返回短提示 _LANG_RETRY_HINT 并记日志（09-21 实测：此前把
+    整段英文"原文如下"贴给用户——改为短提示，各调用点据此触发语言修正轮）。"""
     if text and _reply_lang_mismatch(user_text, text):
         translated = await _force_translate(client, api_url, headers, engine_model, text,
                                             _detect_user_language(user_text))
         if translated == text:
-            return (f"⚠️ 本地模型本轮生成了英文回复，自动翻译暂不可用"
-                    f"（可回复「继续」让我重新整理）。原文如下：\n\n{text}")
+            logger.warning("语言确保失败（翻译返回原文），触发语言修正轮: %.200s",
+                           text.replace("\n", " "))
+            return _LANG_RETRY_HINT
         return translated
     return text
+
+
+async def _ensure_final_language_with_retry(client, api_url: str, headers: dict,
+                                            engine_model: str, text: str, user_text: str,
+                                            msgs: list, *, lang_retry_done: bool) -> tuple[str, bool]:
+    """语言确保 + 语言修正轮（一次性）：翻译失败返回短提示时注入重写指令。
+
+    返回 (deliver_text, retry_now)。retry_now=True 且未做过修正轮时，调用方
+    应继续下一轮（注入的提醒已在 msgs 中）；否则以短提示交付。"""
+    deliver = await _ensure_final_language(client, api_url, headers, engine_model,
+                                           text, user_text)
+    if deliver.startswith(_LANG_RETRY_HINT) and not lang_retry_done:
+        msgs.append({"role": "system", "content":
+                     "必须用简体中文重新输出正文（不要英文，不要解释，直接重写完整回答）。"})
+        return deliver, True
+    return deliver, False
 
 
 async def _force_translate(client, api_url: str, headers: dict, engine_model: str,
@@ -3564,6 +3602,7 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
     max_iterations = 50
     iteration = 0
     _empty_name_streak = 0  # 本地循环空名计数（与云端口径一致，3 次中止）
+    lang_retry_done = False  # 语言修正轮一次性
     recent_tool_calls: set[str] = set()
     stagnation = 0
     max_stagnation = 3  # cap empty-response/dead-end retries to avoid hammering the model server
@@ -4074,9 +4113,13 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                 and not _is_chat_query(last_user_text)
             if _pending_tool_analysis and body_text.strip() and not _has_task_kw:
                 # 闲聊交付不依赖 _recent_tool_failed（⚠️ 常驻系统提示词恒真）
-                _deliver = await _ensure_final_language(
-                    client, api_url, headers, _engine_model,
-                    body_text.strip(), last_user_text)
+                _deliver, _lang_retry = await _ensure_final_language_with_retry(client, api_url, headers, _engine_model, body_text.strip(), last_user_text, current_msgs, lang_retry_done=lang_retry_done)
+                if _lang_retry and not lang_retry_done:
+                    lang_retry_done = True
+                    text_output_delivered = True
+                    text_only_streak += 1
+                    yield {"event": "heartbeat"}
+                    continue
                 current_msgs.append({"role": "assistant", "content": _deliver})
                 yield {"content": "\n\n" + _strip_think_fences(_deliver)}
                 _track_progress(session_id, "completed", f"text_response ({len(_deliver)} chars)")
@@ -4124,9 +4167,13 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                     # 实质回答——分析只在模型思考里，正文从未交付（19:38
                     # 事故），继续走追问轮。
                     # 缓冲交付：语言确保后一次性交付（16:50 事故后不再直播）
-                    _deliver = await _ensure_final_language(
-                        client, api_url, headers, _engine_model,
-                        body_text.strip(), _extract_last_user_text(current_msgs))
+                    _deliver, _lang_retry = await _ensure_final_language_with_retry(client, api_url, headers, _engine_model, body_text.strip(), _extract_last_user_text(current_msgs), current_msgs, lang_retry_done=lang_retry_done)
+                    if _lang_retry and not lang_retry_done:
+                        lang_retry_done = True
+                        text_output_delivered = True
+                        text_only_streak += 1
+                        yield {"event": "heartbeat"}
+                        continue
                     _pending_tool_analysis = False
                     current_msgs.append({"role": "assistant", "content": _deliver})
                     yield {"content": "\n\n" + _strip_think_fences(_deliver)}
@@ -4245,9 +4292,13 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                 # 正文尚可（≥80 字符且非元收尾）→ 语言确保后交付正文；
                 # 正文空/思考-only → 干净提示，绝不把思考 dump 给用户
                 if len(body_text.strip()) >= 80 and not _is_meta_wrapup(body_text):
-                    _deliver = await _ensure_final_language(
-                        client, api_url, headers, _engine_model,
-                        body_text.strip(), _extract_last_user_text(current_msgs))
+                    _deliver, _lang_retry = await _ensure_final_language_with_retry(client, api_url, headers, _engine_model, body_text.strip(), _extract_last_user_text(current_msgs), current_msgs, lang_retry_done=lang_retry_done)
+                    if _lang_retry and not lang_retry_done:
+                        lang_retry_done = True
+                        text_output_delivered = True
+                        text_only_streak += 1
+                        yield {"event": "heartbeat"}
+                        continue
                     yield {"content": "\n\n" + _strip_think_fences(_deliver)}
                     current_msgs.append({"role": "assistant", "content": _deliver})
                     _track_progress(session_id, "completed", f"text_response ({len(_deliver)} chars)")
@@ -4301,9 +4352,13 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                 has_task_kw = any(kw in user_q for kw in ["运行", "执行", "做", "帮我", "写", "创建", "查", "搜", "找", "分析", "修复", "构建", "部署", "安装", "配置", "run", "build", "fix", "create", "search", "analyze", "deploy"])
                 if not has_task_kw:
                     # 缓冲交付：语言确保 + 显式 yield（闲聊回复也可能英文）
-                    _deliver = await _ensure_final_language(
-                        client, api_url, headers, _engine_model,
-                        body_text.strip(), user_q)
+                    _deliver, _lang_retry = await _ensure_final_language_with_retry(client, api_url, headers, _engine_model, body_text.strip(), user_q, current_msgs, lang_retry_done=lang_retry_done)
+                    if _lang_retry and not lang_retry_done:
+                        lang_retry_done = True
+                        text_output_delivered = True
+                        text_only_streak += 1
+                        yield {"event": "heartbeat"}
+                        continue
                     yield {"content": "\n\n" + _strip_think_fences(_deliver)}
                     _track_progress(session_id, "completed", f"text_response ({len(_deliver)} chars)")
                     return
@@ -4315,9 +4370,13 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                         and not _looks_like_planning(body_text)
                         and not _is_meta_wrapup(body_text)
                         and not any(k in body_text.lower() for k in _PENDING_INTENT_PATTERNS)):
-                    _deliver = await _ensure_final_language(
-                        client, api_url, headers, _engine_model,
-                        body_text.strip(), user_q)
+                    _deliver, _lang_retry = await _ensure_final_language_with_retry(client, api_url, headers, _engine_model, body_text.strip(), user_q, current_msgs, lang_retry_done=lang_retry_done)
+                    if _lang_retry and not lang_retry_done:
+                        lang_retry_done = True
+                        text_output_delivered = True
+                        text_only_streak += 1
+                        yield {"event": "heartbeat"}
+                        continue
                     yield {"content": "\n\n" + _strip_think_fences(_deliver)}
                     _track_progress(session_id, "completed", f"text_response ({len(_deliver)} chars)")
                     return
@@ -4462,9 +4521,13 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                     "请回复「继续」重试，或换云端模型重发本任务。")}
                 _track_progress(session_id, "completed", "body_empty_final")
                 return
-            _deliver = await _ensure_final_language(
-                client, api_url, headers, _engine_model,
-                body_text.strip(), _extract_last_user_text(current_msgs))
+            _deliver, _lang_retry = await _ensure_final_language_with_retry(client, api_url, headers, _engine_model, body_text.strip(), _extract_last_user_text(current_msgs), current_msgs, lang_retry_done=lang_retry_done)
+            if _lang_retry and not lang_retry_done:
+                lang_retry_done = True
+                text_output_delivered = True
+                text_only_streak += 1
+                yield {"event": "heartbeat"}
+                continue
             yield {"content": "\n\n" + _strip_think_fences(_deliver)}
             _track_progress(session_id, "completed", f"text_response ({len(_deliver)} chars)")
             logger.info(f"[LOCAL-AGENT] Iteration {iteration}: no tools, returning text ({len(_deliver)} chars)")

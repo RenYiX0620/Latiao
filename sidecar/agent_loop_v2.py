@@ -35,6 +35,7 @@ from agent_loop import (
     _detect_text_loop,
     _detect_user_language,
     _ensure_final_language,
+    _ensure_final_language_with_retry,
     _extract_last_user_text,
     _extract_think_body,
     _filter_tools,
@@ -531,8 +532,7 @@ class _CloudMode(ModeStrategy):
         # 不成立（17:11 事故同根）——直接收官，不得 nudge。
         if has_recent_tool_result and not has_task:
             async with httpx.AsyncClient(timeout=httpx.Timeout(120)) as client:
-                deliver = await _ensure_final_language(
-                    client, loop.api_url, loop.headers, loop.model, text, loop.last_user_text)
+                deliver, _lang_retry = await _ensure_final_language_with_retry(client, loop.api_url, loop.headers, loop.model, text, loop.last_user_text, msgs, lang_retry_done=True)
             msgs.append({"role": "assistant", "content": deliver})
             if deliver != text:
                 ctx.events.append({"event": "content_revised", "content": deliver})
@@ -541,8 +541,7 @@ class _CloudMode(ModeStrategy):
         if has_recent_tool_result and ctx.streak < 1 and text:
             if len(text) >= 200:
                 async with httpx.AsyncClient(timeout=httpx.Timeout(120)) as client:
-                    deliver = await _ensure_final_language(
-                        client, loop.api_url, loop.headers, loop.model, text, loop.last_user_text)
+                    deliver, _lang_retry = await _ensure_final_language_with_retry(client, loop.api_url, loop.headers, loop.model, text, loop.last_user_text, msgs, lang_retry_done=True)
                 if deliver != text:
                     ctx.events.append({"event": "content_revised", "content": deliver})
                 msgs.append({"role": "assistant", "content": deliver})
@@ -559,8 +558,7 @@ class _CloudMode(ModeStrategy):
             user_q = loop.last_user_text.strip().rstrip("?？") if loop.last_user_text else ""
             if not any(kw in user_q for kw in _TASK_KW):
                 async with httpx.AsyncClient(timeout=httpx.Timeout(120)) as client:
-                    deliver = await _ensure_final_language(
-                        client, loop.api_url, loop.headers, loop.model, text, user_q)
+                    deliver, _lang_retry = await _ensure_final_language_with_retry(client, loop.api_url, loop.headers, loop.model, text, user_q, msgs, lang_retry_done=True)
                 if deliver != text:
                     ctx.events.append({"event": "content_revised", "content": deliver})
                 _track_progress(loop.session_id, "completed", f"text_response ({len(deliver)} chars)")
@@ -644,9 +642,7 @@ class _LocalMode(ModeStrategy):
             # 闲聊交付不依赖 recent_failed（⚠️ 常驻系统提示词会让它恒真，
             # 曾把闲聊分支整个跳过——17:11 复现根因之一）
             async with httpx.AsyncClient(timeout=httpx.Timeout(120)) as client:
-                deliver = await _ensure_final_language(
-                    client, loop.api_url, loop.headers, self.engine_model(),
-                    body, loop.last_user_text)
+                deliver, _lang_retry = await _ensure_final_language_with_retry(client, loop.api_url, loop.headers, self.engine_model(), body, loop.last_user_text, msgs, lang_retry_done=True)
             msgs.append({"role": "assistant", "content": deliver})
             ctx.events.append({"content": "\n\n" + _strip_think_fences(deliver)})
             _track_progress(loop.session_id, "completed", f"text_response ({len(deliver)} chars)")
@@ -668,9 +664,7 @@ class _LocalMode(ModeStrategy):
             if (len(body) >= 200 and not _is_meta_wrapup(body) and not pending_intent
                     and not _looks_like_planning(body) and lang_ok):
                 async with httpx.AsyncClient(timeout=httpx.Timeout(120)) as client:
-                    deliver = await _ensure_final_language(
-                        client, loop.api_url, loop.headers, self.engine_model(),
-                        body, loop.last_user_text)
+                    deliver, _lang_retry = await _ensure_final_language_with_retry(client, loop.api_url, loop.headers, self.engine_model(), body, loop.last_user_text, msgs, lang_retry_done=True)
                 msgs.append({"role": "assistant", "content": deliver})
                 ctx.events.append({"content": "\n\n" + _strip_think_fences(deliver)})
                 _track_progress(loop.session_id, "completed", f"text_response ({len(deliver)} chars)")
@@ -750,8 +744,7 @@ class _LocalMode(ModeStrategy):
             user_q = (loop.last_user_text or "").strip().rstrip("?？")
             if not any(kw in user_q for kw in _TASK_KW):
                 async with httpx.AsyncClient(timeout=httpx.Timeout(120)) as client:
-                    deliver = await _ensure_final_language(
-                        client, loop.api_url, loop.headers, self.engine_model(), body, user_q)
+                    deliver, _lang_retry = await _ensure_final_language_with_retry(client, loop.api_url, loop.headers, self.engine_model(), body, user_q, msgs, lang_retry_done=True)
                 ctx.events.append({"content": "\n\n" + _strip_think_fences(deliver)})
                 _track_progress(loop.session_id, "completed", f"text_response ({len(deliver)} chars)")
                 return None
