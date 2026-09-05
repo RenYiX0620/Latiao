@@ -675,6 +675,7 @@ def _translate_to_english(text: str) -> str:
     """
     if not text or not re.search(r"[\u4e00-\u9fff]", text):
         return text
+    logger.debug("upload translate: 检测到中文，尝试云端英化 (len=%d)", len(text))
     try:
         cfg = json.loads((Path.home() / ".local-ai-os" / "config.json").read_text(encoding="utf-8"))
         if not cfg.get("upload_text_en"):

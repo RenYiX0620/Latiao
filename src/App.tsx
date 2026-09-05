@@ -751,15 +751,18 @@ const [timeFilter, setTimeFilter] = useState("all");
     // 等不到主线程，"停止没反应"的根因。
     let flushTimer: ReturnType<typeof setTimeout> | null = null;
     let pendingThinking = "";
+    // 思考起始时间戳：流式期间只攒不发（防"思考闪现多次"），[DONE] 定稿时
+    // 一次性附着到助手消息并结算耗时（09-21 用户反馈：思考应只在折叠栏里）。
+    let thinkingStartedAt = 0;
     // reflection_revised 已把最终文本写入消息；此后 [DONE]/finally 的 flushStream
     // 若再跑，prefix 检查不匹配会把 revised 文本重复 push 一条（M1 复发）。
     let streamFinalized = false;
     const flushStream = () => {
       if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
-      if (streamFinalized) return;
       const text = full;
-      const th = pendingThinking;
-      pendingThinking = "";
+      // 定稿后才附着思考：流式期间正文照常更新，思考攒着不闪现
+      const th = streamFinalized ? pendingThinking : "";
+      if (streamFinalized) pendingThinking = "";
       if (!text && !th) return;
       setMessages((prev) => {
         const msgs = [...prev];
@@ -767,15 +770,17 @@ const [timeFilter, setTimeFilter] = useState("all");
         if (last?.role === "assistant") {
           if (text && last.content && !text.startsWith(last.content)) {
             // 已有内容的 assistant（如 📋 执行计划）：正文另起新消息，不覆盖
-            msgs.push({ id: msgId(), role: "assistant", content: text, ts: Date.now() });
+            msgs.push({ id: msgId(), role: "assistant", content: text, thinking: th || undefined, ts: Date.now() });
           } else {
             const updated: Message = { ...last };
-            if (th) updated.thinking = (last.thinking || "") + th;
-            if (text) updated.content = text;
-            // 正文开始输出 = 思考结束，结算思考耗时
-            if (text && updated.thinkingDuration === undefined && updated.thinking) {
-              updated.thinkingDuration = Math.max(0, Date.now() - (updated.ts || Date.now()));
+            if (th) {
+              updated.thinking = (last.thinking || "") + th;
+              // 思考耗时按真实起止结算（附着发生在定稿时）
+              updated.thinkingDuration = thinkingStartedAt
+                ? Math.max(0, Date.now() - thinkingStartedAt) : undefined;
+              thinkingStartedAt = 0;
             }
+            if (text) updated.content = text;
             msgs[msgs.length - 1] = updated;
           }
         } else if (text || th) {
@@ -823,7 +828,7 @@ const [timeFilter, setTimeFilter] = useState("all");
         {
           const sse = parseSSEDataLine(line);
           if (sse.kind === "skip") continue;
-          if (sse.kind === "done") { flushStream(); return full; }
+          if (sse.kind === "done") { streamFinalized = true; flushStream(); return full; }
           if (sse.kind === "error") throw new Error(sse.message);
           try {
             const parsed = sse.parsed;
@@ -972,7 +977,8 @@ const [timeFilter, setTimeFilter] = useState("all");
                   return msgs;
                 });
               } else if (parsed.reasoning) {
-                // 思考内容：批量累积（flush 时写入最后一条 assistant 的 thinking 字段）
+                // 思考内容：流式期间只攒不发（[DONE] 定稿时一次性附着，防闪现）
+                if (!thinkingStartedAt) thinkingStartedAt = Date.now();
                 pendingThinking += String(parsed.reasoning);
                 scheduleFlush();
               } else if (parsed.content) {
@@ -1077,7 +1083,7 @@ const [timeFilter, setTimeFilter] = useState("all");
     // 12 秒上限：超时/失败用当前内容兜底，不阻塞发送。
     let pf = pendingFileRef.current || pendingFile;
     if (pf && pf.type === "file" && !pf.enReady) {
-      showToast("正在生成英文版文件内容…");
+      // 英化等待改为静默（09-21 用户反馈：不要弹窗；日志在 sidecar 侧可见）
       await new Promise<void>((resolve) => {
         const timer = setTimeout(() => resolve(), 12000);
         enWaitersRef.current.add(() => { clearTimeout(timer); resolve(); });
