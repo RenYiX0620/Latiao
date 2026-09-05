@@ -3238,8 +3238,15 @@ async def _final_answer_extraction(client, api_url: str, headers: dict, engine_m
         _sb = {"model": engine_model, "messages": _smsgs, "max_tokens": 4096,
                "stream": False, "temperature": 0.4,
                "stop": ["<|im_end|>", "<eos>"]}
-        async with _local_llm_serialized(api_url):
-            _sr = await client.post(api_url, json=_sb, headers=headers)
+        # 引擎忙（主循环持有 serialized 锁）时快退——终答提取只是兜底，
+        # 等锁/读等满会拖死收尾（09-21 22:58 实测 ReadTimeout 2 分钟）
+        try:
+            async with asyncio.timeout(20):
+                async with _local_llm_serialized(api_url):
+                    _sr = await client.post(api_url, json=_sb, headers=headers)
+        except TimeoutError:
+            logger.info("终答提取跳过：引擎正忙（serialized 锁占用）")
+            return ""
         if _sr.status_code == 200:
             return ((_sr.json().get("choices") or [{}])[0]
                     .get("message", {}).get("content", "") or "").strip()
@@ -3947,7 +3954,8 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
             # 4-8 分钟，300s 截断导致分析永远写不完（15:34 任务三轮全被
             # 300s 截断后 788s 预算中止）——放宽到 600s；总时长由
             # _session_budget（1800s）与 15 分钟无进展看门狗兜底
-            _gen_deadline = time.monotonic() + 600
+            _gen_deadline = time.monotonic() + 900  # 09-21 22:48：27B 大输入单轮 8-15 分钟
+            # （原 600s 仍会被掐；停滞/零交付护栏并行兜底）
             while True:
                 try:
                     async with _local_llm_stream(client, api_url, body, headers) as r:
@@ -4011,9 +4019,9 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                                     # 单轮生成墙钟超时（300s）：与复读同机制截断，
                                     # 防一轮 7 分钟把总预算耗尽（20:11 事故）
                                     if time.monotonic() > _gen_deadline:
-                                        logger.warning("[LOCAL-AGENT] 单轮生成 300s 超时，截断本轮")
+                                        logger.warning("[LOCAL-AGENT] 单轮生成 900s 超时，截断本轮")
                                         streamed_text = _strip_repeat_tail(streamed_text)
-                                        raise _GenerationLoopError("单轮生成超时(300s)，已截断")
+                                        raise _GenerationLoopError("单轮生成超时(900s)，已截断")
                                     if content:
                                         _any_output = True
                                         streamed_text += content

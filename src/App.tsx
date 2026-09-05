@@ -759,6 +759,9 @@ const [timeFilter, setTimeFilter] = useState("all");
     let streamFinalized = false;
     // 定稿后允许最后一次 flush（附着思考），此后不再跑（M1 防重复保护）
     let thinkingAttached = false;
+    // 流式期思考实时预览节流（09-21 22:48：本地慢生成前端完全静默——每 ≥10s
+    // 写一次"前 120 字…"，既让用户看到"在思考"，又不"闪现内容不同"）
+    let lastThinkingFlush = 0;
     const flushStream = () => {
       if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
       if (streamFinalized && thinkingAttached) return;
@@ -766,7 +769,10 @@ const [timeFilter, setTimeFilter] = useState("all");
       // 定稿后才附着思考：流式期间正文照常更新，思考攒着不闪现
       const th = streamFinalized ? pendingThinking : "";
       if (streamFinalized) pendingThinking = "";
-      if (!text && !th) return;
+      // 非定稿 + 有思考 + 未到节流窗口：跳过空写（避免每 120ms 重渲染）
+      const livePreview = !streamFinalized && pendingThinking !== ""
+        && Date.now() - lastThinkingFlush >= 10_000;
+      if (!text && !th && !livePreview) return;
       setMessages((prev) => {
         const msgs = [...prev];
         const last = msgs[msgs.length - 1];
@@ -782,6 +788,12 @@ const [timeFilter, setTimeFilter] = useState("all");
               updated.thinkingDuration = thinkingStartedAt
                 ? Math.max(0, Date.now() - thinkingStartedAt) : undefined;
               thinkingStartedAt = 0;
+            } else if (livePreview) {
+              // 流式期预览：前 120 字 + 省略号 + 计时（节流 10s）
+              lastThinkingFlush = Date.now();
+              updated.thinking = pendingThinking.slice(0, 120) + " …";
+              updated.thinkingDuration = thinkingStartedAt
+                ? Math.max(0, Date.now() - thinkingStartedAt) : undefined;
             }
             if (text) updated.content = text;
             msgs[msgs.length - 1] = updated;
