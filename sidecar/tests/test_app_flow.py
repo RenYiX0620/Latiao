@@ -83,6 +83,10 @@ def _start_app() -> str:
     import uvicorn
     import api_routes  # noqa: F401
     import main  # noqa: F401  (构建 app; api_routes.app 即主应用)
+    # 全量套件下 main 可能已被其他测试模块先导入（AUTH_TOKEN 为空）——
+    # 端点按请求时模块全局校验，这里补上，避免 401 假象
+    if not main.AUTH_TOKEN:
+        main.AUTH_TOKEN = os.environ.get("LATIAO_AUTH_TOKEN", "") or main.AUTH_TOKEN
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
