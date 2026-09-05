@@ -180,13 +180,13 @@ async def _local_llm_stream(client, api_url: str, body: dict, headers: dict):
             try:
                 ok = await _verify_llm_health(api_url)
             finally:
-                # 健康检查抛错也必须配对 enter/exit——否则 _active_local_streams
-                # 永久 +1 → 引擎"永久忙"→ 健康检查永远跳过 → 死引擎永不被发现
-                # （审计 P1）
-                if _local:
-                    engine.mark_stream_exit()
-                    engine.mark_engine_idle()
-            _llm_suspect_since = None
+                # enter/exit 只由本函数外层 finally 配对一次（09-05 23:31 事故：
+                # 这里曾再 exit/idle 一次——suspect 路径下真实请求随之裸奔
+                # （_active_local_streams=0、_engine_busy_until=0），后台健康
+                # 检查对"空闲"引擎实测生成，长生成期间探测排队双连败，正忙的
+                # 引擎被误判死亡杀杀重载；且外层 finally 再 exit 会把计数打成 -1。
+                # 原"不配对会永久 +1"的顾虑由外层 finally 兜底）
+                _llm_suspect_since = None
             if not ok:
                 # 端口确实死亡或引擎产出异常--先杀残留，再触发自动重载；
                 # 下面的等待-重试循环会等到引擎就绪（此前直接秒死）
@@ -2548,6 +2548,8 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                 yield {"content": "\n\n⚠️ 任务连续 15 分钟无进展（未产出内容或执行工具），已中止。模型服务可能异常（如响应停滞）。可重试或检查网络。"}
                 _track_progress(session_id, "stalled", "total_duration_limit")
                 return
+            # 轮次透明化（09-05 23:52 与本地循环同口径）：多轮拉锯不再静默黑盒
+            yield {"event": "round_start", "iteration": iteration}
             _maybe_add_inline_file_note(current_msgs, last_user_text)
     # Re-evaluate tool set every 3 iterations for multi-step tasks
             if iteration > 1 and iteration % 3 == 0:
@@ -2967,7 +2969,7 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                     return
                 # 任务型请求但模型只回文字不调工具 → nudge 促其行动（不再向用户重复流式输出）
                 current_msgs.append({
-                    "role": "system",
+                    "role": "user",
                     "content": (
                         "不要写执行计划，直接行动。需要用什么工具就立即调用；"
                         "若本次任务基于用户消息里已提供的资料即可完成，请直接给出完整回答，不要做声明或收尾。"
@@ -2983,7 +2985,9 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                     "en": "⚠️ Your last response was empty. Please respond to the user directly, or use a tool.",
                     "ja": "⚠️ 前回の応答が空でした。ユーザーに直接返信するか、ツールを使用してください。",
                 })
-                current_msgs.append({"role": "system", "content": nudge_text})
+                # nudge 用 user 角色（09-05 23:52 与本地循环同口径：追加在
+                # 末尾的 system 语义错误且各引擎容忍度不一）
+                current_msgs.append({"role": "user", "content": nudge_text})
                 text_only_streak += 1
                 continue
             # ── Empty-response exhaustion：streak 耗尽且模型仍无输出。
@@ -3889,6 +3893,19 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
             # Long prompts cause Qwen's <think> to overflow max_tokens on follow-up rounds.
             if iteration == 1:
                 current_prompt = tools_prompt
+                # 09-05 23:52 事故：长输入（整表 11.8K 字符）下 27B 思考型模型
+                # 首轮纯思考 8 分钟不写正文（13:29 同款复现）。长输入首轮追加
+                # 思考预算指令，先给结论再写正文。
+                _first_user_len = len(loop_msgs[-1].get("content", "")) if loop_msgs else 0
+                if _first_user_len > 8000:
+                    current_prompt = (
+                        current_prompt
+                        + "\n\n📏 思考预算（长输入）：用户输入内容很长（表格/文档全文）。"
+                        "请先简短思考（≤300 字），然后立刻在正文写出完整分析——"
+                        "关键数字和结论必须写进正文。禁止长时间只思考不写正文。"
+                        "Think briefly (≤300 chars), then write the full analysis "
+                        "with key numbers and conclusions in the reply body."
+                    )
             else:
                 # Build lightweight tool reminder that still lists available tools by name
                 tool_names = [t.get("function", {}).get("name", "") for t in active_tools if t.get("function", {}).get("name")]
@@ -3935,6 +3952,9 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
             # 思考全文（结尾悬着半截脚本）当最终答案发给用户。正文与思考必须分离。
             _raw_delta_count = 0  # 诊断: 统计收到的 delta 数(空响应时判断是模型真空还是解析丢了)
             logger.info(f"[LOCAL-AGENT] Iteration {iteration}: calling LLM, msgs={len(loop_msgs)}, first_user_content_len={len(loop_msgs[-1].get('content','')) if loop_msgs else 0}")
+            # 轮次透明化（09-05 23:52：8 分钟无正文用户以为卡死）：
+            # 每轮开始通知前端"第 N 轮"，多轮拉锯不再是静默黑盒
+            yield {"event": "round_start", "iteration": iteration}
             # 本地 llama.cpp 并发流式请求会崩溃 -> _local_llm_stream 内部串行化
             # 流式停顿检测：模型过大/未加载完时可能极慢滴灌（120s 超时永不触发），
             # 连续 180s 无任何数据视为僵死，中止不再无限挂起
@@ -4467,9 +4487,12 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                     _track_progress(session_id, "completed", "think_only_abort")
                     return
                 current_msgs.append({"role": "assistant", "content": "（未输出正文）"})
-                current_msgs.append({"role": "system", "content":
+                # 09-05 23:52：nudge 用 system 追加在消息末尾——语义错误（这是
+                # 用户的补写要求，不是系统预设），且 mlx 对末尾 system 敏感
+                # （虽有 _merge_system_messages 兜底，仍应保持 role 正确）
+                current_msgs.append({"role": "user", "content":
                     _get_localized_text(_detect_user_language(_extract_last_user_text(current_msgs)), {
-                        "zh": "你上一轮只输出了思考过程，回复正文是空的。请在正文中直接写出完整回答（含关键数字与结论）。不要只思考不写正文。",
+                        "zh": "你上一轮只输出了思考过程，回复正文是空的。请在正文中直接输出完整回答（含关键数字与结论）。不要只思考不输出正文。",
                         "en": "Your last turn produced only reasoning with an empty reply body. Write the full answer (with key numbers and conclusions) directly in your reply body. Do not think without writing.",
                         "ja": "前回は思考のみで本文が空でした。主要な数字と結論を含む完全な回答を本文に直接書いてください。",
                     })})
@@ -4519,9 +4542,9 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                 logger.info(f"[LOCAL-AGENT] Iteration {iteration}: model planning instead of calling tools, nudging (streak={text_only_streak})")
                 _stag = _check_stagnation(session_id)
                 if _stag:
-                    current_msgs.append({"role": "system", "content": _stag})
+                    current_msgs.append({"role": "user", "content": _stag})
                 current_msgs.append({
-                    "role": "system",
+                    "role": "user",
                     "content": (
                         "不要写执行计划，直接行动。需要用什么工具就立即调用；"
                         "若本次任务基于用户消息里已提供的资料即可完成，请直接给出完整回答，不要做声明或收尾。"

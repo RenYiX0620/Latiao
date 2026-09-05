@@ -110,6 +110,15 @@ class FakeEngine:
         ]
 
     @staticmethod
+    def thinking_only_response(text: str) -> list[str]:
+        """思考型模型只吐 reasoning（无正文、无工具）——09-05 13:29/23:52 故障形态。"""
+        return [
+            _sse({"choices": [{"delta": {"reasoning_content": text}, "index": 0}]}),
+            _sse({"choices": [{"delta": {}, "finish_reason": "stop", "index": 0}]}),
+            "data: [DONE]\n\n",
+        ]
+
+    @staticmethod
     def local_tool_response(name: str, args: dict) -> list[str]:
         """本地循环的提示词栅栏格式：```tool name\\n{json}\\n```。"""
         args_json = json.dumps(args, ensure_ascii=False)

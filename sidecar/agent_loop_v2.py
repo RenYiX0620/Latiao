@@ -239,6 +239,9 @@ class AgentLoop:
 
         while iteration < MAX_ITERATIONS:
             iteration += 1
+            # 轮次透明化（09-05 23:52：8 分钟无正文用户以为卡死——每轮可见）
+            yield {"event": "round_start", "iteration": iteration}
+            self.current_iteration = iteration
             if _session_cancel_requested(self.session_id):
                 _track_progress(self.session_id, "cancelled", "user_stop")
                 yield {"content": "\n\n⏹️ 任务已停止。"}
@@ -558,7 +561,7 @@ class _CloudMode(ModeStrategy):
                 msgs.append({"role": "assistant", "content": deliver})
                 _track_progress(loop.session_id, "completed", f"text_response ({len(deliver)} chars)")
                 return None
-            msgs.append({"role": "system", "content":
+            msgs.append({"role": "user", "content":
                          "⚠️ 你刚才收到了工具的执行结果，但只回复了文字而没有继续调用工具。\n"
                          "请检查：用户的任务是否真的完全完成了？\n"
                          "如果还没完成，请继续调用工具。如果确实完成了，请回复最终结果。"})
@@ -574,13 +577,13 @@ class _CloudMode(ModeStrategy):
                     ctx.events.append({"event": "content_revised", "content": deliver})
                 _track_progress(loop.session_id, "completed", f"text_response ({len(deliver)} chars)")
                 return None
-            msgs.append({"role": "system", "content":
+            msgs.append({"role": "user", "content":
                          "不要写执行计划，直接行动。需要用什么工具就立即调用；"
                          "若本次任务基于用户消息里已提供的资料即可完成，请直接给出完整回答，不要做声明或收尾。"})
             return (ctx.streak + 1, True, ctx.pending_tool_analysis, ctx.intent_nudges,
                     ctx.fabrication_nudges, ctx.think_only_nudges, ctx.brief_answer_nudged)
         if not text and ctx.streak < MAX_STAGNATION:
-            msgs.append({"role": "system", "content": _get_localized_text(loop.lang, {
+            msgs.append({"role": "user", "content": _get_localized_text(loop.lang, {
                 "zh": "⚠️ 你上一轮的回复是空的。请直接回复用户，或者使用工具完成任务。",
                 "en": "⚠️ Your last response was empty. Please respond to the user directly, or use a tool.",
                 "ja": "⚠️ 前回の応答が空でした。ユーザーに直接返信するか、ツールを使用してください。",
@@ -608,6 +611,19 @@ class _LocalMode(ModeStrategy):
     def build_body(self, current_msgs: list) -> dict:
         merged = _merge_system_messages(current_msgs)
         tools_prompt = _build_local_tools_prompt(self.loop.active_tools)
+        # 09-05 23:52 事故（与 v1 同款）：长输入下思考型模型首轮纯思考
+        # 8 分钟不写正文——首轮长输入注入思考预算指令
+        if getattr(self.loop, "current_iteration", 0) == 1:
+            _first_user_len = len(current_msgs[-1].get("content", "")) if current_msgs else 0
+            if _first_user_len > 8000:
+                tools_prompt = (
+                    tools_prompt
+                    + "\n\n📏 思考预算（长输入）：用户输入内容很长（表格/文档全文）。"
+                    "请先简短思考（≤300 字），然后立刻在正文写出完整分析——"
+                    "关键数字和结论必须写进正文。禁止长时间只思考不写正文。"
+                    "Think briefly (≤300 chars), then write the full analysis "
+                    "with key numbers and conclusions in the reply body."
+                )
         if merged and merged[0].get("role") == "system":
             merged[0] = dict(merged[0])
             merged[0]["content"] = tools_prompt + "\n\n" + str(merged[0].get("content", ""))
@@ -742,9 +758,9 @@ class _LocalMode(ModeStrategy):
                 _track_progress(loop.session_id, "completed", "think_only_abort")
                 return None
             msgs.append({"role": "assistant", "content": "（未输出正文）"})
-            msgs.append({"role": "system", "content": _get_localized_text(
+            msgs.append({"role": "user", "content": _get_localized_text(
                 _detect_user_language(loop.last_user_text),
-                {"zh": "你上一轮只输出了思考过程，回复正文是空的。请在正文中直接写出完整回答（含关键数字与结论）。不要只思考不写正文。",
+                {"zh": "你上一轮只输出了思考过程，回复正文是空的。请在正文中直接输出完整回答（含关键数字与结论）。不要只思考不输出正文。",
                  "en": "Your last turn produced only reasoning with an empty reply body. "
                        "Write the full answer directly.",
                  "ja": "前回は思考のみで本文が空でした。主要な数字と結論を含む完全な回答を本文に直接書いてください。"})})

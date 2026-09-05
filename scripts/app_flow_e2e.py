@@ -162,6 +162,7 @@ def main():
     evs = run_scenario(base, engine, "confirm")
     kinds = [ev.get("event", "?") for ev in evs]
     ok = ("agent_plan" in kinds and "plan_confirm" in kinds
+          and "round_start" in kinds  # 09-05：轮次透明化事件必达前端
           and any("执行完成" in str(ev.get("content", "")) for ev in evs))
     print(f"   事件: {kinds[:8]} | 结果: {'✅' if ok else '❌'}")
     if not ok:

@@ -762,6 +762,8 @@ const [timeFilter, setTimeFilter] = useState("all");
     // 流式期思考实时预览节流（09-21 22:48：本地慢生成前端完全静默——每 ≥10s
     // 写一次"前 120 字…"，既让用户看到"在思考"，又不"闪现内容不同"）
     let lastThinkingFlush = 0;
+    // 当前 agent 轮次（round_start 事件；09-05 23:52：多轮拉锯黑盒化）
+    let currentRound = 0;
     const flushStream = () => {
       if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
       if (streamFinalized && thinkingAttached) return;
@@ -779,9 +781,10 @@ const [timeFilter, setTimeFilter] = useState("all");
         if (last?.role === "assistant") {
           if (text && last.content && !text.startsWith(last.content)) {
             // 已有内容的 assistant（如 📋 执行计划）：正文另起新消息，不覆盖
-            msgs.push({ id: msgId(), role: "assistant", content: text, thinking: th || undefined, ts: Date.now() });
+            msgs.push({ id: msgId(), role: "assistant", content: text, thinking: th || undefined, round: currentRound || undefined, ts: Date.now() });
           } else {
             const updated: Message = { ...last };
+            updated.round = currentRound || undefined;
             if (th) {
               updated.thinking = (last.thinking || "") + th;
               // 思考耗时按真实起止结算（附着发生在定稿时）
@@ -804,6 +807,7 @@ const [timeFilter, setTimeFilter] = useState("all");
           msgs.push({
             id: msgId(), role: "assistant", content: text,
             thinking: th || (livePreview ? (pendingThinking.slice(0, 120) + " …") : undefined),
+            round: currentRound || undefined,
             ts: Date.now(),
           });
         }
@@ -872,6 +876,12 @@ const [timeFilter, setTimeFilter] = useState("all");
                   console.info(`[route] 模型「${declared}」未在云端配置，实际运行在本地引擎`);
                 }
                 setRouteInfo({ engine: ended, declaredModel: declared });
+                continue;
+              }
+              if (parsed.event === "round_start") {
+                // 轮次透明化（09-05 23:52：本地慢生成多轮拉锯时前端黑盒）
+                currentRound = Number(parsed.iteration) || currentRound;
+                flushStream();
                 continue;
               }
               if (parsed.event === "tool_confirm") {

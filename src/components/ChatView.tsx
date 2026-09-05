@@ -547,14 +547,16 @@ export default memo(function ChatView({
           const userMsgs = seg.msgs.filter((m) => m.role === "user");
           const asstMsgs = seg.msgs.filter((m) => m.role === "assistant");
           const toolMsgs = seg.msgs.filter((m) => m.role === "tool" || m.type === "tool_call");
-          const thinkRows: { key: string; text: string; dur?: number }[] = [];
+          const thinkRows: { key: string; text: string; dur?: number; round?: number }[] = [];
           for (const m of asstMsgs) {
             const localThink = m.content.match(/^<think>([\s\S]*?)<\/think>\s*/);
             const thinkText = m.thinking || (localThink ? localThink[1] : null);
-            if (thinkText) thinkRows.push({ key: m.id || `thk${thinkRows.length}`, text: thinkText, dur: m.thinkingDuration });
+            if (thinkText) thinkRows.push({ key: m.id || `thk${thinkRows.length}`, text: thinkText, dur: m.thinkingDuration, round: m.round });
           }
           // 同一对话段的全部思考合并为单一折叠栏：时长求和展示
           const thinkTotalDur = thinkRows.reduce((acc, r) => acc + (r.dur ?? 0), 0);
+          // 轮次展示（09-05 23:52：多轮拉锯时"第 N 轮"让进度可见）
+          const lastRound = thinkRows.reduce((acc, r) => r.round ?? acc, 0);
           const planMsgs = asstMsgs.filter((m) => m.content.startsWith("📋"));
           const answerMsgs = asstMsgs.filter((m) => !m.content.startsWith("📋"));
           // ZCode 式类别聚合：同类别工具折叠为一行 "探索 · N 搜索"（保持首次出现顺序）
@@ -577,6 +579,7 @@ export default memo(function ChatView({
                   <summary className="thinking-row-head">
                     <Brain size={13} />
                     <span>思考过程</span>
+                    {lastRound > 0 && <span className="thinking-meta">· 第 {lastRound} 轮</span>}
                     {thinkTotalDur > 0 && <span className="thinking-meta">· 持续了 {fmtDur(thinkTotalDur)}</span>}
                   </summary>
                   <div className="thinking-row-body">

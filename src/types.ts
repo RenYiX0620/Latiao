@@ -21,6 +21,7 @@ export interface Message {
   toolStatus?: "running" | "done" | "error" | "confirming";
   duration?: number;        // 工具耗时（毫秒）
   thinkingDuration?: number; // 思考耗时（毫秒）
+  round?: number;            // agent 轮次（round_start 事件，显示"第 N 轮"）
 }
 
 export interface PendingFile {
