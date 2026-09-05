@@ -591,6 +591,20 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
                 "page_count": len(reader.pages) if reader is not None else 0,
                 "size": len(content),
             }
+        elif (file.filename or "").lower().endswith((".xlsx", ".xls")) \
+                or file_type in ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                 "application/vnd.ms-excel"):
+            try:
+                xlsx_text = _extract_xlsx_text(content)
+                return {
+                    "status": "success",
+                    "content": _translate_to_english(xlsx_text),
+                    "filename": file.filename,
+                    "is_xlsx": True,
+                    "size": len(content),
+                }
+            except Exception as e:
+                return {"status": "error", "message": f"Excel 解析失败: {e}"}
         else:
             try:
                 text = content.decode("utf-8")
@@ -606,6 +620,27 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
             }
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+
+def _extract_xlsx_text(content: bytes) -> str:
+    """Excel（xlsx/xls）→ 表格文本（按 sheet 分行、tab 分隔）。
+
+    上传的 xlsx 是 zip 二进制，直接 decode 会产生乱码（09-05 事故），
+    必须解析为表格文本再交给模型。
+    """
+    from openpyxl import load_workbook
+    wb = load_workbook(io.BytesIO(content), data_only=True, read_only=True)
+    out: list[str] = []
+    try:
+        for ws in wb.worksheets:
+            out.append("### Sheet: " + ws.title)
+            for row in ws.iter_rows(values_only=True):
+                cells = [("" if v is None else str(v)) for v in row]
+                if any(c.strip() for c in cells):
+                    out.append("\t".join(cells))
+    finally:
+        wb.close()
+    return "\n".join(out)
 
 
 def _translate_to_english(text: str) -> str:
@@ -625,7 +660,8 @@ def _translate_to_english(text: str) -> str:
             return text
         prompt = (
             "Translate the following text into English. Keep code blocks, tables and "
-            "formatting unchanged. Output only the translation:\n\n" + text[:6000]
+            "formatting unchanged. Do NOT change any numbers, dates or units. "
+            "Output only the translation:\n\n" + text[:6000]
         )
         # 依次尝试所有云端模型（如 GLM 配额耗尽 429 时自动换 deepseek）
         for m in models:
