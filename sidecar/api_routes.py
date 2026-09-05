@@ -198,11 +198,25 @@ async def chat_completion(request: Request):
     if not skip_tools and protocol == "openai":
         session_id = body.get("session_id", str(uuid.uuid4()))
         if use_stream:
+            _reflection_mode = body.get("reflection_mode", "off")
+            _access_mode = body.get("access_mode", "confirm")
+            _thinking_level = body.get("thinking_level", "high")
+
+            async def _run_agent(_protocol, _api_url, _headers, _is_local, _model):
+                if _is_local:
+                    # 本地模型：用 prompt-based tool calling（不依赖 OpenAI function calling API）
+                    async for event in _local_agent_loop_stream(messages, _model, _api_url, _headers, session_id, agent_id, _reflection_mode, _access_mode, _thinking_level):
+                        yield event
+                else:
+                    # 云端模型：原生 OpenAI function calling
+                    # 此前漏传 thinking_level → 恒用默认 high，
+                    # UI 的 off/max 档对云端完全无效（审计 B6）
+                    async for event in _agent_loop_stream(messages, _model, _api_url, _headers, session_id, agent_id, _reflection_mode, _access_mode, _thinking_level):
+                        yield event
+
             async def agent_loop_wrapper():
+                _fb_used = False  # 429 降级只允许一次，防循环
                 try:
-                    _reflection_mode = body.get("reflection_mode", "off")
-                    _access_mode = body.get("access_mode", "confirm")
-                    _thinking_level = body.get("thinking_level", "high")
                     # 新请求清除上一次停止的取消标记（重发消息不受影响）
                     _clear_session_cancel(session_id)
                     # P0 路由透明化：把实际落地的引擎与模型名在流开头回传给前端，
@@ -213,16 +227,8 @@ async def chat_completion(request: Request):
                     #（未选模型）时会冒出假名 gpt-4o-mini → 前端误弹"未在云端配置"警告。
                     # 模型名真实发给引擎仍用 model（208/214）；仅 UI 展示层不再暴露默认兜底名。
                     yield f"data: {json.dumps({'event': 'engine_route', 'is_local': is_local, 'engine': 'local' if is_local else 'cloud', 'declared_model': user_selected_model or '', 'resolved_endpoint': api_url}, ensure_ascii=False)}\n\n"
-                    if is_local:
-                        # 本地模型：用 prompt-based tool calling（不依赖 OpenAI function calling API）
-                        async for event in _local_agent_loop_stream(messages, model, api_url, headers, session_id, agent_id, _reflection_mode, _access_mode, _thinking_level):
-                            yield f"data: {json.dumps(event)}\n\n"
-                    else:
-                        # 云端模型：原生 OpenAI function calling
-                        # 此前漏传 thinking_level → 恒用默认 high，
-                        # UI 的 off/max 档对云端完全无效（审计 B6）
-                        async for event in _agent_loop_stream(messages, model, api_url, headers, session_id, agent_id, _reflection_mode, _access_mode, _thinking_level):
-                            yield f"data: {json.dumps(event)}\n\n"
+                    async for event in _run_agent(protocol, api_url, headers, is_local, model):
+                        yield f"data: {json.dumps(event)}\n\n"
                     yield "data: [DONE]\n\n"
                 except httpx.TransportError as e:
                     logger.error(f"Agent stream 连接错误: {type(e).__name__}: {e}", exc_info=True)
@@ -249,6 +255,46 @@ async def chat_completion(request: Request):
                     req_url = str(e.request.url) if e.request else "?"
                     # 注意：不能复用外层 is_local（内层赋值会把外层变量遮蔽为局部 → UnboundLocalError）
                     req_is_local = "127.0.0.1" in req_url or "localhost" in req_url
+                    # 云端 429（限流/配额耗尽，09-05 15:14 事故：GLM 周配额用尽后
+                    # 自动路由仍选它，429 直接抛给用户）→ 自动降级：换下一个
+                    # 云端模型（GLM→deepseek），没有则回退本地引擎。只降级一次。
+                    if (e.response.status_code == 429 and not req_is_local
+                            and not _fb_used and not user_selected_model):
+                        _fb_used = True
+                        _next_cfg = None
+                        try:
+                            _cur_ep = (cloud_config or {}).get("endpoint", "")
+                            _cfg = {}
+                            if CONFIG_FILE.exists():
+                                _cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+                            for _m in _cfg.get("cloud_models", []) or []:
+                                if _m.get("endpoint") and _m.get("endpoint") != _cur_ep:
+                                    _next_cfg = {
+                                        "endpoint": _m["endpoint"],
+                                        "key": _m.get("key", ""),
+                                        "model": _m.get("name", ""),
+                                        "protocol": _m.get("protocol", "openai"),
+                                    }
+                                    break
+                        except Exception:
+                            _next_cfg = None
+                        _next_name = (_next_cfg or {}).get("model") or "本地引擎"
+                        logger.warning(
+                            "云端 429 降级: %s → %s",
+                            (cloud_config or {}).get("model") or req_url, _next_name)
+                        try:
+                            _p2, _u2, _h2, _l2 = await _resolve_api_target(_next_cfg)
+                            _m2 = _next_cfg.get("model") if _next_cfg else model
+                            yield f"data: {json.dumps({'event': 'route_fallback', 'message': f'云端模型限流(429)，已自动切换到 {_next_name}', 'is_local': _l2, 'declared_model': _m2}, ensure_ascii=False)}\n\n"
+                            async for event in _run_agent(_p2, _u2, _h2, _l2, _m2):
+                                yield f"data: {json.dumps(event)}\n\n"
+                            yield "data: [DONE]\n\n"
+                            return
+                        except Exception as _e2:
+                            logger.error("429 降级重试失败: %s", _e2, exc_info=True)
+                            yield f"data: {json.dumps({'error': '云端模型限流(429)，且备用模型/本地引擎暂不可用，请稍后重试'}, ensure_ascii=False)}\n\n"
+                            yield "data: [DONE]\n\n"
+                            return
                     if e.response.status_code == 404 and req_is_local:
                         err_msg = "本地模型服务未就绪：模型可能正在加载或已卸载，请到模型页重新加载"
                     elif e.response.status_code == 404:
