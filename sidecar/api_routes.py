@@ -55,10 +55,12 @@ from agent_loop import (
     _pending_lock,
     _record_tool_call_db,
     _clear_session_cancel,
+    _event_log_for,
     _request_session_cancel,
     _resolve_api_target,
     _resolve_max_tokens,
     _save_custom_agents,
+    _session_cancel_requested,
     _session_states,
     _spawn,
     _strip_native_tool_calls,
@@ -85,6 +87,42 @@ from memory import (
 from tool_executor import _resolve_permission
 
 logger = logging.getLogger("latiao-sidecar")
+
+
+async def _logged_agent_turn(session_id: str, messages: list, inner):
+    """阶段 1 事件日志接线：turn 边界 + 用户消息 + 结束原因（灰度，见 session_log.py）。
+
+    事件记录放在 SSE 消费层（而非两个生成器内部），零侵入地拿到完整 turn
+    生命周期：进场记 turn/start + user/message，finally 记 turn/end。
+
+    结束原因与取消注册表保持一致——停止按钮是唯一的中断语义（0.3.14 审计
+    P0 修复后的语义），事件日志与运行时行为同源，回放/审计能还原"用户何时
+    按过停止"。
+    """
+    log = _event_log_for(session_id) if session_id else None
+    if log is not None:
+        try:
+            log.append("turn/start", {"session_id": session_id})
+            last_user = _extract_last_user_text(messages) or ""
+            if last_user:
+                log.append("user/message", {"text": last_user[:4000]}, surface_op="append")
+        except Exception:
+            logger.warning("failed to log turn/start", exc_info=True)
+    reason = "completed"
+    try:
+        async for event in inner:
+            yield event
+    except Exception:
+        reason = "error"
+        raise
+    finally:
+        if log is not None:
+            if reason == "completed" and _session_cancel_requested(session_id):
+                reason = "aborted"
+            try:
+                log.append("turn/end", {"reason": reason})
+            except Exception:
+                logger.warning("failed to log turn/end", exc_info=True)
 
 
 def _get_cloud_model_names() -> list[dict]:
@@ -317,8 +355,11 @@ async def chat_completion(request: Request):
                     logger.error("Agent loop unexpected error", exc_info=True)
                     yield f"data: {json.dumps({'error': 'Agent 循环内部错误，请查看日志。'})}\n\n"
                     yield "data: [DONE]\n\n"
-            return StreamingResponse(agent_loop_wrapper(), media_type="text/event-stream",
-                                 headers={"Cache-Control": "no-cache"})
+            return StreamingResponse(
+                _logged_agent_turn(session_id, messages, agent_loop_wrapper()),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache"},
+            )
 
     # Non-streaming agent loop (for Tauri HTTP plugin compatibility)
     if not skip_tools and protocol == "openai":

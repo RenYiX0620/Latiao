@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 # 派生模型消息时必须声明如何进入 surface（positional append / revision / replacement）。
 EVENT_TYPES = frozenset({
     "turn/start",          # {turn}
+    "turn/end",            # {reason: completed|aborted|error}
     "step/start",          # {turn, step}
     "step/end",            # {turn, step}
     "user/message",        # {message}                    surface: append
@@ -133,6 +134,9 @@ class SessionLog:
         self.session_id = session_id
         self._conn = conn
         self._persist = _persist_enabled() if persist is None else persist
+        if self._persist and self._conn is None:
+            # 灰度开启时接管默认连接（memory.db）；拿不到连接则退化为纯内存
+            self._conn = _default_conn()
         self._events: list[SessionEvent] = []
         self._lock = threading.Lock()   # append 幂等/并发（代理层是 asyncio，但 SQLite 写是同步）
         if self._persist and self._conn is not None:

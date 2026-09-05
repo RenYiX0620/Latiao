@@ -13,6 +13,7 @@ import os
 import platform
 import re
 import tempfile
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -490,9 +491,24 @@ _session_cancelled: set[str] = set()
 # session_events 表（sidecar/session_log.py，移植 dsh append 契约）。
 # 有会话级取消事件时，重放/审计能还原"用户何时按过停止"——0.3.14 审计发现
 # 停止按钮此前只断前端流，这类时序信息在旧日志里是彻底丢失的。
+# 日志实例按会话缓存：seq 连续性契约要求同一会话共用同一实例（否则每个
+# 新实例 seq 都从 0 开始，回放时"连续序号"语义失效）。缓存有界（LRU 32），
+# 会话结束不清理——事件是审计事实，实例只是写入口。
+_EVENT_LOGS: dict[str, SessionLog] = {}
+_EVENT_LOGS_LOCK = threading.Lock()
+_EVENT_LOGS_MAX = 32
+
+
 def _event_log_for(session_id: str) -> SessionLog | None:
     try:
-        return SessionLog(session_id)
+        with _EVENT_LOGS_LOCK:
+            log = _EVENT_LOGS.get(session_id)
+            if log is None:
+                log = SessionLog(session_id)
+                if len(_EVENT_LOGS) >= _EVENT_LOGS_MAX:
+                    _EVENT_LOGS.pop(next(iter(_EVENT_LOGS)))
+                _EVENT_LOGS[session_id] = log
+            return log
     except Exception:
         logger.warning("event log unavailable for %s", session_id, exc_info=True)
         return None
@@ -1922,9 +1938,57 @@ def _stamp_time_sensitive() -> str:
             f"{now.strftime('%H:%M:%S')} —— 下方结果内日期若与此矛盾，以当前时间为准\n\n")
 
 
+def _tool_end_result(events: list[dict]) -> str:
+    """从事件列表回取最后一次 tool_end 的结果（包装层写 tool/result 用）。"""
+    for ev in reversed(events):
+        if isinstance(ev, dict) and ev.get("event") == "tool_end":
+            return str(ev.get("result", ""))
+    return ""
+
+
 async def _handle_tool_execution(tc: dict, current_msgs: list, session_id: str,
-                                  agent_id: str, access_mode: str = "confirm",
-                                  pre_started: dict | None = None) -> tuple[bool, list[dict]]:
+                                 agent_id: str, access_mode: str = "confirm",
+                                 pre_started: dict | None = None) -> tuple[bool, list[dict]]:
+    """事件日志包装（阶段 1，灰度）：tool/call + tool/result 单点入日志。
+
+    _handle_tool_execution_inner 是全循环唯一的工具执行入口（云/本地两个
+    生成器都在此交汇），在这里配对其"调用-结果"事件最不容易漏——
+    早期/拒绝/异常四条早退路径都经过同一包装。
+    """
+    log = _event_log_for(session_id) if session_id else None
+    call_seq: int | None = None
+    if log is not None:
+        try:
+            _func = tc.get("function", {}) or {}
+            call_seq = log.append(
+                "tool/call",
+                {
+                    "call_id": tc.get("id") or "",
+                    "name": _func.get("name", "unknown"),
+                    "arguments": _func.get("arguments", ""),
+                },
+            ).seq
+        except Exception:
+            logger.warning("failed to log tool/call for %s", session_id, exc_info=True)
+    verify_failed, events = await _handle_tool_execution_inner(
+        tc, current_msgs, session_id, agent_id, access_mode, pre_started,
+    )
+    if log is not None and call_seq is not None:
+        try:
+            log.append(
+                "tool/result",
+                {"result": _tool_end_result(events)},
+                surface_op="append",
+                source_seqs=[call_seq],
+            )
+        except Exception:
+            logger.warning("failed to log tool/result for %s", session_id, exc_info=True)
+    return verify_failed, events
+
+
+async def _handle_tool_execution_inner(tc: dict, current_msgs: list, session_id: str,
+                                       agent_id: str, access_mode: str = "confirm",
+                                       pre_started: dict | None = None) -> tuple[bool, list[dict]]:
     """Execute a single tool call within the agent loop. Returns (verify_failed, events).
 
     pre_started: SSE 调用方已通过 _start_tool_confirmation 启动确认并发出
