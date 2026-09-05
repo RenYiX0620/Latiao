@@ -585,7 +585,7 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
 
             return {
                 "status": "success",
-                "content": pdf_text,
+                "content": _translate_to_english(pdf_text),
                 "filename": file.filename,
                 "is_pdf": True,
                 "page_count": len(reader.pages) if reader is not None else 0,
@@ -599,13 +599,59 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
 
             return {
                 "status": "success",
-                "content": text,
+                "content": _translate_to_english(text),
                 "filename": file.filename,
                 "is_image": False,
                 "size": len(content),
             }
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+
+def _translate_to_english(text: str) -> str:
+    """用户偏好（config.upload_text_en=true）：上传的文字部分以英文上传。
+
+    检测到中文时，用已配置的第一个云端模型翻译为英文保持原格式；
+    未配置云端/翻译失败/无中文时保留原文（fail-open，不阻塞上传）。
+    """
+    if not text or not re.search(r"[\u4e00-\u9fff]", text):
+        return text
+    try:
+        cfg = json.loads((Path.home() / ".local-ai-os" / "config.json").read_text(encoding="utf-8"))
+        if not cfg.get("upload_text_en"):
+            return text
+        models = cfg.get("cloud_models", []) or []
+        if not models:
+            return text
+        prompt = (
+            "Translate the following text into English. Keep code blocks, tables and "
+            "formatting unchanged. Output only the translation:\n\n" + text[:6000]
+        )
+        # 依次尝试所有云端模型（如 GLM 配额耗尽 429 时自动换 deepseek）
+        for m in models:
+            try:
+                url = (m.get("endpoint") or "").rstrip("/") + "/chat/completions"
+                resp = httpx.post(
+                    url,
+                    headers={"Authorization": "Bearer " + str(m.get("key") or "")},
+                    json={"model": m.get("name"),
+                          "messages": [{"role": "user", "content": prompt}],
+                          "max_tokens": 4096},
+                    timeout=120, follow_redirects=True,
+                )
+                if resp.status_code != 200:
+                    logger.info("upload translate: %s -> HTTP %s, try next", m.get("name"), resp.status_code)
+                    continue
+                out = (resp.json().get("choices") or [{}])[0].get("message", {}).get("content", "")
+                if out and out.strip():
+                    return out.strip()
+            except Exception as e:
+                logger.warning("upload translate via %s failed: %s", m.get("name"), e)
+                continue
+        return text
+    except Exception as e:
+        logger.warning("upload translate failed, keep original: %s", e)
+        return text
 
 
 # ── Whisper model cache (lazy-load once, reuse across requests) ──
