@@ -1241,9 +1241,14 @@ const [timeFilter, setTimeFilter] = useState("all");
           const now = Date.now();
           if (lastDropRef.current.path === path && now - lastDropRef.current.ts < 1500) return;
           lastDropRef.current = { path, ts: now };
+          // 预览秒出：先显示"解析中"，后端解析+英化完成后更新内容
+          //（翻译是云端调用，大文件可达 1-2 分钟——预览框不能等它）
+          const name0 = path.split("/").pop() || "文件";
+          setPendingFile({ name: name0, preview: "📄", type: "file", content: "⏳ 正在解析文件内容…" });
           try {
             const data = await uploadLocalPath(path);
             if (data?.status !== "success") {
+              setPendingFile(null);
               showToast(String((data as { message?: string })?.message || "文件解析失败"), "warn");
               return;
             }
