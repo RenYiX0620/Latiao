@@ -1050,7 +1050,6 @@ const [timeFilter, setTimeFilter] = useState("all");
     setActiveTask(null);
     setTaskStartAt(null);
     setIsProcessing(false);
-    setPendingFile(null);
     setAgentPhase("");
   }, []);
 
@@ -1118,6 +1117,9 @@ const [timeFilter, setTimeFilter] = useState("all");
       }
     }
 
+    // 发送即清预览框（此前只在 finally 清：请求期间预览残留；且任务执行中
+    // 发送会先经 stopGeneration 把 pendingFile 提前清掉导致文件丢失）
+    setPendingFile(null);
     setMessages((prev) => [...prev, userMsg]);
 
     const assistantPlaceholder: Message = { id: msgId(), role: "assistant", content: "", ts: Date.now() };
