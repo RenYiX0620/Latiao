@@ -1262,7 +1262,12 @@ const [timeFilter, setTimeFilter] = useState("all");
             showToast("文件上传失败", "warn");
           }
         });
-      } catch { /* Tauri 环境不可用（如浏览器调试）时静默 */ }
+        console.info("[drag-drop] 原生拖放监听已挂载");
+        showToast("✅ 拖放监听已就绪", "info");
+      } catch (e) {
+        console.error("[drag-drop] 挂载失败", e);
+        showToast("拖放初始化失败: " + String((e as { message?: string })?.message || e), "warn");
+      }
     })();
     return () => { unlisten?.(); };
   }, [showToast]);
