@@ -1284,6 +1284,20 @@ INTENT_PATTERNS = [
 READ_ONLY_TOOLS = {"read_file", "list_dir", "search_files", "tavily_search", "web_search", "bing_search"}
 AUTO_EDIT_TOOLS = {"write_file", "open_folder"}
 
+
+_INLINED_FILE_RE = re.compile(r"上传|内容如下|附件|粘贴")
+
+
+def _maybe_add_inline_file_note(current_msgs: list, user_text: str) -> None:
+    """用户消息含内联文件内容时，注入提示避免模型白费一轮去读文件路径
+    （09-21 实测：模型"先看看环境中是否有这个文件"→ 空名/读盘失败诱因）。"""
+    if _INLINED_FILE_RE.search(user_text or ""):
+        note = ("用户已在消息中提供文件/表格内容，无需调用 read_file/list_dir 等读取工具；"
+                "直接基于消息内容分析即可。")
+        if not any(m.get("role") == "system" and "无需调用" in str(m.get("content", ""))
+                   for m in current_msgs):
+            current_msgs.insert(0, {"role": "system", "content": note})
+
 _MARKET_TASK_RE = re.compile(r"大盘|行情|股票|板块|资金|涨|跌|收盘|市场|指数|A股|美股|港股")
 
 
@@ -1303,6 +1317,21 @@ def _recover_tool_name(args: dict) -> str:
         if pkeys and keys <= pkeys:
             candidates.append(fn.get("name", ""))
     return candidates[0] if len(set(candidates)) == 1 else ""
+
+
+def _candidate_tool_names(args: dict) -> list:
+    """与参数键匹配的全部候选工具名（供守卫消息给出可操作提示）。"""
+    if not isinstance(args, dict) or not args:
+        return []
+    keys = set(args.keys())
+    out = []
+    for t in TOOLS:
+        fn = t.get("function", {}) or {}
+        params = fn.get("parameters") or {}
+        pkeys = set((params.get("properties") or {}).keys())
+        if pkeys and keys <= pkeys:
+            out.append(fn.get("name", ""))
+    return out
 
 
 def _ensure_market_tools(active_tools: list, user_text: str) -> list:
@@ -2077,10 +2106,19 @@ async def _handle_tool_execution_inner(tc: dict, current_msgs: list, session_id:
             logger.warning("空工具名恢复: 参数匹配 %s", _recovered)
             tool_name = _recovered
         else:
+            _cands = _candidate_tool_names(_args if _args else {})
+            _hint = ""
+            if len(_cands) >= 2:
+                _desc = {"read_file": "读文件", "list_dir": "列目录", "open_folder": "打开文件夹",
+                         "write_file": "写文件", "mx_query": "查行情", "tavily_search": "联网搜索",
+                         "web_search": "联网搜索", "bing_search": "联网搜索",
+                         "dokobot_search": "搜索", "ak_finance": "金融数据", "run_cmd": "运行命令"}
+                _hint = "。参数匹配多个工具（" + ", ".join(
+                    f"{c}({_desc.get(c, c)})" for c in _cands) + "）——请明确工具名"
             result = (
                 "⛔ 工具调用格式错误：工具名为空。请直接以 ```tool 工具名\n{参数JSON}\n``` "
                 "形式调用（工具名后不要有空格/换行/标签），例如：\n"
-                "```tool list_dir\n{\"path\": \".\"}\n```"
+                "```tool list_dir\n{\"path\": \".\"}\n```" + _hint
             )
             current_msgs.append({"role": "tool", "tool_call_id": call_id, "content": result})
             return True, [{"event": "tool_end", "call_id": call_id, "tool": "?", "result": result,
@@ -2502,7 +2540,8 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                 yield {"content": "\n\n⚠️ 任务连续 15 分钟无进展（未产出内容或执行工具），已中止。模型服务可能异常（如响应停滞）。可重试或检查网络。"}
                 _track_progress(session_id, "stalled", "total_duration_limit")
                 return
-            # Re-evaluate tool set every 3 iterations for multi-step tasks
+            _maybe_add_inline_file_note(current_msgs, last_user_text)
+    # Re-evaluate tool set every 3 iterations for multi-step tasks
             if iteration > 1 and iteration % 3 == 0:
                 # 恢复全量工具，但仍须套用权限过滤（read_only 等模式不可绕过）
                 # （本函数为云端循环，无 is_local 变量；本地循环独立实现）
@@ -3124,13 +3163,24 @@ def _reply_lang_mismatch(user_text: str, reply_text: str) -> bool:
     user_lang = _detect_user_language(user_text)
     if not reply_text:
         return False
+    # 尾部段落窗口（09-21 实测）：nudge 轮的英文尾巴以段落为单位接在长中文
+    # 正文后，全文判定（中文多、英文<80字母）会漏——对最后 2 段单独判定。
+    def _lang_counts(t: str):
+        return (len(re.findall(r'[\u4e00-\u9fff]', t)),
+                len(re.findall(r'[\u3040-\u309f\u30a0-\u30ff]', t)),
+                len(re.findall(r'[a-zA-Z]', t)))
+    paras = [p for p in re.split(r'\n\s*\n', reply_text) if p.strip()]
+    tail_parts = paras[-2:] if len(paras) >= 2 else paras
+    tail_text = "\n".join(tail_parts)
+    tzh, tkana, ten = _lang_counts(tail_text)
+    tail_en_heavy = ten >= 40 and ten > tzh + tkana
     zh = len(re.findall(r'[\u4e00-\u9fff]', reply_text))
     ja_kana = len(re.findall(r'[\u3040-\u309f\u30a0-\u30ff]', reply_text))
     en = len(re.findall(r'[a-zA-Z]', reply_text))
     if user_lang == "zh":
-        return en >= 80 and en > zh
+        return (en >= 80 and en > zh) or tail_en_heavy
     if user_lang == "ja":
-        return en >= 80 and en > (zh + ja_kana)
+        return (en >= 80 and en > (zh + ja_kana)) or tail_en_heavy
     if user_lang == "en":
         other = zh + ja_kana
         return other >= 80 and other > en
@@ -3771,6 +3821,7 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
         # 有进展的长时间研究任务不应被总时长预算掐断。
         _session_start = time.monotonic()
         _session_budget = time.monotonic() + 1800
+        _maybe_add_inline_file_note(current_msgs, last_user_text)
         while iteration < max_iterations:
             iteration += 1
             if _session_cancel_requested(session_id):
