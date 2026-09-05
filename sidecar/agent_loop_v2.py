@@ -608,7 +608,8 @@ class _LocalMode(ModeStrategy):
             "model": self.engine_model(),
             "messages": merged,
             "stream": True,
-            "temperature": 0.6,
+            # 工具调用确定性（0 温度）
+            "temperature": 0.0,
             "frequency_penalty": 0.6,
             "stop": ["<|im_end|>", "<|endoftext|>", "<end_of_turn>", "<eos>"],
         }

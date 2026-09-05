@@ -2538,7 +2538,9 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                 "model": model, "messages": _msgs_for_body,
                 "tools": active_tools, "tool_choice": "auto",
                 "max_tokens": _resolve_max_tokens(model), "stream": True,
-                "temperature": 0.5,
+                # 工具调用确定性（Nous Hermes 指引：function calling 建议 0 温度，
+                # 防 JSON/结构损坏——09-21 实测空名/坏参数的概率来源）
+                "temperature": 0.0,
                 "frequency_penalty": 0.6,
                 "stop": ["<|im_end|>", "<|endoftext|>", "<end_of_turn>", "<eos>"],
             }
@@ -3009,6 +3011,11 @@ _PROMPT_TOOL_RE = re.compile(
 )
 
 # Natural language fallback: matches "web_search \"query\"" or "search \"query\"" etc.
+# 09-21 收紧（Nous Hermes 立场：工具执行应由模型结构化调用决定，不做散文推断）：
+# 默认关闭；即使开启也只允许只读类工具（可开不可误执行危险性动作）。
+_NL_TOOL_FALLBACK_ENABLED = False
+_NL_TOOL_READONLY = frozenset({"read_file", "list_dir", "search_files", "headless_read",
+                               "web_search", "tavily_search", "dokobot_read", "bing_search"})
 _NL_TOOL_RE = re.compile(
     r'\b(web_search|tavily_search|search|read_file|write_file|list_dir|run_cmd|open_app|open_folder|search_files)\s*[\(\[""]\s*([^\")\]\.]+)\s*[\)\]""]',
     re.IGNORECASE,
@@ -3450,12 +3457,14 @@ def _parse_prompt_tool_calls(text: str) -> tuple[str, list[dict]]:
             used_ranges.append((m.start(), m.end()))
 
     # Priority 3: Natural language fallback — "web_search \"query\"" etc.
-    if not tool_calls:
+    # 09-21 收紧：默认关闭（_NL_TOOL_FALLBACK_ENABLED），开启时仅限只读工具。
+    if not tool_calls and _NL_TOOL_FALLBACK_ENABLED:
         for idx, m in enumerate(_NL_TOOL_RE.finditer(search_text)):
             name = m.group(1).lower()
-            # Normalize tool name
             if name == "search":
                 name = "web_search"
+            if name not in _NL_TOOL_READONLY:
+                continue
             raw_query = m.group(2).strip()
             if not raw_query:
                 continue
@@ -3841,7 +3850,8 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                 # 挤不下，致"查完不写总结/潦草收尾"并引发 nudge 压力下的数字
                 # 编造；复读截断(09-03 e27ba50)+预算收口(07e9460)已兜住原问题）
                 "max_tokens": _resolve_max_tokens(model), "stream": True,
-                "temperature": 0.5,
+                # 工具调用确定性（0 温度；本地模型同样受益）
+                "temperature": 0.0,
                 "frequency_penalty": 0.6,
                 "stop": ["<|im_end|>", "<|endoftext|>", "<end_of_turn>", "<eos>"],
             }
