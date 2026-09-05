@@ -5,7 +5,7 @@ import logoUrl from "./assets/logo.png";
 import type { Message, PendingFile, SessionInfo, ViewId, CloudModel, DownloadState, HFModelResult, LLMStatus } from "./types";
 // API keys stored in OS keychain via Rust commands (store_secret/get_secret/delete_secret)
 import { useSessions } from "./hooks/useSessions";
-import { sidecarFetch, waitForSidecar, authFetch, uploadSidecarFile } from "./utils/api";
+import { sidecarFetch, waitForSidecar, authFetch, uploadSidecarFile, uploadLocalPath } from "./utils/api";
 import { useTranslation } from "./i18n";
 import { useCronJobs } from "./hooks/useCronJobs";
 import ChatView from "./components/ChatView";
@@ -1201,6 +1201,7 @@ const [timeFilter, setTimeFilter] = useState("all");
 
   const handleDrop = useCallback(async (e: React.DragEvent) => {
     e.preventDefault();
+    // HTML5 拖放（保底路径）：多数情况下 Tauri 原生 onDragDropEvent 已处理
     const file = e.dataTransfer?.files?.[0];
     if (!file) return;
     if (file.type.startsWith("image/")) {
@@ -1219,6 +1220,41 @@ const [timeFilter, setTimeFilter] = useState("all");
       }
     }
   }, []);
+
+  // Tauri 原生拖放（macOS 稳定路径）：onDragDropEvent 拿到文件路径，sidecar 读盘
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    (async () => {
+      try {
+        const { getCurrentWebview } = await import("@tauri-apps/api/webview");
+        unlisten = await getCurrentWebview().onDragDropEvent(async (event: { payload?: { type?: string; paths?: string[] } }) => {
+          const payload = event?.payload;
+          if (!payload || payload.type === "over") return;
+          const path = (payload.paths || [])[0];
+          if (!path) return;
+          try {
+            const data = await uploadLocalPath(path);
+            if (data?.status !== "success") {
+              showToast(String((data as { message?: string })?.message || "文件解析失败"), "warn");
+              return;
+            }
+            const d = data as { content?: string; base64_data?: string; content_type?: string; filename?: string; is_image?: boolean };
+            const name = d.filename || path.split("/").pop() || "文件";
+            if (d.is_image === true || (d.base64_data && (d.content_type || "").startsWith("image/"))) {
+              const mime = d.content_type || "image/png";
+              setPendingFile({ name, preview: `data:${mime};base64,${d.base64_data}`, type: "image", content: `data:${mime};base64,${d.base64_data}`, base64: d.base64_data, mimeType: mime });
+            } else {
+              setPendingFile({ name, preview: "📄", type: "file", content: String(d.content || "") });
+              if ((d.content_type || "").includes("pdf") || name.toLowerCase().endsWith(".pdf")) showToast("PDF 已提取文字");
+            }
+          } catch {
+            showToast("文件上传失败", "warn");
+          }
+        });
+      } catch { /* Tauri 环境不可用（如浏览器调试）时静默 */ }
+    })();
+    return () => { unlisten?.(); };
+  }, [showToast]);
 
   const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];

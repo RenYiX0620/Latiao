@@ -110,3 +110,14 @@ export async function uploadSidecarFile(file: File): Promise<Record<string, unkn
   });
   return resp.json();
 }
+
+/** 本地路径上传（Tauri 原生拖放事件拿到的是文件路径，sidecar 直接读盘）。 */
+export async function uploadLocalPath(path: string): Promise<Record<string, unknown>> {
+  const token = await getToken();
+  const resp = await fetch(SIDECAR + "/v1/upload_local", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...(token ? { "X-Latiao-Token": token } : {}) },
+    body: JSON.stringify({ path }),
+  });
+  return resp.json();
+}

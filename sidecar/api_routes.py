@@ -534,10 +534,108 @@ async def chat_completion(request: Request):
     }
 
 
+
+
+def _process_upload_bytes(content: bytes, filename: str, content_type: str) -> dict:
+    """统一处理上传字节：图片→base64；PDF→提取文字；xlsx→表格；文本→读取。
+    content 统一经 _translate_to_english（用户偏好：文字部分英化）。"""
+    filename = filename or ""
+    is_image = content_type.startswith("image/")
+    is_pdf = content_type == "application/pdf" or filename.lower().endswith(".pdf")
+    is_xlsx = filename.lower().endswith((".xlsx", ".xls")) \
+        or content_type in ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            "application/vnd.ms-excel")
+
+    if is_image:
+        return {
+            "status": "success",
+            "content": f"图片已上传: {filename}",
+            "filename": filename,
+            "is_image": True,
+            "base64_data": base64.b64encode(content).decode("utf-8"),
+            "content_type": content_type,
+            "size": len(content),
+        }
+    if is_pdf:
+        reader = None
+        try:
+            from PyPDF2 import PdfReader
+            reader = PdfReader(io.BytesIO(content))
+            pages = []
+            for page in reader.pages:
+                text = page.extract_text()
+                if text:
+                    pages.append(text)
+            pdf_text = "\n\n".join(pages)
+            if not pdf_text.strip():
+                pdf_text = "(PDF 中没有可提取的文字，可能是扫描件或图片型 PDF)"
+        except Exception as e:
+            pdf_text = f"(PDF 解析失败: {e})"
+        return {
+            "status": "success",
+            "content": _translate_to_english(pdf_text),
+            "filename": filename,
+            "is_pdf": True,
+            "page_count": len(reader.pages) if reader is not None else 0,
+            "size": len(content),
+        }
+    if is_xlsx:
+        try:
+            xlsx_text = _extract_xlsx_text(content)
+            return {
+                "status": "success",
+                "content": _translate_to_english(xlsx_text),
+                "filename": filename,
+                "is_xlsx": True,
+                "size": len(content),
+            }
+        except Exception as e:
+            return {"status": "error", "message": f"Excel 解析失败: {e}"}
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError:
+        text = content.decode("latin-1", errors="replace")
+    return {
+        "status": "success",
+        "content": _translate_to_english(text),
+        "filename": filename,
+        "is_image": False,
+        "size": len(content),
+    }
+
+
+@app.post("/v1/upload_local")
+async def upload_local(request: Request):
+    """本地路径上传：Tauri 原生拖放事件（onDragDropEvent）拿到的是文件路径，
+    由 sidecar 直接读盘（免前端读字节），解析逻辑与 /v1/upload_file 一致。"""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"status": "error", "message": "无效请求"}, status_code=400)
+    path = str(body.get("path") or "")
+    if not path or not os.path.isfile(path):
+        return JSONResponse({"status": "error", "message": f"文件不存在: {path}"}, status_code=400)
+    try:
+        size = os.path.getsize(path)
+        if size > MAX_UPLOAD_SIZE:
+            return JSONResponse(
+                {"status": "error", "message": f"文件过大 (上限 {MAX_UPLOAD_SIZE / 1024 / 1024:.0f}MB)"},
+                status_code=413)
+        with open(path, "rb") as f:
+            content = f.read(MAX_UPLOAD_SIZE + 1)
+        if len(content) > MAX_UPLOAD_SIZE:
+            return JSONResponse({"status": "error", "message": "文件过大"}, status_code=413)
+        import mimetypes
+        mime, _ = mimetypes.guess_type(path)
+        return _process_upload_bytes(content, os.path.basename(path), mime or "application/octet-stream")
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
 @app.post("/v1/upload_file")
 async def upload_file(request: Request, file: UploadFile = File(...)):
-    """文件上传：图片转 base64，PDF 提取文本，文本直接读取"""
-    # 先检查 Content-Length，超限直接 413，避免把超大文件读进内存
+    """文件上传：图片转 base64，PDF 提取文本，Excel 解析表格，文本直接读取；
+    全部经 _process_upload_bytes 统一处理（含文字英化偏好）。"""
     cl = request.headers.get("content-length", "")
     if cl.isdigit() and int(cl) > MAX_UPLOAD_SIZE:
         return JSONResponse(
@@ -545,172 +643,15 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
             status_code=413,
         )
     try:
-        # 限量读取：最多读 MAX_UPLOAD_SIZE+1 字节，超限即拒绝
         content = await file.read(MAX_UPLOAD_SIZE + 1)
         if len(content) > MAX_UPLOAD_SIZE:
             return JSONResponse(
                 {"status": "error", "message": f"文件过大 (上限 {MAX_UPLOAD_SIZE / 1024 / 1024:.0f}MB)"},
                 status_code=413,
             )
-        file_type = file.content_type or ""
-        is_image = file_type.startswith("image/")
-        is_pdf = file_type == "application/pdf" or (file.filename or "").lower().endswith(".pdf")
-
-        if is_image:
-            base64_content = base64.b64encode(content).decode("utf-8")
-            return {
-                "status": "success",
-                "content": f"图片已上传: {file.filename}",
-                "filename": file.filename,
-                "is_image": True,
-                "base64_data": base64_content,
-                "content_type": file_type,
-                "size": len(content),
-            }
-        elif is_pdf:
-            reader = None
-            try:
-                from PyPDF2 import PdfReader
-                reader = PdfReader(io.BytesIO(content))
-                pages = []
-                for page in reader.pages:
-                    text = page.extract_text()
-                    if text:
-                        pages.append(text)
-                pdf_text = "\n\n".join(pages)
-                if not pdf_text.strip():
-                    pdf_text = "(PDF 中没有可提取的文字，可能是扫描件或图片型 PDF)"
-            except Exception as e:
-                pdf_text = f"(PDF 解析失败: {e})"
-
-            return {
-                "status": "success",
-                "content": _translate_to_english(pdf_text),
-                "filename": file.filename,
-                "is_pdf": True,
-                "page_count": len(reader.pages) if reader is not None else 0,
-                "size": len(content),
-            }
-        elif (file.filename or "").lower().endswith((".xlsx", ".xls")) \
-                or file_type in ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                 "application/vnd.ms-excel"):
-            try:
-                xlsx_text = _extract_xlsx_text(content)
-                return {
-                    "status": "success",
-                    "content": _translate_to_english(xlsx_text),
-                    "filename": file.filename,
-                    "is_xlsx": True,
-                    "size": len(content),
-                }
-            except Exception as e:
-                return {"status": "error", "message": f"Excel 解析失败: {e}"}
-        else:
-            try:
-                text = content.decode("utf-8")
-            except UnicodeDecodeError:
-                text = content.decode("latin-1", errors="replace")
-
-            return {
-                "status": "success",
-                "content": _translate_to_english(text),
-                "filename": file.filename,
-                "is_image": False,
-                "size": len(content),
-            }
+        return _process_upload_bytes(content, file.filename or "", file.content_type or "")
     except Exception as e:
         return {"status": "error", "message": str(e)}
-
-
-def _extract_xlsx_text(content: bytes) -> str:
-    """Excel（xlsx/xls）→ 表格文本（按 sheet 分行、tab 分隔）。
-
-    上传的 xlsx 是 zip 二进制，直接 decode 会产生乱码（09-05 事故），
-    必须解析为表格文本再交给模型。
-    """
-    from openpyxl import load_workbook
-    wb = load_workbook(io.BytesIO(content), data_only=True, read_only=True)
-    out: list[str] = []
-    try:
-        for ws in wb.worksheets:
-            out.append("### Sheet: " + ws.title)
-            for row in ws.iter_rows(values_only=True):
-                cells = [("" if v is None else str(v)) for v in row]
-                if any(c.strip() for c in cells):
-                    out.append("\t".join(cells))
-    finally:
-        wb.close()
-    return "\n".join(out)
-
-
-def _translate_to_english(text: str) -> str:
-    """用户偏好（config.upload_text_en=true）：上传的文字部分以英文上传。
-
-    检测到中文时，用已配置的第一个云端模型翻译为英文保持原格式；
-    未配置云端/翻译失败/无中文时保留原文（fail-open，不阻塞上传）。
-    """
-    if not text or not re.search(r"[\u4e00-\u9fff]", text):
-        return text
-    try:
-        cfg = json.loads((Path.home() / ".local-ai-os" / "config.json").read_text(encoding="utf-8"))
-        if not cfg.get("upload_text_en"):
-            return text
-        models = cfg.get("cloud_models", []) or []
-        if not models:
-            return text
-        prompt = (
-            "Translate the following text into English. Keep code blocks, tables and "
-            "formatting unchanged. Do NOT change any numbers, dates or units. "
-            "Output only the translation:\n\n" + text[:6000]
-        )
-        # 依次尝试所有云端模型（如 GLM 配额耗尽 429 时自动换 deepseek）
-        for m in models:
-            try:
-                url = (m.get("endpoint") or "").rstrip("/") + "/chat/completions"
-                resp = httpx.post(
-                    url,
-                    headers={"Authorization": "Bearer " + str(m.get("key") or "")},
-                    json={"model": m.get("name"),
-                          "messages": [{"role": "user", "content": prompt}],
-                          "max_tokens": 4096},
-                    timeout=120, follow_redirects=True,
-                )
-                if resp.status_code != 200:
-                    logger.info("upload translate: %s -> HTTP %s, try next", m.get("name"), resp.status_code)
-                    continue
-                out = (resp.json().get("choices") or [{}])[0].get("message", {}).get("content", "")
-                if out and out.strip():
-                    return out.strip()
-            except Exception as e:
-                logger.warning("upload translate via %s failed: %s", m.get("name"), e)
-                continue
-        return text
-    except Exception as e:
-        logger.warning("upload translate failed, keep original: %s", e)
-        return text
-
-
-# ── Whisper model cache (lazy-load once, reuse across requests) ──
-_whisper_model = None
-
-_WHISPER_DIR = Path.home() / ".local-ai-os" / "whisper-tiny"
-
-
-def _get_whisper_model():
-    global _whisper_model
-    if _whisper_model is None:
-        from faster_whisper import WhisperModel
-        # 优先本地目录加载: huggingface.co 在国内不可达(502),huggingface_hub
-        # 的 httpx 也不吃 SSL_CERT_FILE 环境变量。已预下载模型文件到
-        # ~/.local-ai-os/whisper-tiny/(镜像下载,见部署脚本),离线可用。
-        local_model = _WHISPER_DIR / "model.bin"
-        if local_model.exists():
-            _whisper_model = WhisperModel(str(_WHISPER_DIR), device="cpu", compute_type="int8")
-        else:
-            # fallback: 尝试镜像在线下载
-            os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
-            _whisper_model = WhisperModel("tiny", device="cpu", compute_type="int8")
-    return _whisper_model
 
 
 @app.post("/v1/recognize_speech")
