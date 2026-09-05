@@ -601,7 +601,7 @@ def _extract_xlsx_text(content: bytes) -> str:
     return "\n".join(out)
 
 
-def _process_upload_bytes(content: bytes, filename: str, content_type: str) -> dict:
+def _process_upload_bytes(content: bytes, filename: str, content_type: str, translate: bool = True) -> dict:
     """统一处理上传字节：图片→base64；PDF→提取文字；xlsx→表格；文本→读取。
     content 统一经 _translate_to_english（用户偏好：文字部分英化）。"""
     filename = filename or ""
@@ -638,7 +638,7 @@ def _process_upload_bytes(content: bytes, filename: str, content_type: str) -> d
             pdf_text = f"(PDF 解析失败: {e})"
         return {
             "status": "success",
-            "content": _translate_to_english(pdf_text),
+            "content": _translate_to_english(pdf_text) if translate else pdf_text,
             "filename": filename,
             "is_pdf": True,
             "page_count": len(reader.pages) if reader is not None else 0,
@@ -649,7 +649,7 @@ def _process_upload_bytes(content: bytes, filename: str, content_type: str) -> d
             xlsx_text = _extract_xlsx_text(content)
             return {
                 "status": "success",
-                "content": _translate_to_english(xlsx_text),
+                "content": _translate_to_english(xlsx_text) if translate else xlsx_text,
                 "filename": filename,
                 "is_xlsx": True,
                 "size": len(content),
@@ -662,7 +662,7 @@ def _process_upload_bytes(content: bytes, filename: str, content_type: str) -> d
         text = content.decode("latin-1", errors="replace")
     return {
         "status": "success",
-        "content": _translate_to_english(text),
+        "content": _translate_to_english(text) if translate else text,
         "filename": filename,
         "is_image": False,
         "size": len(content),
@@ -678,6 +678,7 @@ async def upload_local(request: Request):
     except Exception:
         return JSONResponse({"status": "error", "message": "无效请求"}, status_code=400)
     path = str(body.get("path") or "")
+    translate = bool(body.get("translate", True))
     if not path or not os.path.isfile(path):
         return JSONResponse({"status": "error", "message": f"文件不存在: {path}"}, status_code=400)
     try:
@@ -692,7 +693,7 @@ async def upload_local(request: Request):
             return JSONResponse({"status": "error", "message": "文件过大"}, status_code=413)
         import mimetypes
         mime, _ = mimetypes.guess_type(path)
-        return _process_upload_bytes(content, os.path.basename(path), mime or "application/octet-stream")
+        return _process_upload_bytes(content, os.path.basename(path), mime or "application/octet-stream", translate=translate)
     except Exception as e:
         return {"status": "error", "message": str(e)}
 

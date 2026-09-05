@@ -1246,7 +1246,9 @@ const [timeFilter, setTimeFilter] = useState("all");
           const name0 = path.split("/").pop() || "文件";
           setPendingFile({ name: name0, preview: "📄", type: "file", content: "⏳ 正在解析文件内容…" });
           try {
-            const data = await uploadLocalPath(path);
+            // 第一段：translate=false 秒回解析原文，预览立即显示真实内容；
+            // 第二段：后台再请求 translate=true 的英文版，完成后替换预览。
+            const data = await uploadLocalPath(path, false);
             if (data?.status !== "success") {
               setPendingFile(null);
               showToast(String((data as { message?: string })?.message || "文件解析失败"), "warn");
@@ -1260,6 +1262,14 @@ const [timeFilter, setTimeFilter] = useState("all");
             } else {
               setPendingFile({ name, preview: "📄", type: "file", content: String(d.content || "") });
               if ((d.content_type || "").includes("pdf") || name.toLowerCase().endsWith(".pdf")) showToast("PDF 已提取文字");
+              // 后台英化更新（不阻塞发送——发送时用当前已有内容）
+              uploadLocalPath(path, true).then((td) => {
+                if (td?.status === "success" && td.content) {
+                  setPendingFile((prev) => prev && prev.name === name
+                    ? { ...prev, content: String(td.content) }
+                    : prev);
+                }
+              }).catch(() => { /* 英化失败保留原文 */ });
             }
           } catch {
             showToast("文件上传失败", "warn");
