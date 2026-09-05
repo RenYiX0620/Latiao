@@ -26,6 +26,7 @@ from config import PROGRESS_DIR
 from cron import _create_cron
 from db import _db_write_lock, _get_db
 from identity import _load_agent_identity, _process_identity_intents, _read_identity
+from session_log import SessionLog
 from memory import (
     _extract_learnings_heuristic,
     _get_high_confidence_preferences,
@@ -485,11 +486,28 @@ _pending_lock = asyncio.Lock()
 # 执行工具/扣云端费用（P0）。set 的 add/discard/contains 原子，无需锁。
 _session_cancelled: set[str] = set()
 
+# 事件日志（阶段 1，灰度）：LATIAO_EVENT_LOG=1 时取消/回合边界事件写入
+# session_events 表（sidecar/session_log.py，移植 dsh append 契约）。
+# 有会话级取消事件时，重放/审计能还原"用户何时按过停止"——0.3.14 审计发现
+# 停止按钮此前只断前端流，这类时序信息在旧日志里是彻底丢失的。
+def _event_log_for(session_id: str) -> SessionLog | None:
+    try:
+        return SessionLog(session_id)
+    except Exception:
+        logger.warning("event log unavailable for %s", session_id, exc_info=True)
+        return None
+
 
 def _request_session_cancel(session_id: str) -> None:
     """置位会话取消标记（/v1/chat/cancel 调用）。"""
     if session_id:
         _session_cancelled.add(session_id)
+        log = _event_log_for(session_id)
+        if log is not None:
+            try:
+                log.append("cancel/request", {"cause": "user"})
+            except Exception:
+                logger.warning("failed to log cancel/request", exc_info=True)
 
 
 def _clear_session_cancel(session_id: str) -> None:
