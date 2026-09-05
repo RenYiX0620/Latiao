@@ -2723,6 +2723,21 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
             # 只补问一次：模型已交付最终文字后，再拖一轮确认“没有未完工具”，
             # 之后直接结束——此前最多空转 10 轮（每轮 30-60s）→ 用户看到
             # "答案有了但任务 1 分钟才结束"。
+            # 非任务消息门槛（17:11 事故同根）：闲聊 + 模型乱调了工具 → 直接收官
+            _has_task_kw = any(kw in (last_user_text or "").lower() for kw in (
+                "运行", "执行", "做", "帮我", "写", "创建", "查", "搜", "找", "分析",
+                "修复", "构建", "部署", "安装", "配置", "列出", "读取", "总结", "告诉",
+                "run", "build", "fix", "create", "search", "analyze", "deploy")) \
+                and not _is_chat_query(last_user_text)
+            if has_recent_tool_result and not _has_task_kw and streamed_text.strip():
+                _deliver = await _ensure_final_language(
+                    client, api_url, headers, model,
+                    streamed_text.strip(), last_user_text)
+                current_msgs.append({"role": "assistant", "content": _deliver})
+                if _deliver != streamed_text.strip():
+                    yield {"event": "content_revised", "content": _deliver}
+                _track_progress(session_id, "completed", f"text_response ({len(_deliver)} chars)")
+                return
             if has_recent_tool_result and text_only_streak < 1 and streamed_text.strip():
                 if len(streamed_text.strip()) >= 200:
                     # 工具结果后已给出实质性回答——接受为最终答案直接收尾
@@ -3981,6 +3996,24 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                 m.get("role") == "tool" and ("Error" in str(m.get("content", "")) or "⚠️" in str(m.get("content", "")) or "失败" in str(m.get("content", "")))
                 for m in current_msgs[-4:]
             )
+            # 非任务消息门槛（17:11 事故根治）：闲聊/能力介绍时工具是模型自己
+            # 乱调的（演示式 list_dir），绝不能进入工具结果追问链——否则
+            # "思考→演示工具→nudge→再思考"循环、思考闪现三次 + 重复能力清单。
+            # 闲聊零追问：直接交付（语言确保后），立即结束。
+            _has_task_kw = any(kw in (last_user_text or "").lower() for kw in (
+                "运行", "执行", "做", "帮我", "写", "创建", "查", "搜", "找", "分析",
+                "修复", "构建", "部署", "安装", "配置", "列出", "读取", "总结", "告诉",
+                "run", "build", "fix", "create", "search", "analyze", "deploy")) \
+                and not _is_chat_query(last_user_text)
+            if _pending_tool_analysis and body_text.strip() and not _has_task_kw:
+                # 闲聊交付不依赖 _recent_tool_failed（⚠️ 常驻系统提示词恒真）
+                _deliver = await _ensure_final_language(
+                    client, api_url, headers, _engine_model,
+                    body_text.strip(), last_user_text)
+                current_msgs.append({"role": "assistant", "content": _deliver})
+                yield {"content": "\n\n" + _strip_think_fences(_deliver)}
+                _track_progress(session_id, "completed", f"text_response ({len(_deliver)} chars)")
+                return
             if _pending_tool_analysis and body_text.strip() and not _recent_tool_failed:
                 # 推理模型(Muse/Qwen3.5/Ornith)常先输出规划文字、下一轮才调工具——
                 # 但“只声明不动手”的回复（让我读取/我再查一下…）不能当完成。
@@ -4631,6 +4664,24 @@ def _strip_file_blocks(text: str) -> str:
     t = re.split(r"内容如下[：:]?", text, flags=re.S)[0]
     t = re.sub(r"📎\s*文件[「『].*", " ", t, flags=re.S)
     return t.strip()
+
+
+# 闲聊识别（17:11 事故根治）：任务词表里的"做"字会把"你能做什么"判成任务型
+# ——model 因此进入工具结果追问链。闲聊标记优先于任务词：命中即按非任务处理。
+_CHAT_MARKERS = (
+    "你能做什么", "你能干什么", "你可以做什么", "你会什么", "你会哪些",
+    "你有什么功能", "有哪些功能", "你有什么能力", "你是谁", "介绍一下",
+    "自我介绍一下", "自我介绍", "谢谢", "感谢", "你好", "在吗", "你好呀",
+    "hello", "hi", "what can you do", "who are you",
+)
+
+
+def _is_chat_query(text: str) -> bool:
+    """闲聊/能力介绍类查询判定（空输入按闲聊处理：无任务可做）。"""
+    t = (text or "").strip().lower()
+    if not t:
+        return True
+    return any(m in t for m in _CHAT_MARKERS)
 
 
 def _detect_user_language(text: str) -> str:

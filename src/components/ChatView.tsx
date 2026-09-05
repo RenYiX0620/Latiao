@@ -570,16 +570,20 @@ export default memo(function ChatView({
                 <span className="chat-segment-chevron">{collapsed ? <ChevronRight size={13} /> : <ChevronDown size={13} />}</span>
               </button>
               {userMsgs.map((m, i) => renderMsg(m, i))}
-              {!collapsed && thinkRows.map((r) => (
-                <details key={`thk${r.key}`} className="thinking-row">
+              {!collapsed && thinkRows.length > 0 && (
+                <details className="thinking-row">
                   <summary className="thinking-row-head">
                     <Brain size={13} />
                     <span>思考过程</span>
-                    {r.dur !== undefined && <span className="thinking-meta">· 持续了 {fmtDur(r.dur)}</span>}
+                    {thinkTotalDur > 0 && <span className="thinking-meta">· 持续了 {fmtDur(thinkTotalDur)}</span>}
                   </summary>
-                  <div className="thinking-row-body">{r.text}</div>
+                  <div className="thinking-row-body">
+                    {thinkRows.map((r, i) => (
+                      <p key={r.key} style={{ margin: i > 0 ? "8px 0 0" : 0 }}>{r.text}</p>
+                    ))}
+                  </div>
                 </details>
-              ))}
+              )}
               {!collapsed && planMsgs.map((m, i) => renderMsg(m, i))}
               {!collapsed && catGroups.map((g, gi) => {
                 const Icon = g.icon;

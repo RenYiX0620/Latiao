@@ -45,6 +45,7 @@ from agent_loop import (
     _get_agent_tools,
     _get_localized_text,
     _handle_tool_execution,
+    _is_chat_query,
     _is_local_llm_url,
     _is_meta_wrapup,
     _looks_like_planning,
@@ -76,8 +77,10 @@ _STALL_FIRST_TOKEN = 90.0
 _STALL_AFTER_FIRST = 180.0
 _GEN_DEADLINE = 300.0
 _TASK_KW = ("运行", "执行", "做", "帮我", "写", "创建", "查", "搜", "找", "分析",
-            "修复", "构建", "部署", "安装", "配置",
-            "run", "build", "fix", "create", "search", "analyze", "deploy")
+            "修复", "构建", "部署", "安装", "配置", "列出", "读取", "读", "总结",
+            "生成", "打开", "查看", "解释", "整理", "统计", "告诉",
+            "run", "build", "fix", "create", "search", "analyze", "deploy",
+            "list", "read", "summar", "write", "explain", "tell")
 
 
 class _GenerationLoopAbort(Exception):
@@ -504,10 +507,24 @@ class _CloudMode(ModeStrategy):
         loop, state = ctx.loop, ctx.state
         text = state.streamed_text.strip()
         msgs = loop.current_msgs
+        has_task = (any(kw in (loop.last_user_text or "").lower() for kw in _TASK_KW)
+          and not _is_chat_query(loop.last_user_text))
+        # 闲聊/能力介绍：模型乱调工具不能进入追问链（17:11 事故根治，agent_loop._is_chat_query）
         has_recent_tool_result = any(
             m.get("role") == "tool" or (isinstance(m.get("content"), str)
                                         and m["content"].startswith("[工具结果]"))
             for m in msgs[-3:])
+        # 非任务消息 + 模型乱调了工具：工具结果后的"短回答/无实质"追问对闲聊
+        # 不成立（17:11 事故同根）——直接收官，不得 nudge。
+        if has_recent_tool_result and not has_task:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(120)) as client:
+                deliver = await _ensure_final_language(
+                    client, loop.api_url, loop.headers, loop.model, text, loop.last_user_text)
+            msgs.append({"role": "assistant", "content": deliver})
+            if deliver != text:
+                ctx.events.append({"event": "content_revised", "content": deliver})
+            _track_progress(loop.session_id, "completed", f"text_response ({len(deliver)} chars)")
+            return None
         if has_recent_tool_result and ctx.streak < 1 and text:
             if len(text) >= 200:
                 async with httpx.AsyncClient(timeout=httpx.Timeout(120)) as client:
@@ -600,9 +617,27 @@ class _LocalMode(ModeStrategy):
         body = state.body_text.strip()
         text = state.streamed_text.strip()
         msgs = loop.current_msgs
+        # 非任务消息门槛（17:11 事故根治）：用户消息不含任务词时，工具是模型
+        # 自己乱调的（如"你能做什么"的演示式 list_dir），绝不能因此进入
+        # pending_tool_analysis 追问链——否则"思考→演示工具→nudge→再思考"循环，
+        # 用户看到思考闪现三次 + 重复能力清单。闲聊零追问，直接交付。
+        has_task = (any(kw in (loop.last_user_text or "").lower() for kw in _TASK_KW)
+          and not _is_chat_query(loop.last_user_text))
+        # 闲聊/能力介绍：模型乱调工具不能进入追问链（17:11 事故根治，agent_loop._is_chat_query）
         recent_failed = any(
             "Error" in str(m.get("content", "")) or "⚠️" in str(m.get("content", ""))
             for m in msgs[-4:])
+        if ctx.pending_tool_analysis and body and not has_task:
+            # 闲聊交付不依赖 recent_failed（⚠️ 常驻系统提示词会让它恒真，
+            # 曾把闲聊分支整个跳过——17:11 复现根因之一）
+            async with httpx.AsyncClient(timeout=httpx.Timeout(120)) as client:
+                deliver = await _ensure_final_language(
+                    client, loop.api_url, loop.headers, self.engine_model(),
+                    body, loop.last_user_text)
+            msgs.append({"role": "assistant", "content": deliver})
+            ctx.events.append({"content": "\n\n" + _strip_think_fences(deliver)})
+            _track_progress(loop.session_id, "completed", f"text_response ({len(deliver)} chars)")
+            return None
         if ctx.pending_tool_analysis and body and not recent_failed:
             unsourced = _find_unsourced_numbers(body, msgs)
             if unsourced and ctx.fabrication_nudges < ctx.fab_cap:

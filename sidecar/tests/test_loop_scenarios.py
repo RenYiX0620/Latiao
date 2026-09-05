@@ -240,3 +240,69 @@ async def test_v2_local_tool_round_trip():
         assert any(e.get("event") == "tool_start" for e in events), events
         texts = [e.get("content", "") for e in events if "content" in e]
         assert any("根据刚才的目录输出" in t for t in texts), events
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 非任务消息零追问（17:11 事故回归）：闲聊 + 模型乱调工具 → 不得 nudge 循环
+# ═══════════════════════════════════════════════════════════════════════
+CHAT_MSGS = [{"role": "user", "content": "你能做什么"}]
+NO_NUDGE_TEXT = "我能做很多事情，有任务随时吩咐。"
+
+
+@pytest.mark.asyncio
+async def test_chat_no_nudge_v2_local():
+    from agent_loop_v2 import AgentLoop
+    with FakeEngine() as engine:
+        engine.push(engine.local_tool_response("list_dir", {"path": "."}))
+        engine.push(engine.text_response(NO_NUDGE_TEXT))
+        events = await _collect(AgentLoop(
+            "local", CHAT_MSGS, "fake-model", engine.url, HEADERS,
+            session_id=f"v2-chat-local-{time.time()}", access_mode="full",
+        ).run())
+        assert len(engine.requests) == 2, "闲聊+乱调工具必须 2 请求内结束（零 nudge）"
+        assert not any(e.get("event") == "heartbeat" for e in events), events
+        texts = [e.get("content", "") for e in events if "content" in e]
+        assert any(NO_NUDGE_TEXT in t for t in texts), events
+
+
+@pytest.mark.asyncio
+async def test_chat_no_nudge_v2_cloud():
+    from agent_loop_v2 import AgentLoop
+    with FakeEngine() as engine:
+        engine.push(engine.tool_response("list_dir", {"path": "."}))
+        engine.push(engine.text_response(NO_NUDGE_TEXT))
+        events = await _collect(AgentLoop(
+            "cloud", CHAT_MSGS, "fake-model", engine.url, HEADERS,
+            session_id=f"v2-chat-cloud-{time.time()}", access_mode="full",
+        ).run())
+        assert len(engine.requests) == 2, "云端闲聊+乱调工具同样零 nudge"
+        texts = [e.get("content", "") for e in events if "content" in e]
+        assert any(NO_NUDGE_TEXT in t for t in texts), events
+
+
+@pytest.mark.asyncio
+async def test_chat_no_nudge_v1_local():
+    with FakeEngine() as engine:
+        engine.push(engine.local_tool_response("list_dir", {"path": "."}))
+        engine.push(engine.text_response(NO_NUDGE_TEXT))
+        events = await _collect(_local_agent_loop_stream(
+            CHAT_MSGS, "fake-model", engine.url, HEADERS,
+            session_id=f"v1-chat-local-{time.time()}", access_mode="full",
+        ))
+        assert len(engine.requests) == 2, "v1 本地闲聊同样零 nudge"
+        texts = [e.get("content", "") for e in events if "content" in e]
+        assert any(NO_NUDGE_TEXT in t for t in texts), events
+
+
+@pytest.mark.asyncio
+async def test_chat_no_nudge_v1_cloud():
+    with FakeEngine() as engine:
+        engine.push(engine.tool_response("list_dir", {"path": "."}))
+        engine.push(engine.text_response(NO_NUDGE_TEXT))
+        events = await _collect(_agent_loop_stream(
+            CHAT_MSGS, "fake-model", engine.url, HEADERS,
+            session_id=f"v1-chat-cloud-{time.time()}", access_mode="full",
+        ))
+        assert len(engine.requests) == 2, "v1 云端闲聊同样零 nudge"
+        texts = [e.get("content", "") for e in events if "content" in e]
+        assert any(NO_NUDGE_TEXT in t for t in texts), events
