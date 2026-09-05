@@ -1283,6 +1283,42 @@ INTENT_PATTERNS = [
 #   full       完全访问 —— 仅高危确认，其余自动
 READ_ONLY_TOOLS = {"read_file", "list_dir", "search_files", "tavily_search", "web_search", "bing_search"}
 AUTO_EDIT_TOOLS = {"write_file", "open_folder"}
+
+_MARKET_TASK_RE = re.compile(r"大盘|行情|股票|板块|资金|涨|跌|收盘|市场|指数|A股|美股|港股")
+
+
+def _recover_tool_name(args: dict) -> str:
+    """空工具名恢复（09-21 实测：deepseek-v4 流式 tool_calls 名称字段为空串，
+    参数却完整——按参数键与工具 JSON Schema 匹配推断名称；唯一候选才恢复，
+    多候选/无候选返回空（走守卫提示）。"""
+    if not isinstance(args, dict) or not args:
+        return ""
+    keys = set(args.keys())
+    candidates = []
+    for t in TOOLS:
+        fn = t.get("function", {}) or {}
+        params = fn.get("parameters") or {}
+        props = params.get("properties") or {}
+        pkeys = set(props.keys())
+        if pkeys and keys <= pkeys:
+            candidates.append(fn.get("name", ""))
+    return candidates[0] if len(set(candidates)) == 1 else ""
+
+
+def _ensure_market_tools(active_tools: list, user_text: str) -> list:
+    """行情类问题保底工具：_cap_tools 按序裁剪会丢 mx_query/ak_finance
+    （09-21 实测：模型工具列表 8 个无 mx_query）——命中市场关键词时补回。"""
+    if _MARKET_TASK_RE.search(user_text or ""):
+        have = {t.get("function", {}).get("name") for t in active_tools}
+        out = list(active_tools)
+        for t in TOOLS:
+            n = t.get("function", {}).get("name")
+            if n in ("mx_query", "ak_finance") and n not in have:
+                out.append(t)
+        return out
+    return active_tools
+
+
 ACCESS_LEVELS = {"read_only", "confirm", "auto_edit", "plan", "full"}
 # 旧版本 workspace 档位迁移到 auto_edit（语义对应）
 _LEGACY_ACCESS_MAP = {"workspace": "auto_edit"}
@@ -2029,14 +2065,26 @@ async def _handle_tool_execution_inner(tc: dict, current_msgs: list, session_id:
     # 反复自我谴责死循环（8 连调）。这里在执行前拦截并回馈可操作的格式提示，
     # 让模型下一轮直接修正格式而不是猜。
     if not tool_name.strip():
-        result = (
-            "⛔ 工具调用格式错误：工具名为空。请直接以 ```tool 工具名\n{参数JSON}\n``` "
-            "形式调用（工具名后不要有空格/换行/标签），例如：\n"
-            "```tool list_dir\n{\"path\": \".\"}\n```"
-        )
-        current_msgs.append({"role": "tool", "tool_call_id": call_id, "content": result})
-        return True, [{"event": "tool_end", "call_id": call_id, "tool": "?", "result": result,
-                       "ts": int(time.time() * 1000)}]
+        # 空名恢复（09-21 实测：deepseek-v4 名称字段为空串但参数完整）：
+        # 先解析参数，若与唯一工具 schema 匹配则按推断名继续执行，否则走守卫提示。
+        _recovered = ""
+        try:
+            _args = json.loads(func.get("arguments", "{}") or "{}")
+            _recovered = _recover_tool_name(_args)
+        except Exception:
+            _args = {}
+        if _recovered:
+            logger.warning("空工具名恢复: 参数匹配 %s", _recovered)
+            tool_name = _recovered
+        else:
+            result = (
+                "⛔ 工具调用格式错误：工具名为空。请直接以 ```tool 工具名\n{参数JSON}\n``` "
+                "形式调用（工具名后不要有空格/换行/标签），例如：\n"
+                "```tool list_dir\n{\"path\": \".\"}\n```"
+            )
+            current_msgs.append({"role": "tool", "tool_call_id": call_id, "content": result})
+            return True, [{"event": "tool_end", "call_id": call_id, "tool": "?", "result": result,
+                           "ts": int(time.time() * 1000)}]
     # 权限模式拦截：read_only/workspace 下越权工具直接拒绝（不执行）
     denied = _check_access(tool_name, access_mode)
     if denied:
@@ -2414,6 +2462,7 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
     # Cap tools to prevent overflowing model context
     if len(active_tools) > 5:
         active_tools = _cap_tools(active_tools, 8)
+    active_tools = _ensure_market_tools(active_tools, last_user_text)
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(120)) as client:
         # ── 规划模式：复杂任务先生成执行计划（显示给用户，等确认后执行） ──
@@ -3628,6 +3677,7 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
     active_tools = _filter_tools_by_access(active_tools, access_mode)
     if len(active_tools) > 8:
         active_tools = _cap_tools(active_tools, 12)
+    active_tools = _ensure_market_tools(active_tools, last_user_text)
     tools_prompt = _build_local_tools_prompt(active_tools)
     # 4B-class models often have only ~8K ctx. If the system prompt + tool list
     # blows past it, llama.cpp silently truncates the prompt and the model

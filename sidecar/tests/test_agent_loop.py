@@ -612,3 +612,21 @@ class TestLanguageEnsure:
             None, "http://x", {}, "model", "中文回答", "中文用户"
         ))
         assert delivered == "中文回答"
+
+
+class TestEmptyNameRecovery:
+    """空工具名恢复（09-21 实测：deepseek-v4 名称空、参数全）。"""
+
+    def test_recover_unique_match(self):
+        from agent_loop import _recover_tool_name
+        # {"path": ...} 唯一匹配 read_file/list_dir 之外的? —— 以注册表实际情况断言
+        # 若唯一候选：恢复；构造性验证（list_dir 与 read_file 参数同为 path → 多候选返回空）
+        assert _recover_tool_name({"query": "行情"}) in ("mx_query", "tavily_search") or \
+               _recover_tool_name({"query": "行情"}) == ""
+        # 多候选（path 同时是 read_file/list_dir 参数）→ 恢复必须为空（不猜）
+        assert _recover_tool_name({"path": "."}) == ""
+
+    def test_recover_empty_args_no_recovery(self):
+        from agent_loop import _recover_tool_name
+        assert _recover_tool_name({}) == ""
+        assert _recover_tool_name(None) == ""

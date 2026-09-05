@@ -209,6 +209,8 @@ class AgentLoop:
         active = _filter_tools_by_access(active, access_mode)
         if len(active) > 8:
             active = _cap_tools(active, 12)
+        from agent_loop import _ensure_market_tools
+        active = _ensure_market_tools(active, self.last_user_text)
         self.active_tools = active
         self.tool_names = {t.get("function", {}).get("name") for t in active}
         self._ctx_warned = False
