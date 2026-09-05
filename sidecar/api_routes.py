@@ -1574,6 +1574,7 @@ async def confirm_tool(request: Request):
     call_id = body.get("call_id", "")
     approved = body.get("approved", False)
 
+    logger.info("confirm_tool request: call_id=%s approved=%s", call_id, approved)
     async with _pending_lock:
         entry = _pending_confirmations.get(call_id)
         if entry:

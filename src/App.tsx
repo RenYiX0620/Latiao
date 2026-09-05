@@ -1023,12 +1023,33 @@ const [timeFilter, setTimeFilter] = useState("all");
         method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ call_id: callId, approved }),
       });
       const data = await resp.json();
-      if (data.status === "already") return;  // 服务端幂等：已处理不重复提示
+      if (data.status === "already") {
+        // 服务端幂等：已处理（本卡已批准/拒绝）——收尾卡片状态，避免永远 confirming
+        setMessages(prev => prev.map(m => m.callId === callId && m.toolStatus === "confirming"
+          ? { ...m, toolStatus: "done" as const } : m));
+        return;
+      }
       if (data.status === "not_found") {
         showToast(t("toast.timeout"));
         setMessages(prev => prev.map(m => m.callId === callId && m.toolStatus === "confirming" ? { ...m, toolStatus: "error" as const, toolResult: t("toast.timeout_detail") } : m));
       }
-    } catch (e) { console.error(e); showToast(t("toast.confirm_fail")); }
+    } catch (e) {
+      console.error(e);
+      // 服务端若已处理（21:01 实证：客户端失败但 approve 已生效）→ 重试一次再判定
+      try {
+        await new Promise(r => setTimeout(r, 300));
+        const resp2 = await authFetch("/v1/confirm_tool", {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ call_id: callId, approved }),
+        });
+        const d2 = await resp2.json();
+        if (d2.status === "ok" || d2.status === "already") {
+          setMessages(prev => prev.map(m => m.callId === callId && m.toolStatus === "confirming"
+            ? { ...m, toolStatus: "done" as const } : m));
+          return;
+        }
+      } catch (e2) { console.error("confirm retry failed", e2); }
+      showToast(t("toast.confirm_fail"));
+    }
     finally { confirmInFlightRef.current.delete(callId); }
   }, [showToast, setMessages, t]);
 
