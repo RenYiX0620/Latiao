@@ -4155,7 +4155,6 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                     "\n\n⚠️ 本地模型本轮未能生成有效的分析正文（只输出了思考过程）。"
                     "请直接回复「继续」让我再试一次；或换一个模型（如云端模型）重发本任务。")}
                 _track_progress(session_id, "completed", "body_empty_fallback")
-                _track_progress(session_id, "completed", f"text_response ({len(_deliver)} chars)")
                 logger.warning(f"[LOCAL-AGENT] Iteration {iteration}: {_intent_nudges} 轮追问仍无实质回答，收尾返回")
                 # 必须 return：之前这里只打日志不返回，落回"短回答追问"分支
                 # 再白送一轮（20:48 事故：收尾后又进"追问充分回答一轮"，迭代 6 重复跑）
