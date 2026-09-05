@@ -757,8 +757,11 @@ const [timeFilter, setTimeFilter] = useState("all");
     // reflection_revised 已把最终文本写入消息；此后 [DONE]/finally 的 flushStream
     // 若再跑，prefix 检查不匹配会把 revised 文本重复 push 一条（M1 复发）。
     let streamFinalized = false;
+    // 定稿后允许最后一次 flush（附着思考），此后不再跑（M1 防重复保护）
+    let thinkingAttached = false;
     const flushStream = () => {
       if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+      if (streamFinalized && thinkingAttached) return;
       const text = full;
       // 定稿后才附着思考：流式期间正文照常更新，思考攒着不闪现
       const th = streamFinalized ? pendingThinking : "";
@@ -790,7 +793,7 @@ const [timeFilter, setTimeFilter] = useState("all");
       });
     };
     const scheduleFlush = () => {
-      if (!flushTimer) flushTimer = setTimeout(flushStream, 120);
+      if (!flushTimer) flushTimer = setTimeout(flushStream, 0);
     };
 
 
@@ -828,7 +831,7 @@ const [timeFilter, setTimeFilter] = useState("all");
         {
           const sse = parseSSEDataLine(line);
           if (sse.kind === "skip") continue;
-          if (sse.kind === "done") { streamFinalized = true; flushStream(); return full; }
+          if (sse.kind === "done") { streamFinalized = true; flushStream(); thinkingAttached = true; return full; }
           if (sse.kind === "error") throw new Error(sse.message);
           try {
             const parsed = sse.parsed;
@@ -900,7 +903,9 @@ const [timeFilter, setTimeFilter] = useState("all");
                 const revised = String(parsed.content ?? "");
                 if (revised.trim()) {
                   full = revised;
-                  streamFinalized = true; // 后续 [DONE]/finally flush 不再跑（否则 revised 被重复 push）
+                  streamFinalized = true;
+                  thinkingAttached = true;
+                  thinkingAttached = true; // 后续 flush 不再跑（否则 revised 被重复 push）
                   setMessages((prev) => {
                     const msgs = [...prev];
                     for (let i = msgs.length - 1; i >= 0; i--) {
@@ -920,6 +925,7 @@ const [timeFilter, setTimeFilter] = useState("all");
                 if (revised.trim()) {
                   full = revised;
                   streamFinalized = true;
+                  thinkingAttached = true;
                   setMessages((prev) => {
                     const msgs = [...prev];
                     for (let i = msgs.length - 1; i >= 0; i--) {
