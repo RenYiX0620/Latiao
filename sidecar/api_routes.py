@@ -320,7 +320,9 @@ async def chat_completion(request: Request):
                     # 云端 404 = 模型名或路径不存在——分别给出可操作的提示
                     req_url = str(e.request.url) if e.request else "?"
                     # 注意：不能复用外层 is_local（内层赋值会把外层变量遮蔽为局部 → UnboundLocalError）
-                    req_is_local = "127.0.0.1" in req_url or "localhost" in req_url
+                    # 用路由级权威标志（云端配置指向 localhost 代理时，URL
+                    # 推断会把云端 404 错标成"本地未就绪"——09-21 E2E 发现）
+                    req_is_local = is_local or "127.0.0.1" in req_url or "localhost" in req_url
                     # 云端 429（限流/配额耗尽，09-05 15:14 事故：GLM 周配额用尽后
                     # 自动路由仍选它，429 直接抛给用户）→ 自动降级：换下一个
                     # 云端模型（GLM→deepseek），没有则回退本地引擎。只降级一次。
@@ -1580,7 +1582,7 @@ async def confirm_tool(request: Request):
         if entry:
             entry["approved"] = approved
             entry["event"].set()
-            _recently_confirmed.add(call_id)
+            _recently_confirmed.append(call_id)
             return {"status": "ok", "call_id": call_id, "approved": approved}
     # 双击去重（09-21 实测：第一次批准并移除注册，第二次点击触发误报）
     if call_id in _recently_confirmed:
