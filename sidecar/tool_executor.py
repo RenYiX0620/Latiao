@@ -390,9 +390,22 @@ _READONLY_ARG_RE = re.compile(r"-{1,2}[A-Za-z0-9][A-Za-z0-9_-]*|[\w./@+~:-]+")
 
 
 def _is_readonly_cmd(cmd: str) -> bool:
-    """判断子智能体请求的命令是否命中只读白名单（仅限单条简单命令）。"""
+    """判断子智能体请求的命令是否命中只读白名单（仅限单条简单命令）。
+
+    阶段 3 优先走语义层（safety.rules.readonly_safe）：AST 展开嵌套/前缀，
+    `env cat`、`bash -c 'cat x'`、$() 全部现形；语义层不可用时回退本函数
+    原有的 token 形态校验（升级不改变旧环境行为）。
+    """
     cmd = (cmd or "").strip()
-    if not cmd or re.search(r"[;&|><`$]", cmd):
+    if not cmd:
+        return False
+    try:
+        from safety.rules import analyze, readonly_safe
+        if analyze(cmd).ts_available:
+            return readonly_safe(cmd)
+    except Exception:
+        pass  # 语义层异常 → 回退旧路径
+    if re.search(r"[;&|><`$]", cmd):
         return False
     if re.match(r"git\s+(log|status|diff|show|branch|remote|tag|blame)\b", cmd):
         return True
