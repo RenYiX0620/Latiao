@@ -2813,6 +2813,17 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
             if not has_called_tool and text_only_streak < 3 and streamed_text.strip():
                 # Model gave a text response without calling tools.
                 # Record the response so the model knows it already replied.
+                # ≥200 字符视为实质回答直接交付（09-21 实测：任务词 nudge 会让
+                # R2 正文被抑制、用户看不到分析——本地同口径的 ≥200 规则）
+                if len(streamed_text.strip()) >= 200:
+                    _deliver = await _ensure_final_language(
+                        client, api_url, headers, model,
+                        streamed_text.strip(), last_user_text)
+                    current_msgs.append({"role": "assistant", "content": _deliver})
+                    if _deliver != streamed_text.strip():
+                        yield {"event": "content_revised", "content": _deliver}
+                    _track_progress(session_id, "completed", f"text_response ({len(_deliver)} chars)")
+                    return
                 current_msgs.append({"role": "assistant", "content": streamed_text.strip()})
                 # 非任务型消息（闲聊/陈述/提问/长回复）→ 文本已交付给用户，直接结束，不再 nudge 重发
                 user_q = last_user_text.strip().rstrip("?？") if last_user_text else ""

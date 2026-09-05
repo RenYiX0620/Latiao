@@ -925,7 +925,7 @@ const [timeFilter, setTimeFilter] = useState("all");
                 if (revised.trim()) {
                   full = revised;
                   streamFinalized = true;
-                  thinkingAttached = true;
+                  // 注意：不置 thinkingAttached——定稿时最后一次 flush 仍需附着思考
                   setMessages((prev) => {
                     const msgs = [...prev];
                     for (let i = msgs.length - 1; i >= 0; i--) {
