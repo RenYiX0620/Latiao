@@ -15,7 +15,9 @@
     "lint:fix": "eslint src/ --fix",
     "lint:py:fix": "cd sidecar && ruff check --fix .",
     "deploy": "bash scripts/deploy.sh",
-    "release": "bash scripts/release.sh \"$@\""
+    "release": "bash scripts/release.sh \"$@\"",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "keywords": [],
   "author": "",
@@ -47,6 +49,7 @@
     "eslint-plugin-react-hooks": "^7.1.1",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.60.1",
-    "vite": "^8.0.16"
+    "vite": "^8.0.16",
+    "vitest": "^5.0.0"
   }
 }

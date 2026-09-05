@@ -3,6 +3,8 @@ import { fetch } from "@tauri-apps/plugin-http";
 import { invoke } from "@tauri-apps/api/core";
 import logoUrl from "./assets/logo.png";
 import type { Message, PendingFile, SessionInfo, ViewId, CloudModel, DownloadState, HFModelResult, LLMStatus } from "./types";
+import { parseSSEDataLine } from "./utils/sse";
+import { saveSessionsWithFallback } from "./utils/storage";
 // API keys stored in OS keychain via Rust commands (store_secret/get_secret/delete_secret)
 import { useSessions } from "./hooks/useSessions";
 import { sidecarFetch, waitForSidecar, authFetch, uploadSidecarFile, uploadLocalPath } from "./utils/api";
@@ -267,33 +269,8 @@ const [timeFilter, setTimeFilter] = useState("all");
 
   // Save sessions to localStorage with quota-exceeded fallback
   const saveSessions = useCallback((data: string) => {
-    const trySave = (s: string): boolean => {
-      try { localStorage.setItem("local_ai_os_sessions", s); return true; }
-      catch { return false; }
-    };
-    if (trySave(data)) return;
-    // 配额超限：对同一份 data 逐级降级重试——此前修剪的是已存旧数据、
-    // 写回的仍是同一份超限 data，二次写必然再抛异常 → 全部会话静默丢失（P0）。
-    try {
-      let arr = JSON.parse(data);
-      if (!Array.isArray(arr)) return;
-      // Level 1: 剥掉全部图片字段（stripForStorage 已做，此处兜底）
-      arr = arr.map((s: SessionInfo) => ({
-        ...s,
-        messages: s.messages.map(m => ({ ...m, imageBase64: undefined, imagePreview: undefined })),
-      }));
-      if (trySave(JSON.stringify(arr))) return;
-      // Level 2: 只保留最近 2 个会话
-      if (arr.length > 1 && trySave(JSON.stringify(arr.slice(-2)))) return;
-      // Level 3: 只保留最近 1 个会话的最后 20 条消息
-      const last = arr[arr.length - 1];
-      if (last && trySave(JSON.stringify([{ ...last, messages: last.messages.slice(-20) }]))) return;
-      // 仍失败：清空旧数据后保住本次会话的最后 10 条
-      try { localStorage.removeItem("local_ai_os_sessions"); } catch { /* ignore */ }
-      if (last) trySave(JSON.stringify([{ ...last, messages: last.messages.slice(-10) }]));
-    } catch {
-      // data 解析失败（不应发生）——放弃本次持久化
-    }
+    // 审计 P0-5：配额降级逻辑抽为纯函数（storage.ts），行为与原实现一致且可测
+    saveSessionsWithFallback(data);
   }, []);
 
   useEffect(() => {
@@ -843,14 +820,13 @@ const [timeFilter, setTimeFilter] = useState("all");
       const lines = buffer.split("\n");
       buffer = lines.pop() || "";
       for (const line of lines) {
-        if (line.startsWith("data: ")) {
-          const data = line.substring(6).trim();
-          if (data === "[DONE]") { flushStream(); return full; }
+        {
+          const sse = parseSSEDataLine(line);
+          if (sse.kind === "skip") continue;
+          if (sse.kind === "done") { flushStream(); return full; }
+          if (sse.kind === "error") throw new Error(sse.message);
           try {
-            const parsed = JSON.parse(data);
-            // Error events must reach the outer catch (and finally sendMessage's
-            // ❌ error display) instead of being swallowed as "malformed event".
-            if (parsed.error) throw new Error(parsed.error);
+            const parsed = sse.parsed;
             try {
               if (parsed.event === "engine_route") {
                 // P0 路由透明化：如实告知用户本请求实际落地的引擎，
