@@ -16,6 +16,7 @@ matching, custom-permission state, shared constants, and facade re-exports so
 from __future__ import annotations
 
 import sys
+import secrets
 
 if __name__ == "__main__":
     # 以脚本方式运行时本模块名为 __main__，而子模块（api_routes/memory 等）
@@ -255,7 +256,8 @@ def _check_auth(request: Request) -> None:
         auth = request.headers.get("authorization", "") or ""
         if auth.startswith("Bearer "):
             token = auth[7:]
-    if token != AUTH_TOKEN:
+    # 常数时间比较（审计 P2-24）：普通不等比较可被计时侧信道探测 token
+    if not secrets.compare_digest(token, AUTH_TOKEN):
         raise _UnauthorizedError()
 
 # Log key lifecycle events
