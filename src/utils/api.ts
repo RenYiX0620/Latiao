@@ -93,3 +93,20 @@ export async function sidecarFetchWithRetry(
   }
   throw new Error("sidecarFetchWithRetry: unreachable");
 }
+
+/**
+ * 上传文件到 sidecar（/v1/upload_file：图片转 base64、PDF 提取文字、
+ * 文本按偏好英化）。普通 fetch + 手动 token（plugin-http 不保证支持
+ * FormData，CSP 已允许 connect-src 127.0.0.1:8765）。
+ */
+export async function uploadSidecarFile(file: File): Promise<Record<string, unknown>> {
+  const token = await getToken();
+  const fd = new FormData();
+  fd.append("file", file);
+  const resp = await fetch(SIDECAR + "/v1/upload_file", {
+    method: "POST",
+    body: fd,
+    headers: token ? { "X-Latiao-Token": token } : {},
+  });
+  return resp.json();
+}

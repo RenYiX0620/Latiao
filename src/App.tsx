@@ -5,7 +5,7 @@ import logoUrl from "./assets/logo.png";
 import type { Message, PendingFile, SessionInfo, ViewId, CloudModel, DownloadState, HFModelResult, LLMStatus } from "./types";
 // API keys stored in OS keychain via Rust commands (store_secret/get_secret/delete_secret)
 import { useSessions } from "./hooks/useSessions";
-import { sidecarFetch, waitForSidecar, authFetch } from "./utils/api";
+import { sidecarFetch, waitForSidecar, authFetch, uploadSidecarFile } from "./utils/api";
 import { useTranslation } from "./i18n";
 import { useCronJobs } from "./hooks/useCronJobs";
 import ChatView from "./components/ChatView";
@@ -1202,8 +1202,21 @@ const [timeFilter, setTimeFilter] = useState("all");
   const handleDrop = useCallback(async (e: React.DragEvent) => {
     e.preventDefault();
     const file = e.dataTransfer?.files?.[0];
-    if (file?.type.startsWith("image/")) {
+    if (!file) return;
+    if (file.type.startsWith("image/")) {
       await processImageFile(file);
+    } else {
+      try {
+        const data = await uploadSidecarFile(file);
+        if (data?.status === "success" && data.content) {
+          setPendingFile({ name: file.name, preview: "📄", type: "file", content: String(data.content) });
+          if (file.type === "application/pdf") showToast("PDF 已提取文字");
+        } else {
+          showToast(String(data?.message || "文件解析失败"), "warn");
+        }
+      } catch {
+        showToast("文件上传失败", "warn");
+      }
     }
   }, []);
 
@@ -1212,19 +1225,20 @@ const [timeFilter, setTimeFilter] = useState("all");
     if (!file) return;
     if (file.type.startsWith("image/")) {
       await processImageFile(file);
-    } else if (file.type === "application/pdf") {
-      // PDF 无法作为 image_url 发给模型（视觉模型也解不了 PDF），也没有
-      // 内置解析器——直接提示不支持，避免用户等 180s 超时。
-      showToast(t("toast.pdf_unsupported"), "warn");
-      if (fileInputRef.current) fileInputRef.current.value = "";
-      return;
     } else {
-      const reader = new FileReader();
-      reader.onload = () => {
-        const result = reader.result as string;
-        setPendingFile({ name: file.name, preview: "📄", type: "file", content: result });
-      };
-      reader.readAsText(file);
+      // PDF/文本等统一走后端 /v1/upload_file：PDF 提取文字、文本英化
+      // （用户偏好 upload_text_en），本地 FileReader 会绕过英化。
+      try {
+        const data = await uploadSidecarFile(file);
+        if (data?.status === "success" && data.content) {
+          setPendingFile({ name: file.name, preview: "📄", type: "file", content: String(data.content) });
+          if (file.type === "application/pdf") showToast("PDF 已提取文字");
+        } else {
+          showToast(String(data?.message || "文件解析失败"), "warn");
+        }
+      } catch {
+        showToast("文件上传失败", "warn");
+      }
     }
     if (fileInputRef.current) fileInputRef.current.value = "";
   };
