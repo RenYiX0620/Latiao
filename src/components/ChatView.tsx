@@ -296,6 +296,9 @@ export default memo(function ChatView({
     return segs;
   }, [messages]);
   const [collapsedSegs, setCollapsedSegs] = useState<Record<string, boolean>>({});
+  // 用户消息里内联文件块的展开状态（默认收起：只显示文件名与展开按钮，
+  // 不再把整段文件文本刷屏在气泡里）
+  const [expandedFiles, setExpandedFiles] = useState<Record<string, boolean>>({});
 
   // 单条消息渲染（段内复用；思考内容由段渲染器提前提取为独立活动行，此处只渲染正文）
   const renderMsg = (msg: Message, i: number) => {
@@ -339,18 +342,41 @@ export default memo(function ChatView({
             );
           }
           if (msg.type === "file") {
+            // 拆分"用户输入文本 + 📎 文件…内容如下：```…```"结构：
+            // 文本正常显示，文件内容默认折叠（点击展开）——模型仍收到完整内容，
+            // 气泡不再整段刷屏。
+            const fm = msg.content.match(/^([\s\S]*?)\n*📎 文件「(.+?)」内容如下：\s*```\n([\s\S]*?)\n```\s*$/);
+            const textPart = fm ? fm[1].trim() : "";
+            const fname = fm ? fm[2] : msg.filename || "";
+            const fbody = fm ? fm[3] : msg.content;
+            const isExpanded = !!expandedFiles[msg.id || ""];
             return (
               <div key={msg.id || i} className={`msg-row user file`}>
                 <div className="avatar-small avatar-user"><User size={19} strokeWidth={2} /></div>
                 <div className="msg-content">
-                  <div className="msg-bubble">
+                  {textPart && <div className="msg-bubble user">{textPart}</div>}
+                  <div className="msg-bubble" style={{ marginTop: textPart ? 6 : 0 }}>
                     {msg.imagePreview ? (
                       <img src={msg.imagePreview} alt="" style={{ maxWidth: 240 }} />
                     ) : (
-                      <span>📄 {msg.filename}</span>
+                      <span className="file-attach-line" style={{ cursor: "pointer" }}
+                        onClick={() => setExpandedFiles((prev) => ({ ...prev, [msg.id || ""]: !prev[msg.id || ""] }))}>
+                        📄 {fname}
+                        <span className="file-attach-meta" style={{ opacity: 0.65, fontSize: "0.85em" }}>
+                          {isExpanded ? " · 收起" : ` · ${(fbody.length / 1024).toFixed(1)} KB · 点击展开`}
+                        </span>
+                      </span>
                     )}
                   </div>
-                  {msg.content && <div className="msg-bubble" style={{ marginTop: 6 }}>{msg.content}</div>}
+                  {isExpanded && (
+                    <pre className="msg-bubble file-content" style={{ marginTop: 6, maxHeight: 260, overflow: "auto", whiteSpace: "pre-wrap", wordBreak: "break-all", fontSize: "0.85em" }}>{fbody}</pre>
+                  )}
+                  <div className="msg-actions">
+                    <button className="btn-icon" title={t("chat.copy")} onClick={() => {
+                      navigator.clipboard?.writeText(msg.content).then(() => showToast(t("chat.copied"))).catch(() => showToast(t("chat.copy_fail"), "warn"));
+                    }}>⧉</button>
+                    {fmtTime(msg.ts) && <span className="msg-time">{fmtTime(msg.ts)}</span>}
+                  </div>
                 </div>
               </div>
             );

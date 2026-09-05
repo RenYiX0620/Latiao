@@ -211,7 +211,11 @@ def install_extension(source: str, sha256: str = "", label: str = "") -> dict:
     except Exception as e:
         return {"status": "error", "message": f"下载失败: {e}"}
 
-    # sha256 校验
+    # sha256 校验（审计 P1-10）：网络来源必须提供 sha256——扩展无签名体系，
+    # 传输完整性 hash 是仅有的防线；本地文件视为管理员显式操作，允许免传。
+    if not Path(source).expanduser().is_file() and not sha256:
+        return {"status": "error",
+                "message": "网络来源安装必须提供 sha256（防传输篡改）；请从可信市场清单或发布页获取后重试"}
     if sha256:
         actual = hashlib.sha256(zip_bytes).hexdigest()
         if actual.lower() != sha256.lower():

@@ -244,6 +244,11 @@ const [timeFilter, setTimeFilter] = useState("all");
   /* ── Persistence: debounce during SSE streaming, immediate otherwise ── */
   const isProcessingRef = useRef(isProcessing);
   isProcessingRef.current = isProcessing;
+  // 最新 pendingFile 镜像 + 后台英化完成等待者（sendMessage 组装消息前
+  // 若英化未完成，等待英化结果拿英文内容——用户偏好"上传文字以英文上传"）
+  const pendingFileRef = useRef<PendingFile | null>(null);
+  const enWaitersRef = useRef<Set<() => void>>(new Set());
+  useEffect(() => { pendingFileRef.current = pendingFile; }, [pendingFile]);
 
   // Strip large fields before persisting to avoid localStorage bloat
   const stripForStorage = useCallback((s: SessionInfo[]) => {
@@ -1092,28 +1097,40 @@ const [timeFilter, setTimeFilter] = useState("all");
     setActiveTask(null);
     setTaskStartAt(Date.now()); // 任务头部"已工作"计时起点
 
+    // 等待后台英化完成再组装消息（用户偏好：上传文字以英文上传）。
+    // 12 秒上限：超时/失败用当前内容兜底，不阻塞发送。
+    let pf = pendingFileRef.current || pendingFile;
+    if (pf && pf.type === "file" && !pf.enReady) {
+      showToast("正在生成英文版文件内容…");
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(() => resolve(), 12000);
+        enWaitersRef.current.add(() => { clearTimeout(timer); resolve(); });
+      });
+      pf = pendingFileRef.current || pf;
+    }
+
     const userMsg: Message = { id: msgId(), role: "user", content: text || "Analyze this file", ts: Date.now() };
-    if (pendingFile) {
-      userMsg.type = pendingFile.type === "image" ? "image" : "file";
-      userMsg.filename = pendingFile.name;
-      if (pendingFile.base64) {
-        userMsg.imageBase64 = pendingFile.base64;
-        userMsg.imageMime = pendingFile.mimeType;
+    if (pf) {
+      userMsg.type = pf.type === "image" ? "image" : "file";
+      userMsg.filename = pf.name;
+      if (pf.base64) {
+        userMsg.imageBase64 = pf.base64;
+        userMsg.imageMime = pf.mimeType;
         // imagePreview drives the in-bubble thumbnail (ChatView.tsx); without it
         // the screenshot history collapses to a "[File: ...]" text line.
-        if (pendingFile.type === "image" && pendingFile.preview) userMsg.imagePreview = pendingFile.preview;
+        if (pf.type === "image" && pf.preview) userMsg.imagePreview = pf.preview;
       }
-      if (pendingFile.type === "image") {
-        userMsg.content = text || `[Image: ${pendingFile.name}]`;
+      if (pf.type === "image") {
+        userMsg.content = text || `[Image: ${pf.name}]`;
       } else {
         // 文本附件必须把内容真正发给模型（此前只发占位符，模型看不到文件）。
         // 太长截断：上下文有限，128KB 足够覆盖绝大多数源码/文档。
         const MAX_FILE_CHARS = 128 * 1024;
-        let body = (pendingFile.content || "").slice(0, MAX_FILE_CHARS);
-        if ((pendingFile.content || "").length > MAX_FILE_CHARS) body += "\n\n...(文件过长已截断)";
+        let body = (pf.content || "").slice(0, MAX_FILE_CHARS);
+        if ((pf.content || "").length > MAX_FILE_CHARS) body += "\n\n...(文件过长已截断)";
         userMsg.content =
           (text ? text + "\n\n" : "") +
-          `📎 文件「${pendingFile.name}」内容如下：\n\n\`\`\`\n${body}\n\`\`\``;
+          `📎 文件「${pf.name}」内容如下：\n\n\`\`\`\n${body}\n\`\`\``;
       }
     }
 
@@ -1264,12 +1281,18 @@ const [timeFilter, setTimeFilter] = useState("all");
               if ((d.content_type || "").includes("pdf") || name.toLowerCase().endsWith(".pdf")) showToast("PDF 已提取文字");
               // 后台英化更新（不阻塞发送——发送时用当前已有内容）
               uploadLocalPath(path, true).then((td) => {
-                if (td?.status === "success" && td.content) {
-                  setPendingFile((prev) => prev && prev.name === name
-                    ? { ...prev, content: String(td.content) }
-                    : prev);
-                }
-              }).catch(() => { /* 英化失败保留原文 */ });
+                setPendingFile((prev) => prev && prev.name === name
+                  ? (td?.status === "success" && td.content
+                      ? { ...prev, content: String(td.content), enReady: true }
+                      : { ...prev, enReady: true })  // 失败也标记完成：保留原文可发送
+                  : prev);
+                enWaitersRef.current.forEach((w) => w());
+                enWaitersRef.current.clear();
+              }).catch(() => {
+                setPendingFile((prev) => prev && prev.name === name ? { ...prev, enReady: true } : prev);
+                enWaitersRef.current.forEach((w) => w());
+                enWaitersRef.current.clear();
+              });
             }
           } catch {
             showToast("文件上传失败", "warn");

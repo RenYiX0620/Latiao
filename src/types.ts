@@ -30,6 +30,7 @@ export interface PendingFile {
   content: string;
   base64?: string;
   mimeType?: string;
+  enReady?: boolean;  // 后台英化是否已完成（发送前据此决定是否等待英文版）
 }
 
 export interface SessionInfo {
