@@ -182,3 +182,27 @@ async def test_tool_call_and_result_paired(monkeypatch, conn):
     assert result_ev.source_seqs == (call_ev.seq,)  # 结果引用其调用事件
     assert "tool output" in result_ev.data["result"]
 
+
+
+@pytest.mark.asyncio
+async def test_empty_tool_name_guarded(monkeypatch, conn):
+    """17:23 事故回归：空工具名必须执行前拦截，回馈可操作格式提示。"""
+    import agent_loop
+
+    executed = []
+
+    async def _dummy(args):
+        executed.append(args)
+        return "should not run"
+
+    monkeypatch.setitem(agent_loop.TOOL_DISPATCH, "dummy-tool", _dummy)
+    tc = {"id": "call-empty", "function": {"name": "", "arguments": "{}"}}
+    verify_failed, events = await agent_loop._handle_tool_execution(
+        tc, [], "sess-empty", "latiao", access_mode="full",
+    )
+    assert verify_failed is True
+    assert executed == [], "空名工具不得执行"
+    tail = [e for e in events if e.get("event") == "tool_end"]
+    assert tail and "工具名为空" in tail[-1]["result"]
+    log = SessionLog.load("sess-empty", conn=conn)
+    assert [e.type for e in log] == ["tool/call", "tool/result"]

@@ -2009,7 +2009,20 @@ async def _handle_tool_execution_inner(tc: dict, current_msgs: list, session_id:
     确认事件若在等待完成后才发出，前端弹窗永不出现（死锁）。"""
     call_id = tc.get("id") or str(uuid.uuid4())
     func = tc.get("function", {})
-    tool_name = func.get("name", "unknown")
+    tool_name = func.get("name", "unknown") or ""
+    # 空名守卫（17:23 事故根治）：云端路径对 delta 工具名无过滤，模型流式
+    # 输出 name=""（分片/格式问题）会被原样执行 → 模型只见 "Unknown tool ''"
+    # 反复自我谴责死循环（8 连调）。这里在执行前拦截并回馈可操作的格式提示，
+    # 让模型下一轮直接修正格式而不是猜。
+    if not tool_name.strip():
+        result = (
+            "⛔ 工具调用格式错误：工具名为空。请直接以 ```tool 工具名\n{参数JSON}\n``` "
+            "形式调用（工具名后不要有空格/换行/标签），例如：\n"
+            "```tool list_dir\n{\"path\": \".\"}\n```"
+        )
+        current_msgs.append({"role": "tool", "tool_call_id": call_id, "content": result})
+        return True, [{"event": "tool_end", "call_id": call_id, "tool": "?", "result": result,
+                       "ts": int(time.time() * 1000)}]
     # 权限模式拦截：read_only/workspace 下越权工具直接拒绝（不执行）
     denied = _check_access(tool_name, access_mode)
     if denied:

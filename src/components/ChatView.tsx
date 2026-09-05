@@ -553,6 +553,8 @@ export default memo(function ChatView({
             const thinkText = m.thinking || (localThink ? localThink[1] : null);
             if (thinkText) thinkRows.push({ key: m.id || `thk${thinkRows.length}`, text: thinkText, dur: m.thinkingDuration });
           }
+          // 同一对话段的全部思考合并为单一折叠栏：时长求和展示
+          const thinkTotalDur = thinkRows.reduce((acc, r) => acc + (r.dur ?? 0), 0);
           const planMsgs = asstMsgs.filter((m) => m.content.startsWith("📋"));
           const answerMsgs = asstMsgs.filter((m) => !m.content.startsWith("📋"));
           // ZCode 式类别聚合：同类别工具折叠为一行 "探索 · N 搜索"（保持首次出现顺序）

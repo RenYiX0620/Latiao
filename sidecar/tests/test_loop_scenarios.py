@@ -306,3 +306,19 @@ async def test_chat_no_nudge_v1_cloud():
         assert len(engine.requests) == 2, "v1 云端闲聊同样零 nudge"
         texts = [e.get("content", "") for e in events if "content" in e]
         assert any(NO_NUDGE_TEXT in t for t in texts), events
+
+
+@pytest.mark.asyncio
+async def test_v2_cloud_empty_tool_name_guarded():
+    """17:23 事故云端回归：delta 工具名空串 → 守卫拦截 + 模型拿到可操作提示。"""
+    from agent_loop_v2 import AgentLoop
+    with FakeEngine() as engine:
+        engine.push(engine.tool_response("", {"path": "."}))
+        engine.push(engine.asserts_tool_result_present("工具名为空"))
+        events = await _collect(AgentLoop(
+            "cloud", [{"role": "user", "content": "测试"}], "fake-model", engine.url, HEADERS,
+            session_id=f"v2-empty-name-{time.time()}", access_mode="full",
+        ).run())
+        assert len(engine.requests) == 2, "守卫后的引导轮应结束"
+        texts = [e.get("content", "") for e in events if "content" in e]
+        assert any("完成" in t for t in texts), events
