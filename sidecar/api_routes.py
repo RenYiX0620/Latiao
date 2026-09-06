@@ -1369,6 +1369,31 @@ async def set_cloud_models(request: Request):
 # ── Tavily API Key management endpoints ──
 
 
+@app.get("/v1/debug/tasks")
+async def debug_tasks():
+    """诊断：转储当前所有 asyncio 任务的 await 栈。
+
+    背景（09-06 16:48 事故）：agent 循环卡在某个永不再唤醒的 await 上时，
+    日志零输出、faulthandler 只能看到线程级栈（asyncio 任务栈不可见），
+    "为什么停了"无法回答。此端点直接转储任务级调用栈，一眼定位卡点。"""
+    import asyncio
+    out = []
+    for t in asyncio.all_tasks():
+        try:
+            if t.done():
+                continue
+            stack = t.get_stack(limit=None)
+            frames = []
+            for f in stack:
+                if f.f_code.co_name == "run":
+                    continue
+                frames.append(f"{f.f_code.co_filename.split('/')[-1]}:{f.f_lineno} in {f.f_code.co_name}")
+            out.append({"task": t.get_name(), "repr": repr(t)[:400], "frames": frames})
+        except Exception as e:
+            out.append({"task": t.get_name(), "error": str(e)})
+    return {"tasks": out, "count": len(out)}
+
+
 @app.get("/v1/settings/tavily-key")
 async def get_tavily_key():
     """Get Tavily API key status (masked, never returns full key). Reads from keychain first, then config.json."""

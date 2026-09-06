@@ -50,18 +50,19 @@ npx tauri dev
 ```
 
 ## Architecture
-- `src/` — React frontend (App.tsx is the main component, ~1000 lines)
+- `src/` — React frontend (App.tsx is the main component, ~1700 lines; ChatView.tsx ~800)
 - `src-tauri/` — Rust backend (Tauri commands proxy to sidecar)
-- `sidecar/main.py` — Python FastAPI: agent loop, tool execution, SSE streaming
+- `sidecar/` — Python FastAPI sidecar: agent loops in `agent_loop.py`（云/本地双循环）+ `agent_loop_v2.py`（灰度统一循环）, routing/API in `api_routes.py`, tools in `tool_executor.py`/`tool_system.py`, engine in `local_llm.py`; main.py is the FastAPI app + facade
 - Frontend manages all session state (localStorage); sidecar is stateless
 - Agent loop: SSE streaming with `tool_confirm`/`tool_start`/`tool_end` events
 - Tool permissions: `safe` = auto-execute, `confirm` = user must approve
 - Progress persisted to `~/.local-ai-os/PROGRESS.md`
 
-## When editing sidecar/main.py
+## When editing the sidecar agent layer
 - The agent loop uses `asyncio.Event` for tool confirmation — don't break the async flow.
 - `TOOLS`, `TOOL_DISPATCH`, `TOOL_PERMISSIONS` must stay in sync.
 - New tools need: function definition + dispatch entry + permission level.
+- 路由策略：未选模型一律本地引擎；云端只走显式选择（自动路由机制已删除，哨兵测试 test_no_auto_route_to_cloud）。
 - The SSE event protocol is: `content` for tokens, `tool_confirm`/`tool_start`/`tool_end` for tool lifecycle, `[DONE]` for stream end.
 
 ## When editing src/App.tsx

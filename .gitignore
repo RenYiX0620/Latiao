@@ -34,3 +34,6 @@ sidecar/*.dll
 sidecar/build/
 sidecar/dist/
 scripts/build-win.sh.bak
+# Local test venv / pytest cache（不入库）
+.venv*/
+.pytest_cache/

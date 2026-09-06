@@ -43,7 +43,6 @@ from tool_executor import (
     _FALLBACK_DISPATCH,
     _FALLBACK_PERMISSIONS,
     _FALLBACK_TOOLS,
-    _delegate_task,
     _resolve_permission,
 )
 from tool_system import load_plugins
@@ -1783,6 +1782,9 @@ class _NativeToolsUnsupported(Exception):
 
 # 测试覆盖钩子：None=按引擎自动判定；True/False=强制
 _LOCAL_NATIVE_TOOLS_OVERRIDE: bool | None = None
+# 回退开关：LATIAO_LOCAL_NATIVE=0 一键还原围栏路径（结构化契约出问题时）
+if os.environ.get("LATIAO_LOCAL_NATIVE", "") == "0":
+    _LOCAL_NATIVE_TOOLS_OVERRIDE = False
 
 # 任务关键词（与 agent_loop_v2._TASK_KW 同表；v1 原为内联列表，提出来共用）
 _TASK_KW = ("运行", "执行", "做", "帮我", "写", "创建", "查", "搜", "找", "分析",
@@ -1804,6 +1806,15 @@ _NATIVE_FOLLOWUP_PROMPT = (
     "⚠️ 任务尚未完成：继续调用工具，或如果所有步骤已完成，直接给出最终完整回答。"
 )
 
+# 完成确认轮（native 新契约的唯一"继续压力"）：一轮内还没有任何工具调用时，
+# 第一条纯文本回复会被追问一次——任务没完成就动手，完成了就重发最终回答。
+# 结构化规则（零工具调用计数），不做任何文本内容猜测。
+_NATIVE_COMPLETION_CHECK_PROMPT = (
+    "⚠️ 完成确认：你上一条回复没有调用任何工具。\n"
+    "若任务尚未完成——现在立即调用工具执行，不要再写计划或声明；\n"
+    "若你上一条已经是完整最终回答——请原样重发该回答（含结论与关键数据），不要增删。"
+)
+
 
 def _local_native_tools_ok() -> bool:
     """本地引擎是否支持原生 function calling（自管 mlx 引擎；LM Studio/
@@ -1815,6 +1826,43 @@ def _local_native_tools_ok() -> bool:
         return False
     return (getattr(eng, "_active_backend", "") == "mlx"
             or getattr(eng, "backend", "") == "mlx")
+
+
+def _slim_history_for_local(msgs: list, keep_recent_turns: int = 3) -> list:
+    """本地模型历史预算：近 N 轮完整，更早轮次截断（首尾保留）。
+
+    31 条重历史（整文件内容+全部工具结果+历史⛔错误）使首 token 45s+ 且
+    模型注意力被稀释（复读/声明式收工，09-06 15:19 事故）。只截 content、
+    不动角色结构（tool_calls 与 tool 结果配对安全）。以 user 消息为轮边界。
+    """
+    if len(msgs) <= 12:
+        return msgs
+    user_idx = [i for i, m in enumerate(msgs) if m.get("role") == "user"]
+    if len(user_idx) <= keep_recent_turns:
+        return msgs
+    cutoff = user_idx[-keep_recent_turns]
+
+    def _clip(s: str, head: int, tail: int) -> str:
+        if len(s) <= head + tail + 20:
+            return s
+        return s[:head] + f"\n…(历史截断，原文 {len(s)} 字符)…" + s[-tail:]
+
+    out = []
+    for i, m in enumerate(msgs):
+        if i >= cutoff or m.get("role") == "system":
+            out.append(m)
+            continue
+        c = m.get("content")
+        if not isinstance(c, str) or not c:
+            out.append(m)
+            continue
+        if m.get("role") == "tool":
+            out.append({**m, "content": _clip(c, 200, 200)})
+        elif m.get("role") == "assistant":
+            out.append({**m, "content": _clip(c, 400, 200)})
+        else:
+            out.append({**m, "content": _clip(c, 600, 200)})
+    return out
 
 
 def _is_light_query(text: str, msgs: list) -> bool:
@@ -1938,34 +1986,6 @@ async def _enhance_auto_verify(tool_name: str, args: dict, result: str, checks: 
 
 
 
-async def _await_tool_confirmation(call_id: str, tool_name: str, args: dict) -> tuple[bool, list[dict]]:
-    """Wait for user to approve/deny a confirm-level tool. Returns (approved, events).
-
-    超时不再静默当拒绝（P2-14）：保留 pending 状态并给用户明确提示事件，
-    任务暂停而不是以 User denied 收场。默认不限时（09-21 用户反馈）。"""
-    events = [{"event": "tool_confirm", "call_id": call_id, "tool": tool_name, "args": args}]
-    event = asyncio.Event()
-    async with _pending_lock:
-        _pending_confirmations[call_id] = {"event": event, "approved": False}
-    try:
-        await event.wait()
-        async with _pending_lock:
-            approved = _pending_confirmations.get(call_id, {}).get("approved", False)
-        logger.info("tool confirmation resolved: %s approved=%s", call_id, approved)
-    except asyncio.TimeoutError:
-        approved = False
-        events.append({
-            "content": (
-                f"\n\n⚠️ 工具 `{tool_name}` 等待确认超时（2 分钟无人操作），"
-                "任务已暂停，未执行该操作。可在界面中重新批准后继续。"
-            ),
-        })
-    finally:
-        async with _pending_lock:
-            _pending_confirmations.pop(call_id, None)
-    return approved, events
-
-
 async def _start_tool_confirmation(call_id: str, tool_name: str, args: dict) -> dict:
     """启动工具确认：注册 pending，返回 {"event": 待发事件, "event_obj": 等待用}。
 
@@ -2066,13 +2086,6 @@ async def _wait_plan_confirmation(plan_id: str, event_obj: asyncio.Event,
         async with _pending_lock:
             _pending_confirmations.pop(plan_id, None)
     return approved, events
-
-
-async def _await_plan_confirmation(plan_id: str, plan: str) -> tuple[bool, list[dict]]:
-    """兼容入口：启动 + 等待一次性完成。"""
-    started = await _start_plan_confirmation(plan_id, plan)
-    approved, events = await _wait_plan_confirmation(plan_id, started["event_obj"])
-    return approved, [started["event"]] + events
 
 
 def _check_pre_hooks(tool_name: str, args: dict) -> tuple[bool, list[dict], str]:
@@ -2612,6 +2625,7 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
             iteration += 1
             if _session_cancel_requested(session_id):
                 _track_progress(session_id, "cancelled", "user_stop")
+                logger.info(f"[AGENT] Iteration {iteration}: 会话取消（新消息/手动停止），任务中止")
                 yield {"content": "\n\n⏹️ 任务已停止。"}
                 return
             if time.monotonic() > loop_deadline:
@@ -2879,6 +2893,7 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                         any_new = True
                     if _session_cancel_requested(session_id):
                         _track_progress(session_id, "cancelled", "user_stop")
+                        logger.info(f"[AGENT] tool 执行前检测到取消（新消息/手动停止），任务中止")
                         yield {"content": "\n\n⏹️ 任务已停止。"}
                         return
                     # 先发确认事件再等待（死锁修复）：confirm 级工具的
@@ -2894,8 +2909,9 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                         if not _tname.strip():
                             _empty_name_streak += 1
                             _empty_name_seen = True
-                            logger.warning("empty tool name streak=%s args=%s",
-                                           _empty_name_streak, json.dumps(_targs, ensure_ascii=False)[:200])
+                            logger.warning("empty tool name streak=%s args=%s raw_calls=%s",
+                                           _empty_name_streak, json.dumps(_targs, ensure_ascii=False)[:200],
+                                           json.dumps([tc.get("function", {}) for tc in tool_calls], ensure_ascii=False)[:400])
                             if _empty_name_streak >= 3:
                                 yield {"content": ("\n\n⛔ 模型连续 3 次输出空工具名（工具调用格式异常）。"
                                                    "任务已中止。请切换为其他模型，或在模型页重新加载后重试。")}
@@ -3833,6 +3849,7 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
     _intent_nudges = 0              # “只声明不动手/只道歉”的追问计数
     _fabrication_nudges = 0        # 无来源数字拦截计数（19:05 编造事故，≤2 次有界）
     _think_only_nudges = 0         # 思考-only 轮计数（13:29 事故：思考型模型只产思考不写正文）
+    _continuation_round_done = False  # native 完成确认轮：一轮内零工具调用的第一条纯文本会被确认一次
     # 编造拦截上限：闸门与兜底路径共用同一口径（此前两处不一致：闸门本地=1、
     # 兜底无条件=2——同一回复走不同分支行为不同）
     _fab_cap = 1 if _is_local_llm_url(api_url) else 2
@@ -3846,11 +3863,15 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
     agent_tools = _get_agent_tools(agent_id, TOOLS)
     # 09-06 13:47 事故：全部权限下"打开相册"被意图筛选+8/12 裁剪剥掉了
     # run_cmd/control_launch——关键词猜不准意图（"打开"匹配不到控制类），
-    # 模型只能诚实回答"我没有命令工具"。全部权限+原生 tools 时不再筛选
-    # 裁剪（原生 schema 下 20+ 工具成本很低，判断力交还模型——与 Codex/
-    # ZCode 的薄调度同构）；legacy 围栏路径维持筛选+cap（提示词体积约束）。
-    if _normalize_access(access_mode) == "full" and _local_native_tools_ok():
+    # 模型只能诚实回答"我没有命令工具"。
+    # 09-06 15:40 彻底重构：mlx 自管引擎（原生 function calling）在【全部权限
+    # 模式】下都不再筛选裁剪——原生 schema 下 20+ 工具成本很低，判断力交还
+    # 模型（与 Codex/ZCode 的薄调度同构）；只按权限模式做访问过滤（执行期
+    # _check_access 仍逐次把关）。legacy 围栏路径（外部引擎/回退）维持筛选+cap。
+    if _local_native_tools_ok():
         active_tools = list(agent_tools)
+        if _normalize_access(access_mode) != "full":
+            active_tools = _filter_tools_by_access(active_tools, access_mode)
     else:
         active_tools = _filter_tools(last_user_text, agent_tools) if last_user_text else agent_tools
         active_tools = _filter_tools_by_access(active_tools, access_mode)
@@ -3942,6 +3963,8 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
         _session_start = time.monotonic()
         _session_budget = time.monotonic() + 1800
         _maybe_add_inline_file_note(current_msgs, last_user_text)
+        # 历史预算：旧轮截断（近 3 轮完整），治重历史的首 token 延迟与注意力稀释
+        current_msgs = _slim_history_for_local(current_msgs)
         # 09-06 三档模式（原生 function calling 落地）：
         # - light：闲聊快车道——不传工具、不注入提示、关思考（27B 实测 1.3s）
         # - native：自管 mlx 引擎原生 tools 参数（27B 工具轮实测 4.5s，
@@ -3954,6 +3977,7 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
             iteration += 1
             if _session_cancel_requested(session_id):
                 _track_progress(session_id, "cancelled", "user_stop")
+                logger.info(f"[AGENT] Iteration {iteration}: 会话取消（新消息/手动停止），任务中止")
                 yield {"content": "\n\n⏹️ 任务已停止。"}
                 return
             if time.monotonic() > _session_budget:
@@ -4345,6 +4369,7 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                         any_new = True
                     if _session_cancel_requested(session_id):
                         _track_progress(session_id, "cancelled", "user_stop")
+                        logger.info(f"[AGENT] tool 执行前检测到取消（新消息/手动停止），任务中止")
                         yield {"content": "\n\n⏹️ 任务已停止。"}
                         return
                     # 先发确认事件再等待（死锁修复）：confirm 级工具的
@@ -4360,8 +4385,9 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                         if not _tname.strip():
                             _empty_name_streak += 1
                             _empty_name_seen = True
-                            logger.warning("empty tool name streak=%s args=%s",
-                                           _empty_name_streak, json.dumps(_targs, ensure_ascii=False)[:200])
+                            logger.warning("empty tool name streak=%s args=%s raw_calls=%s",
+                                           _empty_name_streak, json.dumps(_targs, ensure_ascii=False)[:200],
+                                           json.dumps([tc.get("function", {}) for tc in tool_calls], ensure_ascii=False)[:400])
                             if _empty_name_streak >= 3:
                                 yield {"content": ("\n\n⛔ 模型连续 3 次输出空工具名（工具调用格式异常）。"
                                                    "任务已中止。请切换为其他模型，或在模型页重新加载后重试。")}
@@ -4426,6 +4452,45 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
             _track_progress(session_id, "text_round", "text_only")
             if body_text.strip():
                 _no_progress_deadline = time.monotonic() + 900  # 产出正文=实质进展（思考不算）
+            # ═══ native 新契约（09-06 彻底重构）：结构规则，零文本猜测 ═══
+            #   tool_calls → 已在上面执行完并 continue，不会到这里
+            #   有正文 → 本轮零工具调用且未确认过 → 一次完成确认轮（模型要么
+            #            立即调工具、要么重发最终回答）；否则 = 最终回答，交付收尾
+            #   仅思考无正文 → 唯一兜底：终答提取一次 → 交付或干净中止
+            #   完全空 → 落到下方 empty-response 重试/中止（与 legacy 共用）
+            # 下方旧启发式网（关键词/规划/意图/数字闸门）仅在 legacy 围栏路径执行。
+            if _native_tools:
+                if not body_text.strip() and streamed_text.strip():
+                    _sout = await _final_answer_extraction(
+                        client, api_url, headers, _engine_model, current_msgs,
+                        _detect_user_language(_extract_last_user_text(current_msgs)))
+                    if len(_sout) >= 120:
+                        yield {"content": "\n\n" + _strip_think_fences(_sout)}
+                        _track_progress(session_id, "completed", f"think_only_extract ({len(_sout)} chars)")
+                        logger.info(f"[LOCAL-AGENT] Iteration {iteration}: 思考-only，终答提取交付 ({len(_sout)} chars)")
+                        return
+                    yield {"content": "\n\n⚠️ 本地模型只输出了思考过程，未能生成回答正文。请回复「继续」重试，或换云端模型。"}
+                    _track_progress(session_id, "completed", "think_only_no_body")
+                    logger.warning(f"[LOCAL-AGENT] Iteration {iteration}: 思考-only 且终答提取失败，干净中止")
+                    return
+                if body_text.strip():
+                    if not has_called_tool and not _continuation_round_done:
+                        _continuation_round_done = True
+                        current_msgs.append({"role": "assistant", "content": body_text.strip()})
+                        current_msgs.append({"role": "system", "content": _NATIVE_COMPLETION_CHECK_PROMPT})
+                        text_output_delivered = True
+                        text_only_streak += 1
+                        yield {"event": "heartbeat"}
+                        logger.info(f"[LOCAL-AGENT] Iteration {iteration}: 零工具纯文本 → 完成确认轮")
+                        continue
+                    _deliver = await _ensure_final_language(
+                        client, api_url, headers, _engine_model,
+                        body_text.strip(), last_user_text)
+                    yield {"content": "\n\n" + _strip_think_fences(_deliver)}
+                    _track_progress(session_id, "completed", f"text_response ({len(_deliver)} chars)")
+                    logger.info(f"[LOCAL-AGENT] Iteration {iteration}: 纯文本最终回答交付 ({len(_deliver)} chars)")
+                    return
+                # body 为空 → 继续往下走 empty-response 重试/中止（共用逻辑）
             # 工具已产出结果但模型尚未给出实质性回答时，不允许一句话收尾。
             # 此前依赖“最近 3 条消息里有工具结果”这个窗口，nudge 消息一多
             # 工具结果就被挤出窗口，模型连说两轮“让我读取数据再分析”都能
@@ -5104,34 +5169,6 @@ async def _resolve_api_target(cloud_config: dict | None) -> tuple[str, str, dict
         return protocol, api_url, headers, True
 
 
-# ── Task Intent Detection + Model Auto-Routing ──
-
-_CODE_INTENT_PATTERNS = [
-    # 单字"改/写/类"极易误伤（09-05 15:14 事故：文件块里"不可更改数量"的"改"字
-    # 把报价分析误判成 code 任务 → 路由到 GLM → 429 直接抛给用户）。
-    # 收紧为多字语境模式；"类型/分类"不再误命中。
-    r'(?:代码|编程|修复|优化|重构|实现|开发|修改|debug|review)',
-    r'(?:改(?:代码|程序|脚本|函数|类|bug|一下|进)|写(?:个|一|一下)?[\w\s]{0,8}?(?:代码|程序|脚本|函数|类))',
-    r'(?:code|fix|write|implement|refactor|debug|review|optimize)',
-    r'(?:bug|error|报错|异常|crash)',
-    r'(?:function|函数|class|类名|基类|子类|module|模块|API|接口)',
-    r'(?:read_file|write_file|list_dir|run_cmd)',
-]
-
-
-def _strip_file_blocks(text: str) -> str:
-    """剥离用户消息里的内联文件块（📎 文件「…」内容如下：```…```），
-    只保留用户真正的提问——intent 判定/任务词检测都应对提问本身做，
-    而不是对文件内容（09-05 15:14 事故：文件里"不可更改"的"改"字
-    让报价分析被误判为 code 任务）。"""
-    if not text:
-        return text
-    # 先按"内容如下"截断（提问在文件块之前），再清残留的文件头标记
-    t = re.split(r"内容如下[：:]?", text, flags=re.S)[0]
-    t = re.sub(r"📎\s*文件[「『].*", " ", t, flags=re.S)
-    return t.strip()
-
-
 # 闲聊识别（17:11 事故根治）：任务词表里的"做"字会把"你能做什么"判成任务型
 # ——model 因此进入工具结果追问链。闲聊标记优先于任务词：命中即按非任务处理。
 _CHAT_MARKERS = (
@@ -5201,31 +5238,6 @@ def _detect_user_language(text: str) -> str:
 def _get_localized_text(lang: str, texts: dict[str, str | dict]) -> str | dict:
     """Get localized text for a given language, falling back to zh."""
     return texts.get(lang) or texts.get("zh", "")
-
-def _detect_task_intent(text: str) -> str:
-    """Detect whether the user intent is 'code', 'chat', or 'research'.
-    Used for automatic model routing."""
-    text_lower = _strip_file_blocks(text).lower()  # 只看提问，不看文件内容（15:14 事故）
-    for pattern in _CODE_INTENT_PATTERNS:
-        if re.search(pattern, text_lower):
-            return "code"
-    # Research indicators
-    if re.search(r'(?:搜索|查|找|论文|研究|分析|最新|news|search|research)', text_lower):
-        return "research"
-    return "chat"
-
-
-def _has_cloud_models() -> bool:
-    """Check if any cloud model is configured."""
-    try:
-        config_file = CONFIG_FILE
-        if config_file.exists():
-            cfg = json.loads(config_file.read_text(encoding="utf-8"))
-            models = cfg.get("cloud_models", [])
-            return any(m.get("endpoint") for m in models)
-    except Exception:
-        logger.warning("Failed to read cloud models config", exc_info=True)
-    return False
 
 
 def _get_best_cloud_config() -> dict | None:

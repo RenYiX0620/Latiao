@@ -1,5 +1,4 @@
 """Database connection and schema management for Latiao sidecar."""
-import asyncio
 import logging
 import re
 import sqlite3
@@ -16,7 +15,6 @@ MEMORY_DB = PROGRESS_DIR / "memory.db"
 _db_conn: sqlite3.Connection | None = None
 _db_init_lock = threading.Lock()   # protects lazy connection init
 _db_write_lock = threading.Lock()  # protects sync write paths
-_async_db_lock = asyncio.Lock()    # protects async write paths
 
 
 def _get_db() -> sqlite3.Connection:

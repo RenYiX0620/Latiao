@@ -374,13 +374,15 @@ class TestPlanConfirmationGate(unittest.TestCase):
 
         async def run():
             # 启动确认等待，然后模拟用户拒绝（计划被拒 -> 任务不执行）
-            task = asyncio.create_task(agent_loop._await_plan_confirmation("plan-t1", "1. 步骤A\n2. 步骤B"))
+            started = await agent_loop._start_plan_confirmation("plan-t1", "1. 步骤A\n2. 步骤B")
+            task = asyncio.create_task(
+                agent_loop._wait_plan_confirmation("plan-t1", started["event_obj"]))
             await asyncio.sleep(0.1)
             async with agent_loop._pending_lock:
                 agent_loop._pending_confirmations["plan-t1"]["approved"] = False
                 agent_loop._pending_confirmations["plan-t1"]["event"].set()
             approved, events = await task
-            return approved, events
+            return approved, [started["event"]] + events
 
         approved, events = asyncio.run(run())
         self.assertFalse(approved)
@@ -391,7 +393,9 @@ class TestPlanConfirmationGate(unittest.TestCase):
         import agent_loop
 
         async def run():
-            task = asyncio.create_task(agent_loop._await_plan_confirmation("plan-t2", "计划"))
+            started = await agent_loop._start_plan_confirmation("plan-t2", "计划")
+            task = asyncio.create_task(
+                agent_loop._wait_plan_confirmation("plan-t2", started["event_obj"]))
             await asyncio.sleep(0.1)
             async with agent_loop._pending_lock:
                 agent_loop._pending_confirmations["plan-t2"]["approved"] = True

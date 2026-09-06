@@ -580,30 +580,6 @@ def _get_recent_learnings(limit: int = 5) -> list[str]:
     return learnings
 
 
-def _build_learning_context(user_query: str) -> str:
-    """Build a context string from relevant learnings + preferences to inject into system prompt."""
-    parts = []
-
-    # Get relevant learnings
-    learnings = _retrieve_relevant_learnings(user_query)
-    if learnings:
-        lines = ["## 你从过去的交互中学到了:"]
-        for item in learnings:
-            confidence_bar = "█" * int(item["confidence"] * 5) + "░" * (5 - int(item["confidence"] * 5))
-            lines.append(f"- [{item['topic']}] {item['content']} (置信度: {confidence_bar})")
-        parts.append("\n".join(lines))
-
-    # Get learned preferences
-    prefs = _retrieve_preferences()
-    if prefs:
-        lines = ["## 用户偏好 (从历史交互中推断):"]
-        for p in prefs:
-            lines.append(f"- {p['key']}: {p['value']}")
-        parts.append("\n".join(lines))
-
-    return "\n\n".join(parts) if parts else ""
-
-
 # ── Heuristic knowledge extraction from conversation ──
 
 _KNOWLEDGE_PATTERNS = [
@@ -656,35 +632,3 @@ def _extract_learnings_heuristic(user_text: str, session_id: str) -> int:
                 _store_preference(pref_key, matched_text, confidence)
             count += 1
     return count
-
-
-
-async def _summarize_learning(raw_content: str) -> str:
-    """Use LLM to compress a raw learning into a concise semantic summary (1-2 sentences)."""
-    import main  # lazy: 本地请求串行锁
-    try:
-        prompt = (
-            "将以下知识片段压缩为一到两句中文摘要，只保留可操作的结论，去掉冗余细节。\n\n"
-            f"原文: {raw_content[:500]}\n\n摘要:"
-        )
-        async with httpx.AsyncClient(timeout=httpx.Timeout(30)) as client:
-            # 本地 llama.cpp 并发请求会崩溃 -> 走 main 的串行锁
-            async with main._local_llm_serialized(LM_STUDIO_URL):
-                r = await client.post(
-                LM_STUDIO_URL,
-                json={
-                    "model": SUBAGENT_MODEL,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 120,
-                    "temperature": 0.3,
-                    "stream": False,
-                },
-                headers={"Content-Type": "application/json"},
-            )
-            if r.status_code == 200:
-                data = r.json()
-                summary = data["choices"][0]["message"]["content"].strip()
-                return summary if summary else raw_content[:200]
-            return raw_content[:200]
-    except Exception:
-        return raw_content[:200]  # Fall back to truncation
