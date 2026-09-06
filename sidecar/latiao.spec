@@ -20,6 +20,12 @@ a = Analysis(
         'mcp_client', 'extension_manager',
         'cron', 'identity', 'memory', 'local_llm', 'db', 'config',
         'tool_system', 'tool_executor',
+        # Stage 1-5 拆分：agent/ 包（薄循环/Scope 容器/传输/解析/上下文/闸门/子代理），
+        # 多处函数内 from agent.* import ——静态扫描可能漏，显式列出保 Windows 不炸
+        'agent', 'agent.loop', 'agent.core', 'agent.transport', 'agent.parsing',
+        'agent.text_quality', 'agent.context', 'agent.gates', 'agent.subagent',
+        'agent.plugins', 'agent.plugins.builtin',
+        'uuid',
         # mx_query 金融工具：--mx-query 模式下需要 import（目录已改为合法包名 mx_data）
         'skills', 'skills.mx_data', 'skills.mx_data.mx_data',
         # 控制类插件（plugins/ 下由 tool_system 动态加载，需随包）
