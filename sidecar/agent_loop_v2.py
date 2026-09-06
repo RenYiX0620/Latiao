@@ -47,6 +47,8 @@ from agent_loop import (
     _get_localized_text,
     _handle_tool_execution,
     _is_chat_query,
+    _is_light_query,
+    _local_native_tools_ok,
     _maybe_add_inline_file_note,
     _is_local_llm_url,
     _strip_transient_reminders,
@@ -55,6 +57,8 @@ from agent_loop import (
     _looks_like_tool_fantasy,
     _merge_system_messages,
     _NATIVE_CONTROL_RE,
+    _NATIVE_FOLLOWUP_PROMPT,
+    _NATIVE_LEAN_PROMPT,
     _NATIVE_TOOL_RE,
     _PENDING_INTENT_PATTERNS,
     _parse_native_tool_calls,
@@ -217,6 +221,12 @@ class AgentLoop:
         active = _ensure_market_tools(active, self.last_user_text)
         self.active_tools = active
         self.tool_names = {t.get("function", {}).get("name") for t in active}
+        # 09-06 三档模式（与 v1 本地循环同口径）：
+        # light=闲聊快车道（不传工具+关思考）；native=原生 tools 参数（自管
+        # mlx）；legacy=围栏提示词。native 遇 400 自动回退 legacy。
+        self.light_query = _is_light_query(self.last_user_text, self.current_msgs)
+        self.native_tools = (not self.light_query) and _local_native_tools_ok() and bool(self.active_tools)
+        self.native_fallback_used = False
         self._ctx_warned = False
 
     async def run(self):
@@ -268,6 +278,14 @@ class AgentLoop:
             except _GenerationLoopAbort:
                 pass  # 截断语义：文本交给我后续的提取/闸门（v1 18:01 同款）
             except httpx.HTTPStatusError as e:
+                # 原生 tools 被引擎拒绝（模板不支持工具，400）→ 回退围栏格式重跑本轮
+                if (self.native_tools and not self.native_fallback_used
+                        and getattr(e.response, "status_code", 0) == 400):
+                    self.native_fallback_used = True
+                    self.native_tools = False
+                    iteration -= 1  # 回退迭代号：重试轮拿完整围栏提示词
+                    logger.warning("v2 引擎拒绝 tools 参数（HTTP 400），回退围栏提示词格式")
+                    continue
                 yield {"content": f"\n\n⚠️ 模型服务返回错误 HTTP {e.response.status_code}，请稍后重试。"}
                 return
             except TimeoutError:
@@ -609,21 +627,57 @@ class _LocalMode(ModeStrategy):
         return _GEN_DEADLINE
 
     def build_body(self, current_msgs: list) -> dict:
+        loop = self.loop
         merged = _merge_system_messages(current_msgs)
-        tools_prompt = _build_local_tools_prompt(self.loop.active_tools)
-        # 09-05 23:52 事故（与 v1 同款）：长输入下思考型模型首轮纯思考
-        # 8 分钟不写正文——首轮长输入注入思考预算指令
-        if getattr(self.loop, "current_iteration", 0) == 1:
-            _first_user_len = len(current_msgs[-1].get("content", "")) if current_msgs else 0
-            if _first_user_len > 8000:
-                tools_prompt = (
-                    tools_prompt
+        if loop.light_query:
+            # 闲聊快车道：不传工具、不注入提示、关思考（27B 实测 7.0s→1.3s）
+            return {
+                "model": self.engine_model(),
+                "messages": merged,
+                "stream": True,
+                "temperature": 0.0,
+                "frequency_penalty": 0.6,
+                "stop": ["<|im_end|>", "<|endoftext|>", "<end_of_turn>", "<eos>"],
+                "chat_template_kwargs": {"enable_thinking": False},
+            }
+        iteration = getattr(loop, "current_iteration", 1)
+        if loop.native_tools:
+            # 原生 function calling：工具经 API tools 参数，系统提示只留纪律
+            prompt = _NATIVE_LEAN_PROMPT if iteration == 1 else _NATIVE_FOLLOWUP_PROMPT
+            if iteration == 1 and (current_msgs and len(current_msgs[-1].get("content", "")) > 8000):
+                # 09-05 23:52 事故：长输入首轮纯思考 8 分钟不写正文
+                prompt = (
+                    prompt
                     + "\n\n📏 思考预算（长输入）：用户输入内容很长（表格/文档全文）。"
                     "请先简短思考（≤300 字），然后立刻在正文写出完整分析——"
                     "关键数字和结论必须写进正文。禁止长时间只思考不写正文。"
                     "Think briefly (≤300 chars), then write the full analysis "
                     "with key numbers and conclusions in the reply body."
                 )
+            if merged and merged[0].get("role") == "system":
+                merged[0] = dict(merged[0])
+                merged[0]["content"] = prompt + "\n\n" + str(merged[0].get("content", ""))
+            else:
+                merged.insert(0, {"role": "system", "content": prompt})
+            return {
+                "model": self.engine_model(),
+                "messages": merged,
+                "stream": True,
+                "temperature": 0.0,
+                "frequency_penalty": 0.6,
+                "stop": ["<|im_end|>", "<|endoftext|>", "<end_of_turn>", "<eos>"],
+                "tools": [dict(t) for t in loop.active_tools],
+            }
+        # legacy 围栏路径：首轮全量提示，后续轮轻量提醒（此前每轮重发
+        # 4800 字符全量工具清单——27B 下每轮多付数千 token prefill + 更长思考）
+        tools_prompt = _build_local_tools_prompt(loop.active_tools)
+        if iteration > 1:
+            names_str = ", ".join(sorted(n for n in loop.tool_names if n)) or "无"
+            tools_prompt = (
+                f"⚠️ 任务尚未完成，你必须继续！可用工具: {names_str}。\n"
+                "格式：```tool 工具名\n{\"参数\":\"值\"}\n```\n"
+                "如果当前任务的所有步骤都已完成，才可以直接回复用户。否则必须继续使用工具。"
+            )
         if merged and merged[0].get("role") == "system":
             merged[0] = dict(merged[0])
             merged[0]["content"] = tools_prompt + "\n\n" + str(merged[0].get("content", ""))
@@ -639,7 +693,30 @@ class _LocalMode(ModeStrategy):
             "stop": ["<|im_end|>", "<|endoftext|>", "<end_of_turn>", "<eos>"],
         }
 
+    def ingest_tool_calls(self, delta: dict, state: IterState) -> None:
+        # 原生模式：mlx ToolParser 的 delta.tool_calls（收尾包整体送达）
+        if not self.loop.native_tools:
+            return  # legacy：工具走围栏解析
+        for tc_delta in delta.get("tool_calls", []) or []:
+            idx = tc_delta.get("index", 0)
+            if idx not in state.tool_call_bufs:
+                state.tool_call_bufs[idx] = {"id": "", "type": "function",
+                                             "function": {"name": "", "arguments": ""}}
+            buf = state.tool_call_bufs[idx]
+            if tc_delta.get("id"):
+                buf["id"] = tc_delta["id"]
+            fn = tc_delta.get("function") or {}
+            if fn.get("name"):
+                buf["function"]["name"] += fn["name"]
+            if fn.get("arguments"):
+                buf["function"]["arguments"] += fn["arguments"]
+
     def note_tool_calls(self, state: IterState) -> list[dict]:
+        # 原生 API tool_calls 优先（09-06）
+        if state.tool_call_bufs:
+            tcs = [state.tool_call_bufs[i] for i in sorted(state.tool_call_bufs.keys())]
+            if any(tc.get("function", {}).get("name") for tc in tcs):
+                return tcs
         clean, calls = _parse_prompt_tool_calls(state.streamed_text)
         if not calls and _NATIVE_TOOL_RE.search(state.streamed_text):
             native = _parse_native_tool_calls(state.streamed_text)

@@ -433,7 +433,6 @@ async def test_stream_registration_balance_with_suspect():
         def mark_stream_exit(self):
             counters["streams"] -= 1
 
-    import local_llm
     old_engine = local_llm._engine
     local_llm._engine = _CountingEngine()
     agent_loop._llm_suspect_since = time.monotonic()
@@ -464,3 +463,148 @@ async def test_stream_registration_balance_with_suspect():
     finally:
         agent_loop._llm_suspect_since = None
         local_llm._engine = old_engine
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 09-06 原生 function calling 三档模式：native tools / 闲聊快车道 / 400 回退
+# ═══════════════════════════════════════════════════════════════════════
+
+import json as _json  # noqa: E402
+
+
+@pytest.mark.asyncio
+async def test_local_native_tools_round_trip():
+    """原生 tools 参数下发 → delta.tool_calls 执行 → assistant 携 tool_calls 回传。"""
+    import agent_loop
+    with FakeEngine() as engine:
+        def _round2(body):
+            assert isinstance(body.get("tools"), list) and body["tools"], \
+                "第二轮仍应携带原生 tools 参数"
+            asst = [m for m in body["messages"]
+                    if m.get("role") == "assistant" and m.get("tool_calls")]
+            assert asst, "原生模式 assistant 消息必须携带 tool_calls"
+            return FakeEngine.text_response(NEUTRAL_TEXT)
+        engine.push(engine.native_tool_response("list_dir", {"path": "."}))
+        engine.push(_round2)
+        agent_loop._LOCAL_NATIVE_TOOLS_OVERRIDE = True
+        try:
+            events = await _collect(_local_agent_loop_stream(
+                MESSAGES, "fake-model", engine.url, HEADERS,
+                session_id=f"t-native-{time.time()}", access_mode="full",
+            ))
+        finally:
+            agent_loop._LOCAL_NATIVE_TOOLS_OVERRIDE = None
+        req1 = engine.requests[0]
+        assert isinstance(req1.get("tools"), list) and req1["tools"], "首轮请求必须携带 tools"
+        assert "```tool" not in _json.dumps(req1, ensure_ascii=False), \
+            "原生模式不得注入围栏提示词"
+        assert any(e.get("event") == "tool_start" for e in events), "原生工具应被执行"
+        texts = [e.get("content", "") for e in events if "content" in e]
+        assert any("根据刚才的目录输出" in t for t in texts), events
+
+
+@pytest.mark.asyncio
+async def test_v2_local_native_tools_round_trip():
+    """v2 同款：原生 tools 下发 + delta.tool_calls 摄取 + 工具轮次。"""
+    import agent_loop
+    from agent_loop_v2 import AgentLoop
+    with FakeEngine() as engine:
+        engine.push(engine.native_tool_response("list_dir", {"path": "."}))
+        engine.push(engine.asserts_tool_result_present("agent_loop.py"))
+        engine.push(engine.text_response(NEUTRAL_TEXT))
+        agent_loop._LOCAL_NATIVE_TOOLS_OVERRIDE = True
+        try:
+            events = await _collect(AgentLoop(
+                "local", MESSAGES, "fake-model", engine.url, HEADERS,
+                session_id=f"v2-native-{time.time()}", access_mode="full",
+            ).run())
+        finally:
+            agent_loop._LOCAL_NATIVE_TOOLS_OVERRIDE = None
+        assert isinstance(engine.requests[0].get("tools"), list), "v2 首轮应携带 tools"
+        assert any(e.get("event") == "tool_start" for e in events), events
+        texts = [e.get("content", "") for e in events if "content" in e]
+        assert any("根据刚才的目录输出" in t for t in texts), events
+
+
+@pytest.mark.asyncio
+async def test_local_light_query_fast_path():
+    """闲聊快车道：不传 tools、enable_thinking=false、零工具提示注入。"""
+    with FakeEngine() as engine:
+        engine.push(engine.text_response("收到，一切正常！有什么需要帮忙的吗？"))
+        events = await _collect(_local_agent_loop_stream(
+            [{"role": "user", "content": "测试"}], "fake-model", engine.url, HEADERS,
+            session_id=f"t-light-{time.time()}", access_mode="full",
+        ))
+        body = engine.requests[0]
+        assert "tools" not in body, f"快车道不得携带 tools：{list(body.keys())}"
+        assert (body.get("chat_template_kwargs") or {}).get("enable_thinking") is False, \
+            "快车道必须关闭思考"
+        sys_text = _json.dumps(body["messages"], ensure_ascii=False)
+        assert "```tool" not in sys_text and "可用工具" not in sys_text, "快车道不得注入工具提示"
+        texts = [e.get("content", "") for e in events if "content" in e]
+        assert any("收到" in t for t in texts), events
+
+
+@pytest.mark.asyncio
+async def test_v2_local_light_query_fast_path():
+    """v2 闲聊快车道同款。"""
+    from agent_loop_v2 import AgentLoop
+    with FakeEngine() as engine:
+        engine.push(engine.text_response("收到，一切正常！有什么需要帮忙的吗？"))
+        events = await _collect(AgentLoop(
+            "local", [{"role": "user", "content": "测试"}], "fake-model", engine.url, HEADERS,
+            session_id=f"v2-light-{time.time()}", access_mode="full",
+        ).run())
+        body = engine.requests[0]
+        assert "tools" not in body, "v2 快车道不得携带 tools"
+        assert (body.get("chat_template_kwargs") or {}).get("enable_thinking") is False
+        texts = [e.get("content", "") for e in events if "content" in e]
+        assert any("收到" in t for t in texts), events
+
+
+@pytest.mark.asyncio
+async def test_local_native_400_fallback():
+    """引擎拒绝 tools（400，模板不支持工具）→ 自动回退围栏提示词，任务完成。"""
+    import agent_loop
+    with FakeEngine() as engine:
+        engine.push(engine.http_error(400, "model does not support tool calling"))
+        engine.push(engine.local_tool_response("list_dir", {"path": "."}))
+        engine.push(engine.text_response(NEUTRAL_TEXT))
+        agent_loop._LOCAL_NATIVE_TOOLS_OVERRIDE = True
+        try:
+            events = await _collect(_local_agent_loop_stream(
+                MESSAGES, "fake-model", engine.url, HEADERS,
+                session_id=f"t-400fb-{time.time()}", access_mode="full",
+            ))
+        finally:
+            agent_loop._LOCAL_NATIVE_TOOLS_OVERRIDE = None
+        req1, req2 = engine.requests[0], engine.requests[1]
+        assert "tools" in req1, "首次请求应携带原生 tools"
+        assert "tools" not in req2, "回退后不得再携带 tools"
+        assert "```tool" in _json.dumps(req2, ensure_ascii=False), "回退后应注入围栏提示词"
+        assert any(e.get("event") == "tool_start" for e in events), events
+        texts = [e.get("content", "") for e in events if "content" in e]
+        assert any("根据刚才的目录输出" in t for t in texts), events
+
+
+@pytest.mark.asyncio
+async def test_v2_local_native_400_fallback():
+    """v2 同款 400 回退。"""
+    import agent_loop
+    from agent_loop_v2 import AgentLoop
+    with FakeEngine() as engine:
+        engine.push(engine.http_error(400, "model does not support tool calling"))
+        engine.push(engine.local_tool_response("list_dir", {"path": "."}))
+        engine.push(engine.text_response(NEUTRAL_TEXT))
+        agent_loop._LOCAL_NATIVE_TOOLS_OVERRIDE = True
+        try:
+            events = await _collect(AgentLoop(
+                "local", MESSAGES, "fake-model", engine.url, HEADERS,
+                session_id=f"v2-400fb-{time.time()}", access_mode="full",
+            ).run())
+        finally:
+            agent_loop._LOCAL_NATIVE_TOOLS_OVERRIDE = None
+        assert "tools" in engine.requests[0]
+        assert "tools" not in engine.requests[1], "v2 回退后不得再携带 tools"
+        texts = [e.get("content", "") for e in events if "content" in e]
+        assert any("根据刚才的目录输出" in t for t in texts), events

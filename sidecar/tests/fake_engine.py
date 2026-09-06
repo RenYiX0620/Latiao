@@ -16,7 +16,7 @@ import queue
 import threading
 import time
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import StreamingResponse
 
 
@@ -47,10 +47,16 @@ class FakeEngine:
                     iter(FakeEngine.text_response("（桩脚本耗尽）")),
                     media_type="text/event-stream",
                 )
+            # Response 对象直通（http_error 场景：400/500 注入）——
+            # Response 本身 callable，isinstance 判断必须先于 callable 分支
+            if isinstance(entry, Response):
+                return entry
             if callable(entry):
                 lines = entry(body)
             else:
                 lines = entry
+            if not isinstance(lines, (list, tuple)):
+                return lines
             return StreamingResponse(
                 iter(lines), media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache"},
@@ -117,6 +123,26 @@ class FakeEngine:
             _sse({"choices": [{"delta": {}, "finish_reason": "stop", "index": 0}]}),
             "data: [DONE]\n\n",
         ]
+
+    @staticmethod
+    def native_tool_response(name: str, args: dict, content: str = "") -> list[str]:
+        """mlx 原生 function calling 形态：delta.tool_calls 在收尾包整体送达
+        （server.py generate_response 收尾一次性携带 tool_calls+finish_reason）。"""
+        return [
+            _sse({"choices": [{"delta": {
+                "role": "assistant", "content": content,
+                "tool_calls": [{"index": 0, "id": "call_native_1", "type": "function",
+                                "function": {"name": name,
+                                             "arguments": json.dumps(args, ensure_ascii=False)}}],
+            }, "finish_reason": "tool_calls", "index": 0}]}),
+            "data: [DONE]\n\n",
+        ]
+
+    @staticmethod
+    def http_error(status: int, message: str):
+        """非 200 响应直通（400 原生回退场景用）。"""
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=status, content={"error": message})
 
     @staticmethod
     def local_tool_response(name: str, args: dict) -> list[str]:

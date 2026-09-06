@@ -1762,6 +1762,64 @@ def _merge_system_messages(messages: list) -> list:
     return out
 
 
+# ══ 本地原生工具调用（09-06：mlx_lm.server 原生 tools 参数，替代 3K token
+# 围栏文字扮演——真机实测 27B 工具轮 4.5s、围栏格式分钟级）══
+class _NativeToolsUnsupported(Exception):
+    """引擎拒绝 tools 参数（HTTP 400，模板不支持工具）→ 回退围栏提示词。"""
+
+
+# 测试覆盖钩子：None=按引擎自动判定；True/False=强制
+_LOCAL_NATIVE_TOOLS_OVERRIDE: bool | None = None
+
+# 任务关键词（与 agent_loop_v2._TASK_KW 同表；v1 原为内联列表，提出来共用）
+_TASK_KW = ("运行", "执行", "做", "帮我", "写", "创建", "查", "搜", "找", "分析",
+            "修复", "构建", "部署", "安装", "配置", "列出", "读取", "读", "总结",
+            "生成", "打开", "查看", "解释", "整理", "统计", "告诉",
+            "run", "build", "fix", "create", "search", "analyze", "deploy",
+            "list", "read", "summar", "write", "explain", "tell")
+
+# 原生模式下的精简系统提示（工具经 API tools 参数传入，不再文字罗列）
+_NATIVE_LEAN_PROMPT = (
+    "# 工具\n可用工具已随请求提供（function calling）。需要时直接调用；"
+    "不需要工具时直接回复用户。\n"
+    "# 输出纪律\n"
+    "1. 不要输出执行计划或「我将要…」声明——要么调用工具，要么直接写出完整回答。\n"
+    "2. 工具结果返回后，把完整结论（含关键数字）写进回复正文。"
+)
+
+_NATIVE_FOLLOWUP_PROMPT = (
+    "⚠️ 任务尚未完成：继续调用工具，或如果所有步骤已完成，直接给出最终完整回答。"
+)
+
+
+def _local_native_tools_ok() -> bool:
+    """本地引擎是否支持原生 function calling（自管 mlx 引擎；LM Studio/
+    llama.cpp 外部引擎不启用——未验证，保持围栏路径）。"""
+    if _LOCAL_NATIVE_TOOLS_OVERRIDE is not None:
+        return _LOCAL_NATIVE_TOOLS_OVERRIDE
+    eng = getattr(local_llm, "_engine", None)
+    if eng is None or getattr(eng, "_external_engine", ""):
+        return False
+    return (getattr(eng, "_active_backend", "") == "mlx"
+            or getattr(eng, "backend", "") == "mlx")
+
+
+def _is_light_query(text: str, msgs: list) -> bool:
+    """闲聊快车道判定：短输入、无任务词、会话至今无工具使用。
+
+    命中后本轮不传工具、不注入工具提示、关闭思考（chat_template_kwargs
+    enable_thinking=false，真机实测 27B 闲聊 7.0s → 1.3s）。"""
+    t = (text or "").strip()
+    if not t or len(t) > 24:
+        return False
+    if any(kw in t.lower() for kw in _TASK_KW):
+        return False
+    # 会话里出现过工具结果 → 可能是任务续聊（如"继续"），不走快车道
+    if any(m.get("role") == "tool" for m in msgs or []):
+        return False
+    return True
+
+
 def _resolve_max_tokens(model: str) -> int:
     """Pick max_tokens by model family.
 
@@ -3847,6 +3905,14 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
         _session_start = time.monotonic()
         _session_budget = time.monotonic() + 1800
         _maybe_add_inline_file_note(current_msgs, last_user_text)
+        # 09-06 三档模式（原生 function calling 落地）：
+        # - light：闲聊快车道——不传工具、不注入提示、关思考（27B 实测 1.3s）
+        # - native：自管 mlx 引擎原生 tools 参数（27B 工具轮实测 4.5s，
+        #   围栏文字扮演分钟级）——400 回退 legacy
+        # - legacy：围栏提示词（外部引擎/GGUF/回退）
+        _light_query = _is_light_query(last_user_text, current_msgs)
+        _native_tools = (not _light_query) and _local_native_tools_ok() and bool(active_tools)
+        _native_fallback_used = False
         while iteration < max_iterations:
             iteration += 1
             if _session_cancel_requested(session_id):
@@ -3891,7 +3957,23 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
             ]
             # Inject tool prompt: full on first iteration, short on later ones.
             # Long prompts cause Qwen's <think> to overflow max_tokens on follow-up rounds.
-            if iteration == 1:
+            if _light_query:
+                current_prompt = ""  # 快车道：不注入任何提示（裸聊天）
+            elif _native_tools:
+                # 原生模式：工具经 API tools 参数传入，只留精简纪律
+                current_prompt = _NATIVE_LEAN_PROMPT if iteration == 1 else _NATIVE_FOLLOWUP_PROMPT
+                _first_user_len = len(loop_msgs[-1].get("content", "")) if loop_msgs else 0
+                if iteration == 1 and _first_user_len > 8000:
+                    # 09-05 23:52 事故：长输入首轮纯思考 8 分钟不写正文
+                    current_prompt = (
+                        current_prompt
+                        + "\n\n📏 思考预算（长输入）：用户输入内容很长（表格/文档全文）。"
+                        "请先简短思考（≤300 字），然后立刻在正文写出完整分析——"
+                        "关键数字和结论必须写进正文。禁止长时间只思考不写正文。"
+                        "Think briefly (≤300 chars), then write the full analysis "
+                        "with key numbers and conclusions in the reply body."
+                    )
+            elif iteration == 1:
                 current_prompt = tools_prompt
                 # 09-05 23:52 事故：长输入（整表 11.8K 字符）下 27B 思考型模型
                 # 首轮纯思考 8 分钟不写正文（13:29 同款复现）。长输入首轮追加
@@ -3915,12 +3997,13 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                     "格式：```tool 工具名\n{\"参数\":\"值\"}\n```\n"
                     "如果当前任务的所有步骤都已完成，才可以直接回复用户。否则必须继续使用工具。"
                 )
-            for m in loop_msgs:
-                if m.get("role") == "system":
-                    m["content"] = m["content"] + "\n\n" + current_prompt
-                    break
-            else:
-                loop_msgs.insert(0, {"role": "system", "content": current_prompt})
+            if current_prompt:
+                for m in loop_msgs:
+                    if m.get("role") == "system":
+                        m["content"] = m["content"] + "\n\n" + current_prompt
+                        break
+                else:
+                    loop_msgs.insert(0, {"role": "system", "content": current_prompt})
 
             # mlx_lm.server v0.31 只接受一个 system 消息且必须在最前面，
             # 多个 system 直接 404 "System message must be at the beginning"
@@ -3944,6 +4027,13 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                 "frequency_penalty": 0.6,
                 "stop": ["<|im_end|>", "<|endoftext|>", "<end_of_turn>", "<eos>"],
             }
+            if _light_query:
+                # 闲聊快车道：关思考（Qwen3 chat_template_kwargs；27B 实测 7.0s→1.3s）
+                body["chat_template_kwargs"] = {"enable_thinking": False}
+            elif _native_tools:
+                # 原生 function calling（mlx_lm.server 0.31：模板渲染工具 +
+                # ToolParser 输出 OpenAI 格式 delta.tool_calls，真机实测通过）
+                body["tools"] = [dict(t) for t in active_tools]
 
             streamed_text = ""
             body_text = ""  # 09-05 13:29 事故：只累计正文(content)delta——思考(reasoning)混进
@@ -3967,6 +4057,8 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
             _stream_break_retries = 0
             _any_output = False  # 本轮是否产出过 content/reasoning（role-only 空块不算，P1-6）
             _dedup_fired = False  # 去重一次性截断标志（审计 A5：命中后不再永久吞输出）
+            _native_tcs: dict[int, dict] = {}  # 原生 delta.tool_calls 累积（mlx ToolParser）
+            _retry_round_400 = False  # 本轮 400 回退标志（消费后必须复位，防死循环）
             # 单轮生成墙钟上限（20:11 事故：12288 预算下 27B 单轮可跑 7 分半，
             # 2 轮即撞 720s 总预算）——超时截断本轮（同复读截断机制），
             # 已产出文本交给闸门；截断后模型下一轮带着"请直接收尾"继续
@@ -4033,6 +4125,20 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                                     if delta is None:
                                         continue  # usage-only chunk（仅 token 统计，无 delta）
                                     _raw_delta_count += 1
+                                    # 原生 tool_calls 增量累积（mlx ToolParser 在
+                                    # 收尾包整体送达 delta.tool_calls，OpenAI 格式）
+                                    for _tc_d in delta.get("tool_calls", []) or []:
+                                        _tidx = _tc_d.get("index", 0)
+                                        _tbuf = _native_tcs.setdefault(_tidx, {
+                                            "id": "", "type": "function",
+                                            "function": {"name": "", "arguments": ""}})
+                                        if _tc_d.get("id"):
+                                            _tbuf["id"] = _tc_d["id"]
+                                        _tfn = _tc_d.get("function") or {}
+                                        if _tfn.get("name"):
+                                            _tbuf["function"]["name"] += _tfn["name"]
+                                        if _tfn.get("arguments"):
+                                            _tbuf["function"]["arguments"] += _tfn["arguments"]
                                     content = delta.get("content", "")
                                     # LM Studio/方舟等返回 reasoning_content,OpenAI o 系列返回 reasoning
                                     reasoning = delta.get("reasoning") or delta.get("reasoning_content") or ""
@@ -4127,6 +4233,24 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                         f"({type(e).__name__})，等待引擎恢复后重发本轮调用 ({_stream_break_retries}/1)")
                     await asyncio.sleep(10)
                     continue
+                except httpx.HTTPStatusError as e:
+                    # 原生 tools 参数被引擎拒绝（模板不支持工具调用，mlx server
+                    # 对无工具能力模型回 400）→ 本轮起回退围栏提示词，任务继续
+                    if (_native_tools and not _native_fallback_used
+                            and getattr(e.response, "status_code", 0) == 400):
+                        _native_fallback_used = True
+                        _native_tools = False
+                        _retry_round_400 = True
+                        logger.warning("[LOCAL-AGENT] 引擎拒绝 tools 参数（HTTP 400），"
+                                       "回退围栏提示词格式重跑本轮")
+                        break
+                    raise
+
+            if _retry_round_400:
+                # 400 回退：重走本轮（无 tools + 完整围栏提示词——回退迭代号，
+                # 让重试轮拿到带示例的首轮提示，而非轻量提醒）
+                iteration -= 1
+                continue
 
             # 收尾修正已移除（16:50 事故）：此前每轮流结束都发一次 content_revised
             # 全量替换，等于把模型文本在闸门/翻译之前直播给用户。缓冲交付下
@@ -4141,6 +4265,16 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                     streamed_text = _strip_native_tool_calls(streamed_text)
                     body_text = _strip_native_tool_calls(body_text)
                     tool_calls = native_tcs
+            # 原生 function calling 优先（09-06：API 结构化 tool_calls，最高保真）
+            if _native_tcs:
+                native_api_tcs = [_native_tcs[i] for i in sorted(_native_tcs.keys())]
+                if any(tc.get("function", {}).get("name") for tc in native_api_tcs):
+                    tool_calls = native_api_tcs
+                    # 原生路径下正文不含围栏文本，无需清理；仅剥离模型可能
+                    # 复读出来的 <tool_call> 文本标签
+                    if _NATIVE_TOOL_RE.search(streamed_text):
+                        streamed_text = _strip_native_tool_calls(streamed_text)
+                        body_text = _strip_native_tool_calls(body_text)
 
 
             # Whitelist: only execute tools in the active set
@@ -4151,10 +4285,15 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                 _track_progress(session_id, "tool_calling", f"{len(tool_calls)} tool(s)")
 
                 # Add assistant message (cleaned text)
-                current_msgs.append({
-                    "role": "assistant",
-                    "content": clean_text or "正在调用工具...",
-                })
+                _asst_msg: dict = {"role": "assistant", "content": clean_text or ""}
+                if _native_tools or _native_tcs:
+                    # 原生模式：assistant 消息必须携带 tool_calls——Qwen 模板
+                    # 据此渲染 <tool_call> 块，工具结果才有正确的对话上下文
+                    _asst_msg["tool_calls"] = tool_calls
+                    current_msgs.append(_asst_msg)
+                else:
+                    _asst_msg["content"] = clean_text or "正在调用工具..."
+                    current_msgs.append(_asst_msg)
                 has_called_tool = True
                 text_output_delivered = False  # 工具被调用=实质推进，后续文本是新的最终回复，恢复流式输出
 
