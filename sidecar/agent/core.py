@@ -89,6 +89,7 @@ class Scope:
         existing = self._tools.get(name)
         if existing is not None and existing != tool:
             raise ScopeError(f"工具 {name} 重复注册且定义不同（fail-loud）")
+        self._tools[name] = tool
         if dispatch is not None:
             existing_dispatch = self._dispatch.get(name)
             if existing_dispatch is not None and existing_dispatch is not dispatch:
