@@ -252,6 +252,33 @@ def test_confirm_unknown_id_not_found(e2e):
     assert r.get("status") == "not_found", r
 
 
+def test_no_auto_route_to_cloud(e2e, monkeypatch):
+    """09-06 事故回归：自动路由机制已删除——未选模型时，代码意图不得
+    劫持到云端（曾致 GLM 429 → deepseek 降级 → 空工具名中止）。若有人
+    重新引入自动路由，本测试通过哨兵立即暴露。"""
+    import api_routes
+
+    def _must_not_be_called():
+        raise AssertionError("自动路由仍在调用 _get_best_cloud_config（机制应已删除）")
+
+    # raising=False：导入已随机制删除；若有人重新引入自动路由（模块级导入
+    # + 模块内引用），此哨兵会替换模块属性并被命中
+    monkeypatch.setattr(api_routes, "_get_best_cloud_config", _must_not_be_called,
+                        raising=False)
+    base, engine = e2e
+    engine.stream_script.put(_stream_text("好的，这是修复后的代码说明。" * 5))
+    body = {"messages": [{"role": "user", "content": "帮我修复这个代码 bug，写个函数实现排序"}],
+            "stream": True, "access_mode": "full"}
+    cs = ChatSession(base, f"e2e-noroute-{uuid.uuid4().hex[:10]}", body_override=body)
+    deadline = time.time() + 30
+    while time.time() < deadline and not cs.has(lambda ev: ev.get("event") == "__reader_done__"):
+        time.sleep(0.05)
+    kinds = [ev.get("event") for ev in list(cs.events)]
+    assert cs.has(lambda ev: ev.get("event") == "engine_route"), kinds
+    assert "修复后的代码" in cs.text(), cs.text()[:200]
+    assert not cs.has(lambda ev: ev.get("event") == "__reader_error__"), kinds
+
+
 @pytest.mark.skip(reason="并行空名场景由 scripts/app_flow_e2e.py 场景3 覆盖（pytest 线程读流在该场景不稳定）")
 def test_parallel_empty_names_disable_retry(e2e):
     """09-21 22:15 回归：并行双空名 → 守卫反馈 → 第二轮请求带 parallel_tool_calls=false → 完成。"""

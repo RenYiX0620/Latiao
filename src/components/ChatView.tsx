@@ -127,6 +127,8 @@ interface ChatViewProps {
   streamingThink?: string;  // 流式中的思考缓冲（运行中 Think 行实时摘要）
   subagents?: { id: string; agent: string; task: string; status: string; summary?: string }[];
   routeInfo?: { engine: string; declaredModel: string } | null;  // 实际引擎路由（engine_route/route_fallback）
+  localModelId?: string;    // 已加载的本地模型 id（选择器展示 💻 选项）
+  localModelName?: string;  // 已加载的本地模型名
 }
 
 export default memo(function ChatView({
@@ -138,7 +140,7 @@ export default memo(function ChatView({
   cloudModels, selectedModel, onSelectModel,
   accessMode, setAccessMode, thinkingLevel, setThinkingLevel,
   contextEstimate, showToast, activeTask, taskStartAt, streamingThink, subagents,
-  routeInfo,
+  routeInfo, localModelId, localModelName,
 }: ChatViewProps) {
   const { t } = useTranslation();
   // WebKit (WKWebView) 下 compositionend 先于最终 keydown 派发，
@@ -202,10 +204,8 @@ export default memo(function ChatView({
     return () => { el.removeEventListener("scroll", onScroll); ro.disconnect(); };
   }, [messages.length]);
 
-  // 每条消息的真实布局测量（offsetTop/height）——minimap 横杠按真实高度分布，
-  // hover/点击按真实位置映射。此前横杠固定 2px/条、点击按滚动比例，两套坐标系
-  // 对不上：长消息在条上只占 2px，点第 N 根线跳到的消息和第 N 条毫无关系；
-  // 且消息多时固定 2px/条溢出容器被裁剪，后面的消息在导航条上不存在。
+  // 每条消息的真实布局测量（offsetTop/height）——Turn Navigator 用它把每轮
+  // 对话映射到真实滚动位置（点击跳转、当前轮高亮）。
   const [msgMetrics, setMsgMetrics] = useState<{ id: string; top: number; height: number }[]>([]);
   useEffect(() => {
     const el = scrollRef.current;
@@ -225,52 +225,12 @@ export default memo(function ChatView({
     measure();
     const ro = new ResizeObserver(measure);
     ro.observe(el);
-    // 消息内容/数量变化也重测
     const t = setTimeout(measure, 300);
     return () => { ro.disconnect(); clearTimeout(t); };
   }, [messages]);
 
-  // 按真实布局生成横杠：每条消息的高度占比 = flex-grow（真实比例，自动适配任意条数）
-  const miniBlocks = useMemo(() => {
-    const byId = new Map(msgMetrics.map((m) => [m.id, m.height]));
-    return messages.map((m, i) => {
-      const h = byId.get(m.id || "") || 24; // 未测到（刚插入未渲染）时给默认权重
-      return {
-        index: i,
-        id: m.id || `m${i}`,
-        grow: Math.min(40, Math.max(1, h / 14)), // 压缩动态范围：最长 40 倍于最短
-        color: m.role === "user" ? "var(--accent)" : m.role === "tool" ? "var(--text-disabled)" : "var(--success)",
-        key: m.id || `m${i}`,
-      };
-    });
-  }, [messages, msgMetrics]);
-
-  const jumpTo = (ratio: number) => {
-    const el = scrollRef.current;
-    if (!el) return;
-    el.scrollTop = ratio * (el.scrollHeight - el.clientHeight);
-  };
-
-  // 滚动比例 → 真实消息序号（取该滚动位置视口中线覆盖的消息）
-  const idxAtRatio = (ratio: number) => {
-    const el = scrollRef.current;
-    if (!el || msgMetrics.length === 0) {
-      return Math.min(messages.length - 1, Math.floor(ratio * messages.length));
-    }
-    const target = ratio * (el.scrollHeight - el.clientHeight) + el.clientHeight * 0.5;
-    let idx = 0;
-    for (let i = 0; i < msgMetrics.length; i++) {
-      if (msgMetrics[i].top <= target) idx = i; else break;
-    }
-    // metrics 顺序对应不了 messages 序号时兜底：按 id 找
-    const id = msgMetrics[idx]?.id;
-    const byId = messages.findIndex((m) => (m.id || "") === id);
-    return byId >= 0 ? byId : Math.min(messages.length - 1, Math.floor(ratio * messages.length));
-  };
-
-  // 每次工具调用独立成行（活动摘要行 ZCode 式），不再分组折叠
-  // minimap 悬停预览：hoverRatio + 对应消息预览
-  const [minimapHover, setMinimapHover] = useState<{ ratio: number; idx: number } | null>(null);
+  // minimap 悬停轮次（Turn Navigator 式：悬停显示该轮问题主题，点击跳转）
+  const [hoverTurn, setHoverTurn] = useState<{ idx: number; topPx: number } | null>(null);
   // 子任务详情弹窗：点 subagent 行看 task 全文 + 结果摘要（✗ 只是状态标记，
   // 此前无点击入口，用户误以为 ✗ 是删除按钮）
   const [subagentDetail, setSubagentDetail] = useState<{ id: string; agent: string; task: string; status: string; summary?: string; started_at?: string; updated_at?: string } | null>(null);
@@ -545,69 +505,53 @@ export default memo(function ChatView({
           </div>
         </div>
       )}
-      {messages.length > 8 && (
-        <>
-        <div className="chat-minimap" onClick={(e) => {
-          const rect = e.currentTarget.getBoundingClientRect();
-          jumpTo((e.clientY - rect.top) / rect.height);
-        }} onMouseMove={(e) => {
-          const rect = e.currentTarget.getBoundingClientRect();
-          const ratio = Math.min(1, Math.max(0, (e.clientY - rect.top) / rect.height));
-          setMinimapHover({ ratio, idx: idxAtRatio(ratio) });
-        }} onMouseLeave={() => setMinimapHover(null)}>
-          {miniBlocks.map(b => (
-            <div key={b.key} className={`mini-block${minimapHover && minimapHover.idx === b.index ? " hover" : ""}`}
-              style={{ background: b.color, flexGrow: b.grow }} />
-          ))}
-          <div className="mini-viewport" style={{
-            top: `${(scrollInfo.top / Math.max(1, scrollInfo.totalH - scrollInfo.viewH)) * 100}%`,
-            height: `${(scrollInfo.viewH / scrollInfo.totalH) * 100}%`,
-          }} />
-        </div>
-        {/* 悬停预览浮层（ZCode 式：以悬停消息为中心的滑动窗口对话流） */}
-        {minimapHover && messages[minimapHover.idx] && (() => {
-          const cur = minimapHover.idx;
-          const lo = Math.max(0, cur - 4);
-          const hi = Math.min(messages.length - 1, cur + 4);
-          const entries: { icon: string; text: string; isCurrent: boolean; key: string }[] = [];
-          for (let i = lo; i <= hi; i++) {
-            const m = messages[i];
-            const isCur = i === cur;
-            if (m.role === "tool") {
-              let args = "";
-              try {
-                args = m.toolArgs
-                  ? JSON.stringify(m.toolArgs).replace(/[{}"]/g, "").replace(/[:,]/g, " ").replace(/\s+/g, " ").trim()
-                  : "";
-              } catch { /* 参数不可序列化时忽略 */ }
-              entries.push({
-                icon: "◆",
-                text: `${m.toolName || "工具"}${args ? " · " + args.slice(0, 48) : ""}`.slice(0, 80),
-                isCurrent: isCur, key: m.id || `t${i}`,
-              });
-            } else if ((m.content || "").trim()) {
-              const text = (m.content || "").replace(/[#*|`>-]/g, "").replace(/\s+/g, " ").slice(0, 110);
-              entries.push({
-                icon: m.role === "user" ? "🧑" : "🤖",
-                text, isCurrent: isCur, key: m.id || `m${i}`,
-              });
-            }
-          }
-          if (entries.length === 0) return null;
-          const follow = Math.max(0, Math.min(scrollInfo.viewH - 320, minimapHover.ratio * Math.max(0, scrollInfo.viewH - 320)));
-          return (
-            <div className="mini-preview" style={{ top: 34 + follow }}>
-              {entries.map(e => (
-                <div key={e.key} className={`mini-preview-line${e.isCurrent ? " current" : ""}`}>
-                  <span className="mini-preview-icon">{e.icon}</span>
-                  <span>{e.text}</span>
-                </div>
-              ))}
+      {(() => {
+        // ── Turn Navigator（ZCode 式对话轮导航条）──
+        // 每轮对话（一段）一根细横杠：均匀分布、当前轮高亮、运行中脉冲；
+        // 悬停显示该轮主题（问题 2 行 + 回答摘要 3 行），点击平滑跳转。
+        // 此前 per-message 色块 + 滑动窗口预览内容过多且与滚动位置错位，已废。
+        const turns = segments.map((seg, i) => {
+          const q = seg.msgs.find((m) => m.role === "user");
+          const a = [...seg.msgs].reverse().find((m) => m.role === "assistant" && (m.content || "").trim());
+          const top = q ? msgMetrics.find((mm) => mm.id === q.id)?.top : undefined;
+          return { key: seg.msgs[0]?.id || `t${i}`, q, a, top, idx: i };
+        }).filter((t) => t.q);
+        if (turns.length < 3) return null;
+        const live = isProcessing || activeTask !== null;
+        // 当前轮：滚动视口上 35% 位置覆盖的那一轮
+        const center = scrollInfo.top + scrollInfo.viewH * 0.35;
+        let activeIdx = 0;
+        turns.forEach((t, i) => { if (t.top !== undefined && t.top <= center) activeIdx = i; });
+        const hovered = hoverTurn ? turns[hoverTurn.idx] : null;
+        const stripText = (s: string | undefined, n: number) =>
+          (s || "").replace(/```[\s\S]*?```/g, " [代码] ").replace(/[#*|`>-]/g, "").replace(/\s+/g, " ").trim().slice(0, n);
+        return (
+          <>
+          <div className="chat-minimap" onMouseLeave={() => setHoverTurn(null)}>
+            {turns.map((t, i) => (
+              <div key={t.key} className="turn-slot"
+                onMouseEnter={(e) => {
+                  const r = e.currentTarget.getBoundingClientRect();
+                  const p = e.currentTarget.parentElement!.getBoundingClientRect();
+                  setHoverTurn({ idx: i, topPx: r.top - p.top + r.height / 2 });
+                }}
+                onClick={() => {
+                  const el = scrollRef.current;
+                  if (el && t.top !== undefined) el.scrollTo({ top: Math.max(0, t.top - 16), behavior: "smooth" });
+                }}>
+                <span className={`turn-dash${i === activeIdx ? " active" : ""}${live && i === turns.length - 1 ? " running" : ""}`} />
+              </div>
+            ))}
+          </div>
+          {hovered && hovered.q && (
+            <div className="mini-preview" style={{ top: Math.max(34, Math.min(34 + (scrollInfo.viewH - 220), 20 + (hoverTurn!.topPx))) }}>
+              <p className="mini-preview-q">{stripText(hovered.q.content, 140) || "（无文字）"}</p>
+              {hovered.a && <p className="mini-preview-a">{stripText(hovered.a.content, 180)}</p>}
             </div>
-          );
-        })()}
-        </>
-      )}
+          )}
+          </>
+        );
+      })()}
       <div className="chat-scroll" ref={scrollRef} onDrop={handleDrop} onDragOver={(e) => { if (handleDrop) e.preventDefault(); }}>
         {segments.map((seg, si) => {
           const segKey = seg.msgs[0]?.id || `seg${si}`;
@@ -806,6 +750,9 @@ export default memo(function ChatView({
                 value={selectedModel} onChange={(e) => onSelectModel(e.target.value)}
                 title={t("chat.model_select")}>
                 <option value="">{t("sidebar.auto_detect")}</option>
+                {localModelId && (
+                  <option key="local-loaded" value={localModelId}>💻 {localModelName || localModelId.split("/").filter(Boolean).pop()}</option>
+                )}
                 {cloudModels.map((m) => (
                   <option key={m.name} value={m.name}>☁️ {m.name}</option>
                 ))}

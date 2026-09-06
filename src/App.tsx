@@ -1579,6 +1579,9 @@ const [timeFilter, setTimeFilter] = useState("all");
         <div className="sidebar-footer">
           <select className="sidebar-model-select" value={session.selectedModel} onChange={(e) => { setSelectedModel(e.target.value); showToast(t("toast.model_switched", { model: e.target.value || t("sidebar.auto_detect") })); }}>
             <option value="">{t("sidebar.auto_detect")}</option>
+            {localLLMStatus.model_id && (
+              <option key="local-loaded" value={localLLMStatus.model_id}>💻 {localLLMStatus.model_name || localLLMStatus.model_id.split("/").filter(Boolean).pop()}</option>
+            )}
             {cloudModels.map((m) => (<option key={m.name} value={m.name}>☁️ {m.name}</option>))}
           </select>
         </div>
@@ -1636,6 +1639,8 @@ const [timeFilter, setTimeFilter] = useState("all");
             streamingThink={streamingThink}
             subagents={subagents}
             routeInfo={routeInfo}
+            localModelId={localLLMStatus.model_id}
+            localModelName={localLLMStatus.model_name}
           />
         </div>
 

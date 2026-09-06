@@ -16,7 +16,7 @@ const T: Record<string, Record<Lang, string>> = {
   "sidebar.collapse": { zh: "折叠侧边栏", en: "Collapse", ja: "折りたたむ", ru: "Свернуть" },
   "sidebar.nav": { zh: "导航", en: "Navigation", ja: "ナビ", ru: "Навигация" },
   "sidebar.sessions": { zh: "会话", en: "Sessions", ja: "セッション", ru: "Сессии" },
-  "sidebar.auto_detect": { zh: "自动检测", en: "Auto Detect", ja: "自動検出", ru: "Авто" },
+  "sidebar.auto_detect": { zh: "本地引擎（默认）", en: "Local engine (default)", ja: "ローカルエンジン（デフォルト）", ru: "Локальный движок" },
   "sidebar.online": { zh: "已就绪", en: "Ready", ja: "準備完了", ru: "Готов" },
   "sidebar.offline": { zh: "未就绪", en: "Offline", ja: "未準備", ru: "Не готов" },
   "sidebar.identity": { zh: "身份文件:", en: "Identity:", ja: "アイデンティティ:", ru: "Идентичность:" },

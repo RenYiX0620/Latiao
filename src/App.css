@@ -505,55 +505,54 @@ img.sidebar-logo {
 .chat-wrap { position: relative; flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
 
 /* 消息导航缩略图 minimap（ZCode 式：悬停显示内容预览） */
-/* ZCode/VSCode 式 minimap：无底色条、无边框，行块直接铺；
-   纯净极简，只有内容形状 + 视口框 */
+/* ZCode Turn Navigator 式对话轮导航条：左侧竖排，每轮对话一根细横杠
+   （2px×12px 均匀分布），当前轮高亮、运行中脉冲、悬停/点击跳转。
+   此前 per-message 色块 + 视口框与滚动坐标系错位，已废。 */
 .chat-minimap {
-  position: absolute; right: 6px; top: 34px; bottom: 14px; width: 14px;
+  position: absolute; left: 6px; top: 34px; bottom: 14px; width: 14px;
   background: transparent; border: none;
-  cursor: pointer; overflow: hidden; display: flex; flex-direction: column;
-  padding: 0;
+  display: flex; flex-direction: column;
+  overflow-y: auto; scrollbar-width: none;
 }
-/* 每条消息 = 一根横线，高度按消息真实高度比例分布（flexGrow 由内联样式
-   传入，正比于消息实测高度，压缩了动态范围）——修复此前固定 2px/条与
-   点击/视口的滚动比例坐标系不一致 + 消息多时溢出裁剪的 bug */
-.mini-block {
-  flex: 1 1 2px; min-height: 1px; width: 12px; margin: 0 auto; border-radius: 1px;
-  opacity: 0.55; transition: opacity 0.18s ease, transform 0.18s ease;
+.chat-minimap::-webkit-scrollbar { display: none; }
+.turn-slot {
+  flex: 1 0 10px;  /* 均匀分布；轮次多到放不下时容器可滚动 */
+  display: flex; align-items: center; cursor: pointer;
 }
-/* 悬停行块平滑提亮（ZCode 式动画：亮度渐变动效，非跳变） */
-.mini-block.hover {
-  opacity: 1;
-  transform: scale(1.25);
+.turn-dash {
+  display: block; width: 12px; height: 2px; border-radius: 1px;
+  background: var(--text-disabled); opacity: 0.45;
+  transition: opacity 0.15s ease, transform 0.15s ease, background 0.15s ease;
 }
-[data-theme="light"] .mini-viewport {
-  background: rgba(0, 0, 0, 0.04);
-  border-color: rgba(0, 0, 0, 0.25);
+.turn-dash:hover { opacity: 0.8; }
+.turn-dash.active { background: var(--text-primary); opacity: 0.95; }
+.turn-dash.running { animation: turn-pulse 1.6s ease-in-out infinite; }
+@keyframes turn-pulse {
+  0%, 100% { opacity: 0.3; }
+  50% { opacity: 0.95; }
 }
-.mini-viewport {
-  position: absolute; left: 0; right: 0; border-radius: 3px;
-  background: rgba(255,255,255,0.08);
-  border: 1px solid rgba(255,255,255,0.45);
-  pointer-events: none; min-height: 12px;
-  transition: top 0.12s ease-out;
+@media (prefers-reduced-motion: reduce) {
+  .turn-dash.running { animation: none; opacity: 0.7; }
 }
 .mini-preview {
-  position: absolute; right: 30px; top: 34px; bottom: auto;
-  width: min(280px, 40vw); max-height: 260px; overflow: hidden;
+  position: absolute; left: 30px; top: 34px; bottom: auto;
+  width: min(320px, 44vw); overflow: hidden;
   background: var(--bg-card); border: 1px solid var(--border-default);
-  border-radius: 8px; padding: 8px 10px; box-shadow: 0 6px 24px rgba(0,0,0,0.22);
+  border-radius: 8px; padding: 10px 12px; box-shadow: 0 6px 24px rgba(0,0,0,0.22);
   pointer-events: none; z-index: 60;
   animation: fadeInMsg 0.15s ease;
 }
-.mini-preview-line {
-  display: flex; gap: 5px; font-size: 10.5px; color: var(--text-secondary);
-  line-height: 1.5; padding: 2px 0; align-items: flex-start;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+/* ZCode tooltip 结构：该轮问题（2 行截断、加粗）+ 回答摘要（3 行截断、弱色） */
+.mini-preview-q {
+  font-size: 11.5px; font-weight: 550; color: var(--text-primary); line-height: 1.45;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+  white-space: pre-line;
 }
-.mini-preview-line > span:last-child {
-  overflow: hidden; text-overflow: ellipsis; min-width: 0;
+.mini-preview-a {
+  margin-top: 6px; font-size: 11px; color: var(--text-secondary); line-height: 1.5;
+  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
+  white-space: pre-line;
 }
-.mini-preview-line.current { color: var(--text-primary); font-weight: 550; }
-.mini-preview-icon { flex-shrink: 0; font-size: 10px; }
 
 /* ── 对话卡片（ZCode 式：一次对话 = 一张卡片，头部显示耗时） ── */
 /* ZCode 式：对话段无卡片底/无边框，内容直接铺在主背景上，

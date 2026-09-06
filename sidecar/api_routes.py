@@ -38,12 +38,9 @@ from agent_loop import (
     _build_local_tools_prompt,
     _cap_tools,
     _deduplicate_response,
-    _detect_task_intent,
     _extract_last_user_text,
     _filter_tools,
     _get_agent_tools,
-    _get_best_cloud_config,
-    _has_cloud_models,
     _last_cloud_config,
     _load_custom_agents,
     _local_agent_loop_stream,
@@ -188,23 +185,13 @@ async def chat_completion(request: Request):
             _m["reasoning_content"] = ""
     model = body.get("model") or SUBAGENT_MODEL
 
-    # ── Auto-route: if no explicit model selected, pick based on task intent ──
+    # ── 路由策略（09-06 起简化，原自动路由机制已删除）──
+    # 此前"代码任务自动路由到云端"：用户加载并依赖本地 27B，代码类问题被
+    # 本机制静默劫持到云端 → GLM 429 → deepseek 降级 → 空工具名 3 连击中止
+    # （zcode 两连问事故）。现在：未选模型一律本地引擎；云端只走用户显式
+    # 选择；429 降级保留但不再静默（弹提示 + 任务头引擎徽标）。
     cloud_config = body.get("cloud_config")
-    user_selected_model = body.get("model")  # User explicitly chose a model?
-    if not user_selected_model and not cloud_config and last_user_text:
-        intent = _detect_task_intent(last_user_text)
-        if intent == "code" and _has_cloud_models():
-            logger.info("Auto-route: code task → using cloud model")
-            # Try to use an available cloud model for code tasks
-            cloud_config = _get_best_cloud_config()
-            if cloud_config:
-                model = cloud_config.get("model", model)
-        elif intent == "chat":
-            from starlette.concurrency import run_in_threadpool as _rtp
-            if await _rtp(local_llm.get_api_url):
-                logger.info("Auto-route: chat task → using local model (free)")
-            # Keep local model for casual chat
-            pass
+    user_selected_model = body.get("model")
 
     logger.info("Chat request: model=%s, msg_count=%d, stream=%s", model, len(messages), body.get("stream", False))
     # 路由透明化：请求声明了具体模型名但既没带 cloud_config、名字也不匹配任何
@@ -323,11 +310,12 @@ async def chat_completion(request: Request):
                     # 用路由级权威标志（云端配置指向 localhost 代理时，URL
                     # 推断会把云端 404 错标成"本地未就绪"——09-21 E2E 发现）
                     req_is_local = is_local or "127.0.0.1" in req_url or "localhost" in req_url
-                    # 云端 429（限流/配额耗尽，09-05 15:14 事故：GLM 周配额用尽后
-                    # 自动路由仍选它，429 直接抛给用户）→ 自动降级：换下一个
-                    # 云端模型（GLM→deepseek），没有则回退本地引擎。只降级一次。
+                    # 云端 429（限流/配额耗尽）→ 自动降级：换下一个云端模型
+                    # （GLM→deepseek），没有则回退本地引擎。只降级一次。
+                    # 09-06：显式选择的云端模型也降级（此前仅自动路由降级——
+                    # 自动路由已删除）；降级不再静默：前端弹提示 + 引擎徽标。
                     if (e.response.status_code == 429 and not req_is_local
-                            and not _fb_used and not user_selected_model):
+                            and not _fb_used):
                         _fb_used = True
                         _next_cfg = None
                         try:
