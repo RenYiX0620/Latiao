@@ -21,6 +21,10 @@ The sidecar runs a local agent loop with OpenAI Function Calling tools.
 - One-shot operations don't need helper functions.
 - Similar code repeated twice is fine; abstract on the third occurrence.
 
+## Language (user preference, 2026-09-06)
+- Commit messages and GitHub release notes MUST be written in English.
+- This applies to every future push; do not switch back to Chinese.
+
 ## Surgical Changes
 - Every changed line must trace back to the user's request.
 - Fixing bug A does not mean refactoring file B or renaming variable C.
