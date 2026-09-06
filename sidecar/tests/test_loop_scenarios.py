@@ -311,16 +311,20 @@ async def test_chat_no_nudge_v1_cloud():
 
 @pytest.mark.asyncio
 async def test_v2_cloud_empty_tool_name_guarded():
-    """17:23 事故云端回归：delta 工具名空串 → 守卫拦截 + 模型拿到可操作提示。"""
+    """17:23 事故云端回归（09-06 更新）：delta 工具名空串 → 按参数恢复执行
+    （{"path": …} → read_file）→ 工具结果回传 → 完成。"""
     from agent_loop_v2 import AgentLoop
     with FakeEngine() as engine:
         engine.push(engine.tool_response("", {"path": "."}))
-        engine.push(engine.asserts_tool_result_present("工具名为空"))
+        engine.push(engine.text_response("好的，已按当前信息完成确认。"))
         events = await _collect(AgentLoop(
             "cloud", [{"role": "user", "content": "测试"}], "fake-model", engine.url, HEADERS,
             session_id=f"v2-empty-name-{time.time()}", access_mode="full",
         ).run())
-        assert len(engine.requests) == 2, "守卫后的引导轮应结束"
+        assert len(engine.requests) == 2, "恢复执行后的引导轮应结束"
+        starts = [e for e in events if e.get("event") == "tool_start"]
+        assert starts and starts[0].get("tool") == "read_file", \
+            f"空名应恢复为 read_file 执行：{starts}"
         texts = [e.get("content", "") for e in events if "content" in e]
         assert any("完成" in t for t in texts), events
 
@@ -470,6 +474,29 @@ async def test_stream_registration_balance_with_suspect():
 # ═══════════════════════════════════════════════════════════════════════
 
 import json as _json  # noqa: E402
+
+
+def test_search_files_finds_hidden_dirs(tmp_path):
+    """09-06 14:34 事故回归：glob 的 * 不匹配点开头目录——search_files
+    "*zcode*" 找不到 ~/.zcode，模型误判"本地没装 zcode"。"""
+    import os
+    (tmp_path / ".zcode").mkdir()
+    (tmp_path / ".zcode" / "cli").mkdir()
+    (tmp_path / "zcode-readme.md").write_text("x", encoding="utf-8")
+    from tool_executor import search_files
+    out = search_files(str(tmp_path), "*zcode*")
+    assert ".zcode" in out, f"隐藏目录必须可见：{out}"
+    assert "zcode-readme.md" in out
+
+
+def test_recover_tool_name_multi_candidate_picks_one():
+    """09-06 14:34 事故回归：{"url": …} 多候选（dokobot_read/headless_read）
+    曾放弃恢复 → 守卫循环 3 连击中止；现确定性择优必返回工具名。"""
+    from agent_loop import _recover_tool_name
+    assert _recover_tool_name({"url": "https://github.com/x/y"}) != "", \
+        "多候选也必须恢复出一个工具名"
+    assert _recover_tool_name({"query": "zcode"}) != ""
+    assert _recover_tool_name({}) == ""
 
 
 def test_reply_lang_mismatch_ignores_filenames():

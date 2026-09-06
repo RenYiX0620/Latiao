@@ -255,8 +255,15 @@ def search_files(directory: str, pattern: str) -> str:
         return "⛔ Blocked: path traversal not allowed"
     import glob as glob_mod
     try:
-        search_path = os.path.join(os.path.expanduser(directory), pattern)
-        matches = glob_mod.glob(search_path, recursive=True)
+        base = os.path.expanduser(directory)
+        matches = glob_mod.glob(os.path.join(base, pattern), recursive=True)
+        if not pattern.startswith("."):
+            # Python glob 的 * 不匹配点开头的隐藏文件/目录（.zcode、.ssh…）——
+            # 09-06 14:34 事故：search_files "~/*zcode*" 找不到 ~/.zcode，
+            # 模型误判"本地没装 zcode"，转去网上搜回垃圾结果。始终合并隐藏变体。
+            hidden = glob_mod.glob(
+                os.path.join(base, ".*" + pattern.lstrip("*")), recursive=True)
+            matches = list(dict.fromkeys(matches + hidden))
         if not matches:
             return f"No files matching '{pattern}' found in {directory}"
         lines = []

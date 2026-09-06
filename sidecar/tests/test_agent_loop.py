@@ -619,12 +619,13 @@ class TestEmptyNameRecovery:
 
     def test_recover_unique_match(self):
         from agent_loop import _recover_tool_name
-        # {"path": ...} 唯一匹配 read_file/list_dir 之外的? —— 以注册表实际情况断言
-        # 若唯一候选：恢复；构造性验证（list_dir 与 read_file 参数同为 path → 多候选返回空）
-        assert _recover_tool_name({"query": "行情"}) in ("mx_query", "tavily_search") or \
-               _recover_tool_name({"query": "行情"}) == ""
-        # 多候选（path 同时是 read_file/list_dir 参数）→ 恢复必须为空（不猜）
-        assert _recover_tool_name({"path": "."}) == ""
+        # {"query": ...} 唯一候选 tavily_search → 恢复
+        assert _recover_tool_name({"query": "行情"}) == "tavily_search"
+        # 09-06 14:34 事故：多候选（path 同时是 read_file/list_dir 参数）曾返回
+        # 空 → 守卫反馈循环 3 连击中止；现确定性择优（exact 键匹配优先，注册表
+        # 顺序兜底）——执行结果会引导模型，优于中止
+        assert _recover_tool_name({"path": "."}) == "read_file"
+        assert _recover_tool_name({"url": "https://github.com/x"}) == "dokobot_read"
 
     def test_recover_empty_args_no_recovery(self):
         from agent_loop import _recover_tool_name

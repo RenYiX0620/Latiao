@@ -222,11 +222,13 @@ def scenario_parallel_empty_names(base: str, engine: Engine):
     stream_reqs = [q for q in engine.requests[req_start:] if q.get("stream")]
     second_has_flag = any((q.get("body") or {}).get("parallel_tool_calls") is False for q in stream_reqs)
     ev_text = " ".join(str(ev.get("content", "")) + " " + str(ev.get("result", "")) for ev in events)
-    ok = ("工具名为空" in ev_text
+    # 09-06 更新：空名现在按参数恢复执行（read_file），断言工具真实执行而非守卫文案
+    recovered_exec = any(ev.get("event") == "tool_start" and ev.get("tool") for ev in events)
+    ok = (recovered_exec
           and second_has_flag
           and any("已按计划完成" in str(ev.get("content", "")) or "已按计划完成" in str(ev.get("result", "")) for ev in events))
-    print(f"== 场景3: 并行空名→parallel=false ==")
-    print(f"   事件: {kinds[:6]} | parallel_flag: {second_has_flag} | 结果: {'✅' if ok else '❌'}")
+    print(f"== 场景3: 并行空名→恢复执行+parallel=false ==")
+    print(f"   事件: {kinds[:6]} | recovered_exec: {recovered_exec} | parallel_flag: {second_has_flag} | 结果: {'✅' if ok else '❌'}")
     if not ok:
         print("   engine bodies:", [(q.get('stream'), (q.get('body') or {}).get('parallel_tool_calls')) for q in engine.requests[req_start:]][:5])
     return ok

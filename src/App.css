@@ -513,14 +513,14 @@ img.sidebar-logo {
   cursor: pointer; overflow: hidden; display: flex; flex-direction: column;
   padding: 0;
 }
-/* 每条消息 = 一条固定 2px 高的横线（ZCode 式：一条条横线）。
-   此前 flex:1 均分容器高度，消息少时每块被拉高成"竖柱子"——参数错误 */
+/* 每条消息 = 一根横线，高度按消息真实高度比例分布（flexGrow 由内联样式
+   传入，正比于消息实测高度，压缩了动态范围）——修复此前固定 2px/条与
+   点击/视口的滚动比例坐标系不一致 + 消息多时溢出裁剪的 bug */
 .mini-block {
-  height: 2px; width: 12px; margin: 1px auto; border-radius: 1px;
-  flex: 0 0 auto; opacity: 0.55; transition: opacity 0.1s;
+  flex: 1 1 2px; min-height: 1px; width: 12px; margin: 0 auto; border-radius: 1px;
+  opacity: 0.55; transition: opacity 0.18s ease, transform 0.18s ease;
 }
 /* 悬停行块平滑提亮（ZCode 式动画：亮度渐变动效，非跳变） */
-.mini-block { transition: opacity 0.18s ease, transform 0.18s ease; }
 .mini-block.hover {
   opacity: 1;
   transform: scale(1.25);

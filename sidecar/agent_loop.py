@@ -1310,12 +1310,17 @@ _MARKET_TASK_RE = re.compile(r"大盘|行情|股票|板块|资金|涨|跌|收盘
 
 def _recover_tool_name(args: dict) -> str:
     """空工具名恢复（09-21 实测：deepseek-v4 流式 tool_calls 名称字段为空串，
-    参数却完整——按参数键与工具 JSON Schema 匹配推断名称；唯一候选才恢复，
-    多候选/无候选返回空（走守卫提示）。"""
+    参数却完整——按参数键与工具 JSON Schema 匹配推断名称）。
+
+    09-06 14:34 事故：{"url": …} 同时命中 dokobot_read/headless_read（多候选）
+    → 恢复放弃 → 守卫反馈循环 3 连击 → 任务中止。多候选改为确定性择优：
+    参数键与工具 schema 完全等同者优先；仍平手取注册表顺序首个——执行后
+    工具结果会引导模型，优于中止。"""
     if not isinstance(args, dict) or not args:
         return ""
     keys = set(args.keys())
     candidates = []
+    exact = []
     for t in TOOLS:
         fn = t.get("function", {}) or {}
         params = fn.get("parameters") or {}
@@ -1323,7 +1328,15 @@ def _recover_tool_name(args: dict) -> str:
         pkeys = set(props.keys())
         if pkeys and keys <= pkeys:
             candidates.append(fn.get("name", ""))
-    return candidates[0] if len(set(candidates)) == 1 else ""
+            if keys == pkeys:
+                exact.append(fn.get("name", ""))
+    if not candidates:
+        return ""
+    if len(set(candidates)) == 1:
+        return candidates[0]
+    if len(set(exact)) == 1:
+        return exact[0]
+    return candidates[0]
 
 
 def _candidate_tool_names(args: dict) -> list:

@@ -200,17 +200,70 @@ export default memo(function ChatView({
     return () => { el.removeEventListener("scroll", onScroll); ro.disconnect(); };
   }, [messages.length]);
 
-  // 每条消息 → 色块（均匀等高，ZCode 风格；仅颜色区分角色）
-  const miniBlocks = useMemo(() => messages.map((m, i) => ({
-    index: i,
-    color: m.role === "user" ? "var(--accent)" : m.role === "tool" ? "var(--text-disabled)" : "var(--success)",
-    key: m.id || `m${i}`,
-  })), [messages]);
+  // 每条消息的真实布局测量（offsetTop/height）——minimap 横杠按真实高度分布，
+  // hover/点击按真实位置映射。此前横杠固定 2px/条、点击按滚动比例，两套坐标系
+  // 对不上：长消息在条上只占 2px，点第 N 根线跳到的消息和第 N 条毫无关系；
+  // 且消息多时固定 2px/条溢出容器被裁剪，后面的消息在导航条上不存在。
+  const [msgMetrics, setMsgMetrics] = useState<{ id: string; top: number; height: number }[]>([]);
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const measure = () => {
+      const elRect = el.getBoundingClientRect();
+      const next: { id: string; top: number; height: number }[] = [];
+      el.querySelectorAll<HTMLElement>("[data-mid]").forEach((n) => {
+        const id = n.dataset.mid;
+        if (!id) return;
+        const r = n.getBoundingClientRect();
+        next.push({ id, top: r.top - elRect.top + el.scrollTop, height: Math.max(4, r.height) });
+      });
+      next.sort((a, b) => a.top - b.top);
+      setMsgMetrics(next);
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    // 消息内容/数量变化也重测
+    const t = setTimeout(measure, 300);
+    return () => { ro.disconnect(); clearTimeout(t); };
+  }, [messages]);
+
+  // 按真实布局生成横杠：每条消息的高度占比 = flex-grow（真实比例，自动适配任意条数）
+  const miniBlocks = useMemo(() => {
+    const byId = new Map(msgMetrics.map((m) => [m.id, m.height]));
+    return messages.map((m, i) => {
+      const h = byId.get(m.id || "") || 24; // 未测到（刚插入未渲染）时给默认权重
+      return {
+        index: i,
+        id: m.id || `m${i}`,
+        grow: Math.min(40, Math.max(1, h / 14)), // 压缩动态范围：最长 40 倍于最短
+        color: m.role === "user" ? "var(--accent)" : m.role === "tool" ? "var(--text-disabled)" : "var(--success)",
+        key: m.id || `m${i}`,
+      };
+    });
+  }, [messages, msgMetrics]);
 
   const jumpTo = (ratio: number) => {
     const el = scrollRef.current;
     if (!el) return;
     el.scrollTop = ratio * (el.scrollHeight - el.clientHeight);
+  };
+
+  // 滚动比例 → 真实消息序号（取该滚动位置视口中线覆盖的消息）
+  const idxAtRatio = (ratio: number) => {
+    const el = scrollRef.current;
+    if (!el || msgMetrics.length === 0) {
+      return Math.min(messages.length - 1, Math.floor(ratio * messages.length));
+    }
+    const target = ratio * (el.scrollHeight - el.clientHeight) + el.clientHeight * 0.5;
+    let idx = 0;
+    for (let i = 0; i < msgMetrics.length; i++) {
+      if (msgMetrics[i].top <= target) idx = i; else break;
+    }
+    // metrics 顺序对应不了 messages 序号时兜底：按 id 找
+    const id = msgMetrics[idx]?.id;
+    const byId = messages.findIndex((m) => (m.id || "") === id);
+    return byId >= 0 ? byId : Math.min(messages.length - 1, Math.floor(ratio * messages.length));
   };
 
   // 每次工具调用独立成行（活动摘要行 ZCode 式），不再分组折叠
@@ -332,7 +385,7 @@ export default memo(function ChatView({
               // 否则未闭合的围栏会让 ReactMarkdown 把后续全部渲染成代码块（灰框）
               .replace(/```{3,}\s*think\s*[<>]/g, "");
             return (
-              <div key={msg.id || i} className={`msg-row assistant${msg.type === "file" ? " file" : ""}`}>
+              <div key={msg.id || i} data-mid={msg.id} className={`msg-row assistant${msg.type === "file" ? " file" : ""}`}>
                 <div className="avatar-small avatar-bot"><Bot size={19} strokeWidth={2} /></div>
                 <div className="msg-content">
                   {bodyText && (
@@ -374,7 +427,7 @@ export default memo(function ChatView({
             const fbody = fm ? fm[3] : msg.content;
             const isExpanded = !!expandedFiles[msg.id || ""];
             return (
-              <div key={msg.id || i} className={`msg-row user file`}>
+              <div key={msg.id || i} data-mid={msg.id} className={`msg-row user file`}>
                 <div className="avatar-small avatar-user"><User size={19} strokeWidth={2} /></div>
                 <div className="msg-content">
                   {textPart && <div className="msg-bubble user">{textPart}</div>}
@@ -405,7 +458,7 @@ export default memo(function ChatView({
             );
           }
           return (
-            <div key={msg.id || i} className={`msg-row user${msg.type === "image" ? " file" : ""}`}>
+            <div key={msg.id || i} data-mid={msg.id} className={`msg-row user${msg.type === "image" ? " file" : ""}`}>
               <div className="avatar-small avatar-user"><User size={19} strokeWidth={2} /></div>
               <div className="msg-content">
                 <div className="msg-bubble user">{msg.content}</div>
@@ -498,12 +551,11 @@ export default memo(function ChatView({
         }} onMouseMove={(e) => {
           const rect = e.currentTarget.getBoundingClientRect();
           const ratio = Math.min(1, Math.max(0, (e.clientY - rect.top) / rect.height));
-          const idx = Math.min(miniBlocks.length - 1, Math.floor(ratio * miniBlocks.length));
-          setMinimapHover({ ratio, idx });
+          setMinimapHover({ ratio, idx: idxAtRatio(ratio) });
         }} onMouseLeave={() => setMinimapHover(null)}>
           {miniBlocks.map(b => (
             <div key={b.key} className={`mini-block${minimapHover && minimapHover.idx === b.index ? " hover" : ""}`}
-              style={{ background: b.color }} />
+              style={{ background: b.color, flexGrow: b.grow }} />
           ))}
           <div className="mini-viewport" style={{
             top: `${(scrollInfo.top / Math.max(1, scrollInfo.totalH - scrollInfo.viewH)) * 100}%`,
