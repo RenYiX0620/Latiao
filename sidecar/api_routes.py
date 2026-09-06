@@ -249,6 +249,15 @@ async def chat_completion(request: Request):
             _thinking_level = body.get("thinking_level", "high")
 
             async def _run_agent(_protocol, _api_url, _headers, _is_local, _model):
+                if os.environ.get("LATIAO_AGENT_LOOP_V3", "") == "1":
+                    # 薄循环（Stage 2）：cloud/local 单循环，模型驱动终止
+                    from agent.loop import ThinAgentLoop
+                    async for event in ThinAgentLoop(
+                        messages, _model, _api_url, _headers, session_id,
+                        _access_mode, _thinking_level,
+                    ).run():
+                        yield event
+                    return
                 if os.environ.get("LATIAO_AGENT_LOOP_V2", "") == "1":
                     from agent_loop_v2 import AgentLoop
                     engine_kind = "local" if _is_local else "cloud"

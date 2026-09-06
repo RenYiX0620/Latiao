@@ -121,7 +121,6 @@ from agent_loop import (  # noqa: F401 — 门面 re-export：保持 main.xxx �
     _local_agent_loop_stream,
     _local_llm_serialized,
     _local_llm_stream,
-    _local_llm_stream_lock,
     _merge_agents,
     _parse_kv_args,
     _parse_native_tool_calls,

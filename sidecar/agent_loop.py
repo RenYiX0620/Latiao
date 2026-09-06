@@ -50,8 +50,7 @@ from tool_system import load_plugins
 # ── Stage 1 拆分：实现移至 agent/ 包（兼容导入，既有引用继续可用）──
 from agent.transport import (  # noqa: F401
     _is_local_llm_url, _local_llm_serialized, _local_llm_stream,
-    _local_llm_stream_lock, _safe_cwd, _verify_llm_health,
-    clear_llm_suspect, mark_llm_suspect,
+    _safe_cwd, _verify_llm_health, clear_llm_suspect, mark_llm_suspect,
 )
 from agent.parsing import (  # noqa: F401
     _NATIVE_CONTROL_RE, _NATIVE_TOOL_RE, _append_loop_log,

@@ -3,6 +3,7 @@ import asyncio
 import os
 import time
 import logging
+import weakref
 from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import urlparse
@@ -38,10 +39,22 @@ def _safe_cwd() -> str:
 # （连接被 peer 关闭 → 上层表现为"空响应/任务执行一半停止"）。
 # 主对话 agent 循环与 cron 任务并发调用本地模型是实际触发场景——
 # 所有打到本地端口的模型请求必须串行执行。
-_local_llm_stream_lock = asyncio.Lock()
 # 引擎疑似损坏的时间戳：流被取消（停止按钮/新消息）或空响应后置位，
 # 下一次本地请求在锁内先验证引擎健康，避免向残留线程竞争损坏的引擎发请求。
 _llm_suspect_since: float | None = None
+
+# 串行锁按事件循环持有：生产单循环=单锁；测试多循环互不绑定
+# （模块级单一 Lock 会被首个使用它的循环绑定，跨循环抛 RuntimeError）
+_stream_locks: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock]" = weakref.WeakKeyDictionary()
+
+
+def _stream_lock() -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    lock = _stream_locks.get(loop)
+    if lock is None:
+        lock = asyncio.Lock()
+        _stream_locks[loop] = lock
+    return lock
 
 
 def _is_local_llm_url(api_url: str | None) -> bool:
@@ -90,12 +103,12 @@ async def _local_llm_serialized(api_url: str | None):
     """非流式本地请求串行化：本地 llama.cpp 时持锁，云端不设限。"""
     _local = _is_local_llm_url(api_url)
     if _local:
-        await _local_llm_stream_lock.acquire()
+        await _stream_lock().acquire()
     try:
         yield
     finally:
         if _local:
-            _local_llm_stream_lock.release()
+            _stream_lock().release()
 
 
 @asynccontextmanager
