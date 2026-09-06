@@ -53,19 +53,20 @@ def _quick_reflect(tool_name: str, result: str) -> str:
     """Quick heuristic reflection on tool execution result.
     Returns a reflection note or empty string."""
     result_lower = result.lower()
-    # 具体建议分支放在通用 is_error 判断之前，否则永远不可达
-    if "permission denied" in result_lower or "权限不足" in result:
-        return "权限不足，建议检查文件/目录权限"
-    # Error detection — covers both English and Chinese tool error messages
+    # 错误判定只看结果开头 120 字符（09-06 因果簿事故：子串全文匹配把
+    # "内容里提到 error/失败"的成功结果错标 805/1127 条——README 讲
+    # error handling、行情带"错误"列名全部中招）。真正的工具错误
+    # （Error:/错误：/Traceback/⛔）都在返回体头部。
+    result_head = result_lower[:120]
     is_error = (
-        "error" in result_lower or "错误" in result
-        or "failed" in result_lower or "失败" in result
-        or "traceback" in result_lower
-        or "denied" in result_lower
+        result_lower.startswith(("error", "错误", "traceback", "⛔"))
+        or "traceback (most recent call last)" in result_head
+        or result_head.startswith(("error:", "错误：", "错误:"))
+        or re.search(r"^(error|错误|failed|失败|⛔)", result.strip()[:20]) is not None
     )
     if is_error:
         return f"工具 {tool_name} 执行出错，可能需要重试或调整参数"
-    if "not found" in result_lower or "不存在" in result:
+    if "not found" in result_head or result_head.startswith(("不存在", "未找到")):
         return "目标不存在，可能需要先确认路径或创建前置资源"
     if len(result.strip()) < 5:
         return "工具返回为空，可能参数不正确或目标无内容"

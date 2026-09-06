@@ -861,9 +861,13 @@ async def _generate_plan(user_text: str, model: str, api_url: str, headers: dict
             {"role": "system", "content": sys_prompt},
             {"role": "user", "content": user_text},
         ],
-        "max_tokens": 1024,
+        "max_tokens": 2048,
         "stream": False,
         "temperature": 0.3,
+        # 推理模型（Qwen3.8 等）思考模式开着时，token 全进 <think>、正文为空
+        # → 计划生成"失败"（09-06 22:28 事故：板块资金分析表计划模式必现）。
+        # 计划是结构化短输出，直接关思考；预算提到 2048 防长任务计划截断。
+        "chat_template_kwargs": {"enable_thinking": False},
     }
     try:
         resp = await client.post(api_url, json=body, headers=headers)

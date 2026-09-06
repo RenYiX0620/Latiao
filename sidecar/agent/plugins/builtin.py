@@ -101,10 +101,34 @@ def setup_planning(scope):
         if getattr(loop, "_plan_injected", False):
             return payload
         from agent_loop import _generate_plan, _start_plan_confirmation
-        plan = await _generate_plan(loop.last_user_text, loop.model,
+        # 必须用引擎实际加载的模型 id——声明名（如 latiao-local-default）会被
+        # mlx 引擎当 HF repo 解析 → 404（09-06 20:21 事故，21:06 同款坑）
+        if loop.is_local:
+            # plan 生成直连引擎（不走主循环的恢复机制）：app 刚启动时引擎可能
+            # 还在加载。用轻量健康探测轮询（上限 ~45s）——注意不要用
+            # get_api_url（其内部健康探测+重载等待最长 20s/次，叠轮询会静默
+            # 拖 10 分钟，09-06 20:59 事故）；等待超时就快速失败并给出准确指引，
+            # 实际执行阶段主循环自有恢复机制兜底。
+            import asyncio as _asyncio
+            from agent.transport import _verify_llm_health
+            _ready = False
+            for _ in range(10):
+                if await _verify_llm_health(loop.api_url):
+                    _ready = True
+                    break
+                await _asyncio.sleep(3)
+            if not _ready:
+                payload["reject"] = True
+                payload["reject_reason"] = "generate_failed"
+                payload["pre_events"].append({"content": (
+                    "\n\n⚠️ 计划模式：本地模型未就绪（引擎连接失败/加载超时），任务未执行。"
+                    "请到模型页确认模型后重试。")})
+                return payload
+        plan = await _generate_plan(loop.last_user_text, loop._engine_model(),
                                     loop.api_url, loop.headers, loop._client)
         if not plan:
             payload["reject"] = True
+            payload["reject_reason"] = "generate_failed"
             payload["pre_events"].append({"content": (
                 "\n\n⚠️ 计划模式：计划生成失败，任务未执行。请重试或切换到其他模式。")})
             return payload

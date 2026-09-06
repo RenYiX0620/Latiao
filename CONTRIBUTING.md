@@ -1,5 +1,3 @@
-> **English** | [中文](CONTRIBUTING.zh.md)
-
 
 
 # 🤝 Contributing to Latiao
