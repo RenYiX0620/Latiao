@@ -132,6 +132,11 @@ class ThinAgentLoop:
         return tools
 
     def _engine_model(self) -> str:
+        # 云端请求必须用所选云端模型名——本地引擎的模型 id 发给云端必然 400
+        # （09-06 19:29 事故：本地 Qwen3.8 加载中，"测试"被路由到 deepseek，
+        # body.model 却是 Qwen 本地路径 → 400 "Model Not Exist"）
+        if not self.is_local:
+            return self.model
         import local_llm
         return getattr(local_llm._engine, "current_model_id", "") or self.model
 
@@ -317,6 +322,11 @@ class ThinAgentLoop:
                     return
                 except httpx.HTTPStatusError as e:
                     status = getattr(e.response, "status_code", 0)
+                    try:
+                        logger.error("thin loop HTTP %s body: %s", status,
+                                     (e.response.text or "")[:500])
+                    except Exception:
+                        pass
                     if (self.native_tools and not self.native_fallback_used
                             and status == 400):
                         # 引擎不支持 tools 参数（模板无工具能力）→ 回退围栏格式重跑本步

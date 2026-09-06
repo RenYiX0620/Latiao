@@ -242,3 +242,26 @@ async def test_thin_think_only_assist():
             local_llm._engine = old
         texts = "".join(str(e.get("content", "")) for e in events if "content" in e)
         assert "思考" in texts, "应触发思考-only 辅助提示而非静默结束"
+
+
+@pytest.mark.asyncio
+async def test_thin_cloud_body_model_is_cloud_name():
+    """09-06 19:29 事故回归：本地引擎加载着 Qwen 时，云端请求的 model
+    必须仍是云端模型名（此前返回本地路径 → deepseek 400）。"""
+    import agent_loop
+    import local_llm
+    from agent.loop import ThinAgentLoop
+    from tests.test_loop_scenarios import _StubEngine
+    with FakeEngine() as engine:
+        old = local_llm._engine
+        local_llm._engine = _StubEngine()
+        local_llm._engine.current_model_id = "/Users/x/Qwen3.8-27B-MLX-4bit"
+        try:
+            loop = ThinAgentLoop(MESSAGES, "deepseek-v4-flash-vision-exp", engine.url,
+                                 HEADERS, session_id=f"thin-t8-{time.time()}",
+                                 access_mode="full", is_local=False)
+            body = loop._build_request(loop._engine_model())
+        finally:
+            local_llm._engine = old
+        assert body["model"] == "deepseek-v4-flash-vision-exp", \
+            f"云端请求 model 必须是云端名：{body['model']}"
