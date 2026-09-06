@@ -172,6 +172,8 @@ const [timeFilter, setTimeFilter] = useState("all");
   // 后台子智能体任务（ZCode 式活动栏：delegate_task background=true 产生）
   const [subagents, setSubagents] = useState<{ id: string; agent: string; task: string; status: string; steps?: number; activity?: Record<string, number>; last_activity?: string; summary?: string }[]>([]);
   const [taskStartAt, setTaskStartAt] = useState<number | null>(null);
+  // 流式中的思考缓冲（运行中 Think 行实时摘要；800ms 节流，见 flushStream）
+  const [streamingThink, setStreamingThink] = useState<string>("");
   const activeTaskStackRef = useRef<string[]>([]);
   const abortControllerRef = useRef<AbortController | null>(null);
   // 已提示过的 cron 完成事件（ts+task 键），防止 5s 心跳对同一事件反复弹 toast
@@ -762,6 +764,7 @@ const [timeFilter, setTimeFilter] = useState("all");
     // 流式期思考实时预览节流（09-21 22:48：本地慢生成前端完全静默——每 ≥10s
     // 写一次"前 120 字…"，既让用户看到"在思考"，又不"闪现内容不同"）
     let lastThinkingFlush = 0;
+    let lastThinkPropFlush = 0;
     // 当前 agent 轮次（round_start 事件；09-05 23:52：多轮拉锯黑盒化）
     let currentRound = 0;
     const flushStream = () => {
@@ -771,6 +774,16 @@ const [timeFilter, setTimeFilter] = useState("all");
       // 定稿后才附着思考：流式期间正文照常更新，思考攒着不闪现
       const th = streamFinalized ? pendingThinking : "";
       if (streamFinalized) pendingThinking = "";
+      // 运行中 Think 行实时摘要（独立轻量 state，800ms 节流——只重渲染
+      // 活动行，不打全量消息列表；定稿后清空，行数据交回消息 thinking 字段）
+      if (!streamFinalized && pendingThinking) {
+        if (Date.now() - lastThinkPropFlush >= 800) {
+          lastThinkPropFlush = Date.now();
+          setStreamingThink(pendingThinking);
+        }
+      } else if (streamFinalized) {
+        setStreamingThink("");
+      }
       // 非定稿 + 有思考 + 未到节流窗口：跳过空写（避免每 120ms 重渲染）
       const livePreview = !streamFinalized && pendingThinking !== ""
         && Date.now() - lastThinkingFlush >= 10_000;
@@ -1219,6 +1232,7 @@ const [timeFilter, setTimeFilter] = useState("all");
       abortControllerRef.current = null;
       setIsProcessing(false);
       setPendingFile(null);
+      setStreamingThink("");
       setAgentPhase("");
     }
   };
@@ -1611,6 +1625,7 @@ const [timeFilter, setTimeFilter] = useState("all");
             showToast={showToast}
             activeTask={activeTask}
             taskStartAt={taskStartAt}
+            streamingThink={streamingThink}
             subagents={subagents}
           />
         </div>

@@ -227,6 +227,7 @@ class AgentLoop:
         self.light_query = _is_light_query(self.last_user_text, self.current_msgs)
         self.native_tools = (not self.light_query) and _local_native_tools_ok() and bool(self.active_tools)
         self.native_fallback_used = False
+        self.has_called_tool = False  # 工具后续轮关思考用（与 v1 同口径）
         self._ctx_warned = False
 
     async def run(self):
@@ -316,6 +317,7 @@ class AgentLoop:
                     "tool_calls": state.tool_calls,
                 })
                 has_called_tool = True
+                self.has_called_tool = True  # 后续轮关思考（v1 同口径）
                 text_output_delivered = False
                 any_new = False
                 round_failed = False
@@ -659,7 +661,7 @@ class _LocalMode(ModeStrategy):
                 merged[0]["content"] = prompt + "\n\n" + str(merged[0].get("content", ""))
             else:
                 merged.insert(0, {"role": "system", "content": prompt})
-            return {
+            body = {
                 "model": self.engine_model(),
                 "messages": merged,
                 "stream": True,
@@ -668,6 +670,10 @@ class _LocalMode(ModeStrategy):
                 "stop": ["<|im_end|>", "<|endoftext|>", "<end_of_turn>", "<eos>"],
                 "tools": [dict(t) for t in loop.active_tools],
             }
+            if loop.has_called_tool:
+                # 工具后续轮关思考（09-06 13:23：工具后仍开思考 97s 零交付）
+                body["chat_template_kwargs"] = {"enable_thinking": False}
+            return body
         # legacy 围栏路径：首轮全量提示，后续轮轻量提醒（此前每轮重发
         # 4800 字符全量工具清单——27B 下每轮多付数千 token prefill + 更长思考）
         tools_prompt = _build_local_tools_prompt(loop.active_tools)
@@ -683,7 +689,7 @@ class _LocalMode(ModeStrategy):
             merged[0]["content"] = tools_prompt + "\n\n" + str(merged[0].get("content", ""))
         else:
             merged.insert(0, {"role": "system", "content": tools_prompt})
-        return {
+        body = {
             "model": self.engine_model(),
             "messages": merged,
             "stream": True,
@@ -692,6 +698,10 @@ class _LocalMode(ModeStrategy):
             "frequency_penalty": 0.6,
             "stop": ["<|im_end|>", "<|endoftext|>", "<end_of_turn>", "<eos>"],
         }
+        if loop.has_called_tool:
+            # 工具后续轮关思考（外部引擎会忽略该字段，无害）
+            body["chat_template_kwargs"] = {"enable_thinking": False}
+        return body
 
     def ingest_tool_calls(self, delta: dict, state: IterState) -> None:
         # 原生模式：mlx ToolParser 的 delta.tool_calls（收尾包整体送达）

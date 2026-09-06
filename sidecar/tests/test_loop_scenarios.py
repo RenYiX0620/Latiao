@@ -472,6 +472,45 @@ async def test_stream_registration_balance_with_suspect():
 import json as _json  # noqa: E402
 
 
+def test_reply_lang_mismatch_ignores_filenames():
+    """09-06 13:27 事故回归：桌面清单的英文件名不得把中文答案判成英文
+    （曾触发强制翻译→修正轮重跑全模型→180s 超时，正确答案被扔掉）。"""
+    from agent_loop import _reply_lang_mismatch
+    user = "列出桌面有哪些文件"
+    reply = ("桌面文件清单如下：\n\n**文件（10 个）**\n"
+             "- `.DS_Store`（系统隐藏文件）\n"
+             "- `10Eros_T2V_Simple (2).json`（文生图配置）\n"
+             "- `LTX2.3_图生视频.json`\n"
+             "- `Latiao本地模型问题排查与修复报告.docx`\n"
+             "- `Qwen-Image-config.json`\n\n"
+             "以上为桌面全部内容，共 10 个文件，其中 3 个是配置文件。")
+    assert not _reply_lang_mismatch(user, reply), "文件名不应触发语言误判"
+    assert _reply_lang_mismatch(
+        user, "Sure! Here is the complete summary of the analysis result for your request today. " * 3), \
+        "纯英文回答仍必须命中"
+
+
+@pytest.mark.asyncio
+async def test_v2_local_post_tool_thinking_off():
+    """v2 工具后续轮关思考。"""
+    import agent_loop
+    from agent_loop_v2 import AgentLoop
+    with FakeEngine() as engine:
+        engine.push(engine.native_tool_response("list_dir", {"path": "."}))
+        engine.push(engine.text_response(NEUTRAL_TEXT))
+        agent_loop._LOCAL_NATIVE_TOOLS_OVERRIDE = True
+        try:
+            await _collect(AgentLoop(
+                "local", MESSAGES, "fake-model", engine.url, HEADERS,
+                session_id=f"v2-postool-{time.time()}", access_mode="full",
+            ).run())
+        finally:
+            agent_loop._LOCAL_NATIVE_TOOLS_OVERRIDE = None
+        req2 = engine.requests[1]
+        assert (req2.get("chat_template_kwargs") or {}).get("enable_thinking") is False, \
+            "v2 工具后续轮必须关闭思考"
+
+
 @pytest.mark.asyncio
 async def test_local_native_tools_round_trip():
     """原生 tools 参数下发 → delta.tool_calls 执行 → assistant 携 tool_calls 回传。"""
@@ -480,6 +519,8 @@ async def test_local_native_tools_round_trip():
         def _round2(body):
             assert isinstance(body.get("tools"), list) and body["tools"], \
                 "第二轮仍应携带原生 tools 参数"
+            assert (body.get("chat_template_kwargs") or {}).get("enable_thinking") is False, \
+                "工具后续轮必须关闭思考（09-06 13:23：工具后开思考 97s 零交付）"
             asst = [m for m in body["messages"]
                     if m.get("role") == "assistant" and m.get("tool_calls")]
             assert asst, "原生模式 assistant 消息必须携带 tool_calls"

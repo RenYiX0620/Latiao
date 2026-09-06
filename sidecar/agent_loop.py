@@ -3226,6 +3226,20 @@ def _looks_like_planning(text: str) -> bool:
     return sum(1 for sig in _PLANNING_SIGNALS if sig in low) >= 2
 
 
+def _strip_nonprose_for_lang(t: str) -> str:
+    """语言计数前剥离非散文 token：URL、行内代码、路径、文件名。
+
+    09-06 13:27 事故：桌面文件清单的英文件名（.DS_Store、
+    10Eros_T2V_Simple.json…）把纯中文答案的字母计数拉到 en>zh，
+    误判成英文回复 → 强制翻译（返回原文）→ 语言修正轮重跑全模型，
+    正确答案被扔掉、180s 看门狗超时。文件名/路径/代码是数据不是语言。"""
+    t = re.sub(r"https?://\S+|www\.\S+", " ", t)            # URL
+    t = re.sub(r"`[^`\n]*`", " ", t)                        # 行内代码
+    t = re.sub(r"(?<![\w])[\w.\-]*[\w\-]/[\w.\-/]{1,}", " ", t)   # 路径
+    t = re.sub(r"[\w.\-]+\.[A-Za-z0-9]{1,5}\b", " ", t)     # 文件名（含扩展名）
+    return t
+
+
 def _reply_lang_mismatch(user_text: str, reply_text: str) -> bool:
     """回复语言与用户语言明显不符（中文用户收到英文/英文占优回复）→ True。
 
@@ -3234,13 +3248,14 @@ def _reply_lang_mismatch(user_text: str, reply_text: str) -> bool:
     混合英文回答命中；20:09 重放中 440 字母 vs 170 汉字（英文主体+中文
     股票名镶入）也命中（en>zh 即判，不要求 3 倍——此前 3 倍阈值放过 2.6 倍
     的漏网）；"NVIDIA涨5%"（字母 6 < 80）与中文为主的正常回答（汉字多于
-    字母）不误伤。"""
+    字母）不误伤。计数前剥离文件名/路径/代码（_strip_nonprose_for_lang）。"""
     user_lang = _detect_user_language(user_text)
     if not reply_text:
         return False
     # 尾部段落窗口（09-21 实测）：nudge 轮的英文尾巴以段落为单位接在长中文
     # 正文后，全文判定（中文多、英文<80字母）会漏——对最后 2 段单独判定。
     def _lang_counts(t: str):
+        t = _strip_nonprose_for_lang(t)
         return (len(re.findall(r'[\u4e00-\u9fff]', t)),
                 len(re.findall(r'[\u3040-\u309f\u30a0-\u30ff]', t)),
                 len(re.findall(r'[a-zA-Z]', t)))
@@ -3249,9 +3264,10 @@ def _reply_lang_mismatch(user_text: str, reply_text: str) -> bool:
     tail_text = "\n".join(tail_parts)
     tzh, tkana, ten = _lang_counts(tail_text)
     tail_en_heavy = ten >= 40 and ten > tzh + tkana
-    zh = len(re.findall(r'[\u4e00-\u9fff]', reply_text))
-    ja_kana = len(re.findall(r'[\u3040-\u309f\u30a0-\u30ff]', reply_text))
-    en = len(re.findall(r'[a-zA-Z]', reply_text))
+    _full = _strip_nonprose_for_lang(reply_text)
+    zh = len(re.findall(r'[\u4e00-\u9fff]', _full))
+    ja_kana = len(re.findall(r'[\u3040-\u309f\u30a0-\u30ff]', _full))
+    en = len(re.findall(r'[a-zA-Z]', _full))
     if user_lang == "zh":
         return (en >= 80 and en > zh) or tail_en_heavy
     if user_lang == "ja":
@@ -4027,10 +4043,12 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
                 "frequency_penalty": 0.6,
                 "stop": ["<|im_end|>", "<|endoftext|>", "<end_of_turn>", "<eos>"],
             }
-            if _light_query:
-                # 闲聊快车道：关思考（Qwen3 chat_template_kwargs；27B 实测 7.0s→1.3s）
+            if _light_query or has_called_tool:
+                # 关思考两档：闲聊快车道（27B 实测 7.0s→1.3s）；工具后续轮
+                # （结果=数据，直接写答案——09-06 13:23 事故：工具后仍开思考，
+                # 两轮纯思考 97s 零交付收尾）
                 body["chat_template_kwargs"] = {"enable_thinking": False}
-            elif _native_tools:
+            if not _light_query and _native_tools:
                 # 原生 function calling（mlx_lm.server 0.31：模板渲染工具 +
                 # ToolParser 输出 OpenAI 格式 delta.tool_calls，真机实测通过）
                 body["tools"] = [dict(t) for t in active_tools]
