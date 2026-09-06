@@ -300,8 +300,7 @@ class ThinAgentLoop:
                 for evt in payload.get("pre_events", []):
                     yield evt
                 if payload.get("reject"):
-                    if payload.get("reject_reason") != "generate_failed":
-                        yield {"content": "\n\n⏹️ 计划已被拒绝，任务未执行。你可以调整要求后重新发起。"}
+                    yield {"content": "\n\n⏹️ 计划已被拒绝，任务未执行。你可以调整要求后重新发起。"}
                     return
 
                 # 规划等待：插件标记 plan_wait → 循环执行 yield+await（生成器语义）
@@ -391,36 +390,10 @@ class ThinAgentLoop:
                     else:
                         clean_text = streamed
                 tool_names = {t.get("function", {}).get("name") for t in self._active_tools()}
-                # 空名调用必须放行到执行器（恢复/守卫都在那边）。
-                # "有名但不在册"（模型幻觉出的工具名）：不静默丢弃（09-06 21:19
-                # 事故：丢弃后模型以为调用成功，用户只拿到 25 字残答）——
-                # 回一条可见错误（附在册工具清单）让模型下一轮自行纠正。
-                _known_calls, _unknown_named = [], []
-                for tc in tool_calls:
-                    nm = (tc.get("function") or {}).get("name", "")
-                    if not nm or nm in tool_names:
-                        _known_calls.append(tc)
-                    else:
-                        _unknown_named.append(tc)
-                if _unknown_named:
-                    for tc in _unknown_named:
-                        nm = (tc.get("function") or {}).get("name", "?")
-                        if not tc.get("id"):
-                            tc["id"] = str(uuid.uuid4())
-                        err = (f"⛔ 未知工具 '{nm}'。可用工具："
-                               f"{', '.join(sorted(n for n in tool_names if n))}。"
-                               f"请从以上清单中选择正确的工具重新调用。")
-                        self.current_msgs.append({"role": "tool", "tool_call_id": tc["id"], "content": err})
-                        self._step_log("未知工具", f"{nm} → 已回错误清单")
-                        logger.warning("thin loop: 未知工具调用 '%s' 已回错误（在册: %s）",
-                                       nm, sorted(n for n in tool_names if n))
-                        yield {"event": "tool_end", "call_id": tc["id"], "tool": nm,
-                               "result": err, "ts": int(time.time() * 1000)}
-                    if not _known_calls:
-                        # 全部是幻觉调用 → 不交付正文，直接进下一轮让模型纠正
-                        text_output_delivered = True
-                        continue
-                tool_calls = _known_calls
+                # 空名调用必须放行到执行器（恢复/守卫都在那边）；只滤"有名但不在册"
+                tool_calls = [tc for tc in tool_calls
+                              if (not tc.get("function", {}).get("name"))
+                              or tc.get("function", {}).get("name") in tool_names]
 
                 self._step_log("采样完成",
                                f"正文={len(body_text)}字 思考={len(reasoning)}字 "
