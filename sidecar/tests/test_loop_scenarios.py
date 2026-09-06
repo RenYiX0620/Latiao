@@ -419,6 +419,7 @@ async def test_stream_registration_balance_with_suspect():
     请求进行中引擎保持"忙"注册，退出后计数归零（此前双重 exit 打成 -1，
     busy_until 清零让健康检查对正忙的引擎双连败误杀重载）。"""
     import agent_loop
+    import agent.context as agent_context
     import local_llm
     counters = {"busy": 0, "idle": 0, "streams": 0}
 
@@ -521,18 +522,19 @@ def test_reply_lang_mismatch_ignores_filenames():
 async def test_v2_local_post_tool_thinking_off():
     """v2 工具后续轮关思考。"""
     import agent_loop
+    import agent.context as agent_context
     from agent_loop_v2 import AgentLoop
     with FakeEngine() as engine:
         engine.push(engine.native_tool_response("list_dir", {"path": "."}))
         engine.push(engine.text_response(NEUTRAL_TEXT))
-        agent_loop._LOCAL_NATIVE_TOOLS_OVERRIDE = True
+        agent_context._LOCAL_NATIVE_TOOLS_OVERRIDE = True
         try:
             await _collect(AgentLoop(
                 "local", MESSAGES, "fake-model", engine.url, HEADERS,
                 session_id=f"v2-postool-{time.time()}", access_mode="full",
             ).run())
         finally:
-            agent_loop._LOCAL_NATIVE_TOOLS_OVERRIDE = None
+            agent_context._LOCAL_NATIVE_TOOLS_OVERRIDE = None
         req2 = engine.requests[1]
         assert (req2.get("chat_template_kwargs") or {}).get("enable_thinking") is False, \
             "v2 工具后续轮必须关闭思考"
@@ -548,17 +550,18 @@ async def test_full_access_exposes_command_tools_v1():
     （此前意图筛选+cap 把 run_cmd/control_launch 剥掉，模型只能答"我没有
     命令工具"）。"""
     import agent_loop
+    import agent.context as agent_context
     with FakeEngine() as engine:
         engine.push(engine.native_tool_response("list_dir", {"path": "."}))
         engine.push(engine.text_response(NEUTRAL_TEXT))
-        agent_loop._LOCAL_NATIVE_TOOLS_OVERRIDE = True
+        agent_context._LOCAL_NATIVE_TOOLS_OVERRIDE = True
         try:
             await _collect(_local_agent_loop_stream(
                 [{"role": "user", "content": "打开相册"}], "fake-model", engine.url, HEADERS,
                 session_id=f"t-fullacc-{time.time()}", access_mode="full",
             ))
         finally:
-            agent_loop._LOCAL_NATIVE_TOOLS_OVERRIDE = None
+            agent_context._LOCAL_NATIVE_TOOLS_OVERRIDE = None
         names = _tool_names(engine.requests[0])
         assert len(names) >= 15, f"全部权限应暴露全量工具，实际 {len(names)} 个：{sorted(names)}"
         assert names & {"run_cmd", "control_launch"}, \
@@ -569,18 +572,19 @@ async def test_full_access_exposes_command_tools_v1():
 async def test_full_access_exposes_command_tools_v2():
     """v2 同款。"""
     import agent_loop
+    import agent.context as agent_context
     from agent_loop_v2 import AgentLoop
     with FakeEngine() as engine:
         engine.push(engine.native_tool_response("list_dir", {"path": "."}))
         engine.push(engine.text_response(NEUTRAL_TEXT))
-        agent_loop._LOCAL_NATIVE_TOOLS_OVERRIDE = True
+        agent_context._LOCAL_NATIVE_TOOLS_OVERRIDE = True
         try:
             await _collect(AgentLoop(
                 "local", [{"role": "user", "content": "打开相册"}], "fake-model", engine.url,
                 HEADERS, session_id=f"v2-fullacc-{time.time()}", access_mode="full",
             ).run())
         finally:
-            agent_loop._LOCAL_NATIVE_TOOLS_OVERRIDE = None
+            agent_context._LOCAL_NATIVE_TOOLS_OVERRIDE = None
         names = _tool_names(engine.requests[0])
         assert names & {"run_cmd", "control_launch"}, \
             f"v2 全部权限命令工具必须在场：{sorted(names)}"
@@ -590,6 +594,7 @@ async def test_full_access_exposes_command_tools_v2():
 async def test_local_native_tools_round_trip():
     """原生 tools 参数下发 → delta.tool_calls 执行 → assistant 携 tool_calls 回传。"""
     import agent_loop
+    import agent.context as agent_context
     with FakeEngine() as engine:
         def _round2(body):
             assert isinstance(body.get("tools"), list) and body["tools"], \
@@ -602,14 +607,14 @@ async def test_local_native_tools_round_trip():
             return FakeEngine.text_response(NEUTRAL_TEXT)
         engine.push(engine.native_tool_response("list_dir", {"path": "."}))
         engine.push(_round2)
-        agent_loop._LOCAL_NATIVE_TOOLS_OVERRIDE = True
+        agent_context._LOCAL_NATIVE_TOOLS_OVERRIDE = True
         try:
             events = await _collect(_local_agent_loop_stream(
                 MESSAGES, "fake-model", engine.url, HEADERS,
                 session_id=f"t-native-{time.time()}", access_mode="full",
             ))
         finally:
-            agent_loop._LOCAL_NATIVE_TOOLS_OVERRIDE = None
+            agent_context._LOCAL_NATIVE_TOOLS_OVERRIDE = None
         req1 = engine.requests[0]
         assert isinstance(req1.get("tools"), list) and req1["tools"], "首轮请求必须携带 tools"
         assert "```tool" not in _json.dumps(req1, ensure_ascii=False), \
@@ -623,19 +628,20 @@ async def test_local_native_tools_round_trip():
 async def test_v2_local_native_tools_round_trip():
     """v2 同款：原生 tools 下发 + delta.tool_calls 摄取 + 工具轮次。"""
     import agent_loop
+    import agent.context as agent_context
     from agent_loop_v2 import AgentLoop
     with FakeEngine() as engine:
         engine.push(engine.native_tool_response("list_dir", {"path": "."}))
         engine.push(engine.asserts_tool_result_present("agent_loop.py"))
         engine.push(engine.text_response(NEUTRAL_TEXT))
-        agent_loop._LOCAL_NATIVE_TOOLS_OVERRIDE = True
+        agent_context._LOCAL_NATIVE_TOOLS_OVERRIDE = True
         try:
             events = await _collect(AgentLoop(
                 "local", MESSAGES, "fake-model", engine.url, HEADERS,
                 session_id=f"v2-native-{time.time()}", access_mode="full",
             ).run())
         finally:
-            agent_loop._LOCAL_NATIVE_TOOLS_OVERRIDE = None
+            agent_context._LOCAL_NATIVE_TOOLS_OVERRIDE = None
         assert isinstance(engine.requests[0].get("tools"), list), "v2 首轮应携带 tools"
         assert any(e.get("event") == "tool_start" for e in events), events
         texts = [e.get("content", "") for e in events if "content" in e]
@@ -682,18 +688,19 @@ async def test_v2_local_light_query_fast_path():
 async def test_local_native_400_fallback():
     """引擎拒绝 tools（400，模板不支持工具）→ 自动回退围栏提示词，任务完成。"""
     import agent_loop
+    import agent.context as agent_context
     with FakeEngine() as engine:
         engine.push(engine.http_error(400, "model does not support tool calling"))
         engine.push(engine.local_tool_response("list_dir", {"path": "."}))
         engine.push(engine.text_response(NEUTRAL_TEXT))
-        agent_loop._LOCAL_NATIVE_TOOLS_OVERRIDE = True
+        agent_context._LOCAL_NATIVE_TOOLS_OVERRIDE = True
         try:
             events = await _collect(_local_agent_loop_stream(
                 MESSAGES, "fake-model", engine.url, HEADERS,
                 session_id=f"t-400fb-{time.time()}", access_mode="full",
             ))
         finally:
-            agent_loop._LOCAL_NATIVE_TOOLS_OVERRIDE = None
+            agent_context._LOCAL_NATIVE_TOOLS_OVERRIDE = None
         req1, req2 = engine.requests[0], engine.requests[1]
         assert "tools" in req1, "首次请求应携带原生 tools"
         assert "tools" not in req2, "回退后不得再携带 tools"
@@ -707,19 +714,20 @@ async def test_local_native_400_fallback():
 async def test_v2_local_native_400_fallback():
     """v2 同款 400 回退。"""
     import agent_loop
+    import agent.context as agent_context
     from agent_loop_v2 import AgentLoop
     with FakeEngine() as engine:
         engine.push(engine.http_error(400, "model does not support tool calling"))
         engine.push(engine.local_tool_response("list_dir", {"path": "."}))
         engine.push(engine.text_response(NEUTRAL_TEXT))
-        agent_loop._LOCAL_NATIVE_TOOLS_OVERRIDE = True
+        agent_context._LOCAL_NATIVE_TOOLS_OVERRIDE = True
         try:
             events = await _collect(AgentLoop(
                 "local", MESSAGES, "fake-model", engine.url, HEADERS,
                 session_id=f"v2-400fb-{time.time()}", access_mode="full",
             ).run())
         finally:
-            agent_loop._LOCAL_NATIVE_TOOLS_OVERRIDE = None
+            agent_context._LOCAL_NATIVE_TOOLS_OVERRIDE = None
         assert "tools" in engine.requests[0]
         assert "tools" not in engine.requests[1], "v2 回退后不得再携带 tools"
         texts = [e.get("content", "") for e in events if "content" in e]

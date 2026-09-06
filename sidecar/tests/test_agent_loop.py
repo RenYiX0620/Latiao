@@ -588,7 +588,8 @@ class TestLanguageEnsure:
         async def _fail(*a, **k):
             return self.EN_TEXT  # 翻译失败 = 返回原文；必须与入参完全一致
 
-        monkeypatch.setattr(agent_loop, "_force_translate", _fail)
+        import agent.gates as _gates
+        monkeypatch.setattr(_gates, "_force_translate", _fail)
         delivered = asyncio.run(agent_loop._ensure_final_language(
             None, "http://x", {}, "model", self.EN_TEXT, "分析这个文件"
         ))
@@ -603,7 +604,8 @@ class TestLanguageEnsure:
         async def _ok(*a, **k):
             return "中文翻译结果"
 
-        monkeypatch.setattr(agent_loop, "_force_translate", _ok)
+        import agent.gates as _gates
+        monkeypatch.setattr(_gates, "_force_translate", _ok)
         delivered = asyncio.run(agent_loop._ensure_final_language(
             None, "http://x", {}, "model", self.EN_TEXT, "中文用户"
         ))
