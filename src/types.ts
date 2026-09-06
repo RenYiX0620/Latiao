@@ -6,14 +6,11 @@ export interface Message {
   content: string;
   ts?: number;
   thinking?: string;
-  type?: "file" | "text" | "image" | "audio" | "translation" | "tool_call";
+  type?: "file" | "image" | "tool_call";
   filename?: string;
   imagePreview?: string;
   imageBase64?: string;
   imageMime?: string;
-  audioUrl?: string;
-  originalText?: string;
-  translatedText?: string;
   callId?: string;
   toolName?: string;
   toolArgs?: Record<string, unknown>;
