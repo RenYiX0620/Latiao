@@ -123,7 +123,9 @@ class ThinAgentLoop:
         tools = _filter_tools(self.last_user_text, TOOLS) if self.last_user_text else list(TOOLS)
         tools = _filter_tools_by_access(tools, self.access_mode)
         if len(tools) > 12:
-            tools = _cap_tools(tools, 12)
+            # 元工具（委派/技能/定时）cap 保底——委派被裁掉会让模型"看不到"
+            # 子代理机制而自己硬扛（09-06 真机验收 C 场景发现）
+            tools = _cap_tools(tools, 12, keep_first=("delegate_task", "use_skill", "create_cron"))
         tools = _ensure_market_tools(tools, self.last_user_text)
         if self.tool_whitelist is not None:
             tools = [t for t in tools if t.get("function", {}).get("name") in self.tool_whitelist]
