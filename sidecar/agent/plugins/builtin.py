@@ -62,7 +62,8 @@ def setup_assists(scope):
                                        "模型不支持当前请求格式。建议换用更大的模型或重试。")})
             payload["handled"] = True
             return payload
-        # 辅助 2：语言交付闸门（本地引擎英文漂移是高频真实问题）
+        # 辅助 2：语言交付闸门（本地引擎英文漂移）——正文已实时流出，
+        # 用 content_revised 整体替换（前端把最后一条回答替换为译文）
         if _reply_lang_mismatch(payload["user_text"], text):
             try:
                 async with httpx.AsyncClient(timeout=httpx.Timeout(60)) as c2:
@@ -70,11 +71,11 @@ def setup_assists(scope):
                         c2, payload["api_url"], payload["headers"], payload["engine_model"],
                         text, payload["user_lang"])
                 if translated and translated != text:
-                    events.append({"content": "\n\n" + translated})
+                    events.append({"event": "content_revised", "content": translated})
                     payload["handled"] = True
                     return payload
             except Exception:
-                logger.debug("语言闸门翻译失败，按原文交付", exc_info=True)
+                logger.debug("语言闸门翻译失败，按已流出原文交付", exc_info=True)
         return payload
 
     async def guard(payload, ctx):

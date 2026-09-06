@@ -140,6 +140,11 @@ class ThinAgentLoop:
         import local_llm
         return getattr(local_llm._engine, "current_model_id", "") or self.model
 
+    def _step_log(self, phase: str, detail: str = "") -> None:
+        """终端式每步日志：统一前缀，进 sidecar.log 与 app 实况日志。"""
+        logger.info("[THIN][step %s] %s%s", self.steps, phase,
+                    f" | {detail}" if detail else "")
+
     # ── 请求组装（request waterfall 之前的宿主编排）──────────
     def _build_request(self, engine_model: str) -> dict:
         light = self.is_local and _is_light_query(self.last_user_text, self.current_msgs)
@@ -218,8 +223,9 @@ class ThinAgentLoop:
                     any_out = any_out or '"delta"' in line or '"reasoning"' in line
                 yield line
 
-    # ── 单 step：流式采样，返回 (全文, 正文, 思考, 原生工具调用) ─
-    async def _sample(self, client, body, reasoning_events: list):
+    # ── 单 step：流式采样（实时流出 reasoning/content），结果经
+    # __result__ 终端事件回传（消费者吞掉，不下发前端）──
+    async def _sample(self, client, body):
         streamed, body_text, reasoning = "", "", ""
         native: dict[int, dict] = {}
         raw = 0
@@ -257,15 +263,23 @@ class ThinAgentLoop:
             if think:
                 reasoning += think
                 streamed += think
-                reasoning_events.append({"reasoning": think, "ts": int(time.time() * 1000)})
+                yield {"reasoning": think, "ts": int(time.time() * 1000)}
             if content:
                 streamed += content
                 body_text += content
-        return streamed, body_text, reasoning, native
+                # 真流式：正文 delta 即刻下发（09-06 用户反馈"直接蹦出答案"）
+                yield {"content": content, "ts": int(time.time() * 1000)}
+        yield {"__result__": (streamed, body_text, reasoning, native)}
 
     # ── 主循环 ────────────────────────────────────────────
     async def run(self):
         self.steps = 0
+        mode = "native" if (self.is_local and _local_native_tools_ok()) else (
+            "legacy-fence" if self.is_local else "cloud-native")
+        self._step_log("任务开始",
+                       f"model={self.model} endpoint={self.api_url} "
+                       f"is_local={self.is_local} access={self.access_mode} "
+                       f"mode={mode} 消息={len(self.current_msgs)}")
         async with httpx.AsyncClient(timeout=httpx.Timeout(120)) as client:
             self._client = client
             while self.steps < MAX_STEPS:
@@ -308,12 +322,31 @@ class ThinAgentLoop:
 
                 engine_model = self._engine_model()
                 body = self._build_request(engine_model)
+                tools_n = len(body.get("tools") or [])
+                chars = sum(len(str(m.get("content") or "")) for m in body.get("messages", []))
+                self._step_log("请求构建",
+                               f"model={body.get('model')} 消息={len(body.get('messages', []))} "
+                               f"字符={chars} tools={tools_n} "
+                               f"思考={'关' if (body.get('chat_template_kwargs') or {}).get('enable_thinking') is False else '开'}")
                 # request waterfall：fastpath（快车道）等插件改写请求
+                body_keys_before = sorted(body.keys())
                 body = await self.scope.run_waterfall("request", body)
-                reasoning_events: list = []
+                if sorted(body.keys()) != body_keys_before:
+                    self._step_log("request 插件改写",
+                                   f"键变化 {body_keys_before} → {sorted(body.keys())}")
+                t_sample = time.monotonic()
+                result = None
+                raw_deltas = 0
                 try:
-                    streamed, body_text, reasoning, native = await self._sample(
-                        client, body, reasoning_events)
+                    async for evt in self._sample(client, body):
+                        if "__result__" in evt:
+                            result = evt["__result__"]
+                            continue
+                        raw_deltas += 1
+                        yield evt
+                    if result is None:
+                        return
+                    streamed, body_text, reasoning, native = result
                 except _GenerationLoopError as e:
                     yield {"content": f"\n\n⚠️ {e}"}
                     return
@@ -337,8 +370,9 @@ class ThinAgentLoop:
                         continue
                     yield {"content": f"\n\n⚠️ 模型服务返回错误 HTTP {status}，请稍后重试。"}
                     return
-                for evt in reasoning_events:
-                    yield evt
+                self._step_log("流结束",
+                               f"delta={raw_deltas} 思考={len(reasoning)}字 "
+                               f"正文={len(body_text)}字 耗时={time.monotonic()-t_sample:.1f}s")
 
                 # 工具调用：原生优先，围栏兜底
                 tool_calls = []
@@ -346,6 +380,9 @@ class ThinAgentLoop:
                 if native:
                     # 原生 delta（含空名——执行器按参数恢复，09-21 deepseek quirk）
                     tool_calls = [native[i] for i in sorted(native.keys())]
+                self._step_log("工具解析",
+                               f"原生={len(native)} 围栏待查")
+
                 if not tool_calls:
                     clean_text, fence_calls = _parse_prompt_tool_calls(streamed)
                     if fence_calls:
@@ -358,10 +395,15 @@ class ThinAgentLoop:
                               if (not tc.get("function", {}).get("name"))
                               or tc.get("function", {}).get("name") in tool_names]
 
+                self._step_log("采样完成",
+                               f"正文={len(body_text)}字 思考={len(reasoning)}字 "
+                               f"工具调用={len(tool_calls)}")
+
                 if not tool_calls:
-                    # deliver waterfall：弱模型辅助（思考-only/语言闸门/空响应诊断）
+                    # deliver waterfall：弱模型辅助（思考-only/空响应诊断/语言替换）
+                    # 正文已实时流出——辅助只能"替换"（content_revised）或补充，不得重复
                     payload = {
-                        "text": body_text or streamed, "streamed": streamed,
+                        "text": body_text, "streamed": streamed,
                         "client": client, "api_url": self.api_url,
                         "headers": self.headers, "engine_model": engine_model,
                         "current_msgs": self.current_msgs, "user_text": self.last_user_text,
@@ -371,11 +413,13 @@ class ThinAgentLoop:
                     payload = await self.scope.run_waterfall("deliver", payload)
                     for evt in payload.get("events", []):
                         yield evt
-                    if not payload.get("handled") and payload.get("text", "").strip():
-                        yield {"content": "\n\n" + _strip_think_fences(payload["text"].strip())}
+                    self._step_log("交付",
+                                   f"handled={payload.get('handled')} "
+                                   f"events={len(payload.get('events', []))}")
                     # dsh 语义：交付后若 inbox 有排队输入 → 续开下一轮
                     pending = _claim_steer(self.session_id)
                     if pending:
+                        self._step_log("steer 认领", f"{len(pending)} 条")
                         for m in pending:
                             self.current_msgs.append({"role": "user", "content": m})
                         continue
@@ -406,6 +450,10 @@ class ThinAgentLoop:
                     verify_failed, events = await _handle_tool_execution(
                         tc, self.current_msgs, self.session_id, "latiao",
                         self.access_mode, pre_started=pre)
+                    _res = next((str(e.get("result", "")) for e in events
+                                 if isinstance(e, dict) and "result" in e), "")
+                    self._step_log("工具结果", f"{tname} → {len(_res)}字符 "
+                                               f"摘要: {_res[:80]!r}")
                     for evt in events:
                         yield evt
 

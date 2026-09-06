@@ -265,3 +265,31 @@ async def test_thin_cloud_body_model_is_cloud_name():
             local_llm._engine = old
         assert body["model"] == "deepseek-v4-flash-vision-exp", \
             f"云端请求 model 必须是云端名：{body['model']}"
+
+
+@pytest.mark.asyncio
+async def test_thin_streams_content_deltas_live():
+    """09-06 19:29 反馈回归：正文必须逐段实时流出（不是结束时一次蹦出）。"""
+    from tests.test_loop_scenarios import _StubEngine
+    from agent.loop import ThinAgentLoop
+    import agent.transport as transport
+    import local_llm
+    with FakeEngine() as engine:
+        deltas = ["第一段结论。", "第二段展开说明。", "第三段补充细节。"]
+        lines = []
+        for d in deltas:
+            lines.append(f"data: {json.dumps({'choices': [{'delta': {'content': d}, 'index': 0}]}, ensure_ascii=False)}\n\n")
+        lines.append("data: [DONE]\n\n")
+        engine.push(lines)
+        old = local_llm._engine
+        local_llm._engine = _StubEngine()
+        transport._LOCAL_NATIVE_TOOLS_OVERRIDE = True
+        try:
+            events = await _collect(ThinAgentLoop(
+                [{"role": "user", "content": "写个分析"}], "fake-model", engine.url,
+                HEADERS, session_id=f"thin-t9-{time.time()}", access_mode="full").run())
+        finally:
+            local_llm._engine = old
+            transport._LOCAL_NATIVE_TOOLS_OVERRIDE = None
+        contents = [e["content"] for e in events if "content" in e]
+        assert contents == deltas, f"content delta 必须逐段原样流出：{contents}"
