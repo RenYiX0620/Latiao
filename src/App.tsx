@@ -227,7 +227,7 @@ const [timeFilter, setTimeFilter] = useState("all");
   const [autoCheckUpdate, setAutoCheckUpdate] = useState(() => localStorage.getItem("latiao_auto_check_update") !== "false");
   const [recentLearnings, setRecentLearnings] = useState<{topic: string; content: string; confidence: number}[]>([]);
   const [agentPhase, setAgentPhase] = useState<string>("");
-  const [, setRouteInfo] = useState<{ engine: string; declaredModel: string } | null>(null);
+  const [routeInfo, setRouteInfo] = useState<{ engine: string; declaredModel: string } | null>(null);
   const [activeAgent, setActiveAgent] = useState<string>("latiao");
   const [capabilities, setCapabilities] = useState<Capability[]>([]);
   const [localLLMStatus, setLocalLLMStatus] = useState<LLMStatus>({ backend: "", status: "checking", model_id: "", model_name: "", port: 1235, message: "", has_image_support: false, token_limit: 32768 });
@@ -889,6 +889,14 @@ const [timeFilter, setTimeFilter] = useState("all");
                   console.info(`[route] 模型「${declared}」未在云端配置，实际运行在本地引擎`);
                 }
                 setRouteInfo({ engine: ended, declaredModel: declared });
+                continue;
+              }
+              if (parsed.event === "route_fallback") {
+                // 429 降级切换引擎（09-06：静默切换让用户以为还在用本地模型）
+                const fbLocal = Boolean(parsed.is_local);
+                const fbModel = String(parsed.declared_model || "");
+                setRouteInfo({ engine: fbLocal ? "本地" : "云端", declaredModel: fbModel });
+                showToast(String(parsed.message || "模型已切换") + (fbModel ? `（${fbModel}）` : ""), "warn");
                 continue;
               }
               if (parsed.event === "round_start") {
@@ -1627,6 +1635,7 @@ const [timeFilter, setTimeFilter] = useState("all");
             taskStartAt={taskStartAt}
             streamingThink={streamingThink}
             subagents={subagents}
+            routeInfo={routeInfo}
           />
         </div>
 

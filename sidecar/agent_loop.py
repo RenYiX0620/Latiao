@@ -2856,7 +2856,7 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                 loop_deadline = time.monotonic() + 900  # 实质进展：顺延无进展看门狗
                 _append_loop_log(f"Iteration {iteration}: found {len(tool_calls)} tool(s): {[tc.get('function',{}).get('name') for tc in tool_calls]}\n")
                 _track_progress(session_id, "tool_calling", f"{len(tool_calls)} tool(s)")
-                logger.info(f"[LOCAL-AGENT] Iteration {iteration}: {len(tool_calls)} tool(s) called, msgs_in_context={len(current_msgs)}")
+                logger.info(f"[AGENT] Iteration {iteration}: {len(tool_calls)} tool(s) called, msgs_in_context={len(current_msgs)}")
 
                 current_msgs.append({
                     "role": "assistant",
@@ -2912,7 +2912,7 @@ async def _agent_loop_stream(messages: list, model: str, api_url: str, headers: 
                         pre_started = None
                     verify_failed, events = await _handle_tool_execution(
                         tc, current_msgs, session_id, agent_id, access_mode, pre_started=pre_started)
-                    logger.info(f"[LOCAL-AGENT] Iteration {iteration}: tool={tc.get('function',{}).get('name','')} executed, result_len={len(current_msgs[-1].get('content','')) if current_msgs else 0}")
+                    logger.info(f"[AGENT] Iteration {iteration}: tool={tc.get('function',{}).get('name','')} executed, result_len={len(current_msgs[-1].get('content','')) if current_msgs else 0}")
                     for evt in events:
                         yield evt
                     denied = any(

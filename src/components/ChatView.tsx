@@ -126,6 +126,7 @@ interface ChatViewProps {
   taskStartAt: number | null;
   streamingThink?: string;  // 流式中的思考缓冲（运行中 Think 行实时摘要）
   subagents?: { id: string; agent: string; task: string; status: string; summary?: string }[];
+  routeInfo?: { engine: string; declaredModel: string } | null;  // 实际引擎路由（engine_route/route_fallback）
 }
 
 export default memo(function ChatView({
@@ -137,6 +138,7 @@ export default memo(function ChatView({
   cloudModels, selectedModel, onSelectModel,
   accessMode, setAccessMode, thinkingLevel, setThinkingLevel,
   contextEstimate, showToast, activeTask, taskStartAt, streamingThink, subagents,
+  routeInfo,
 }: ChatViewProps) {
   const { t } = useTranslation();
   // WebKit (WKWebView) 下 compositionend 先于最终 keydown 派发，
@@ -618,6 +620,14 @@ export default memo(function ChatView({
           const label = live
             ? (elapsed >= 15000 ? `Deep diving… ${fmtDur(elapsed)}` : "Deep diving…")
             : segDur > 0 ? `已工作 ${fmtDur(segDur)}` : qText || "对话";
+          // 引擎徽标（09-06：429 降级静默换引擎，用户以为还在用本地模型）——
+          // 仅进行中且路由信息可用时显示；本地路径截尾段作短名
+          const badgeModel = routeInfo?.declaredModel
+            ? (routeInfo.declaredModel.includes("/") ? routeInfo.declaredModel.split("/").filter(Boolean).pop() : routeInfo.declaredModel)
+            : "";
+          const badge = live && routeInfo?.engine && badgeModel
+            ? `${routeInfo.engine === "云端" ? "☁" : "💻"} ${badgeModel.slice(0, 28)}`
+            : "";
           // ZCode 分区渲染：用户消息 → 思考活动行 → 计划 → 工具聚合行 → 回答正文
           const userMsgs = seg.msgs.filter((m) => m.role === "user");
           const asstMsgs = seg.msgs.filter((m) => m.role === "assistant");
@@ -647,7 +657,9 @@ export default memo(function ChatView({
           return (
             <div key={segKey} className={`chat-segment${collapsed ? " collapsed" : ""}${live ? " live-seg" : ""}`}>
               <button className="chat-segment-head" onClick={() => setCollapsedSegs(p => ({ ...p, [segKey]: !collapsed }))}>
-                <span className="chat-segment-label">{label}</span>
+                <span className="chat-segment-label">{label}{badge && (
+                  <span style={{ fontSize: 10, color: "var(--text-muted)", padding: "1px 6px", borderRadius: "var(--radius-sm)", background: "var(--bg-elevated)", marginLeft: 8, fontWeight: 400 }}>{badge}</span>
+                )}</span>
                 <span className="chat-segment-chevron">{collapsed ? <ChevronRight size={13} /> : <ChevronDown size={13} />}</span>
               </button>
               {userMsgs.map((m, i) => renderMsg(m, i))}
