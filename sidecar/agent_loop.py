@@ -3831,10 +3831,18 @@ async def _local_agent_loop_stream(messages: list, model: str, api_url: str, hea
     if last_user_text:
         _extract_learnings_heuristic(last_user_text, session_id)
     agent_tools = _get_agent_tools(agent_id, TOOLS)
-    active_tools = _filter_tools(last_user_text, agent_tools) if last_user_text else agent_tools
-    active_tools = _filter_tools_by_access(active_tools, access_mode)
-    if len(active_tools) > 8:
-        active_tools = _cap_tools(active_tools, 12)
+    # 09-06 13:47 事故：全部权限下"打开相册"被意图筛选+8/12 裁剪剥掉了
+    # run_cmd/control_launch——关键词猜不准意图（"打开"匹配不到控制类），
+    # 模型只能诚实回答"我没有命令工具"。全部权限+原生 tools 时不再筛选
+    # 裁剪（原生 schema 下 20+ 工具成本很低，判断力交还模型——与 Codex/
+    # ZCode 的薄调度同构）；legacy 围栏路径维持筛选+cap（提示词体积约束）。
+    if _normalize_access(access_mode) == "full" and _local_native_tools_ok():
+        active_tools = list(agent_tools)
+    else:
+        active_tools = _filter_tools(last_user_text, agent_tools) if last_user_text else agent_tools
+        active_tools = _filter_tools_by_access(active_tools, access_mode)
+        if len(active_tools) > 8:
+            active_tools = _cap_tools(active_tools, 12)
     active_tools = _ensure_market_tools(active_tools, last_user_text)
     tools_prompt = _build_local_tools_prompt(active_tools)
     # 4B-class models often have only ~8K ctx. If the system prompt + tool list

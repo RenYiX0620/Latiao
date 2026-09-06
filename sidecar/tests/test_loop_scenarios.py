@@ -511,6 +511,54 @@ async def test_v2_local_post_tool_thinking_off():
             "v2 工具后续轮必须关闭思考"
 
 
+def _tool_names(body: dict) -> set:
+    return {t.get("function", {}).get("name") for t in (body.get("tools") or [])}
+
+
+@pytest.mark.asyncio
+async def test_full_access_exposes_command_tools_v1():
+    """09-06 13:47 事故回归：全部权限下"打开相册"必须能看到命令执行工具
+    （此前意图筛选+cap 把 run_cmd/control_launch 剥掉，模型只能答"我没有
+    命令工具"）。"""
+    import agent_loop
+    with FakeEngine() as engine:
+        engine.push(engine.native_tool_response("list_dir", {"path": "."}))
+        engine.push(engine.text_response(NEUTRAL_TEXT))
+        agent_loop._LOCAL_NATIVE_TOOLS_OVERRIDE = True
+        try:
+            await _collect(_local_agent_loop_stream(
+                [{"role": "user", "content": "打开相册"}], "fake-model", engine.url, HEADERS,
+                session_id=f"t-fullacc-{time.time()}", access_mode="full",
+            ))
+        finally:
+            agent_loop._LOCAL_NATIVE_TOOLS_OVERRIDE = None
+        names = _tool_names(engine.requests[0])
+        assert len(names) >= 15, f"全部权限应暴露全量工具，实际 {len(names)} 个：{sorted(names)}"
+        assert names & {"run_cmd", "control_launch"}, \
+            f"命令执行工具必须在场：{sorted(names)}"
+
+
+@pytest.mark.asyncio
+async def test_full_access_exposes_command_tools_v2():
+    """v2 同款。"""
+    import agent_loop
+    from agent_loop_v2 import AgentLoop
+    with FakeEngine() as engine:
+        engine.push(engine.native_tool_response("list_dir", {"path": "."}))
+        engine.push(engine.text_response(NEUTRAL_TEXT))
+        agent_loop._LOCAL_NATIVE_TOOLS_OVERRIDE = True
+        try:
+            await _collect(AgentLoop(
+                "local", [{"role": "user", "content": "打开相册"}], "fake-model", engine.url,
+                HEADERS, session_id=f"v2-fullacc-{time.time()}", access_mode="full",
+            ).run())
+        finally:
+            agent_loop._LOCAL_NATIVE_TOOLS_OVERRIDE = None
+        names = _tool_names(engine.requests[0])
+        assert names & {"run_cmd", "control_launch"}, \
+            f"v2 全部权限命令工具必须在场：{sorted(names)}"
+
+
 @pytest.mark.asyncio
 async def test_local_native_tools_round_trip():
     """原生 tools 参数下发 → delta.tool_calls 执行 → assistant 携 tool_calls 回传。"""

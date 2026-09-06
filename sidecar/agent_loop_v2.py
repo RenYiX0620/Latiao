@@ -65,6 +65,7 @@ from agent_loop import (
     _parse_prompt_tool_calls,
     _parse_delta_line,
     _reply_lang_mismatch,
+    _normalize_access,
     _resolve_permission,
     _session_cancel_requested,
     _start_tool_confirmation,
@@ -212,11 +213,15 @@ class AgentLoop:
         _maybe_add_inline_file_note(self.current_msgs, self.last_user_text)
         self.lang = _detect_user_language(self.last_user_text)
         self.agent_tools = _get_agent_tools(agent_id, TOOLS)
-        active = (_filter_tools(self.last_user_text, self.agent_tools)
-                  if self.last_user_text else self.agent_tools)
-        active = _filter_tools_by_access(active, access_mode)
-        if len(active) > 8:
-            active = _cap_tools(active, 12)
+        # 09-06 13:47（与 v1 同口径）：全部权限+原生 tools 不筛选不裁剪
+        if _normalize_access(access_mode) == "full" and _local_native_tools_ok():
+            active = list(self.agent_tools)
+        else:
+            active = (_filter_tools(self.last_user_text, self.agent_tools)
+                      if self.last_user_text else self.agent_tools)
+            active = _filter_tools_by_access(active, access_mode)
+            if len(active) > 8:
+                active = _cap_tools(active, 12)
         from agent_loop import _ensure_market_tools
         active = _ensure_market_tools(active, self.last_user_text)
         self.active_tools = active
