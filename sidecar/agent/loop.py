@@ -1,12 +1,13 @@
-"""薄循环（对标 Codex turn.rs / dsh ReactLoopAgent）。
+"""薄循环（对标 Codex turn.rs / dsh ReactLoopAgent）——Scope 容器的第一个消费者。
 
 架构原则：
 - 模型驱动终止：step 循环"采样 → 工具执行 → 结果回填"，模型不再调用
   工具即结束。无 nudge 链、无停滞计数、无 200 字闸门。
 - 错误即结果：工具失败的结构化错误文本回填上下文，由模型自纠。
-- 弱模型辅助（gates，按引擎开关）：语言交付闸门 + 思考-only 终答提取，
-  仅本地引擎启用；云端前沿模型零干预。
-- steer：新消息入队，step 边界认领为同轮续跑输入（不再取消）。
+- 一切机制皆插件：本循环只消费 scope 的 waterfall（pre_step/request/
+  deliver）与工具目录；快车道/弱模型辅助/规划门/压缩全部是插件
+  （agent/plugins/builtin.py）。
+- steer：新消息入队，step 边界/交付后认领（不再取消）。
 - 门控：LATIAO_AGENT_LOOP_V3=1 启用；默认仍走 v1（Stage 4 切换删除）。
 """
 import asyncio
@@ -17,6 +18,7 @@ import logging
 
 import httpx
 
+from agent.core import Scope
 from agent.transport import (
     _is_local_llm_url,
     _local_llm_stream,
@@ -24,26 +26,19 @@ from agent.transport import (
 )
 from agent.parsing import (
     _parse_delta_line,
-    _parse_native_tool_calls,
     _parse_prompt_tool_calls,
-    _strip_native_tool_calls,
 )
 from agent.text_quality import (
     _GenerationLoopError,
-    _ThinkFenceFilter,
-    _deduplicate_response,
     _detect_text_loop,
-    _extract_think_body,
     _strip_repeat_tail,
     _strip_think_fences,
 )
 from agent.context import (
-    _extract_last_user_text,
-    _TASK_KW,
     _detect_user_language,
     _ensure_market_tools,
+    _extract_last_user_text,
     _filter_tools_by_access,
-    _get_localized_text,
     _is_light_query,
     _local_native_tools_ok,
     _maybe_add_inline_file_note,
@@ -51,15 +46,16 @@ from agent.context import (
     _normalize_access,
     _resolve_max_tokens,
     _sanitize_tool_messages,
+    _slim_history_for_local,
     _strip_transient_reminders,
 )
+from agent.gates import _build_local_tools_prompt
 from agent.context import _NATIVE_LEAN_PROMPT
-from agent.gates import (_build_local_tools_prompt, _final_answer_extraction,
-                         _reply_lang_mismatch)
+from agent.plugins.builtin import setup_all
 
 logger = logging.getLogger("latiao-sidecar")
 
-MAX_STEPS = 40          # 安全网（Stage 3 压缩落地后放宽）
+MAX_STEPS = 40          # 安全网（compaction 插件落地后放宽）
 STALL_FIRST = 90        # 首 token 前静默上限
 STALL_AFTER = 180       # 有输出后静默上限
 HEARTBEAT = 60          # 心跳节拍
@@ -86,15 +82,6 @@ def _clear_steer(session_id: str) -> None:
     _steer_inbox.pop(session_id, None)
 
 
-class _StepAbort(Exception):
-    """传输层语义异常：本轮失败且不可恢复（上层转错误事件）。"""
-
-
-def _err_text(result: str) -> str:
-    """工具失败 = 结果（Codex RespondToModel 语义）：原文回填，模型自纠。"""
-    return result
-
-
 class ThinAgentLoop:
     """单一 agent 循环：cloud/local 共用，差异只体现在请求组装与辅助层开关。"""
 
@@ -115,6 +102,11 @@ class ThinAgentLoop:
         self.steps = 0
         self.native_tools = False
         self.native_fallback_used = False
+        self._plan_injected = False
+        # Scope：工具目录 + waterfall 宿主；loop 自身作为服务供钩子读取
+        self.scope = Scope(name=f"agent:{session_id or uuid.uuid4().hex[:8]}")
+        self.scope.provide("loop", self)
+        setup_all(self.scope)
 
     # ── 工具集 ────────────────────────────────────────────
     def _active_tools(self) -> list:
@@ -125,24 +117,21 @@ class ThinAgentLoop:
             tools = _cap_tools(tools, 12)
         return _ensure_market_tools(tools, self.last_user_text)
 
-    def _all_tools(self) -> list:
-        from agent_loop import TOOLS
-        return _filter_tools_by_access(list(TOOLS), self.access_mode)
-
     def _engine_model(self) -> str:
         import local_llm
         return getattr(local_llm._engine, "current_model_id", "") or self.model
 
-    # ── 请求组装（request waterfall 的第一个内置钩子）────────
+    # ── 请求组装（request waterfall 之前的宿主编排）──────────
     def _build_request(self, engine_model: str) -> dict:
         light = self.is_local and _is_light_query(self.last_user_text, self.current_msgs)
         native_ok = self.is_local and _local_native_tools_ok() and not self.native_fallback_used
         tools = self._active_tools() if not light else []
         self.native_tools = bool(tools) and native_ok
 
+        msgs = _merge_system_messages(_sanitize_tool_messages(list(self.current_msgs)))
         body = {
             "model": engine_model,
-            "messages": _merge_system_messages(_sanitize_tool_messages(list(self.current_msgs))),
+            "messages": msgs,
             "stream": True,
             "temperature": 0.0,
             "max_tokens": _resolve_max_tokens(self.model),
@@ -150,19 +139,16 @@ class ThinAgentLoop:
         }
         if not self.is_local:
             body["tools"] = [dict(t) for t in tools]
-            body["messages"] = _sanitize_tool_messages(list(self.current_msgs))
             return body
 
-        # 本地：原生 tools + 精简纪律；闲聊快车道关思考；legacy 回退围栏提示词
+        # 本地：原生 tools + 精简纪律；legacy 回退围栏提示词；闲聊不加提示
         if self.native_tools:
             body["tools"] = [dict(t) for t in tools]
             sys_prompt = _NATIVE_LEAN_PROMPT
         else:
-            from agent.gates import _build_local_tools_prompt
             sys_prompt = _build_local_tools_prompt(tools)
         if light:
             sys_prompt = ""
-        msgs = _merge_system_messages(_sanitize_tool_messages(list(self.current_msgs)))
         if sys_prompt:
             if msgs and msgs[0].get("role") == "system":
                 msgs[0] = dict(msgs[0])
@@ -173,9 +159,9 @@ class ThinAgentLoop:
             msgs[0]["content"] += (
                 "\n\n📏 思考预算（长输入）：请先简短思考（≤300 字），然后立刻在正文"
                 "写出完整分析——关键数字和结论必须写进正文。")
-        body["messages"] = msgs
         body["frequency_penalty"] = 0.6
-        if light or self.steps > 1:
+        if self.steps > 1:
+            # 工具后续轮关思考（09-06 13:23：工具后开思考 97s 零交付）
             body["chat_template_kwargs"] = {"enable_thinking": False}
         return body
 
@@ -209,11 +195,10 @@ class ThinAgentLoop:
                     any_out = any_out or '"delta"' in line or '"reasoning"' in line
                 yield line
 
-    # ── 单 step：流式采样，返回 (正文, 思考, 原生工具调用) ────
-    async def _sample(self, client, body, state):
+    # ── 单 step：流式采样，返回 (全文, 正文, 思考, 原生工具调用) ─
+    async def _sample(self, client, body, reasoning_events: list):
         streamed, body_text, reasoning = "", "", ""
         native: dict[int, dict] = {}
-        fence = _ThinkFenceFilter()
         raw = 0
         deadline = time.monotonic() + 900
         async for line in self._stream(client, body):
@@ -247,12 +232,10 @@ class ThinAgentLoop:
                 streamed = _strip_repeat_tail(streamed)
                 raise _GenerationLoopError("输出复读循环，已截断")
             if think:
-                any_out = True
                 reasoning += think
                 streamed += think
-                state["events"].append({"reasoning": think, "ts": int(time.time() * 1000)})
+                reasoning_events.append({"reasoning": think, "ts": int(time.time() * 1000)})
             if content:
-                any_out = True
                 streamed += content
                 body_text += content
         return streamed, body_text, reasoning, native
@@ -261,6 +244,7 @@ class ThinAgentLoop:
     async def run(self):
         self.steps = 0
         async with httpx.AsyncClient(timeout=httpx.Timeout(120)) as client:
+            self._client = client
             while self.steps < MAX_STEPS:
                 self.steps += 1
                 yield {"event": "round_start", "iteration": self.steps}
@@ -269,15 +253,44 @@ class ThinAgentLoop:
                     yield {"content": "\n\n⏹️ 任务已停止。"}
                     return
                 if self.steps > 1:
-                    steered = _claim_steer(self.session_id)
-                    for m in steered:
+                    for m in _claim_steer(self.session_id):
                         self.current_msgs.append({"role": "user", "content": m})
                         yield {"event": "steer_applied", "content": m[:80]}
+
+                # pre_step waterfall：planning 门 / compaction（payload 携带预事件）
+                payload = {"pre_events": [], "reject": False}
+                payload = await self.scope.run_waterfall("pre_step", payload)
+                for evt in payload.get("pre_events", []):
+                    yield evt
+                if payload.get("reject"):
+                    yield {"content": "\n\n⏹️ 计划已被拒绝，任务未执行。你可以调整要求后重新发起。"}
+                    return
+
+                # 规划等待：插件标记 plan_wait → 循环执行 yield+await（生成器语义）
+                plan_wait = payload.get("plan_wait")
+                if plan_wait and not self._plan_injected:
+                    from agent_loop import _wait_plan_confirmation
+                    approved, evts = await _wait_plan_confirmation(
+                        plan_wait["plan_id"], plan_wait["event_obj"])
+                    for evt in evts:
+                        yield evt
+                    if not approved:
+                        yield {"content": "\n\n⏹️ 计划已被拒绝，任务未执行。你可以调整要求后重新发起。"}
+                        return
+                    self.current_msgs.insert(0, {
+                        "role": "system",
+                        "content": "以下是已确认（用户批准）的执行计划，请严格按计划逐步执行（可调用工具）：\n"
+                                   + plan_wait["plan"]})
+                    self._plan_injected = True
+
                 engine_model = self._engine_model()
                 body = self._build_request(engine_model)
-                state = {"events": [], "raw_deltas": 0}
+                # request waterfall：fastpath（快车道）等插件改写请求
+                body = await self.scope.run_waterfall("request", body)
+                reasoning_events: list = []
                 try:
-                    streamed, body_text, reasoning, native = await self._sample(client, body, state)
+                    streamed, body_text, reasoning, native = await self._sample(
+                        client, body, reasoning_events)
                 except _GenerationLoopError as e:
                     yield {"content": f"\n\n⚠️ {e}"}
                     return
@@ -296,7 +309,7 @@ class ThinAgentLoop:
                         continue
                     yield {"content": f"\n\n⚠️ 模型服务返回错误 HTTP {status}，请稍后重试。"}
                     return
-                for evt in state["events"]:
+                for evt in reasoning_events:
                     yield evt
 
                 # 工具调用：原生优先，围栏兜底
@@ -313,9 +326,20 @@ class ThinAgentLoop:
                               if tc.get("function", {}).get("name") in tool_names]
 
                 if not tool_calls:
-                    async for evt in self._deliver(client, body_text or streamed,
-                                                   reasoning, streamed):
+                    # deliver waterfall：弱模型辅助（思考-only/语言闸门/空响应诊断）
+                    payload = {
+                        "text": body_text or streamed, "streamed": streamed,
+                        "client": client, "api_url": self.api_url,
+                        "headers": self.headers, "engine_model": engine_model,
+                        "current_msgs": self.current_msgs, "user_text": self.last_user_text,
+                        "user_lang": self.user_lang, "is_local": self.is_local,
+                        "events": [], "handled": False,
+                    }
+                    payload = await self.scope.run_waterfall("deliver", payload)
+                    for evt in payload.get("events", []):
                         yield evt
+                    if not payload.get("handled") and payload.get("text", "").strip():
+                        yield {"content": "\n\n" + _strip_think_fences(payload["text"].strip())}
                     # dsh 语义：交付后若 inbox 有排队输入 → 续开下一轮
                     pending = _claim_steer(self.session_id)
                     if pending:
@@ -324,8 +348,9 @@ class ThinAgentLoop:
                         continue
                     return
 
-                # 工具执行：错误即结果（_handle_tool_execution 已含确认/事件/溯源）
-                from agent_loop import _handle_tool_execution
+                # 工具执行：错误即结果（共享执行器含确认/事件/溯源）
+                from agent_loop import _confirm_bypassed, _handle_tool_execution, _start_tool_confirmation
+                from tool_executor import _resolve_permission
                 asst = {"role": "assistant", "content": clean_text or ""}
                 if self.native_tools:
                     asst["tool_calls"] = tool_calls
@@ -338,8 +363,6 @@ class ThinAgentLoop:
                         targs = json.loads(tc.get("function", {}).get("arguments", "{}") or "{}")
                     except Exception:
                         targs = {}
-                    from agent_loop import _confirm_bypassed, _start_tool_confirmation
-                    from tool_executor import _resolve_permission
                     pre = None
                     if _resolve_permission(tname, targs) == "confirm" \
                             and not _confirm_bypassed(tname, self.access_mode):
@@ -352,39 +375,3 @@ class ThinAgentLoop:
                         yield evt
 
             yield {"content": f"\n\n⚠️ 已达安全步数上限（{MAX_STEPS}）。请发送新消息继续。"}
-
-    # ── 交付（弱模型辅助挂载点）────────────────────────────
-    async def _deliver(self, client, body_text: str, reasoning: str, streamed: str):
-        text = (body_text or "").strip()
-        # 辅助 1：思考-only → 终答提取（27B 推理模型故障形态，仅本地）
-        if not text and streamed.strip() and self.is_local:
-            final = await _final_answer_extraction(
-                client, self.api_url, self.headers, self._engine_model(),
-                self.current_msgs, self.user_lang)
-            if len(final) >= 120:
-                yield {"content": "\n\n" + _strip_think_fences(final)}
-                return
-            yield {"content": "\n\n⚠️ 本地模型本轮只输出了思考过程。请回复「继续」重试，或换用其他模型。"}
-            return
-        if not text:
-            yield {"content": ("\n\n⚠️ 模型返回了空响应。可能原因：上下文超限被截断、"
-                               "模型不支持当前请求格式。建议换用更大的模型或重试。")}
-            return
-        # 辅助 2：语言交付闸门
-        if _reply_lang_mismatch(self.last_user_text, text) and self.is_local:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(60)) as c2:
-                translated = await _force_translate_quiet(
-                    c2, self.api_url, self.headers, self._engine_model(), text, self.user_lang)
-            if translated and translated != text:
-                yield {"content": "\n\n" + translated}
-                return
-        yield {"content": "\n\n" + _strip_think_fences(text)}
-
-
-async def _force_translate_quiet(client, api_url, headers, engine_model, text, lang):
-    """交付前翻译（本地引擎直发；失败返回原文）。"""
-    from agent.gates import _force_translate
-    try:
-        return await _force_translate(client, api_url, headers, engine_model, text, lang)
-    except Exception:
-        return text

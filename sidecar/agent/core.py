@@ -23,7 +23,8 @@ class Waterfall:
     """有序异步钩子链：钩子返回改写后的载荷；返回 None 表示不修改。
 
     语义对齐 dsh：agent/pre-step（改写消息或 reject）、agent/request
-    （改写模型/effort/max_tokens）、agent/turn-stopping（收尾钩子）。
+    （改写模型/effort/max_tokens）、deliver（交付前改写/接管输出——弱模型
+    辅助挂这里）、agent/turn-stopping（收尾钩子）。
     """
 
     def __init__(self, name: str):
@@ -59,7 +60,7 @@ class Waterfall:
         return [h[1] for h in self._hooks]
 
 
-WATERFALLS = ("pre_step", "request", "turn_stopping")
+WATERFALLS = ("pre_step", "request", "deliver", "turn_stopping")
 
 
 class Scope:
