@@ -479,10 +479,9 @@ def _dispatch_delegate(args: dict):
     前台模式也进注册表——活动栏实时可见步数/活动摘要，与后台一致。"""
     agent = args.get("agent", "code-reviewer")
     task = args.get("task", "")
+    from agent.subagent import _delegate_task_bg, _delegate_task_fg
     if args.get("background"):
-        from tool_executor import _delegate_task_bg
         return _delegate_task_bg(agent, task)
-    from tool_executor import _delegate_task_fg
     return _delegate_task_fg(agent, task)
 
 TOOL_DISPATCH["delegate_task"] = _dispatch_delegate

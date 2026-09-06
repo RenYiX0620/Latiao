@@ -87,7 +87,8 @@ class ThinAgentLoop:
 
     def __init__(self, messages: list, model: str, api_url: str, headers: dict,
                  session_id: str = "", access_mode: str = "confirm",
-                 thinking_level: str = "high", is_local: bool | None = None):
+                 thinking_level: str = "high", is_local: bool | None = None,
+                 tool_whitelist: set | None = None):
         self.session_id = session_id
         self.model = model
         self.api_url = api_url
@@ -104,6 +105,7 @@ class ThinAgentLoop:
         self.native_tools = False
         self.native_fallback_used = False
         self.parallel_disabled = False  # 空名后下一轮关并行（deepseek quirk 缓解）
+        self.tool_whitelist = tool_whitelist  # 子代理隔离：目录收窄 + 执行拒绝
         self._plan_injected = False
         # Scope：工具目录 + waterfall 宿主；loop 自身作为服务供钩子读取
         self.scope = Scope(name=f"agent:{session_id or uuid.uuid4().hex[:8]}")
@@ -122,7 +124,10 @@ class ThinAgentLoop:
         tools = _filter_tools_by_access(tools, self.access_mode)
         if len(tools) > 12:
             tools = _cap_tools(tools, 12)
-        return _ensure_market_tools(tools, self.last_user_text)
+        tools = _ensure_market_tools(tools, self.last_user_text)
+        if self.tool_whitelist is not None:
+            tools = [t for t in tools if t.get("function", {}).get("name") in self.tool_whitelist]
+        return tools
 
     def _engine_model(self) -> str:
         import local_llm
