@@ -89,8 +89,13 @@ class TestAccessDefaultsConfirm(unittest.TestCase):
     """权限默认档必须为 confirm（审计 P0-1：此前三处默认 full）。"""
 
     def test_loop_defaults_confirm(self):
-        from agent_loop import _agent_loop_stream, _local_agent_loop_stream, _handle_tool_execution
-        for fn in (_agent_loop_stream, _local_agent_loop_stream, _handle_tool_execution):
+        from agent_loop import _handle_tool_execution
+        from agent.loop import ThinAgentLoop
+        import inspect
+        self.assertEqual(
+            inspect.signature(ThinAgentLoop.__init__).parameters["access_mode"].default,
+            "confirm")
+        for fn in (_handle_tool_execution,):
             self.assertEqual(
                 inspect.signature(fn).parameters["access_mode"].default, "confirm",
                 fn.__name__)

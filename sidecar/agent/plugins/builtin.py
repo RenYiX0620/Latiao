@@ -109,6 +109,7 @@ def setup_planning(scope):
             return payload
         plan_id = f"plan_{uuid.uuid4()}"
         started = await _start_plan_confirmation(plan_id, plan)
+        payload["pre_events"].append({"event": "agent_plan", "content": plan})
         payload["pre_events"].append(started["event"])
         payload["plan_wait"] = {"plan_id": plan_id,
                                 "event_obj": started["event_obj"], "plan": plan}

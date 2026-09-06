@@ -87,14 +87,15 @@ class ThinAgentLoop:
 
     def __init__(self, messages: list, model: str, api_url: str, headers: dict,
                  session_id: str = "", access_mode: str = "confirm",
-                 thinking_level: str = "high"):
+                 thinking_level: str = "high", is_local: bool | None = None):
         self.session_id = session_id
         self.model = model
         self.api_url = api_url
         self.headers = headers
         self.access_mode = _normalize_access(access_mode)
         self.thinking_level = thinking_level
-        self.is_local = _is_local_llm_url(api_url)
+        # is_local 由路由层显式传入（v1 同口径）；未传时按 URL 推导兜底
+        self.is_local = _is_local_llm_url(api_url) if is_local is None else bool(is_local)
         self.current_msgs: list = _strip_transient_reminders([dict(m) for m in messages])
         self.last_user_text = _extract_last_user_text(self.current_msgs)
         _maybe_add_inline_file_note(self.current_msgs, self.last_user_text)
@@ -102,11 +103,17 @@ class ThinAgentLoop:
         self.steps = 0
         self.native_tools = False
         self.native_fallback_used = False
+        self.parallel_disabled = False  # 空名后下一轮关并行（deepseek quirk 缓解）
         self._plan_injected = False
         # Scope：工具目录 + waterfall 宿主；loop 自身作为服务供钩子读取
         self.scope = Scope(name=f"agent:{session_id or uuid.uuid4().hex[:8]}")
         self.scope.provide("loop", self)
         setup_all(self.scope)
+        try:
+            from memory import _extract_learnings_heuristic
+            _extract_learnings_heuristic(self.last_user_text, self.session_id)
+        except Exception:
+            logger.debug("learnings heuristic skipped", exc_info=True)
 
     # ── 工具集 ────────────────────────────────────────────
     def _active_tools(self) -> list:
@@ -139,6 +146,8 @@ class ThinAgentLoop:
         }
         if not self.is_local:
             body["tools"] = [dict(t) for t in tools]
+            if self.parallel_disabled:
+                body["parallel_tool_calls"] = False
             return body
 
         # 本地：原生 tools + 精简纪律；legacy 回退围栏提示词；闲聊不加提示
@@ -163,6 +172,8 @@ class ThinAgentLoop:
         if self.steps > 1:
             # 工具后续轮关思考（09-06 13:23：工具后开思考 97s 零交付）
             body["chat_template_kwargs"] = {"enable_thinking": False}
+        if self.parallel_disabled:
+            body["parallel_tool_calls"] = False
         return body
 
     # ── 流读取（本地走传输封装，云端直连；停滞/心跳共用）──────
@@ -314,16 +325,21 @@ class ThinAgentLoop:
 
                 # 工具调用：原生优先，围栏兜底
                 tool_calls = []
+                clean_text = streamed
                 if native:
-                    tcs = [native[i] for i in sorted(native)]
-                    if any(tc.get("function", {}).get("name") for tc in tcs):
-                        tool_calls = tcs
-                clean_text, fence_calls = _parse_prompt_tool_calls(streamed)
-                if not tool_calls and fence_calls:
-                    tool_calls = fence_calls
+                    # 原生 delta（含空名——执行器按参数恢复，09-21 deepseek quirk）
+                    tool_calls = [native[i] for i in sorted(native.keys())]
+                if not tool_calls:
+                    clean_text, fence_calls = _parse_prompt_tool_calls(streamed)
+                    if fence_calls:
+                        tool_calls = fence_calls
+                    else:
+                        clean_text = streamed
                 tool_names = {t.get("function", {}).get("name") for t in self._active_tools()}
+                # 空名调用必须放行到执行器（恢复/守卫都在那边）；只滤"有名但不在册"
                 tool_calls = [tc for tc in tool_calls
-                              if tc.get("function", {}).get("name") in tool_names]
+                              if (not tc.get("function", {}).get("name"))
+                              or tc.get("function", {}).get("name") in tool_names]
 
                 if not tool_calls:
                     # deliver waterfall：弱模型辅助（思考-only/语言闸门/空响应诊断）
@@ -351,6 +367,8 @@ class ThinAgentLoop:
                 # 工具执行：错误即结果（共享执行器含确认/事件/溯源）
                 from agent_loop import _confirm_bypassed, _handle_tool_execution, _start_tool_confirmation
                 from tool_executor import _resolve_permission
+                if any(not (tc.get("function") or {}).get("name") for tc in tool_calls):
+                    self.parallel_disabled = True
                 asst = {"role": "assistant", "content": clean_text or ""}
                 if self.native_tools:
                     asst["tool_calls"] = tool_calls

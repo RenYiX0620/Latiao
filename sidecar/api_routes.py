@@ -33,7 +33,6 @@ from agent_loop import (
     PROGRESS_FILE,
     TOOL_PERMISSIONS,
     TOOLS,
-    _agent_loop_stream,
     _build_chat_messages,
     _build_local_tools_prompt,
     _cap_tools,
@@ -43,7 +42,6 @@ from agent_loop import (
     _get_agent_tools,
     _last_cloud_config,
     _load_custom_agents,
-    _local_agent_loop_stream,
     _local_llm_serialized,
     _local_llm_stream,
     _parse_native_tool_calls,
@@ -249,34 +247,13 @@ async def chat_completion(request: Request):
             _thinking_level = body.get("thinking_level", "high")
 
             async def _run_agent(_protocol, _api_url, _headers, _is_local, _model):
-                if os.environ.get("LATIAO_AGENT_LOOP_V3", "") == "1":
-                    # 薄循环（Stage 2）：cloud/local 单循环，模型驱动终止
-                    from agent.loop import ThinAgentLoop
-                    async for event in ThinAgentLoop(
-                        messages, _model, _api_url, _headers, session_id,
-                        _access_mode, _thinking_level,
-                    ).run():
-                        yield event
-                    return
-                if os.environ.get("LATIAO_AGENT_LOOP_V2", "") == "1":
-                    from agent_loop_v2 import AgentLoop
-                    engine_kind = "local" if _is_local else "cloud"
-                    async for event in AgentLoop(
-                        engine_kind, messages, _model, _api_url, _headers, session_id,
-                        agent_id, _reflection_mode, _access_mode, _thinking_level,
-                    ).run():
-                        yield event
-                    return
-                if _is_local:
-                    # 本地模型：用 prompt-based tool calling（不依赖 OpenAI function calling API）
-                    async for event in _local_agent_loop_stream(messages, _model, _api_url, _headers, session_id, agent_id, _reflection_mode, _access_mode, _thinking_level):
-                        yield event
-                else:
-                    # 云端模型：原生 OpenAI function calling
-                    # 此前漏传 thinking_level → 恒用默认 high，
-                    # UI 的 off/max 档对云端完全无效（审计 B6）
-                    async for event in _agent_loop_stream(messages, _model, _api_url, _headers, session_id, agent_id, _reflection_mode, _access_mode, _thinking_level):
-                        yield event
+                # 薄循环（唯一循环）：cloud/local 共用，模型驱动终止，机制皆插件
+                from agent.loop import ThinAgentLoop
+                async for event in ThinAgentLoop(
+                    messages, _model, _api_url, _headers, session_id,
+                    _access_mode, _thinking_level, is_local=_is_local,
+                ).run():
+                    yield event
 
             async def agent_loop_wrapper():
                 _fb_used = False  # 429 降级只允许一次，防循环

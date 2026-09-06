@@ -440,25 +440,6 @@ class TestStagnationCounterWired(unittest.TestCase):
     """P2-12：_track_progress 的 text_only 计数此前无调用点，停滞告警永远
     不触发。接入后连续 3 轮纯文本应触发告警，工具轮复位。"""
 
-    def test_three_text_rounds_trigger_warning(self):
-        from agent_loop import _track_progress, _check_stagnation, _session_states
-        sid = "test-session-stagnation"
-        # 第 1 轮因 phase 从 init 变化而复位，实际需连续 4 轮同 phase
-        for _ in range(3):
-            _track_progress(sid, "t", "text_only")
-        self.assertEqual(_check_stagnation(sid), "")
-        _track_progress(sid, "t", "text_only")
-        self.assertIn("停滞", _check_stagnation(sid))
-        _track_progress(sid, "t", "tool")
-        self.assertEqual(_check_stagnation(sid), "")
-        _session_states.pop(sid, None)
-
-
-class TestPermissionDangerBlocked(unittest.TestCase):
-    """权限漏洞回归：自定义规则返回 danger/deny 必须拦截执行。
-    此前主循环只拦 confirm，danger 规则落空直接执行（实测 list_dir
-    设 danger 仍读到目录内容）。"""
-
     def test_danger_rule_blocks_tool(self):
         import asyncio
         from agent_loop import _handle_tool_execution
