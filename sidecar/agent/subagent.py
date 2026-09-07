@@ -11,8 +11,47 @@ import json
 import logging
 import time as _time
 import uuid
+from contextvars import ContextVar
 
 logger = logging.getLogger("latiao-sidecar")
+
+# 发起委派的父会话 id（ThinAgentLoop.run() 入口设置；后台任务创建时随
+# contextvars 快照带入，使后台子代理完成后能把结果通知回父会话）
+_CURRENT_PARENT_SESSION: ContextVar[str] = ContextVar("subagent_parent_session", default="")
+
+# 后台子代理完成结果待注入队列（parent_session -> [通知]）：
+# 父循环运行中 → queue_steer 即时认领；父空闲 → 下次该会话循环启动时注入。
+# 通知被任一路径消费后标记 delivered，两路不重复。
+_PENDING_BG_RESULTS: dict[str, list[dict]] = {}
+
+
+def push_bg_result(parent_session: str, agent_type: str, task: str, result: str) -> None:
+    """后台子代理完成：结果进待注入队列，父会话下次循环启动时注入上下文。
+
+    （对齐 DSH subagent-settled / Codex subagent_notification 的语义：
+    后台结果必须让父模型看见。v1 用确定性的"下次启动注入"，不做运行中
+    steer——steer 依赖父循环恰好还在跑且能认领，链路脆（09-07 09:2x 实测
+    丢失）。注入点：ThinAgentLoop.run() 开头的 claim_bg_results。"""
+    if not parent_session:
+        logger.warning("bg result 无父会话 id（contextvar 缺失），通知丢弃: %s", task[:60])
+        return
+    note = {
+        "id": f"bg_{uuid.uuid4().hex[:8]}", "agent": agent_type,
+        "task": task[:120], "result": result[:4000], "delivered": False,
+        "ts": _time.time(),
+    }
+    _PENDING_BG_RESULTS.setdefault(parent_session, []).append(note)
+    logger.info("bg result 已入待注入队列: parent=%s agent=%s notes=%d",
+                parent_session, agent_type, len(_PENDING_BG_RESULTS[parent_session]))
+
+
+def claim_bg_results(parent_session: str) -> list[dict]:
+    """父循环启动时取走未投递的后台结果通知（一次性）。"""
+    pending = _PENDING_BG_RESULTS.get(parent_session) or []
+    fresh = [n for n in pending if not n["delivered"]]
+    for n in fresh:
+        n["delivered"] = True
+    return fresh
 
 # ── 子任务注册表（前端活动栏/结果面板的数据源，契约不变）────────────
 _SUBTASKS: dict[str, dict] = {}
@@ -183,8 +222,12 @@ def _subtask_snapshot() -> list[dict]:
 
 
 
-async def _delegate_task_bg(agent_type: str, task: str) -> str:
-    """后台模式：立即返回任务 ID，子代理异步执行，进度/结果走注册表。"""
+async def _delegate_task_bg(agent_type: str, task: str, parent_session: str = "") -> str:
+    """后台模式：立即返回任务 ID，子代理异步执行，进度/结果走注册表。
+
+    parent_session 必须在派发时（父上下文内）捕获传入——不能在完成时读
+    contextvar：子代理自己的 run() 会把它覆盖成子会话 id（09-07 09:40
+    事故：通知投给了子会话，父模型永远看不到结果）。"""
     global _SUBTASK_SEQ
     _SUBTASK_SEQ += 1
     task_id = f"sub_{_time.strftime('%H%M%S')}_{_SUBTASK_SEQ}"
@@ -196,10 +239,10 @@ async def _delegate_task_bg(agent_type: str, task: str) -> str:
     _SUBTASK_EVENTS.append({"id": task_id, "status": "started", "summary": task[:80]})
     try:
         from agent_loop import _spawn
-        _spawn(_run_subtask_bg(task_id, agent_type, task))
+        _spawn(_run_subtask_bg(task_id, agent_type, task, parent_session))
     except ImportError:
         import asyncio as _asyncio
-        t = _asyncio.get_running_loop().create_task(_run_subtask_bg(task_id, agent_type, task))
+        t = _asyncio.get_running_loop().create_task(_run_subtask_bg(task_id, agent_type, task, parent_session))
         _SUBTASK_TASKS.add(t)
         t.add_done_callback(_SUBTASK_TASKS.discard)
     return (f"[Sub-agent {agent_type} 后台任务已启动] task_id={task_id}\n"
@@ -226,7 +269,7 @@ async def _delegate_task_fg(agent_type: str, task: str) -> str:
     return result
 
 
-async def _run_subtask_bg(task_id: str, agent_type: str, task: str):
+async def _run_subtask_bg(task_id: str, agent_type: str, task: str, parent_session: str = ""):
     """后台跑子 agent（非阻塞主对话），事件实时进注册表。"""
     s = _SUBTASKS[task_id]
     try:
@@ -238,6 +281,10 @@ async def _run_subtask_bg(task_id: str, agent_type: str, task: str):
         s["status"] = "error" if failed else "done"
         s["updated_at"] = _time.time()
         _SUBTASK_EVENTS.append({"id": task_id, "status": s["status"], "summary": result[:120]})
+        # 结果回流父会话（派发时捕获的 parent_session——不能用 contextvar，
+        # 子代理 run() 会把它覆盖成子会话 id）
+        if not failed:
+            push_bg_result(parent_session, agent_type, task, result)
     except Exception as e:
         s["result"] = f"[Sub-agent: {agent_type}] 错误: {e}"
         s["status"] = "error"

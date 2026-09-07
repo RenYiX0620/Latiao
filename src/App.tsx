@@ -702,7 +702,10 @@ const [timeFilter, setTimeFilter] = useState("all");
   const [appVersion, setAppVersion] = useState("…");
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const runUpdateCheck = useCallback(async (silent: boolean) => {
-    if (checkingUpdate) return;
+    if (checkingUpdate) {
+      if (!silent) showToast("更新检查已在进行中，请稍候（大版本下载可能持续数分钟）", "info");
+      return;
+    }
     setCheckingUpdate(true);
     const { checkForUpdates } = await import("./utils/updater");
     const res = await checkForUpdates((msg) => showToast(msg), !silent);

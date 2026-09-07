@@ -464,7 +464,7 @@ _delegate_tool_def = {
             "properties": {
                 "agent": {"type": "string", "enum": ["explore", "code-reviewer", "doc-generator", "debugger", "translator"], "description": "The specialist agent type."},
                 "task": {"type": "string", "description": "The specific task for the sub-agent. Be clear and concise."},
-                "background": {"type": "boolean", "description": "Run in background without blocking the main conversation. Progress appears in the sub-agent panel. Default false."},
+                "background": {"type": "boolean", "description": "Run in background without blocking the main conversation. Progress appears in the sub-agent panel. Use background=true for long-running work (research, multi-directory scans, >1min) — the result will be automatically delivered back to you when done. Default false."},
             },
             "required": ["agent", "task"],
         },
@@ -476,12 +476,15 @@ if not any(t.get("function", {}).get("name") == "delegate_task" for t in TOOLS):
     TOOLS.append(_delegate_tool_def)
 def _dispatch_delegate(args: dict):
     """delegate_task 分发：background=true 时以后台子任务运行（不阻塞主对话）。
-    前台模式也进注册表——活动栏实时可见步数/活动摘要，与后台一致。"""
+    前台模式也进注册表——活动栏实时可见步数/活动摘要，与后台一致。
+    parent_session 在派发时从 contextvar 捕获（此处运行在父会话上下文内，
+    子代理 run() 不会覆盖它——后台完成通知靠它回寻父会话）。"""
     agent = args.get("agent", "code-reviewer")
     task = args.get("task", "")
-    from agent.subagent import _delegate_task_bg, _delegate_task_fg
+    from agent.subagent import _CURRENT_PARENT_SESSION, _delegate_task_bg, _delegate_task_fg
+    parent_session = _CURRENT_PARENT_SESSION.get()
     if args.get("background"):
-        return _delegate_task_bg(agent, task)
+        return _delegate_task_bg(agent, task, parent_session=parent_session)
     return _delegate_task_fg(agent, task)
 
 TOOL_DISPATCH["delegate_task"] = _dispatch_delegate

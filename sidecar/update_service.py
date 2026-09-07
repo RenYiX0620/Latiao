@@ -27,12 +27,22 @@ UPDATE_DIR = Path.home() / ".local-ai-os" / "update"
 STATE_FILE = UPDATE_DIR / "state.json"
 GITHUB_LATEST = "https://github.com/RenYiX0620/Latiao/releases/latest/download/latest.json"
 
+# GitHub 直连在国内常 <50KB/s（09-07 事故：214MB 要 95 分钟）。镜像加速：
+# 每个下载/清单请求按 [_直接, 镜像1, 镜像2] 轮换，重试时自动切换。
+_GH_MIRRORS = ["", "https://gh-proxy.com/", "https://ghfast.top/"]
+
+
+def _mirror_urls(url: str) -> list:
+    """直连优先 + 镜像轮换的候选 URL 列表。"""
+    return [m + url for m in _GH_MIRRORS]
+
 
 def current_app_version() -> str:
     """当前 App 版本（Rust spawn sidecar 时经 LATIAO_APP_VERSION 注入）。"""
     return os.environ.get("LATIAO_APP_VERSION", "")
 
 _state_lock = threading.RLock()  # 可重入：worker 持锁时会嵌套调 _save_state，
+_download_thread: threading.Thread | None = None  # 当前下载线程（跨重启存活检测）
                                  # 普通 Lock 会自死锁（真实事故：事件循环整体卡死）
 _state: dict = {}
 
@@ -137,13 +147,14 @@ def _ssl_context() -> "ssl.SSLContext":
 
 def fetch_remote_manifest() -> dict | None:
     """拉 GitHub 最新清单（原样）。失败返回 None。"""
-    try:
-        req = urllib.request.Request(GITHUB_LATEST, headers={"User-Agent": "Latiao/1.0"})
-        with urllib.request.urlopen(req, timeout=20, context=_ssl_context()) as resp:
-            return json.loads(resp.read().decode("utf-8", "ignore"))
-    except Exception:
-        logger.warning("update manifest fetch failed", exc_info=True)
-        return None
+    for u in _mirror_urls(GITHUB_LATEST):
+        try:
+            req = urllib.request.Request(u, headers={"User-Agent": "Latiao/1.0"})
+            with urllib.request.urlopen(req, timeout=12, context=_ssl_context()) as resp:
+                return json.loads(resp.read().decode("utf-8", "ignore"))
+        except Exception:
+            logger.warning("update manifest fetch failed: %s", u[:80], exc_info=True)
+    return None
 
 
 def _download_worker(url: str, dest: Path, version: str) -> None:
@@ -153,7 +164,8 @@ def _download_worker(url: str, dest: Path, version: str) -> None:
     for attempt in range(max_retries):
         try:
             offset = part.stat().st_size if part.exists() else 0
-            req = urllib.request.Request(url, headers={"User-Agent": "Latiao/1.0"})
+            _u = _mirror_urls(url)[attempt % len(_GH_MIRRORS)]
+            req = urllib.request.Request(_u, headers={"User-Agent": "Latiao/1.0"})
             if offset > 0:
                 req.add_header("Range", f"bytes={offset}-")
             with _state_lock:
@@ -200,7 +212,22 @@ def start_prepare(current_version: str) -> dict:
     platform = _current_platform()
     st = _load_state()
     if st.get("status") == "downloading":
-        return get_progress()  # 已在跑
+        # 进程重启后状态残留但 worker 线程已死 → 重启 worker（.part Range 续传）
+        global _download_thread
+        if _download_thread is not None and _download_thread.is_alive():
+            return get_progress()  # 已在跑
+        url = st.get("url", "")
+        if url:
+            logger.warning("检测到下载状态残留但 worker 已死，续传重启: %s", url.split("/")[-1])
+            _ver = st.get("version", "")
+            _dest = UPDATE_DIR / url.split("/")[-1]
+
+            def _resume_worker():
+                _download_worker(url, _dest, _ver)
+
+            _download_thread = threading.Thread(target=_resume_worker, daemon=True)
+            _download_thread.start()
+        return get_progress()
 
     if st.get("status") == "done":
         # 复用已预下载的包仅当它就是 GitHub 当前最新版；否则重新下载
@@ -257,7 +284,8 @@ def start_prepare(current_version: str) -> dict:
                 _state.update({"status": "failed", "error": str(e)[:200]})
                 _save_state()
 
-    threading.Thread(target=worker, daemon=True).start()
+    _download_thread = threading.Thread(target=worker, daemon=True)
+    _download_thread.start()
     return get_progress()
 
 

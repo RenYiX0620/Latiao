@@ -276,10 +276,21 @@ class ThinAgentLoop:
         self.steps = 0
         mode = "native" if (self.is_local and _local_native_tools_ok()) else (
             "legacy-fence" if self.is_local else "cloud-native")
+        # 本会话 id 供子代理后台完成通知回寻父会话（contextvars 随任务派生带入）
+        from agent.subagent import _CURRENT_PARENT_SESSION, claim_bg_results
+        _CURRENT_PARENT_SESSION.set(self.session_id)
         self._step_log("任务开始",
                        f"model={self.model} endpoint={self.api_url} "
                        f"is_local={self.is_local} access={self.access_mode} "
                        f"mode={mode} 消息={len(self.current_msgs)}")
+        # 空闲期完成的后台子代理：结果通知在本轮启动时注入上下文（一次性）
+        _bg_notes = claim_bg_results(self.session_id)
+        if _bg_notes:
+            _note_text = "\n\n".join(
+                f"【后台子代理通知】{n['agent']} 已完成任务「{n['task']}」，结果：\n{n['result']}"
+                for n in _bg_notes)
+            self.current_msgs.append({"role": "system", "content": _note_text})
+            self._step_log("后台通知注入", f"{len(_bg_notes)} 条")
         async with httpx.AsyncClient(timeout=httpx.Timeout(120)) as client:
             self._client = client
             while self.steps < MAX_STEPS:
@@ -434,6 +445,44 @@ class ThinAgentLoop:
                 if self.native_tools:
                     asst["tool_calls"] = tool_calls
                 self.current_msgs.append(asst)
+
+                # ── 并行委派（对齐 DSH 并行池 / Codex max_threads）──────────
+                # 同一轮全部是 delegate_task 且 ≥2 个 → 并发执行：每个委派是
+                # 独立 ThinAgentLoop（本地引擎串行排队、云端真并行），结果按
+                # 调用顺序回灌。混有其他工具时维持串行（保守）。
+                _all_delegate = bool(tool_calls) and all(
+                    (tc.get("function") or {}).get("name") == "delegate_task"
+                    for tc in tool_calls)
+                if _all_delegate and len(tool_calls) >= 2:
+                    import asyncio as _aio
+                    import uuid as _uuid
+                    from agent.subagent import _CURRENT_PARENT_SESSION as _cps
+                    _cps.set(self.session_id)
+                    for tc in tool_calls:
+                        if not tc.get("id"):
+                            tc["id"] = str(_uuid.uuid4())
+
+                    async def _run_delegate(tc):
+                        targs = json.loads(tc.get("function", {}).get("arguments", "{}") or "{}")
+                        from agent.subagent import _delegate_task_fg, _delegate_task_bg
+                        if targs.get("background"):
+                            return await _delegate_task_bg(
+                                targs.get("agent", "code-reviewer"), targs.get("task", ""))
+                        return await _delegate_task_fg(
+                            targs.get("agent", "code-reviewer"), targs.get("task", ""))
+
+                    self._step_log("并行委派", f"{len(tool_calls)} 个子代理并发启动")
+                    _outs = await _aio.gather(*[_run_delegate(tc) for tc in tool_calls])
+                    for tc, out in zip(tool_calls, _outs):
+                        self.current_msgs.append({"role": "tool",
+                                                  "tool_call_id": tc.get("id"),
+                                                  "content": out})
+                    yield {"content": "\n\n".join(
+                        f"🧩 子代理 {i+1}/{len(_outs)}：{(out or '').strip()[:400]}"
+                        for i, out in enumerate(_outs))}
+                    self._step_log("并行委派完成", f"{len(_outs)} 个结果已回灌")
+                    continue
+
                 for tc in tool_calls:
                     if not tc.get("id"):
                         tc["id"] = str(uuid.uuid4())
