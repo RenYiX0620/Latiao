@@ -255,8 +255,15 @@ def search_files(directory: str, pattern: str) -> str:
         return "⛔ Blocked: path traversal not allowed"
     import glob as glob_mod
     try:
-        search_path = os.path.join(os.path.expanduser(directory), pattern)
-        matches = glob_mod.glob(search_path, recursive=True)
+        base = os.path.expanduser(directory)
+        matches = glob_mod.glob(os.path.join(base, pattern), recursive=True)
+        if not pattern.startswith("."):
+            # Python glob 的 * 不匹配点开头的隐藏文件/目录（.zcode、.ssh…）——
+            # 09-06 14:34 事故：search_files "~/*zcode*" 找不到 ~/.zcode，
+            # 模型误判"本地没装 zcode"，转去网上搜回垃圾结果。始终合并隐藏变体。
+            hidden = glob_mod.glob(
+                os.path.join(base, ".*" + pattern.lstrip("*")), recursive=True)
+            matches = list(dict.fromkeys(matches + hidden))
         if not matches:
             return f"No files matching '{pattern}' found in {directory}"
         lines = []
@@ -368,14 +375,6 @@ async def tavily_search(args: dict) -> str:
 #  Sub-Agent System: delegate_task spawns specialist sub-agents
 # ═══════════════════════════════════════════════════════
 
-_SUBAGENT_TOOLS: dict[str, list[str]] = {
-    "code-reviewer": ["read_file", "list_dir", "search_files"],
-    "doc-generator": ["read_file", "list_dir", "search_files", "write_file"],
-    "debugger": ["read_file", "list_dir", "search_files", "run_cmd"],
-    "translator": ["read_file", "list_dir", "search_files", "write_file"],
-    "explore": ["read_file", "list_dir", "search_files", "run_cmd", "tavily_search"],
-}
-
 # 子智能体可免确认执行的只读命令白名单（ZCode 式 Explore）。
 # 审计 P0：此前只校验首 token 且含 env——"env curl ..." 可执行任意命令、
 # "cat ~/.ssh/id_rsa" 可读私钥。现在校验完整 token 序列：命令名必须在
@@ -390,9 +389,22 @@ _READONLY_ARG_RE = re.compile(r"-{1,2}[A-Za-z0-9][A-Za-z0-9_-]*|[\w./@+~:-]+")
 
 
 def _is_readonly_cmd(cmd: str) -> bool:
-    """判断子智能体请求的命令是否命中只读白名单（仅限单条简单命令）。"""
+    """判断子智能体请求的命令是否命中只读白名单（仅限单条简单命令）。
+
+    阶段 3 优先走语义层（safety.rules.readonly_safe）：AST 展开嵌套/前缀，
+    `env cat`、`bash -c 'cat x'`、$() 全部现形；语义层不可用时回退本函数
+    原有的 token 形态校验（升级不改变旧环境行为）。
+    """
     cmd = (cmd or "").strip()
-    if not cmd or re.search(r"[;&|><`$]", cmd):
+    if not cmd:
+        return False
+    try:
+        from safety.rules import analyze, readonly_safe
+        if analyze(cmd).ts_available:
+            return readonly_safe(cmd)
+    except Exception:
+        pass  # 语义层异常 → 回退旧路径
+    if re.search(r"[;&|><`$]", cmd):
         return False
     if re.match(r"git\s+(log|status|diff|show|branch|remote|tag|blame)\b", cmd):
         return True
@@ -415,279 +427,13 @@ def _is_readonly_cmd(cmd: str) -> bool:
 # ── 后台子任务注册表（ZCode 式：fire-and-forget + 进度事件 + 结果查询） ──
 import time as _time
 
-_SUBTASKS: dict[str, dict] = {}   # task_id -> {agent, task, status, events, result, ...}
-_SUBTASK_EVENTS: list[dict] = []  # 事件流（前端心跳拉取）
-_SUBTASK_TASKS: set = set()       # 后台任务强引用（防 GC 回收）
-_SUBTASK_SEQ = 0
-
-
-def _prune_subtasks(max_keep: int = 50, max_age_sec: float = 3600.0):
-    """清理注册表：已完成/失败的条目超过 1 小时或总量超限时淘汰，防无界增长。"""
-    now = _time.time()
-    for tid in [t for t, s in _SUBTASKS.items()
-                if s.get("status") in ("done", "error")
-                and now - s.get("updated_at", 0) > max_age_sec]:
-        _SUBTASKS.pop(tid, None)
-    if len(_SUBTASKS) > max_keep * 2:
-        done_ids = [t for t, s in _SUBTASKS.items() if s.get("status") in ("done", "error")]
-        done_ids.sort(key=lambda t: _SUBTASKS[t].get("updated_at", 0))
-        for tid in done_ids[:max(len(done_ids) - max_keep, 0)]:
-            _SUBTASKS.pop(tid, None)
-    if len(_SUBTASK_EVENTS) > 200:
-        del _SUBTASK_EVENTS[:-100]
-
-
-def _subtask_snapshot() -> list[dict]:
-    """后台子任务列表快照（heartbeat 附带，前端活动栏渲染）。"""
-    out = []
-    for tid, s in _SUBTASKS.items():
-        out.append({
-            "id": tid, "agent": s["agent"], "task": s["task"][:60],
-            "status": s["status"], "steps": s["steps"],
-            "activity": dict(s.get("activity") or {}),
-            "last_activity": s.get("last_activity", ""),
-            "started_at": s["started_at"], "updated_at": s["updated_at"],
-            "summary": (s["result"] or "")[:160],
-        })
-    return out
-
-
-async def _run_subtask_bg(task_id: str, agent_type: str, task: str):
-    """后台跑子 agent（非阻塞主对话），事件实时进注册表。"""
-    s = _SUBTASKS[task_id]
-    try:
-        # 复用前台逻辑但拦截进度：为简洁直接跑完整 _delegate_task
-        s["status"] = "running"
-        s["updated_at"] = _time.time()
-        result = await _delegate_task(agent_type, task, task_id=task_id)
-        s["result"] = result
-        failed = "[Sub-agent" in result and ("错误" in result or "HTTP" in result.split("\n")[0])
-        s["status"] = "error" if failed else "done"
-        s["updated_at"] = _time.time()
-        _SUBTASK_EVENTS.append({"id": task_id, "status": s["status"], "summary": result[:120]})
-    except Exception as e:
-        s["result"] = f"[Sub-agent: {agent_type}] 错误: {e}"
-        s["status"] = "error"
-        s["updated_at"] = _time.time()
-
-
-async def _delegate_task_bg(agent_type: str, task: str) -> str:
-    """后台模式：立即返回任务 ID，子 agent 异步执行，进度/结果走 heartbeat。"""
-    global _SUBTASK_SEQ
-    _SUBTASK_SEQ += 1
-    task_id = f"sub_{_time.strftime('%H%M%S')}_{_SUBTASK_SEQ}"
-    # 淘汰已完成超过 1 小时的旧任务 + 事件流截断（长期运行防无界增长）
-    _prune_subtasks()
-    _SUBTASKS[task_id] = {
-        "agent": agent_type, "task": task, "status": "running",
-        "steps": 0, "result": "", "started_at": _time.time(), "updated_at": _time.time(),
-    }
-    _SUBTASK_EVENTS.append({"id": task_id, "status": "started", "summary": task[:80]})
-    import asyncio as _asyncio
-    # 必须经 _spawn 保存强引用：asyncio 对 task 只持弱引用，裸 create_task
-    # 可能被 GC 中途回收——子任务消失、注册表永远卡在 running。
-    try:
-        from agent_loop import _spawn
-        _spawn(_run_subtask_bg(task_id, agent_type, task))
-    except ImportError:
-        t = _asyncio.get_running_loop().create_task(_run_subtask_bg(task_id, agent_type, task))
-        _SUBTASK_TASKS.add(t)
-        t.add_done_callback(_SUBTASK_TASKS.discard)
-    return f"[Sub-agent {agent_type} 后台任务已启动] task_id={task_id}\n主对话可继续；结果将自动出现在子智能体面板，也可用 task_id 查询。"
-
-
-async def _delegate_task_fg(agent_type: str, task: str) -> str:
-    """前台模式（阻塞等待结果），同样进注册表——活动栏实时展示步数/活动摘要。"""
-    global _SUBTASK_SEQ
-    _SUBTASK_SEQ += 1
-    task_id = f"sub_{_time.strftime('%H%M%S')}_{_SUBTASK_SEQ}"
-    _SUBTASKS[task_id] = {
-        "agent": agent_type, "task": task, "status": "running",
-        "steps": 0, "result": "", "started_at": _time.time(), "updated_at": _time.time(),
-    }
-    result = await _delegate_task(agent_type, task, task_id=task_id)
-    s = _SUBTASKS[task_id]
-    failed = "[Sub-agent" in result and ("错误" in result or "HTTP" in result.split("\n")[0])
-    s["result"] = result
-    s["status"] = "error" if failed else "done"
-    s["updated_at"] = _time.time()
-    _SUBTASK_EVENTS.append({"id": task_id, "status": s["status"], "summary": result[:120]})
-    return result
-
-
-async def _delegate_task(agent_type: str, task: str, task_id: str | None = None) -> str:
-    """Spawn a specialist sub-agent to handle a delegated task.
-    Uses async httpx to avoid blocking the main event loop.
-    task_id: 后台模式时传入注册表键，实时上报步数与活动摘要（前端活动栏展示）。"""
-    if not task.strip():
-        return "错误：任务描述不能为空"
-
-    # 依赖 agent_loop 的全局状态/LLM 辅助 → 函数内 lazy import 避免循环依赖
-    # SUBAGENT_MODEL 常量由 main.py 门面持有
-    from agent_loop import (
-        AGENT_PROFILES,
-        TOOL_PERMISSIONS,
-        TOOLS,
-        _build_local_tools_prompt,
-        _inject_thinking_disabled,
-        _last_cloud_config,
-        _local_llm_serialized,
-        _parse_prompt_tool_calls,
-        _resolve_api_target,
-        _sanitize_tool_messages,
-        execute_tool,
-    )
-    from main import SUBAGENT_MODEL
-    cfg = AGENT_PROFILES.get(agent_type, AGENT_PROFILES.get("code-reviewer", {}))
-    allowed = _SUBAGENT_TOOLS.get(agent_type, ["read_file", "list_dir", "search_files"])
-    sub_tools = [t for t in TOOLS if t.get("function", {}).get("name") in allowed]
-    # Sub-agents cannot use confirm-level tools (no user confirmation possible)
-    # 例外：explore/debugger 的 run_cmd 靠只读白名单（_is_readonly_cmd）在执行时
-    # 兜底放行——若在这里把 run_cmd 滤掉，模型永远看不到它，白名单形同虚设
-    sub_tools = [
-        t for t in sub_tools
-        if TOOL_PERMISSIONS.get(t.get("function", {}).get("name"), "safe") != "confirm"
-        or (t.get("function", {}).get("name") == "run_cmd"
-            and agent_type in ("explore", "debugger"))
-    ]
-    # A1 补全：子智能体同样尊重 Tools 页的禁用开关（主循环已在
-    # _get_agent_tools 过滤，此处子智能体白名单此前漏掉——禁用 run_cmd
-    # 后子智能体仍可调用）
-    try:
-        from capability_registry import list_capabilities
-        disabled = {c.get("name") for c in list_capabilities("tool") if not c.get("enabled")}
-        if disabled:
-            sub_tools = [t for t in sub_tools
-                         if t.get("function", {}).get("name") not in disabled]
-    except Exception:
-        pass
-
-    messages = [
-        {"role": "system", "content": (cfg.get("identity", "") + "\n你是一个子 Agent。独立完成任务后返回简洁结果。最多 3 步，不要问问题，直接执行。").strip()},
-        {"role": "user", "content": task},
-    ]
-    # 注意：单条 system。本地 llama-cpp 对多条 system 消息有静默空响应 bug
-    # （主循环 _build_chat_messages 已修过同一问题），子智能体必须对齐。
-
-    protocol, api_url, sub_headers, _is_local = await _resolve_api_target(_last_cloud_config.get())
-    if not api_url:
-        return f"[Sub-agent: {agent_type}] 错误: 无法连接模型服务（请配置云端模型或启动本地 LLM）"
-
-    # 模型名解析（审计 A3）：此前写死 SUBAGENT_MODEL（gpt-4o-mini）——
-    # 云端配 GLM/DeepSeek 时发错名字必 404；纯本地时把假名发给 mlx 引擎
-    # 同样必失败。改为：云端用当前云端配置的模型名，本地用引擎真实
-    # 加载的模型 id（与健康检查同口径）。
-    _cloud_cfg = _last_cloud_config.get()
-    if _is_local:
-        import local_llm
-        _sub_model = (getattr(local_llm._engine, "current_model_id", "")
-                      or getattr(local_llm._engine, "current_model_name", "")
-                      or SUBAGENT_MODEL)
-    else:
-        _sub_model = (_cloud_cfg or {}).get("model") or SUBAGENT_MODEL
-
-    current_msgs = list(messages)
-
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(60)) as client:
-            for _ in range(3):
-                _msgs = _sanitize_tool_messages(current_msgs)
-                body = {
-                    "model": _sub_model,
-                    "messages": _msgs,
-                    "max_tokens": 1024,
-                    "stream": False,
-                    "temperature": 0.5,
-                    "frequency_penalty": 0.6,
-                "stop": ["<|im_end|>", "<|endoftext|>", "<end_of_turn>", "<eos>"],
-                }
-                if _is_local:
-                    # 本地模型不支持原生 function calling（此前无条件发送导致
-                    # 400/空响应，P1-5）：改为 prompt-based 工具提示，
-                    # 返回文本用主循环同款解析器提取工具调用。
-                    # ⚠️ 工具提示必须合并进首条 system 消息，绝不能追加为
-                    # 第二条 system——Qwen3.8 等模板直接报
-                    # "System message must be at the beginning" → 404
-                    # （09-01 explore 子任务批量 ✗ 的根因）
-                    _tools_prompt = _build_local_tools_prompt(sub_tools)
-                    _sys_idx = next((i for i, m in enumerate(_msgs) if m.get("role") == "system"), None)
-                    if _sys_idx is not None:
-                        _msgs[_sys_idx]["content"] = (_msgs[_sys_idx].get("content") or "") + "\n\n" + _tools_prompt
-                    else:
-                        _msgs.insert(0, {"role": "system", "content": _tools_prompt})
-                    body["messages"] = _msgs
-                else:
-                    body["tools"] = sub_tools
-                    body["tool_choice"] = "auto"
-                # ⚠️ 私有字段必须清除：_inject_thinking_disabled 注入的
-                # _thinking_level/_thinking_unsupported 发给严格 OpenAI 兼容
-                # 提供商会 400（与云端主循环同款处理，审计 P1）；模型名也要
-                # 用解析后的 _sub_model 而非硬编码 SUBAGENT_MODEL
-                _inject_thinking_disabled(body, _sub_model)
-                body.pop("_thinking_level", None)
-                body.pop("_thinking_unsupported", None)
-                async with _local_llm_serialized(api_url):
-                    r = await client.post(api_url, json=body, headers=sub_headers)
-                if r.status_code != 200:
-                    return f"[Sub-agent: {agent_type}] HTTP {r.status_code}"
-
-                data = r.json()
-                choice = data.get("choices", [{}])[0]
-                msg = choice.get("message", {})
-
-                tool_calls = msg.get("tool_calls", [])
-                if _is_local and not tool_calls:
-                    # prompt-based 工具调用从文本解析
-                    _clean, tool_calls = _parse_prompt_tool_calls(msg.get("content", "") or "")
-                    if tool_calls:
-                        msg = dict(msg)
-                        msg["content"] = _clean
-                if tool_calls:
-                    current_msgs.append({"role": "assistant", "content": msg.get("content"), "tool_calls": tool_calls})
-                    for tc in tool_calls:
-                        fn = tc.get("function", {})
-                        tname = fn.get("name", "")
-                        try:
-                            targs = json.loads(fn.get("arguments", "{}"))
-                        except json.JSONDecodeError:
-                            logger.warning("Sub-agent received malformed tool arguments", exc_info=True)
-                            targs = {}
-                        perm = _resolve_permission(tname, targs)
-                        # ZCode 式探索豁免：explore/debugger 的只读白名单命令免确认
-                        # （子智能体无用户确认通道，但白名单命令纯查询、无写副作用）
-                        if perm == "confirm" and tname == "run_cmd" \
-                                and agent_type in ("explore", "debugger") \
-                                and _is_readonly_cmd(targs.get("cmd", "")):
-                            perm = "safe"
-                        if task_id and task_id in _SUBTASKS:
-                            s = _SUBTASKS[task_id]
-                            s["steps"] = s.get("steps", 0) + 1
-                            _cat = ("终端" if tname == "run_cmd"
-                                    else "搜索" if tname in ("tavily_search", "web_search")
-                                    else "委派" if tname == "delegate_task"
-                                    else "文件")
-                            act = s.setdefault("activity", {})
-                            act[_cat] = act.get(_cat, 0) + 1
-                            brief = str(targs.get("query") or targs.get("cmd")
-                                        or targs.get("path") or targs.get("pattern") or "")[:60]
-                            s["last_activity"] = f"{tname}: {brief}" if brief else tname
-                            s["updated_at"] = _time.time()
-                        if perm in ("deny", "danger", "blocked"):
-                            tres = f"⛔ 工具已被权限规则阻止（级别 {perm}）: " + tname
-                            logger.warning("Sub-agent attempted blocked tool: %s (%s)", tname, perm)
-                        elif perm == "confirm":
-                            tres = "⛔ 子 Agent 不能执行需要用户确认的工具 (" + tname + ")。跳过执行。"
-                            logger.warning("Sub-agent blocked from confirm-level tool: " + tname)
-                        else:
-                            tres = await execute_tool(tname, targs)
-                        current_msgs.append({"role": "tool", "tool_call_id": tc["id"], "content": tres})
-                else:
-                    return f"[Sub-agent: {agent_type}]\n{msg.get('content', '无输出')}"
-
-        return f"[Sub-agent: {agent_type}] 达到最大迭代次数"
-    except Exception as e:
-        return f"[Sub-agent: {agent_type}] 错误: {e}"
-
+# delegate 机制已迁至 agent/subagent.py（Stage 5 子代理一等公民）；
+# 这里保留兼容导入（api_routes/tests 的既有引用不变）。
+from agent.subagent import (  # noqa: F401
+    _SUBTASKS, _SUBTASK_EVENTS, _SUBTASK_SEQ, _SUBTASK_TASKS,
+    _SUBAGENT_TOOLS, _prune_subtasks, _delegate_task,
+    _delegate_task_bg, _delegate_task_fg, _run_subtask_bg,
+    _subtask_snapshot,)
 
 # ── Fallback OpenAI Function Calling tool definitions ──
 

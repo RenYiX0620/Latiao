@@ -7,8 +7,14 @@
 - 白名单快捷路径：整条命令必须完全匹配简单形态，且命中后仍走完整检查
 - 敏感路径读取拦截（cat .ssh/id_rsa 等，与 read_file 插件黑名单对齐）
 """
+import logging
 import platform
 import re
+
+logger = logging.getLogger("latiao-sidecar")
+
+# 语义层缺失告警只打一次（升级后未装 tree-sitter 的环境不刷屏）
+_WARNED_TS_MISSING = False
 
 # ── Blocked patterns (checked case-insensitive) ──
 DESTRUCTIVE_PATTERNS = [
@@ -89,7 +95,33 @@ def reject_sensitive_read(cmd: str) -> str | None:
 
 
 def check_cmd(cmd: str) -> str | None:
-    """整条命令的破坏/混淆/敏感读取检查。返回拒绝文案或 None（放行）。"""
+    """整条命令的安全检查（阶段 3 双层）。返回拒绝文案或 None（放行）。
+
+    第 1 层语义层（safety/rules.py）：tree-sitter 解析全部命令调用/重定向/
+    嵌套子命令——`env curl`、`exec bash -c`、`$(rm -rf)` 等前缀/嵌套绕过
+    在 AST 层直接暴露（正则层的结构损失不复存在）。
+    第 2 层正则兜底：保留既有 DESTRUCTIVE/OBFUSCATION 黑名单作为纵深防御
+    （语义层拿到的是结构，正则层兜的是形状——两层漏判互为镜像，不留单点）。
+    语义层不可用（tree-sitter 缺失）时回退正则层旧行为——升级不能瘫痪现网；
+    语义层可用但命令语法解析失败时 fail-closed 拦截。
+    """
+    global _WARNED_TS_MISSING
+    try:
+        from safety.rules import analyze, decide, Verdict
+        a = analyze(cmd)
+        if a.ts_available:
+            decision = decide(cmd)
+            if decision.verdict is Verdict.FORBIDDEN:
+                return f"⛔ Blocked command: {cmd}（{decision.reason}）"
+            if a.parse_error:
+                # 语法解析失败不静默放行（fail-closed；不是依赖缺失路径）
+                return f"⛔ 命令语义解析失败，已拦截（请检查语法）: {cmd[:80]}"
+        elif not _WARNED_TS_MISSING:
+            _WARNED_TS_MISSING = True
+            logger.warning("命令语义层不可用（tree-sitter 未安装），使用正则层")
+    except Exception:
+        logger.warning("命令语义层异常，回退正则层", exc_info=True)
+    # 正则兜底层（纵深防御；语义层 fail-open 时的唯一防线）
     low = cmd.lower()
     for pattern in DESTRUCTIVE_PATTERNS:
         if re.search(pattern, low):

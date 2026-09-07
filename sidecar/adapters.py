@@ -21,6 +21,16 @@ from pathlib import Path
 
 import httpx
 
+# 证书校验与 discovery 同源：内置 portable Python 缺系统根证书，必须显式
+# 用导出的 CA bundle（~/.local-ai-os/ca-bundle.pem 或系统 keychain 导出），
+# 否则 jsDelivr/GitHub 全部 CERTIFICATE_VERIFY_FAILED（09-21 启动刷屏根因）。
+def _http_verify() -> str | bool:
+    try:
+        from discovery import _verify as _discovery_verify
+        return _discovery_verify()
+    except Exception:
+        return True
+
 logger = logging.getLogger("latiao-sidecar")
 
 _TIMEOUT = httpx.Timeout(25)
@@ -51,10 +61,13 @@ def _jsdelivr_tree(repo: str, ref: str = "main", timeout: float = 20) -> list[st
     """jsDelivr 文件树 API：返回仓库文件路径列表（flat）。"""
     url = f"https://data.jsdelivr.com/v1/packages/gh/{repo}@{ref}?structure=flat"
     try:
-        resp = httpx.get(url, timeout=httpx.Timeout(timeout), headers={"User-Agent": "Latiao/1.0"})
+        resp = httpx.get(url, timeout=httpx.Timeout(timeout), headers={"User-Agent": "Latiao/1.0"}, verify=_http_verify())
         resp.raise_for_status()
         data = resp.json()
         return [f["name"] for f in data.get("files", [])]
+    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, ValueError) as e:
+        logger.info("jsDelivr tree unavailable %s: %s", repo, e)
+        return []
     except Exception:
         logger.warning("jsDelivr tree failed for %s", repo, exc_info=True)
         return []
@@ -66,13 +79,17 @@ def _jsdelivr_file(repo: str, path: str, ref: str = "main", timeout: float = 20)
     url = f"https://cdn.jsdelivr.net/gh/{repo}@{ref}/{enc}"
     try:
         resp = httpx.get(url, timeout=httpx.Timeout(timeout), headers={"User-Agent": _UA},
-                         follow_redirects=True)
+                         follow_redirects=True, verify=_http_verify())
         resp.raise_for_status()
         return resp.text
     except httpx.HTTPStatusError as e:
         # jsDelivr 对未缓存文件返回 301 → raw.githubusercontent（本环境不可达），
         # 属扫描噪音而非异常：降为 INFO 不刷警告
         logger.info("jsDelivr file miss for %s@%s (HTTP %s)", repo, path, e.response.status_code)
+        return None
+    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, ValueError) as e:
+        # 网络/SSL/超时属环境噪音：INFO 一行，不刷 traceback
+        logger.info("jsDelivr file unavailable %s@%s: %s", repo, path, e)
         return None
     except Exception:
         logger.warning("jsDelivr file failed for %s@%s", repo, path, exc_info=True)
@@ -86,9 +103,12 @@ def _codeload_zip(repo: str, ref: str = "main", timeout: float = 60) -> bytes | 
         if ref != "main" else f"https://codeload.github.com/{repo}/zip/refs/heads/main"
     )
     try:
-        resp = httpx.get(url, timeout=httpx.Timeout(timeout), follow_redirects=True)
+        resp = httpx.get(url, timeout=httpx.Timeout(timeout), follow_redirects=True, verify=_http_verify())
         resp.raise_for_status()
         return resp.content
+    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, ValueError) as e:
+        logger.info("codeload unavailable %s@%s: %s", repo, ref, e)
+        return None
     except Exception:
         logger.warning("codeload failed for %s@%s", repo, ref, exc_info=True)
         return None
@@ -97,7 +117,7 @@ def _codeload_zip(repo: str, ref: str = "main", timeout: float = 60) -> bytes | 
 def _fetch_url(url: str, timeout: float = 20) -> str | None:
     """通用 GET：用于 marketplace.json / plugin.json（尝试镜像兜底）。"""
     try:
-        resp = httpx.get(url, timeout=httpx.Timeout(timeout), follow_redirects=True)
+        resp = httpx.get(url, timeout=httpx.Timeout(timeout), follow_redirects=True, verify=_http_verify())
         resp.raise_for_status()
         return resp.text
     except Exception:

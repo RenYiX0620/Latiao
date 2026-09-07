@@ -374,13 +374,15 @@ class TestPlanConfirmationGate(unittest.TestCase):
 
         async def run():
             # 启动确认等待，然后模拟用户拒绝（计划被拒 -> 任务不执行）
-            task = asyncio.create_task(agent_loop._await_plan_confirmation("plan-t1", "1. 步骤A\n2. 步骤B"))
+            started = await agent_loop._start_plan_confirmation("plan-t1", "1. 步骤A\n2. 步骤B")
+            task = asyncio.create_task(
+                agent_loop._wait_plan_confirmation("plan-t1", started["event_obj"]))
             await asyncio.sleep(0.1)
             async with agent_loop._pending_lock:
                 agent_loop._pending_confirmations["plan-t1"]["approved"] = False
                 agent_loop._pending_confirmations["plan-t1"]["event"].set()
             approved, events = await task
-            return approved, events
+            return approved, [started["event"]] + events
 
         approved, events = asyncio.run(run())
         self.assertFalse(approved)
@@ -391,7 +393,9 @@ class TestPlanConfirmationGate(unittest.TestCase):
         import agent_loop
 
         async def run():
-            task = asyncio.create_task(agent_loop._await_plan_confirmation("plan-t2", "计划"))
+            started = await agent_loop._start_plan_confirmation("plan-t2", "计划")
+            task = asyncio.create_task(
+                agent_loop._wait_plan_confirmation("plan-t2", started["event_obj"]))
             await asyncio.sleep(0.1)
             async with agent_loop._pending_lock:
                 agent_loop._pending_confirmations["plan-t2"]["approved"] = True
@@ -499,3 +503,137 @@ class TestJsonFenceParsing(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTransientReminders:
+    """历史污染修复：新回合到达时清除上一轮一次性系统提醒。"""
+
+    def test_strips_transient_reminders(self):
+        from agent_loop import _strip_transient_reminders
+        msgs = [
+            {"role": "system", "content": "可用工具…"},
+            {"role": "user", "content": "你能做什么"},
+            {"role": "assistant", "content": "我可以…"},
+            {"role": "system", "content": "⚠️ 这不是用户的新消息，而是系统提醒（上一轮回复未完成）"},
+            {"role": "user", "content": "测试"},
+            {"role": "system", "content": "你上一轮的回复是空的。请直接回复用户。"},
+            {"role": "assistant", "content": "测试正常"},
+        ]
+        stripped = _strip_transient_reminders(msgs)
+        roles = [m.get("role") for m in stripped]
+        assert roles == ["system", "user", "assistant", "user", "assistant"], roles
+        # 真系统提示（非提醒）必须保留
+        assert stripped[0]["content"].startswith("可用工具")
+
+
+class TestSingleFlight:
+    """双发防御：_running_turns 认领/释放语义。"""
+
+    def test_claim_and_release(self):
+        from api_routes import _running_turns
+        sid = "sf-test-session"
+        _running_turns.add(sid)
+        assert sid in _running_turns
+        _running_turns.discard(sid)
+        assert sid not in _running_turns
+
+
+class TestConfirmationWait:
+    """确认不限时（09-21 用户反馈）：timeout=0 无限等待；显式超时保持暂停语义。"""
+
+    def test_infinite_wait_approved(self):
+        import asyncio
+        from agent_loop import _pending_confirmations, _pending_lock, _wait_tool_confirmation
+
+        async def runner():
+            event = asyncio.Event()
+            async def _approve():
+                async with _pending_lock:
+                    _pending_confirmations["wait-1"] = {"event": event, "approved": True}
+                await asyncio.sleep(0.01)
+                event.set()  # 模拟 confirm_tool API 触发
+            asyncio.create_task(_approve())
+            return await _wait_tool_confirmation("wait-1", "run_cmd", event, timeout=0)
+
+        approved, events = asyncio.run(runner())
+        assert approved is True and events == []
+
+    def test_explicit_timeout_still_pauses(self):
+        import asyncio
+        from agent_loop import _pending_confirmations, _pending_lock, _wait_tool_confirmation
+
+        async def runner():
+            event = asyncio.Event()
+            async with _pending_lock:
+                _pending_confirmations["wait-2"] = {"event": event, "approved": False}
+            return await _wait_tool_confirmation("wait-2", "run_cmd", event, timeout=0.05)
+
+        approved, events = asyncio.run(runner())
+        assert approved is False and len(events) == 1
+        assert "超时" in events[0]["content"]
+
+
+class TestLanguageEnsure:
+    """语言确保兜底（09-21 实测修复）：翻译失败不得粘贴整段英文原文。"""
+
+    EN_TEXT = ("The user wants me to analyze a financial data file, a board sector capital flow "
+               "analysis spreadsheet. This is a Chinese A-share sector analysis and this particular "
+               "sheet tracks sector performance and capital flows over several trading days. "
+               "The main line is the AI computing chain and capital rotated heavily this week.")
+
+    def test_translate_failure_returns_short_hint(self, monkeypatch):
+        import asyncio
+        import agent_loop
+
+        async def _fail(*a, **k):
+            return self.EN_TEXT  # 翻译失败 = 返回原文；必须与入参完全一致
+
+        import agent.gates as _gates
+        monkeypatch.setattr(_gates, "_force_translate", _fail)
+        delivered = asyncio.run(agent_loop._ensure_final_language(
+            None, "http://x", {}, "model", self.EN_TEXT, "分析这个文件"
+        ))
+        assert delivered.startswith("⚠️ 模型本次生成了英文回复")
+        assert "原文如下" not in delivered
+        assert "The user wants" not in delivered  # 英文原文不再出现
+
+    def test_translate_success_returns_translation(self, monkeypatch):
+        import asyncio
+        import agent_loop
+
+        async def _ok(*a, **k):
+            return "中文翻译结果"
+
+        import agent.gates as _gates
+        monkeypatch.setattr(_gates, "_force_translate", _ok)
+        delivered = asyncio.run(agent_loop._ensure_final_language(
+            None, "http://x", {}, "model", self.EN_TEXT, "中文用户"
+        ))
+        assert delivered == "中文翻译结果"
+
+    def test_language_already_ok_passthrough(self):
+        import asyncio
+        import agent_loop
+        delivered = asyncio.run(agent_loop._ensure_final_language(
+            None, "http://x", {}, "model", "中文回答", "中文用户"
+        ))
+        assert delivered == "中文回答"
+
+
+class TestEmptyNameRecovery:
+    """空工具名恢复（09-21 实测：deepseek-v4 名称空、参数全）。"""
+
+    def test_recover_unique_match(self):
+        from agent_loop import _recover_tool_name
+        # {"query": ...} 唯一候选 tavily_search → 恢复
+        assert _recover_tool_name({"query": "行情"}) == "tavily_search"
+        # 09-06 14:34 事故：多候选（path 同时是 read_file/list_dir 参数）曾返回
+        # 空 → 守卫反馈循环 3 连击中止；现确定性择优（exact 键匹配优先，注册表
+        # 顺序兜底）——执行结果会引导模型，优于中止
+        assert _recover_tool_name({"path": "."}) == "read_file"
+        assert _recover_tool_name({"url": "https://github.com/x"}) == "dokobot_read"
+
+    def test_recover_empty_args_no_recovery(self):
+        from agent_loop import _recover_tool_name
+        assert _recover_tool_name({}) == ""
+        assert _recover_tool_name(None) == ""

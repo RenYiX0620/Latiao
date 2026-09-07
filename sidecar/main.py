@@ -65,18 +65,9 @@ import asyncio
 import json
 import logging
 import os
-import platform
 import sys
 from collections import deque
 
-# Fix SSL certificate verification for Python 3.14 on macOS
-# (httpx/huggingface_hub don't find system certs by default)
-try:
-    import certifi
-    os.environ.setdefault("SSL_CERT_FILE", certifi.where())
-    os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
-except ImportError:
-    pass
 from contextlib import asynccontextmanager
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
@@ -102,7 +93,6 @@ from agent_loop import (  # noqa: F401 — 门面 re-export：保持 main.xxx �
     TOOL_HOOKS,
     TOOL_PERMISSIONS,
     TOOLS,
-    _agent_loop_stream,
     _append_loop_log,
     _auto_verify,
     _await_tool_confirmation,
@@ -111,9 +101,7 @@ from agent_loop import (  # noqa: F401 — 门面 re-export：保持 main.xxx �
     _build_local_tools_prompt,
     _cap_tools,
     _check_pre_hooks,
-    _check_stagnation,
     _deduplicate_response,
-    _detect_task_intent,
     _detect_user_language,
     _enhance_auto_verify,
     _extract_last_user_text,
@@ -124,15 +112,12 @@ from agent_loop import (  # noqa: F401 — 门面 re-export：保持 main.xxx �
     _get_best_cloud_config,
     _get_localized_text,
     _handle_tool_execution,
-    _has_cloud_models,
     _inject_image,
     _is_local_llm_url,
     _last_cloud_config,
     _load_custom_agents,
-    _local_agent_loop_stream,
     _local_llm_serialized,
     _local_llm_stream,
-    _local_llm_stream_lock,
     _merge_agents,
     _parse_kv_args,
     _parse_native_tool_calls,
@@ -147,13 +132,11 @@ from agent_loop import (  # noqa: F401 — 门面 re-export：保持 main.xxx �
     _salvage_tool_args,
     _save_custom_agents,
     _semgrep_scan,
-    _session_states,
     _spawn,
     _strip_native_tool_calls,
-    _track_progress,
     execute_tool,
 )
-from config import PROGRESS_DIR
+from config import PROGRESS_DIR, SUBAGENT_MODEL
 from cron import _cron_loop, _seed_default_cron
 from db import _init_db
 from identity import _create_default_identity
@@ -397,12 +380,8 @@ app.add_middleware(
     allow_headers=["Content-Type", "Authorization", "X-Latiao-Token"],
 )
 
-LM_STUDIO_URL = os.environ.get("LATIAO_LM_STUDIO_URL", "http://localhost:1234/v1/chat/completions")
-SUBAGENT_MODEL = os.environ.get("LATIAO_SUBAGENT_MODEL", "gpt-4o-mini")
 TAVILY_API_URL = os.environ.get("TAVILY_API_URL", "https://api.tavily.com/search")
 MAX_UPLOAD_SIZE = 50 * 1024 * 1024  # 50 MB
-IS_MACOS = platform.system() == "Darwin"
-IS_WINDOWS = platform.system() == "Windows"
 
 # ═══════════════════════════════════════════════════════
 #  Harness: 工具权限分级 + 状态持久化

@@ -172,6 +172,8 @@ const [timeFilter, setTimeFilter] = useState("all");
   // 后台子智能体任务（ZCode 式活动栏：delegate_task background=true 产生）
   const [subagents, setSubagents] = useState<{ id: string; agent: string; task: string; status: string; steps?: number; activity?: Record<string, number>; last_activity?: string; summary?: string }[]>([]);
   const [taskStartAt, setTaskStartAt] = useState<number | null>(null);
+  // 流式中的思考缓冲（运行中 Think 行实时摘要；800ms 节流，见 flushStream）
+  const [streamingThink, setStreamingThink] = useState<string>("");
   const activeTaskStackRef = useRef<string[]>([]);
   const abortControllerRef = useRef<AbortController | null>(null);
   // 已提示过的 cron 完成事件（ts+task 键），防止 5s 心跳对同一事件反复弹 toast
@@ -225,7 +227,7 @@ const [timeFilter, setTimeFilter] = useState("all");
   const [autoCheckUpdate, setAutoCheckUpdate] = useState(() => localStorage.getItem("latiao_auto_check_update") !== "false");
   const [recentLearnings, setRecentLearnings] = useState<{topic: string; content: string; confidence: number}[]>([]);
   const [agentPhase, setAgentPhase] = useState<string>("");
-  const [, setRouteInfo] = useState<{ engine: string; declaredModel: string } | null>(null);
+  const [routeInfo, setRouteInfo] = useState<{ engine: string; declaredModel: string } | null>(null);
   const [activeAgent, setActiveAgent] = useState<string>("latiao");
   const [capabilities, setCapabilities] = useState<Capability[]>([]);
   const [localLLMStatus, setLocalLLMStatus] = useState<LLMStatus>({ backend: "", status: "checking", model_id: "", model_name: "", port: 1235, message: "", has_image_support: false, token_limit: 32768 });
@@ -700,7 +702,10 @@ const [timeFilter, setTimeFilter] = useState("all");
   const [appVersion, setAppVersion] = useState("…");
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const runUpdateCheck = useCallback(async (silent: boolean) => {
-    if (checkingUpdate) return;
+    if (checkingUpdate) {
+      if (!silent) showToast("更新检查已在进行中，请稍候（大版本下载可能持续数分钟）", "info");
+      return;
+    }
     setCheckingUpdate(true);
     const { checkForUpdates } = await import("./utils/updater");
     const res = await checkForUpdates((msg) => showToast(msg), !silent);
@@ -751,41 +756,82 @@ const [timeFilter, setTimeFilter] = useState("all");
     // 等不到主线程，"停止没反应"的根因。
     let flushTimer: ReturnType<typeof setTimeout> | null = null;
     let pendingThinking = "";
+    // 思考起始时间戳：流式期间只攒不发（防"思考闪现多次"），[DONE] 定稿时
+    // 一次性附着到助手消息并结算耗时（09-21 用户反馈：思考应只在折叠栏里）。
+    let thinkingStartedAt = 0;
     // reflection_revised 已把最终文本写入消息；此后 [DONE]/finally 的 flushStream
     // 若再跑，prefix 检查不匹配会把 revised 文本重复 push 一条（M1 复发）。
     let streamFinalized = false;
+    // 定稿后允许最后一次 flush（附着思考），此后不再跑（M1 防重复保护）
+    let thinkingAttached = false;
+    // 流式期思考实时预览节流（09-21 22:48：本地慢生成前端完全静默——每 ≥10s
+    // 写一次"前 120 字…"，既让用户看到"在思考"，又不"闪现内容不同"）
+    let lastThinkingFlush = 0;
+    let lastThinkPropFlush = 0;
+    // 当前 agent 轮次（round_start 事件；09-05 23:52：多轮拉锯黑盒化）
+    let currentRound = 0;
     const flushStream = () => {
       if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
-      if (streamFinalized) return;
+      if (streamFinalized && thinkingAttached) return;
       const text = full;
-      const th = pendingThinking;
-      pendingThinking = "";
-      if (!text && !th) return;
+      // 定稿后才附着思考：流式期间正文照常更新，思考攒着不闪现
+      const th = streamFinalized ? pendingThinking : "";
+      if (streamFinalized) pendingThinking = "";
+      // 运行中 Think 行实时摘要（独立轻量 state，800ms 节流——只重渲染
+      // 活动行，不打全量消息列表；定稿后清空，行数据交回消息 thinking 字段）
+      if (!streamFinalized && pendingThinking) {
+        if (Date.now() - lastThinkPropFlush >= 800) {
+          lastThinkPropFlush = Date.now();
+          setStreamingThink(pendingThinking);
+        }
+      } else if (streamFinalized) {
+        setStreamingThink("");
+      }
+      // 非定稿 + 有思考 + 未到节流窗口：跳过空写（避免每 120ms 重渲染）
+      const livePreview = !streamFinalized && pendingThinking !== ""
+        && Date.now() - lastThinkingFlush >= 10_000;
+      if (!text && !th && !livePreview) return;
       setMessages((prev) => {
         const msgs = [...prev];
         const last = msgs[msgs.length - 1];
         if (last?.role === "assistant") {
           if (text && last.content && !text.startsWith(last.content)) {
             // 已有内容的 assistant（如 📋 执行计划）：正文另起新消息，不覆盖
-            msgs.push({ id: msgId(), role: "assistant", content: text, ts: Date.now() });
+            msgs.push({ id: msgId(), role: "assistant", content: text, thinking: th || undefined, round: currentRound || undefined, ts: Date.now() });
           } else {
             const updated: Message = { ...last };
-            if (th) updated.thinking = (last.thinking || "") + th;
-            if (text) updated.content = text;
-            // 正文开始输出 = 思考结束，结算思考耗时
-            if (text && updated.thinkingDuration === undefined && updated.thinking) {
-              updated.thinkingDuration = Math.max(0, Date.now() - (updated.ts || Date.now()));
+            updated.round = currentRound || undefined;
+            if (th) {
+              updated.thinking = (last.thinking || "") + th;
+              // 思考耗时按真实起止结算（附着发生在定稿时）
+              updated.thinkingDuration = thinkingStartedAt
+                ? Math.max(0, Date.now() - thinkingStartedAt) : undefined;
+              thinkingStartedAt = 0;
+            } else if (livePreview) {
+              // 流式期预览：前 120 字 + 省略号 + 计时（节流 10s）
+              lastThinkingFlush = Date.now();
+              updated.thinking = pendingThinking.slice(0, 120) + " …";
+              updated.thinkingDuration = thinkingStartedAt
+                ? Math.max(0, Date.now() - thinkingStartedAt) : undefined;
             }
+            if (text) updated.content = text;
             msgs[msgs.length - 1] = updated;
           }
-        } else if (text || th) {
-          msgs.push({ id: msgId(), role: "assistant", content: text, thinking: th || undefined, ts: Date.now() });
+        } else if (text || th || livePreview) {
+          // 思考预览也创建消息（正文未到时可先占位；09-21 22:48：仅预览时
+          // 无 assistant 消息 → 预览无处挂载，前端 3 分钟无反应）
+          msgs.push({
+            id: msgId(), role: "assistant", content: text,
+            thinking: th || (livePreview ? (pendingThinking.slice(0, 120) + " …") : undefined),
+            round: currentRound || undefined,
+            ts: Date.now(),
+          });
         }
         return msgs;
       });
     };
     const scheduleFlush = () => {
-      if (!flushTimer) flushTimer = setTimeout(flushStream, 120);
+      if (!flushTimer) flushTimer = setTimeout(flushStream, 0);
     };
 
 
@@ -823,7 +869,7 @@ const [timeFilter, setTimeFilter] = useState("all");
         {
           const sse = parseSSEDataLine(line);
           if (sse.kind === "skip") continue;
-          if (sse.kind === "done") { flushStream(); return full; }
+          if (sse.kind === "done") { streamFinalized = true; flushStream(); thinkingAttached = true; return full; }
           if (sse.kind === "error") throw new Error(sse.message);
           try {
             const parsed = sse.parsed;
@@ -846,6 +892,20 @@ const [timeFilter, setTimeFilter] = useState("all");
                   console.info(`[route] 模型「${declared}」未在云端配置，实际运行在本地引擎`);
                 }
                 setRouteInfo({ engine: ended, declaredModel: declared });
+                continue;
+              }
+              if (parsed.event === "route_fallback") {
+                // 429 降级切换引擎（09-06：静默切换让用户以为还在用本地模型）
+                const fbLocal = Boolean(parsed.is_local);
+                const fbModel = String(parsed.declared_model || "");
+                setRouteInfo({ engine: fbLocal ? "本地" : "云端", declaredModel: fbModel });
+                showToast(String(parsed.message || "模型已切换") + (fbModel ? `（${fbModel}）` : ""), "warn");
+                continue;
+              }
+              if (parsed.event === "round_start") {
+                // 轮次透明化（09-05 23:52：本地慢生成多轮拉锯时前端黑盒）
+                currentRound = Number(parsed.iteration) || currentRound;
+                flushStream();
                 continue;
               }
               if (parsed.event === "tool_confirm") {
@@ -895,7 +955,9 @@ const [timeFilter, setTimeFilter] = useState("all");
                 const revised = String(parsed.content ?? "");
                 if (revised.trim()) {
                   full = revised;
-                  streamFinalized = true; // 后续 [DONE]/finally flush 不再跑（否则 revised 被重复 push）
+                  streamFinalized = true;
+                  thinkingAttached = true;
+                  thinkingAttached = true; // 后续 flush 不再跑（否则 revised 被重复 push）
                   setMessages((prev) => {
                     const msgs = [...prev];
                     for (let i = msgs.length - 1; i >= 0; i--) {
@@ -915,6 +977,7 @@ const [timeFilter, setTimeFilter] = useState("all");
                 if (revised.trim()) {
                   full = revised;
                   streamFinalized = true;
+                  // 注意：不置 thinkingAttached——定稿时最后一次 flush 仍需附着思考
                   setMessages((prev) => {
                     const msgs = [...prev];
                     for (let i = msgs.length - 1; i >= 0; i--) {
@@ -972,7 +1035,8 @@ const [timeFilter, setTimeFilter] = useState("all");
                   return msgs;
                 });
               } else if (parsed.reasoning) {
-                // 思考内容：批量累积（flush 时写入最后一条 assistant 的 thinking 字段）
+                // 思考内容：流式期间只攒不发（[DONE] 定稿时一次性附着，防闪现）
+                if (!thinkingStartedAt) thinkingStartedAt = Date.now();
                 pendingThinking += String(parsed.reasoning);
                 scheduleFlush();
               } else if (parsed.content) {
@@ -1001,17 +1065,44 @@ const [timeFilter, setTimeFilter] = useState("all");
     }
   };
 
+  const confirmInFlightRef = useRef<Set<string>>(new Set());
   const confirmTool = useCallback(async (callId: string, approved: boolean) => {
+    // 双击/重复点击去重：同 callId 在途只发一次（09-21 实测：双击触发误报过期）
+    if (confirmInFlightRef.current.has(callId)) return;
+    confirmInFlightRef.current.add(callId);
     try {
       const resp = await authFetch("/v1/confirm_tool", {
         method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ call_id: callId, approved }),
       });
       const data = await resp.json();
+      if (data.status === "already") {
+        // 服务端幂等：已处理（本卡已批准/拒绝）——收尾卡片状态，避免永远 confirming
+        setMessages(prev => prev.map(m => m.callId === callId && m.toolStatus === "confirming"
+          ? { ...m, toolStatus: "done" as const } : m));
+        return;
+      }
       if (data.status === "not_found") {
         showToast(t("toast.timeout"));
         setMessages(prev => prev.map(m => m.callId === callId && m.toolStatus === "confirming" ? { ...m, toolStatus: "error" as const, toolResult: t("toast.timeout_detail") } : m));
       }
-    } catch (e) { console.error(e); showToast(t("toast.confirm_fail")); }
+    } catch (e) {
+      console.error(e);
+      // 服务端若已处理（21:01 实证：客户端失败但 approve 已生效）→ 重试一次再判定
+      try {
+        await new Promise(r => setTimeout(r, 300));
+        const resp2 = await authFetch("/v1/confirm_tool", {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ call_id: callId, approved }),
+        });
+        const d2 = await resp2.json();
+        if (d2.status === "ok" || d2.status === "already") {
+          setMessages(prev => prev.map(m => m.callId === callId && m.toolStatus === "confirming"
+            ? { ...m, toolStatus: "done" as const } : m));
+          return;
+        }
+      } catch (e2) { console.error("confirm retry failed", e2); }
+      showToast(t("toast.confirm_fail"));
+    }
+    finally { confirmInFlightRef.current.delete(callId); }
   }, [showToast, setMessages, t]);
 
   const stopGeneration = useCallback(() => {
@@ -1077,7 +1168,7 @@ const [timeFilter, setTimeFilter] = useState("all");
     // 12 秒上限：超时/失败用当前内容兜底，不阻塞发送。
     let pf = pendingFileRef.current || pendingFile;
     if (pf && pf.type === "file" && !pf.enReady) {
-      showToast("正在生成英文版文件内容…");
+      // 英化等待改为静默（09-21 用户反馈：不要弹窗；日志在 sidecar 侧可见）
       await new Promise<void>((resolve) => {
         const timer = setTimeout(() => resolve(), 12000);
         enWaitersRef.current.add(() => { clearTimeout(timer); resolve(); });
@@ -1152,6 +1243,7 @@ const [timeFilter, setTimeFilter] = useState("all");
       abortControllerRef.current = null;
       setIsProcessing(false);
       setPendingFile(null);
+      setStreamingThink("");
       setAgentPhase("");
     }
   };
@@ -1289,7 +1381,7 @@ const [timeFilter, setTimeFilter] = useState("all");
         }
         unlisten = () => unlisteners.forEach((u) => { try { u(); } catch { /* noop */ } });
         console.info("[drag-drop] 原生拖放监听已挂载（双通道）");
-        showToast("✅ 拖放监听已就绪", "info");
+        // 去掉启动 toast（09-21 用户反馈：状态类提示不进右下角弹窗）
       } catch (e) {
         console.error("[drag-drop] 挂载失败", e);
         showToast("拖放初始化失败: " + String((e as { message?: string })?.message || e), "warn");
@@ -1490,6 +1582,9 @@ const [timeFilter, setTimeFilter] = useState("all");
         <div className="sidebar-footer">
           <select className="sidebar-model-select" value={session.selectedModel} onChange={(e) => { setSelectedModel(e.target.value); showToast(t("toast.model_switched", { model: e.target.value || t("sidebar.auto_detect") })); }}>
             <option value="">{t("sidebar.auto_detect")}</option>
+            {localLLMStatus.model_id && (
+              <option key="local-loaded" value={localLLMStatus.model_id}>💻 {localLLMStatus.model_name || localLLMStatus.model_id.split("/").filter(Boolean).pop()}</option>
+            )}
             {cloudModels.map((m) => (<option key={m.name} value={m.name}>☁️ {m.name}</option>))}
           </select>
         </div>
@@ -1544,7 +1639,11 @@ const [timeFilter, setTimeFilter] = useState("all");
             showToast={showToast}
             activeTask={activeTask}
             taskStartAt={taskStartAt}
+            streamingThink={streamingThink}
             subagents={subagents}
+            routeInfo={routeInfo}
+            localModelId={localLLMStatus.model_id}
+            localModelName={localLLMStatus.model_name}
           />
         </div>
 

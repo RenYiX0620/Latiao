@@ -132,7 +132,7 @@ const ToolCallBubble = memo(function ToolCallBubble({ msg, onConfirm }: {
   }, [expanded, msg.toolResult, displayContent, isMarkdown, truncated, fullExpanded, t]);
 
   return (
-    <div className={`tool-call ${statusClass}`}>
+    <div className={`tool-call ${statusClass}`} data-mid={msg.id}>
       <div className="tool-call-header" onClick={() => setExpanded(!expanded)}>
         <span className="tool-call-icon" style={{ color: iconColor }}><ToolIcon size={14} /></span>
         <span className="tool-call-name">{msg.toolName}</span>

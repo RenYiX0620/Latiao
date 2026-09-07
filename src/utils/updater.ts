@@ -78,6 +78,7 @@ export async function checkForUpdates(
   interactive = true,
 ): Promise<UpdateCheckResult> {
   try {
+    onStatus("正在检查更新…");
     const version = await getAppVersion();
     const waitMs = interactive ? 60 * 60 * 1000 : 90 * 1000;
     let outcome: "done" | "failed" | "up_to_date" | "idle" | null = null;

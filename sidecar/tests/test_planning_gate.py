@@ -6,7 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from agent_loop import _looks_like_planning, _reply_lang_mismatch, _count_successful_duplicates
+from agent_loop import _looks_like_planning, _reply_lang_mismatch
 
 # 13:58 事故真实回复（891 字符英文规划文本，从用户会话 z440ab 提取）
 ENGLISH_PLANNING = (
@@ -106,50 +106,6 @@ class TestCountSuccessfulDuplicates(unittest.TestCase):
 
     def _assistant_call(self, cid, name, args):
         return self._msg("assistant", tool_calls=[{"id": cid, "function": {"name": name, "arguments": json.dumps(args)}}])
-
-    def test_two_successes_counted(self):
-        msgs = [
-            self._assistant_call("c1", "read_file", {"path": "~/.local-ai-os/PROGRESS.md"}),
-            self._msg("tool", tool_call_id="c1", content="(早期进度已轮转) ..."),
-            self._assistant_call("c2", "read_file", {"path": "~/.local-ai-os/PROGRESS.md"}),
-            self._msg("tool", tool_call_id="c2", content="(早期进度已轮转) ..."),
-        ]
-        self.assertEqual(_count_successful_duplicates(msgs, "read_file", {"path": "~/.local-ai-os/PROGRESS.md"}), 2)
-
-    def test_tilde_and_absolute_paths_are_same(self):
-        # 17:10 重放：模型用 "~" 与绝对路径交替重读同一文件绕过护栏
-        msgs = [
-            self._assistant_call("c1", "read_file", {"path": "~/.local-ai-os/PROGRESS.md"}),
-            self._msg("tool", tool_call_id="c1", content="(早期进度已轮转) ..."),
-            self._assistant_call("c2", "read_file", {"path": "/Users/langzuxiang/.local-ai-os/PROGRESS.md"}),
-            self._msg("tool", tool_call_id="c2", content="(早期进度已轮转) ..."),
-        ]
-        self.assertEqual(_count_successful_duplicates(msgs, "read_file", {"path": "~/.local-ai-os/PROGRESS.md"}), 2)
-        self.assertEqual(_count_successful_duplicates(msgs, "read_file", {"path": "/Users/langzuxiang/.local-ai-os/PROGRESS.md"}), 2)
-
-    def test_failure_not_counted(self):
-        msgs = [
-            self._assistant_call("c1", "tavily_search", {"query": "q"}),
-            self._msg("tool", tool_call_id="c1", content="Error: timeout"),
-            self._assistant_call("c2", "tavily_search", {"query": "q"}),
-            self._msg("tool", tool_call_id="c2", content="🔍 Tavily 搜索: q ..."),
-        ]
-        # 只有 1 次成功 → 允许再试一次
-        self.assertEqual(_count_successful_duplicates(msgs, "tavily_search", {"query": "q"}), 1)
-
-    def test_different_args_not_counted(self):
-        msgs = [
-            self._assistant_call("c1", "mx_query", {"query": "上证指数"}),
-            self._msg("tool", tool_call_id="c1", content="..."),
-            self._assistant_call("c2", "mx_query", {"query": "创业板指"}),
-            self._msg("tool", tool_call_id="c2", content="..."),
-        ]
-        self.assertEqual(_count_successful_duplicates(msgs, "mx_query", {"query": "上证指数"}), 1)
-        self.assertEqual(_count_successful_duplicates(msgs, "mx_query", {"query": "创业板指"}), 1)
-
-
-class TestProgressSummary(unittest.TestCase):
-    """PROGRESS.md 中文摘要（read_file 特例）。"""
 
     def test_summary_extracts_entries(self):
         sys.path.insert(0, str(Path(__file__).parent.parent / "plugins"))

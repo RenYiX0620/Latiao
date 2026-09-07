@@ -33,20 +33,15 @@ from agent_loop import (
     PROGRESS_FILE,
     TOOL_PERMISSIONS,
     TOOLS,
-    _agent_loop_stream,
     _build_chat_messages,
     _build_local_tools_prompt,
     _cap_tools,
     _deduplicate_response,
-    _detect_task_intent,
     _extract_last_user_text,
     _filter_tools,
     _get_agent_tools,
-    _get_best_cloud_config,
-    _has_cloud_models,
     _last_cloud_config,
     _load_custom_agents,
-    _local_agent_loop_stream,
     _local_llm_serialized,
     _local_llm_stream,
     _parse_native_tool_calls,
@@ -55,6 +50,7 @@ from agent_loop import (
     _pending_lock,
     _record_tool_call_db,
     _clear_session_cancel,
+    _event_log_for,
     _request_session_cancel,
     _resolve_api_target,
     _resolve_max_tokens,
@@ -76,6 +72,7 @@ from main import (
     _save_permissions,
     app,
 )
+from loop_state import turn_state_for
 from memory import (
     _extract_learnings_heuristic,
     _get_recent_learnings,
@@ -85,6 +82,63 @@ from memory import (
 from tool_executor import _resolve_permission
 
 logger = logging.getLogger("latiao-sidecar")
+
+# 单飞守卫（双发防御）：同会话同时允许一个回合在跑。add/discard 原子，无需锁。
+_running_turns: set[str] = set()
+
+# 已处理确认的 LRU（双击去重：第二次点击不再误报"确认已过期"）
+import collections as _collections
+_recently_confirmed: "collections.deque[str]" = _collections.deque(maxlen=200)
+
+
+async def _logged_agent_turn(session_id: str, messages: list, inner):
+    """阶段 1/2a 接线：turn 边界事件 + 相位状态机（灰度，见 session_log.py）。
+
+    事件记录放在 SSE 消费层（而非两个生成器内部），零侵入地拿到完整 turn
+    生命周期：进场记 turn/start + user/message（并 begin_turn），finally
+    记 turn/end（并 end_turn）。
+
+    结束原因与相位令牌同源（token.stop_requested）——停止按钮是唯一的中断
+    语义（0.3.14 审计 P0 修复后的语义），事件日志与运行时行为同源，回放/
+    审计能还原"用户何时按过停止"。
+    """
+    state = turn_state_for(session_id) if session_id else None
+    token = None
+    if state is not None:
+        try:
+            token = state.begin_turn()
+        except Exception:
+            logger.warning("turn begin rejected for %s", session_id, exc_info=True)
+            token = None
+    log = _event_log_for(session_id) if session_id else None
+    if log is not None:
+        try:
+            log.append("turn/start", {"session_id": session_id})
+            last_user = _extract_last_user_text(messages) or ""
+            if last_user:
+                log.append("user/message", {"text": last_user[:4000]}, surface_op="append")
+        except Exception:
+            logger.warning("failed to log turn/start", exc_info=True)
+    reason = "completed"
+    try:
+        async for event in inner:
+            yield event
+    except Exception:
+        reason = "error"
+        raise
+    finally:
+        if log is not None:
+            if reason == "completed" and (token is not None and token.stop_requested):
+                reason = "aborted"
+            try:
+                log.append("turn/end", {"reason": reason})
+            except Exception:
+                logger.warning("failed to log turn/end", exc_info=True)
+        if state is not None:
+            try:
+                state.end_turn(reason)
+            except Exception:
+                logger.warning("failed to end turn state for %s", session_id, exc_info=True)
 
 
 def _get_cloud_model_names() -> list[dict]:
@@ -129,23 +183,13 @@ async def chat_completion(request: Request):
             _m["reasoning_content"] = ""
     model = body.get("model") or SUBAGENT_MODEL
 
-    # ── Auto-route: if no explicit model selected, pick based on task intent ──
+    # ── 路由策略（09-06 起简化，原自动路由机制已删除）──
+    # 此前"代码任务自动路由到云端"：用户加载并依赖本地 27B，代码类问题被
+    # 本机制静默劫持到云端 → GLM 429 → deepseek 降级 → 空工具名 3 连击中止
+    # （zcode 两连问事故）。现在：未选模型一律本地引擎；云端只走用户显式
+    # 选择；429 降级保留但不再静默（弹提示 + 任务头引擎徽标）。
     cloud_config = body.get("cloud_config")
-    user_selected_model = body.get("model")  # User explicitly chose a model?
-    if not user_selected_model and not cloud_config and last_user_text:
-        intent = _detect_task_intent(last_user_text)
-        if intent == "code" and _has_cloud_models():
-            logger.info("Auto-route: code task → using cloud model")
-            # Try to use an available cloud model for code tasks
-            cloud_config = _get_best_cloud_config()
-            if cloud_config:
-                model = cloud_config.get("model", model)
-        elif intent == "chat":
-            from starlette.concurrency import run_in_threadpool as _rtp
-            if await _rtp(local_llm.get_api_url):
-                logger.info("Auto-route: chat task → using local model (free)")
-            # Keep local model for casual chat
-            pass
+    user_selected_model = body.get("model")
 
     logger.info("Chat request: model=%s, msg_count=%d, stream=%s", model, len(messages), body.get("stream", False))
     # 路由透明化：请求声明了具体模型名但既没带 cloud_config、名字也不匹配任何
@@ -203,22 +247,17 @@ async def chat_completion(request: Request):
             _thinking_level = body.get("thinking_level", "high")
 
             async def _run_agent(_protocol, _api_url, _headers, _is_local, _model):
-                if _is_local:
-                    # 本地模型：用 prompt-based tool calling（不依赖 OpenAI function calling API）
-                    async for event in _local_agent_loop_stream(messages, _model, _api_url, _headers, session_id, agent_id, _reflection_mode, _access_mode, _thinking_level):
-                        yield event
-                else:
-                    # 云端模型：原生 OpenAI function calling
-                    # 此前漏传 thinking_level → 恒用默认 high，
-                    # UI 的 off/max 档对云端完全无效（审计 B6）
-                    async for event in _agent_loop_stream(messages, _model, _api_url, _headers, session_id, agent_id, _reflection_mode, _access_mode, _thinking_level):
-                        yield event
+                # 薄循环（唯一循环）：cloud/local 共用，模型驱动终止，机制皆插件
+                from agent.loop import ThinAgentLoop
+                async for event in ThinAgentLoop(
+                    messages, _model, _api_url, _headers, session_id,
+                    _access_mode, _thinking_level, is_local=_is_local,
+                ).run():
+                    yield event
 
             async def agent_loop_wrapper():
                 _fb_used = False  # 429 降级只允许一次，防循环
                 try:
-                    # 新请求清除上一次停止的取消标记（重发消息不受影响）
-                    _clear_session_cancel(session_id)
                     # P0 路由透明化：把实际落地的引擎与模型名在流开头回传给前端，
                     # 消除"选了云端模型名却静默跑本地最慢路径"的欺骗（08-25 事故根因）。
                     # model 名若不在云端配置里，会落到本地引擎；这里如实上报，用户可见。
@@ -254,12 +293,15 @@ async def chat_completion(request: Request):
                     # 云端 404 = 模型名或路径不存在——分别给出可操作的提示
                     req_url = str(e.request.url) if e.request else "?"
                     # 注意：不能复用外层 is_local（内层赋值会把外层变量遮蔽为局部 → UnboundLocalError）
-                    req_is_local = "127.0.0.1" in req_url or "localhost" in req_url
-                    # 云端 429（限流/配额耗尽，09-05 15:14 事故：GLM 周配额用尽后
-                    # 自动路由仍选它，429 直接抛给用户）→ 自动降级：换下一个
-                    # 云端模型（GLM→deepseek），没有则回退本地引擎。只降级一次。
+                    # 用路由级权威标志（云端配置指向 localhost 代理时，URL
+                    # 推断会把云端 404 错标成"本地未就绪"——09-21 E2E 发现）
+                    req_is_local = is_local or "127.0.0.1" in req_url or "localhost" in req_url
+                    # 云端 429（限流/配额耗尽）→ 自动降级：换下一个云端模型
+                    # （GLM→deepseek），没有则回退本地引擎。只降级一次。
+                    # 09-06：显式选择的云端模型也降级（此前仅自动路由降级——
+                    # 自动路由已删除）；降级不再静默：前端弹提示 + 引擎徽标。
                     if (e.response.status_code == 429 and not req_is_local
-                            and not _fb_used and not user_selected_model):
+                            and not _fb_used):
                         _fb_used = True
                         _next_cfg = None
                         try:
@@ -317,8 +359,31 @@ async def chat_completion(request: Request):
                     logger.error("Agent loop unexpected error", exc_info=True)
                     yield f"data: {json.dumps({'error': 'Agent 循环内部错误，请查看日志。'})}\n\n"
                     yield "data: [DONE]\n\n"
-            return StreamingResponse(agent_loop_wrapper(), media_type="text/event-stream",
-                                 headers={"Cache-Control": "no-cache"})
+                finally:
+                    # 单飞守卫释放：无论正常/异常/停止路径，回合结束即放行下一回合
+                    _running_turns.discard(session_id)
+            # 单飞守卫（双发防御）：同会话已有回合在跑时拒绝新回合，防止
+            # 双击发送/重复发包导致并行双答（17:30 观测：同窗口两条完整回复）。
+            # 停止后的重发不受影响（停止走 turn/end，回合已释放）。
+            if session_id in _running_turns:
+                return StreamingResponse(
+                    iter([
+                        f"data: {json.dumps({'content': '⏳ 上一轮任务仍在运行中，请稍候或先停止。'}, ensure_ascii=False)}\n\n",
+                        "data: [DONE]\n\n",
+                    ]),
+                    media_type="text/event-stream",
+                    headers={"Cache-Control": "no-cache"},
+                )
+            _running_turns.add(session_id)
+            # 顺序契约（P1-1 修复）：clear 必须先于 _logged_agent_turn 的 begin_turn
+            # ——否则新开幕令牌会被 abandon() 作废，停止语义丢失。
+            # 新请求清除上一次停止的取消标记（重发消息不受影响）
+            _clear_session_cancel(session_id)
+            return StreamingResponse(
+                _logged_agent_turn(session_id, messages, agent_loop_wrapper()),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache"},
+            )
 
     # Non-streaming agent loop (for Tauri HTTP plugin compatibility)
     if not skip_tools and protocol == "openai":
@@ -590,6 +655,7 @@ def _translate_to_english(text: str) -> str:
     """
     if not text or not re.search(r"[\u4e00-\u9fff]", text):
         return text
+    logger.debug("upload translate: 检测到中文，尝试云端英化 (len=%d)", len(text))
     try:
         cfg = json.loads((Path.home() / ".local-ai-os" / "config.json").read_text(encoding="utf-8"))
         if not cfg.get("upload_text_en"):
@@ -1289,6 +1355,31 @@ async def set_cloud_models(request: Request):
 # ── Tavily API Key management endpoints ──
 
 
+@app.get("/v1/debug/tasks")
+async def debug_tasks():
+    """诊断：转储当前所有 asyncio 任务的 await 栈。
+
+    背景（09-06 16:48 事故）：agent 循环卡在某个永不再唤醒的 await 上时，
+    日志零输出、faulthandler 只能看到线程级栈（asyncio 任务栈不可见），
+    "为什么停了"无法回答。此端点直接转储任务级调用栈，一眼定位卡点。"""
+    import asyncio
+    out = []
+    for t in asyncio.all_tasks():
+        try:
+            if t.done():
+                continue
+            stack = t.get_stack(limit=None)
+            frames = []
+            for f in stack:
+                if f.f_code.co_name == "run":
+                    continue
+                frames.append(f"{f.f_code.co_filename.split('/')[-1]}:{f.f_lineno} in {f.f_code.co_name}")
+            out.append({"task": t.get_name(), "repr": repr(t)[:400], "frames": frames})
+        except Exception as e:
+            out.append({"task": t.get_name(), "error": str(e)})
+    return {"tasks": out, "count": len(out)}
+
+
 @app.get("/v1/settings/tavily-key")
 async def get_tavily_key():
     """Get Tavily API key status (masked, never returns full key). Reads from keychain first, then config.json."""
@@ -1484,12 +1575,17 @@ async def confirm_tool(request: Request):
     call_id = body.get("call_id", "")
     approved = body.get("approved", False)
 
+    logger.info("confirm_tool request: call_id=%s approved=%s", call_id, approved)
     async with _pending_lock:
         entry = _pending_confirmations.get(call_id)
         if entry:
             entry["approved"] = approved
             entry["event"].set()
+            _recently_confirmed.append(call_id)
             return {"status": "ok", "call_id": call_id, "approved": approved}
+    # 双击去重（09-21 实测：第一次批准并移除注册，第二次点击触发误报）
+    if call_id in _recently_confirmed:
+        return {"status": "already", "call_id": call_id, "approved": approved}
     return {"status": "not_found", "message": f"No pending confirmation for call_id: {call_id}"}
 
 

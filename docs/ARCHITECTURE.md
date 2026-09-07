@@ -167,12 +167,11 @@ local-ai-os/
 │   │   ├── ToolCallBubble.tsx       Tool call display + confirm buttons
 │   │   ├── AgentView.tsx            Multi-agent selection
 │   │   ├── ModelsView.tsx           Local + cloud model management
-│   │   ├── SkillsView.tsx           Skill enable/disable UI
 │   │   ├── ToolsView.tsx            Tool catalog view
 │   │   ├── SettingsView.tsx         API keys, preferences
 │   │   ├── CronView.tsx             Scheduled task management
 │   │   └── LogsView.tsx             Sidecar log viewer
-│   ├── hooks/                       React hooks (useSessions, useSkills, etc.)
+│   ├── hooks/                       React hooks (useSessions, useCronJobs)
 │   ├── i18n/                        Internationalization
 │   ├── utils/                       API client, crypto
 │   └── types.ts                     TypeScript type definitions

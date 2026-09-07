@@ -11,36 +11,37 @@ import {
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 
-// ZCode 式活动类别：工具名 → (动词, 名词, 图标)，聚合行显示 "探索 · N 搜索"
+// 活动类别：工具名 → (类别标签, 数量名词, 图标)。标签英文对齐 DSH/Codex
+// 活动行样式（Think/Bash/Search/Read/Write/Data…），noun 保留中文计数
 const TOOL_CATEGORIES: Record<string, { verb: string; noun: string; icon: LucideIcon }> = {
-  bing_search: { verb: "探索", noun: "搜索", icon: Search },
-  web_search: { verb: "探索", noun: "搜索", icon: Search },
-  tavily_search: { verb: "探索", noun: "搜索", icon: Search },
-  search_files: { verb: "探索", noun: "搜索", icon: Search },
-  mx_query: { verb: "查询", noun: "查询", icon: Database },
-  ak_finance: { verb: "查询", noun: "查询", icon: Database },
-  read_file: { verb: "读取", noun: "文件", icon: FileText },
-  list_dir: { verb: "读取", noun: "目录", icon: FolderOpen },
-  write_file: { verb: "写入", noun: "文件", icon: FilePen },
-  run_cmd: { verb: "执行", noun: "命令", icon: Terminal },
-  open_folder: { verb: "打开", noun: "目录", icon: FolderOpen },
-  open_app: { verb: "打开", noun: "应用", icon: AppWindow },
-  delegate_task: { verb: "委派", noun: "任务", icon: Users },
-  create_cron: { verb: "定时", noun: "任务", icon: Clock },
+  bing_search: { verb: "Search", noun: "搜索", icon: Search },
+  web_search: { verb: "Search", noun: "搜索", icon: Search },
+  tavily_search: { verb: "Search", noun: "搜索", icon: Search },
+  search_files: { verb: "Search", noun: "搜索", icon: Search },
+  mx_query: { verb: "Data", noun: "查询", icon: Database },
+  ak_finance: { verb: "Data", noun: "查询", icon: Database },
+  read_file: { verb: "Read", noun: "文件", icon: FileText },
+  list_dir: { verb: "Read", noun: "目录", icon: FolderOpen },
+  write_file: { verb: "Write", noun: "文件", icon: FilePen },
+  run_cmd: { verb: "Bash", noun: "命令", icon: Terminal },
+  open_folder: { verb: "Open", noun: "目录", icon: FolderOpen },
+  open_app: { verb: "Open", noun: "应用", icon: AppWindow },
+  delegate_task: { verb: "Task", noun: "任务", icon: Users },
+  create_cron: { verb: "Task", noun: "任务", icon: Clock },
   // 五控工具
-  screen_capture: { verb: "截图", noun: "屏幕", icon: Camera },
-  control_list_processes: { verb: "查看", noun: "进程", icon: ListTree },
-  control_kill_process: { verb: "终止", noun: "进程", icon: ScanLine },
-  control_launch: { verb: "启动", noun: "进程", icon: Play },
-  control_process_log: { verb: "读取", noun: "日志", icon: FileText },
-  control_mouse_move: { verb: "移动", noun: "鼠标", icon: MousePointer2 },
-  control_mouse_click: { verb: "点击", noun: "鼠标", icon: MousePointer2 },
-  control_keyboard_type: { verb: "键入", noun: "键盘", icon: Keyboard },
-  control_keyboard_press: { verb: "按键", noun: "键盘", icon: Keyboard },
-  control_wait: { verb: "等待", noun: "进程", icon: Clock },
-  control_audit: { verb: "查询", noun: "记录", icon: History },
+  screen_capture: { verb: "Capture", noun: "屏幕", icon: Camera },
+  control_list_processes: { verb: "List", noun: "进程", icon: ListTree },
+  control_kill_process: { verb: "Kill", noun: "进程", icon: ScanLine },
+  control_launch: { verb: "Launch", noun: "进程", icon: Play },
+  control_process_log: { verb: "Read", noun: "日志", icon: FileText },
+  control_mouse_move: { verb: "Control", noun: "鼠标", icon: MousePointer2 },
+  control_mouse_click: { verb: "Control", noun: "鼠标", icon: MousePointer2 },
+  control_keyboard_type: { verb: "Control", noun: "键盘", icon: Keyboard },
+  control_keyboard_press: { verb: "Control", noun: "键盘", icon: Keyboard },
+  control_wait: { verb: "Wait", noun: "进程", icon: Clock },
+  control_audit: { verb: "Data", noun: "记录", icon: History },
 };
-const TOOL_CATEGORY_FALLBACK = { verb: "工具", noun: "调用", icon: Wrench };
+const TOOL_CATEGORY_FALLBACK = { verb: "Tool call", noun: "调用", icon: Wrench };
 import ReactMarkdown from "react-markdown";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import remarkGfm from "remark-gfm";
@@ -123,7 +124,11 @@ interface ChatViewProps {
   showToast: (msg: string, type?: string) => void;
   activeTask: string | null;
   taskStartAt: number | null;
+  streamingThink?: string;  // 流式中的思考缓冲（运行中 Think 行实时摘要）
   subagents?: { id: string; agent: string; task: string; status: string; summary?: string }[];
+  routeInfo?: { engine: string; declaredModel: string } | null;  // 实际引擎路由（engine_route/route_fallback）
+  localModelId?: string;    // 已加载的本地模型 id（选择器展示 💻 选项）
+  localModelName?: string;  // 已加载的本地模型名
 }
 
 export default memo(function ChatView({
@@ -134,7 +139,8 @@ export default memo(function ChatView({
   chatEndRef, handleDrop, onPasteImage,
   cloudModels, selectedModel, onSelectModel,
   accessMode, setAccessMode, thinkingLevel, setThinkingLevel,
-  contextEstimate, showToast, activeTask, taskStartAt, subagents,
+  contextEstimate, showToast, activeTask, taskStartAt, streamingThink, subagents,
+  routeInfo, localModelId, localModelName,
 }: ChatViewProps) {
   const { t } = useTranslation();
   // WebKit (WKWebView) 下 compositionend 先于最终 keydown 派发，
@@ -198,22 +204,33 @@ export default memo(function ChatView({
     return () => { el.removeEventListener("scroll", onScroll); ro.disconnect(); };
   }, [messages.length]);
 
-  // 每条消息 → 色块（均匀等高，ZCode 风格；仅颜色区分角色）
-  const miniBlocks = useMemo(() => messages.map((m, i) => ({
-    index: i,
-    color: m.role === "user" ? "var(--accent)" : m.role === "tool" ? "var(--text-disabled)" : "var(--success)",
-    key: m.id || `m${i}`,
-  })), [messages]);
-
-  const jumpTo = (ratio: number) => {
+  // 每条消息的真实布局测量（offsetTop/height）——Turn Navigator 用它把每轮
+  // 对话映射到真实滚动位置（点击跳转、当前轮高亮）。
+  const [msgMetrics, setMsgMetrics] = useState<{ id: string; top: number; height: number }[]>([]);
+  useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
-    el.scrollTop = ratio * (el.scrollHeight - el.clientHeight);
-  };
+    const measure = () => {
+      const elRect = el.getBoundingClientRect();
+      const next: { id: string; top: number; height: number }[] = [];
+      el.querySelectorAll<HTMLElement>("[data-mid]").forEach((n) => {
+        const id = n.dataset.mid;
+        if (!id) return;
+        const r = n.getBoundingClientRect();
+        next.push({ id, top: r.top - elRect.top + el.scrollTop, height: Math.max(4, r.height) });
+      });
+      next.sort((a, b) => a.top - b.top);
+      setMsgMetrics(next);
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    const t = setTimeout(measure, 300);
+    return () => { ro.disconnect(); clearTimeout(t); };
+  }, [messages]);
 
-  // 每次工具调用独立成行（活动摘要行 ZCode 式），不再分组折叠
-  // minimap 悬停预览：hoverRatio + 对应消息预览
-  const [minimapHover, setMinimapHover] = useState<{ ratio: number; idx: number } | null>(null);
+  // minimap 悬停轮次（Turn Navigator 式：悬停显示该轮问题主题，点击跳转）
+  const [hoverTurn, setHoverTurn] = useState<{ idx: number; topPx: number } | null>(null);
   // 子任务详情弹窗：点 subagent 行看 task 全文 + 结果摘要（✗ 只是状态标记，
   // 此前无点击入口，用户误以为 ✗ 是删除按钮）
   const [subagentDetail, setSubagentDetail] = useState<{ id: string; agent: string; task: string; status: string; summary?: string; started_at?: string; updated_at?: string } | null>(null);
@@ -233,6 +250,27 @@ export default memo(function ChatView({
     const s = Math.max(0, Math.round(ms / 1000));
     if (s < 60) return `${s} 秒`;
     return `${Math.floor(s / 60)} 分 ${s % 60} 秒`;
+  };
+
+  // 活动行摘要（DSH/Codex 同款：一行可见 = 摘要截断）
+  const thinkSummary = (text: string) => {
+    const m = text.match(/\*\*([^*\n]+)\*\*/);  // 首个 **粗体**（Codex streaming.rs 头部提取）
+    const line = m ? m[1] : (text.split("\n").find((l) => l.trim()) || "");
+    const flat = line.replace(/\s+/g, " ").trim();
+    return flat.length > 80 ? flat.slice(0, 80) + "…" : flat;
+  };
+  // 工具行摘要：run_cmd→command/description，搜索→query/pattern/url，文件→path，其他→args 前 60 字
+  const toolSummary = (m: Message) => {
+    const a = (m.toolArgs || {}) as Record<string, unknown>;
+    const pick = (k: string) => (typeof a[k] === "string" || typeof a[k] === "number") ? String(a[k]) : "";
+    let s = "";
+    if (m.toolName === "run_cmd" || m.toolName === "control_launch") s = pick("command") || pick("description");
+    else if (["web_search", "bing_search", "tavily_search", "search_files"].includes(m.toolName || "")) s = pick("query") || pick("pattern") || pick("url");
+    else if (["read_file", "write_file", "list_dir", "open_folder", "open_app", "control_process_log"].includes(m.toolName || "")) s = pick("path") || pick("directory") || pick("app") || pick("pattern");
+    else if (m.toolName === "mx_query" || m.toolName === "ak_finance") s = pick("query") || pick("index");
+    if (!s) s = JSON.stringify(a || {}).slice(0, 60);
+    s = s.replace(/\s+/g, " ").trim();
+    return s.length > 80 ? s.slice(0, 80) + "…" : s;
   };
 
   // ── 对话分段（ZCode 式：一次对话 = 一张卡片，头部显示耗时）──
@@ -309,7 +347,7 @@ export default memo(function ChatView({
               // 否则未闭合的围栏会让 ReactMarkdown 把后续全部渲染成代码块（灰框）
               .replace(/```{3,}\s*think\s*[<>]/g, "");
             return (
-              <div key={msg.id || i} className={`msg-row assistant${msg.type === "file" ? " file" : ""}`}>
+              <div key={msg.id || i} data-mid={msg.id} className={`msg-row assistant${msg.type === "file" ? " file" : ""}`}>
                 <div className="avatar-small avatar-bot"><Bot size={19} strokeWidth={2} /></div>
                 <div className="msg-content">
                   {bodyText && (
@@ -351,7 +389,7 @@ export default memo(function ChatView({
             const fbody = fm ? fm[3] : msg.content;
             const isExpanded = !!expandedFiles[msg.id || ""];
             return (
-              <div key={msg.id || i} className={`msg-row user file`}>
+              <div key={msg.id || i} data-mid={msg.id} className={`msg-row user file`}>
                 <div className="avatar-small avatar-user"><User size={19} strokeWidth={2} /></div>
                 <div className="msg-content">
                   {textPart && <div className="msg-bubble user">{textPart}</div>}
@@ -382,7 +420,7 @@ export default memo(function ChatView({
             );
           }
           return (
-            <div key={msg.id || i} className={`msg-row user${msg.type === "image" ? " file" : ""}`}>
+            <div key={msg.id || i} data-mid={msg.id} className={`msg-row user${msg.type === "image" ? " file" : ""}`}>
               <div className="avatar-small avatar-user"><User size={19} strokeWidth={2} /></div>
               <div className="msg-content">
                 <div className="msg-bubble user">{msg.content}</div>
@@ -467,70 +505,53 @@ export default memo(function ChatView({
           </div>
         </div>
       )}
-      {messages.length > 8 && (
-        <>
-        <div className="chat-minimap" onClick={(e) => {
-          const rect = e.currentTarget.getBoundingClientRect();
-          jumpTo((e.clientY - rect.top) / rect.height);
-        }} onMouseMove={(e) => {
-          const rect = e.currentTarget.getBoundingClientRect();
-          const ratio = Math.min(1, Math.max(0, (e.clientY - rect.top) / rect.height));
-          const idx = Math.min(miniBlocks.length - 1, Math.floor(ratio * miniBlocks.length));
-          setMinimapHover({ ratio, idx });
-        }} onMouseLeave={() => setMinimapHover(null)}>
-          {miniBlocks.map(b => (
-            <div key={b.key} className={`mini-block${minimapHover && minimapHover.idx === b.index ? " hover" : ""}`}
-              style={{ background: b.color }} />
-          ))}
-          <div className="mini-viewport" style={{
-            top: `${(scrollInfo.top / Math.max(1, scrollInfo.totalH - scrollInfo.viewH)) * 100}%`,
-            height: `${(scrollInfo.viewH / scrollInfo.totalH) * 100}%`,
-          }} />
-        </div>
-        {/* 悬停预览浮层（ZCode 式：以悬停消息为中心的滑动窗口对话流） */}
-        {minimapHover && messages[minimapHover.idx] && (() => {
-          const cur = minimapHover.idx;
-          const lo = Math.max(0, cur - 4);
-          const hi = Math.min(messages.length - 1, cur + 4);
-          const entries: { icon: string; text: string; isCurrent: boolean; key: string }[] = [];
-          for (let i = lo; i <= hi; i++) {
-            const m = messages[i];
-            const isCur = i === cur;
-            if (m.role === "tool") {
-              let args = "";
-              try {
-                args = m.toolArgs
-                  ? JSON.stringify(m.toolArgs).replace(/[{}"]/g, "").replace(/[:,]/g, " ").replace(/\s+/g, " ").trim()
-                  : "";
-              } catch { /* 参数不可序列化时忽略 */ }
-              entries.push({
-                icon: "◆",
-                text: `${m.toolName || "工具"}${args ? " · " + args.slice(0, 48) : ""}`.slice(0, 80),
-                isCurrent: isCur, key: m.id || `t${i}`,
-              });
-            } else if ((m.content || "").trim()) {
-              const text = (m.content || "").replace(/[#*|`>-]/g, "").replace(/\s+/g, " ").slice(0, 110);
-              entries.push({
-                icon: m.role === "user" ? "🧑" : "🤖",
-                text, isCurrent: isCur, key: m.id || `m${i}`,
-              });
-            }
-          }
-          if (entries.length === 0) return null;
-          const follow = Math.max(0, Math.min(scrollInfo.viewH - 320, minimapHover.ratio * Math.max(0, scrollInfo.viewH - 320)));
-          return (
-            <div className="mini-preview" style={{ top: 34 + follow }}>
-              {entries.map(e => (
-                <div key={e.key} className={`mini-preview-line${e.isCurrent ? " current" : ""}`}>
-                  <span className="mini-preview-icon">{e.icon}</span>
-                  <span>{e.text}</span>
-                </div>
-              ))}
+      {(() => {
+        // ── Turn Navigator（ZCode 式对话轮导航条）──
+        // 每轮对话（一段）一根细横杠：均匀分布、当前轮高亮、运行中脉冲；
+        // 悬停显示该轮主题（问题 2 行 + 回答摘要 3 行），点击平滑跳转。
+        // 此前 per-message 色块 + 滑动窗口预览内容过多且与滚动位置错位，已废。
+        const turns = segments.map((seg, i) => {
+          const q = seg.msgs.find((m) => m.role === "user");
+          const a = [...seg.msgs].reverse().find((m) => m.role === "assistant" && (m.content || "").trim());
+          const top = q ? msgMetrics.find((mm) => mm.id === q.id)?.top : undefined;
+          return { key: seg.msgs[0]?.id || `t${i}`, q, a, top, idx: i };
+        }).filter((t) => t.q);
+        if (turns.length < 3) return null;
+        const live = isProcessing || activeTask !== null;
+        // 当前轮：滚动视口上 35% 位置覆盖的那一轮
+        const center = scrollInfo.top + scrollInfo.viewH * 0.35;
+        let activeIdx = 0;
+        turns.forEach((t, i) => { if (t.top !== undefined && t.top <= center) activeIdx = i; });
+        const hovered = hoverTurn ? turns[hoverTurn.idx] : null;
+        const stripText = (s: string | undefined, n: number) =>
+          (s || "").replace(/```[\s\S]*?```/g, " [代码] ").replace(/[#*|`>-]/g, "").replace(/\s+/g, " ").trim().slice(0, n);
+        return (
+          <>
+          <div className="chat-minimap" onMouseLeave={() => setHoverTurn(null)}>
+            {turns.map((t, i) => (
+              <div key={t.key} className="turn-slot"
+                onMouseEnter={(e) => {
+                  const r = e.currentTarget.getBoundingClientRect();
+                  const p = e.currentTarget.parentElement!.getBoundingClientRect();
+                  setHoverTurn({ idx: i, topPx: r.top - p.top + r.height / 2 });
+                }}
+                onClick={() => {
+                  const el = scrollRef.current;
+                  if (el && t.top !== undefined) el.scrollTo({ top: Math.max(0, t.top - 16), behavior: "smooth" });
+                }}>
+                <span className={`turn-dash${i === activeIdx ? " active" : ""}${live && i === turns.length - 1 ? " running" : ""}`} />
+              </div>
+            ))}
+          </div>
+          {hovered && hovered.q && (
+            <div className="mini-preview" style={{ top: Math.max(34, Math.min(34 + (scrollInfo.viewH - 220), 20 + (hoverTurn!.topPx))) }}>
+              <p className="mini-preview-q">{stripText(hovered.q.content, 140) || "（无文字）"}</p>
+              {hovered.a && <p className="mini-preview-a">{stripText(hovered.a.content, 180)}</p>}
             </div>
-          );
-        })()}
-        </>
-      )}
+          )}
+          </>
+        );
+      })()}
       <div className="chat-scroll" ref={scrollRef} onDrop={handleDrop} onDragOver={(e) => { if (handleDrop) e.preventDefault(); }}>
         {segments.map((seg, si) => {
           const segKey = seg.msgs[0]?.id || `seg${si}`;
@@ -541,21 +562,35 @@ export default memo(function ChatView({
           // 进行中的对话段（最后一段）：实时计时 + 当前工具
           const live = si === segments.length - 1 && taskStartAt !== null && (isProcessing || activeTask !== null);
           const label = live
-            ? `已工作 ${fmtDur(elapsed)}${activeTask ? " · " + activeTask.slice(0, 40) : ""}`
+            ? (elapsed >= 15000 ? `Deep diving… ${fmtDur(elapsed)}` : "Deep diving…")
             : segDur > 0 ? `已工作 ${fmtDur(segDur)}` : qText || "对话";
+          // 引擎徽标（09-06：429 降级静默换引擎，用户以为还在用本地模型）——
+          // 仅进行中且路由信息可用时显示；本地路径截尾段作短名
+          const badgeModel = routeInfo?.declaredModel
+            ? (routeInfo.declaredModel.includes("/") ? routeInfo.declaredModel.split("/").filter(Boolean).pop() : routeInfo.declaredModel)
+            : "";
+          const badge = live && routeInfo?.engine && badgeModel
+            ? `${routeInfo.engine === "云端" ? "☁" : "💻"} ${badgeModel.slice(0, 28)}`
+            : "";
           // ZCode 分区渲染：用户消息 → 思考活动行 → 计划 → 工具聚合行 → 回答正文
           const userMsgs = seg.msgs.filter((m) => m.role === "user");
           const asstMsgs = seg.msgs.filter((m) => m.role === "assistant");
           const toolMsgs = seg.msgs.filter((m) => m.role === "tool" || m.type === "tool_call");
-          const thinkRows: { key: string; text: string; dur?: number }[] = [];
+          const thinkRows: { key: string; text: string; dur?: number; round?: number }[] = [];
           for (const m of asstMsgs) {
             const localThink = m.content.match(/^<think>([\s\S]*?)<\/think>\s*/);
             const thinkText = m.thinking || (localThink ? localThink[1] : null);
-            if (thinkText) thinkRows.push({ key: m.id || `thk${thinkRows.length}`, text: thinkText, dur: m.thinkingDuration });
+            if (thinkText) thinkRows.push({ key: m.id || `thk${thinkRows.length}`, text: thinkText, dur: m.thinkingDuration, round: m.round });
           }
+          // 同一对话段的全部思考合并为单一折叠栏：时长求和展示
+          const thinkTotalDur = thinkRows.reduce((acc, r) => acc + (r.dur ?? 0), 0);
+          // 轮次展示（09-05 23:52：多轮拉锯时"第 N 轮"让进度可见）
+          const lastRound = thinkRows.reduce((acc, r) => r.round ?? acc, 0);
+          // 运行中思考行（流式期间消息未定稿，思考还在缓冲里；Codex 同款：提取首个粗体/首行摘要）
+          const liveThink = (live && streamingThink) ? thinkSummary(streamingThink) : null;
           const planMsgs = asstMsgs.filter((m) => m.content.startsWith("📋"));
           const answerMsgs = asstMsgs.filter((m) => !m.content.startsWith("📋"));
-          // ZCode 式类别聚合：同类别工具折叠为一行 "探索 · N 搜索"（保持首次出现顺序）
+          // ZCode 式类别聚合：同类别工具折叠为一行 "Search · N 搜索"（保持首次出现顺序）
           const catGroups: { verb: string; noun: string; icon: LucideIcon; msgs: Message[] }[] = [];
           for (const m of toolMsgs) {
             const cat = TOOL_CATEGORIES[m.toolName || ""] || TOOL_CATEGORY_FALLBACK;
@@ -564,22 +599,41 @@ export default memo(function ChatView({
             else catGroups.push({ verb: cat.verb, noun: cat.noun, icon: cat.icon, msgs: [m] });
           }
           return (
-            <div key={segKey} className={`chat-segment${collapsed ? " collapsed" : ""}`}>
+            <div key={segKey} className={`chat-segment${collapsed ? " collapsed" : ""}${live ? " live-seg" : ""}`}>
               <button className="chat-segment-head" onClick={() => setCollapsedSegs(p => ({ ...p, [segKey]: !collapsed }))}>
-                <span className="chat-segment-label">{label}</span>
+                <span className="chat-segment-label">{label}{badge && (
+                  <span style={{ fontSize: 10, color: "var(--text-muted)", padding: "1px 6px", borderRadius: "var(--radius-sm)", background: "var(--bg-elevated)", marginLeft: 8, fontWeight: 400 }}>{badge}</span>
+                )}</span>
                 <span className="chat-segment-chevron">{collapsed ? <ChevronRight size={13} /> : <ChevronDown size={13} />}</span>
               </button>
               {userMsgs.map((m, i) => renderMsg(m, i))}
-              {!collapsed && thinkRows.map((r) => (
-                <details key={`thk${r.key}`} className="thinking-row">
+              {!collapsed && liveThink && (
+                <div className="thinking-row live">
+                  <div className="thinking-row-head">
+                    <Brain size={13} />
+                    <span>Think</span>
+                    <span className="thinking-meta">·</span>
+                    <span className="thinking-row-summary">{liveThink}</span>
+                  </div>
+                </div>
+              )}
+              {!collapsed && thinkRows.length > 0 && (
+                <details className="thinking-row">
                   <summary className="thinking-row-head">
                     <Brain size={13} />
-                    <span>思考过程</span>
-                    {r.dur !== undefined && <span className="thinking-meta">· 持续了 {fmtDur(r.dur)}</span>}
+                    <span>Think</span>
+                    <span className="thinking-meta">·</span>
+                    <span className="thinking-row-summary">{thinkSummary(thinkRows[0].text)}</span>
+                    {lastRound > 0 && <span className="thinking-meta">· 第 {lastRound} 轮</span>}
+                    {thinkTotalDur > 0 && <span className="thinking-meta">· 持续 {fmtDur(thinkTotalDur)}</span>}
                   </summary>
-                  <div className="thinking-row-body">{r.text}</div>
+                  <div className="thinking-row-body">
+                    {thinkRows.map((r, i) => (
+                      <p key={r.key} style={{ margin: i > 0 ? "8px 0 0" : 0 }}>{r.text}</p>
+                    ))}
+                  </div>
                 </details>
-              ))}
+              )}
               {!collapsed && planMsgs.map((m, i) => renderMsg(m, i))}
               {!collapsed && catGroups.map((g, gi) => {
                 const Icon = g.icon;
@@ -592,12 +646,14 @@ export default memo(function ChatView({
                     </div>
                   );
                 }
+                const gSummary = toolSummary(g.msgs[0]);
                 return (
                   <details key={`cg${gi}`} className="tool-group-row">
                     <summary className="tool-group-row-head">
                       <span className="tool-call-icon"><Icon size={14} /></span>
                       <span className="tool-call-name">{g.verb}</span>
                       <span className="tool-group-row-meta">· {g.msgs.length} {g.noun}</span>
+                      {gSummary && <span className="tool-group-row-summary">· {gSummary}</span>}
                       <span className="tool-group-row-chevron"><ChevronDown size={12} /></span>
                     </summary>
                     <div className="tool-group-row-body">
@@ -694,6 +750,9 @@ export default memo(function ChatView({
                 value={selectedModel} onChange={(e) => onSelectModel(e.target.value)}
                 title={t("chat.model_select")}>
                 <option value="">{t("sidebar.auto_detect")}</option>
+                {localModelId && (
+                  <option key="local-loaded" value={localModelId}>💻 {localModelName || localModelId.split("/").filter(Boolean).pop()}</option>
+                )}
                 {cloudModels.map((m) => (
                   <option key={m.name} value={m.name}>☁️ {m.name}</option>
                 ))}
