@@ -5,23 +5,23 @@
 /* ── Design Tokens ── */
 :root {
   --bg-root: #1e1e1e;
-  --bg-surface: #262626;
+  --bg-surface: #2a2a2a;
   --bg-surface-hover: #2b2b2b;
-  --bg-elevated: #303030;
+  --bg-elevated: #333333;
   --bg-input: #242424;
   --border-default: rgba(255, 255, 255, 0.07);
   --border-strong: rgba(255, 255, 255, 0.10);
   --border-subtle: rgba(255, 255, 255, 0.06);  /* alias for index.css scrollbar */
-  --border-accent: rgba(233, 168, 61, 0.24);
+  --border-accent: rgba(255, 255, 255, 0.16);
   --text-primary: #f0f0f2;
   --text-secondary: #a8a8ad;
   --text-muted: #7a7a80;
   --text-disabled: #50505a;
   --text-tertiary: #7a7a80;  /* alias for scrollbar / index.css compat */
-  --accent: #e9a83d;
-  --accent-hover: #eebf5b;
-  --accent-soft: rgba(233, 168, 61, 0.13);
-  --accent-glow: rgba(233, 168, 61, 0.22);
+  --accent: #e6e6e6;
+  --accent-hover: #f7f7f7;
+  --accent-soft: rgba(255, 255, 255, 0.08);
+  --accent-glow: rgba(255, 255, 255, 0.14);
   --success: #34d399;
   --success-soft: rgba(52, 211, 153, 0.12);
   --warning: #f59e0b;
@@ -41,7 +41,7 @@
   --font-mono: "SF Mono", "JetBrains Mono", "Fira Code", monospace;
   /* ── Adaptive backgrounds (dark default) ── */
   --bg-main: linear-gradient(180deg, #232323 0%, #1e1e1e 100%);
-  --bg-card: #262626;
+  --bg-card: #2a2a2a;
   --bg-card-hover: #2b2b2b;
   --bg-log: #1c1c1c;
   --bg-identity-bar: rgba(255, 255, 255, 0.03);
@@ -62,16 +62,16 @@
   --border-default: rgba(0, 0, 0, 0.05);
   --border-strong: rgba(0, 0, 0, 0.09);
   --border-subtle: rgba(0, 0, 0, 0.04);
-  --border-accent: rgba(201, 138, 46, 0.3);
+  --border-accent: rgba(0, 0, 0, 0.14);
   --text-primary: #1a1a1a;
   --text-secondary: #55555c;
   --text-muted: #8e8e92;
   --text-disabled: #c0c0c4;
   --text-tertiary: rgba(0, 0, 0, 0.22);
-  --accent: #c98a2e;
-  --accent-hover: #a76f1f;
-  --accent-soft: rgba(201, 138, 46, 0.12);
-  --accent-glow: rgba(201, 138, 46, 0.18);
+  --accent: #2a2a2a;
+  --accent-hover: #1f1f1f;
+  --accent-soft: rgba(0, 0, 0, 0.06);
+  --accent-glow: rgba(0, 0, 0, 0.10);
   --glass-saturation: 1;
   /* ── Adaptive backgrounds (light) ── */
   --bg-main: #fafafa;
@@ -153,7 +153,7 @@ body {
 .sidebar-logo {
   width: 30px; height: 30px; border-radius: var(--radius-sm);
   display: flex; align-items: center; justify-content: center;
-  box-shadow: 0 2px 12px rgba(233,168,61,0.3);
+  box-shadow: 0 2px 12px var(--accent-glow);
   flex-shrink: 0;
 }
 .sidebar-logo img,
@@ -192,7 +192,7 @@ img.sidebar-logo {
   cursor: pointer; text-align: left; transition: all 0.15s ease; gap: 6px;
 }
 .session-item:hover { background: var(--hover-overlay); color: var(--text-primary); }
-.session-item.active { background: rgba(233,168,61,0.06); color: var(--text-primary); }
+.session-item.active { background: var(--accent-soft); color: var(--text-primary); }
 .session-info { min-width: 0; flex: 1; }
 .session-name { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .session-preview { font-size: 10px; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 1px; }
@@ -428,7 +428,7 @@ img.sidebar-logo {
   opacity: 0.85;
 }
 .statusbar-sep { opacity: 0.5; }
-.input-row:focus-within { border-color: var(--border-accent); box-shadow: 0 0 0 3px rgba(233,168,61,0.06); }
+.input-row:focus-within { border-color: var(--border-accent); box-shadow: 0 0 0 3px var(--accent-soft); }
 .chat-input {
   flex: 1; min-height: 52px; background: 0 0; border: 0; color: var(--text-primary);
   font-size: 13px; outline: 0; padding: 6px 0; font-family: var(--font-sans);
@@ -639,7 +639,7 @@ img.sidebar-logo {
   font-size: 12.5px; font-weight: 550; font-family: var(--font-sans); cursor: pointer;
   transition: all 0.15s ease; flex-shrink: 0;
 }
-.btn-send:hover { filter: brightness(1.15); transform: translateY(-1px); box-shadow: 0 4px 16px rgba(233,168,61,0.3); }
+.btn-send:hover { filter: brightness(1.15); transform: translateY(-1px); box-shadow: 0 4px 16px var(--accent-glow); }
 .btn-send:active { transform: translateY(0); }
 .btn-send:disabled { opacity: 0.5; cursor: not-allowed; filter: none; transform: none; box-shadow: none; }
 .btn-stop {
@@ -824,7 +824,7 @@ img.sidebar-logo {
 /* ── Hardware Tier ── */
 .tier-grid { display: grid; grid-template-columns: repeat(3,1fr); gap: 10px; }
 .tier-card { background: var(--bg-card); border: 1px solid var(--border-default); border-radius: var(--radius-lg); padding: 14px 16px; cursor: pointer; }
-.tier-card.recommended { border-color: rgba(233,168,61,0.25); background: rgba(233,168,61,0.04); }
+.tier-card.recommended { border-color: var(--border-accent); background: var(--accent-soft); }
 .tier-tag { display: inline-block; padding: 2px 8px; font-size: 10px; font-weight: 600; border-radius: var(--radius-sm); margin-bottom: 8px; }
 .tier-tag.basic { background: rgba(148,163,184,0.15); color: #94a3b8; }
 .tier-tag.rec { background: var(--accent-soft); color: var(--accent); }
