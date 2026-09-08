@@ -40,7 +40,7 @@
   --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", system-ui, sans-serif;
   --font-mono: "SF Mono", "JetBrains Mono", "Fira Code", monospace;
   /* ── Adaptive backgrounds (dark default) ── */
-  --bg-main: linear-gradient(180deg, #232323 0%, #1e1e1e 100%);
+  --bg-main: #1f1f1f;
   --bg-card: #2a2a2a;
   --bg-card-hover: #2b2b2b;
   --bg-log: #1c1c1c;
@@ -74,7 +74,7 @@
   --accent-glow: rgba(0, 0, 0, 0.10);
   --glass-saturation: 1;
   /* ── Adaptive backgrounds (light) ── */
-  --bg-main: #fafafa;
+  --bg-main: #ffffff;
   --bg-card: #ffffff;
   --bg-card-hover: #fafafa;
   --bg-log: #ffffff;
@@ -88,14 +88,15 @@
   background: #ffffff;
 }
 [data-theme="light"] body {
-  background: #ffffff;
+  background: transparent;
 }
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
+button, select, input, textarea { -webkit-app-region: no-drag; }
 
 body {
   font-family: var(--font-sans);
-  background: var(--bg-root);
+  background: transparent;
   color: var(--text-primary);
   -webkit-font-smoothing: antialiased;
   overflow: hidden;
@@ -109,9 +110,7 @@ body {
 .sidebar {
   width: var(--sidebar-width); min-width: var(--sidebar-width);
   height: 100vh; display: flex; flex-direction: column;
-  background: var(--bg-surface);
-  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation));
-  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation));
+  background: transparent;
   border-right: 1px solid var(--border-default);
   z-index: 10;
   transition: width 0.25s cubic-bezier(0.16, 1, 0.3, 1), min-width 0.25s cubic-bezier(0.16, 1, 0.3, 1);
@@ -127,7 +126,9 @@ body {
   border-radius: 8px;
 }
 
-.sidebar-brand { display: flex; align-items: center; gap: 10px; padding: 18px 18px 14px; flex-shrink: 0; }
+.sidebar-brand {
+  -webkit-app-region: drag;
+  padding-left: 78px; display: flex; align-items: center; gap: 10px; padding: 18px 18px 14px; flex-shrink: 0; }
 .sidebar-collapse-btn {
   margin-left: auto; width: 26px; height: 26px; border-radius: var(--radius-sm);
   border: 1px solid var(--border-strong); background: var(--bg-input);
@@ -275,13 +276,16 @@ img.sidebar-logo {
   flex: 1; min-width: 0; display: flex; flex-direction: column;
   height: 100vh;
   background: var(--bg-main);
+  border-left: 1px solid var(--border-default);
 }
 
 /* Topbar */
 .topbar {
   display: flex; align-items: center; gap: 12px;
   padding: 0 20px; height: var(--topbar-height);
-  background: var(--bg-surface);
+  background: transparent;
+  -webkit-app-region: drag;
+  user-select: none;
   backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation));
   -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation));
   border-bottom: 1px solid var(--border-default); flex-shrink: 0;
