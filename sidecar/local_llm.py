@@ -1498,13 +1498,17 @@ class LocalLLMEngine:
         self.server_status = "starting"
         self.status_message = f"正在加载 {self.current_model_name}..."
 
+        # -ngl -1（“未设置”默认）在旧版 llama-server 被接受，新版（XHToken fork）
+        # 要求非负（0-999）——启动即被拒 → “exited early/HTTP timeout”
+        # （09-08 Spark 回退失败根因）。映射为 999（全部 layer），两版兼容。
+        _ngl = self.n_gpu_layers if self.n_gpu_layers >= 0 else 999
         cmd = [
             str(exe),
             "-m", model_path,
             "--port", str(port),
             "--host", "127.0.0.1",
             "-c", str(self.model_token_limit),
-            "-ngl", str(self.n_gpu_layers),
+            "-ngl", str(_ngl),
         ]
         kv_k, kv_v = _auto_cache_type(model_path)
         # cache-type 值兼容：旧版 CLI 接受数字（8），新版（XHToken fork）要求
