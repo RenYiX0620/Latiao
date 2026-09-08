@@ -135,6 +135,12 @@ def _parse_delta_line(line: str) -> tuple[bool, dict | None]:
     chunks = parsed.chunks
     if not chunks:
         return False, {}
+    # finish_reason 透传（09-07 提速/完整性：max-tokens 截断的 tool-call
+    # 必须在执行层丢弃——DSH BlockAssembler 同款语义。引擎有时把 finish
+    # 放在 usage-only 行，故在 usage 过滤之前提取）
+    for c in chunks:
+        if c.kind == "finish" and c.finish_reason:
+            return False, {"finish_reason": c.finish_reason}
     if all(c.kind == "usage" for c in chunks):
         return False, None  # usage-only chunk（旧: if not choices: continue）
     delta: dict = {}

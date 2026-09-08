@@ -483,8 +483,19 @@ def _is_light_query(text: str, msgs: list) -> bool:
         return False
     if any(kw in t.lower() for kw in _TASK_KW):
         return False
+    # 市场类问题（行情/资金/涨跌……）必须保留工具——快车道剥掉工具后
+    # 模型只会凭印象编数字（09-08 20:14 实况："今天大盘资金流向怎么样"
+    # 19 字未命中任务词 → tools=0 → 编造主力净流出 118 亿、每板块 ±118 亿）
+    if _MARKET_TASK_RE.search(t):
+        return False
     # 会话里出现过工具结果 → 可能是任务续聊（如"继续"），不走快车道
     if any(m.get("role") == "tool" for m in msgs or []):
+        return False
+    # 深会话保护（09-07 17:14 事故）：前端回传的历史不含 role:"tool" 消息，
+    # 上一条保护形同虚设——任务进行中的会话（24-28 条历史）里，"继续"/
+    # "重新去查数据"这类短消息是任务续聊而非闲聊。误走快车道会把工具全剥掉，
+    # 模型只能"说要查"却无工具可调（用户看到连续静默停止 + 逼出数据编造）。
+    if len(msgs or []) > 8:
         return False
     return True
 

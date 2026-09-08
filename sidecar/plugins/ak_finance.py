@@ -49,7 +49,7 @@ DEFINITION = {
     "type": "function",
     "function": {
         "name": "ak_finance",
-        "description": "免费金融数据查询（无需 API Key，基于 AKShare/东方财富公开数据）。支持【A股、港股、指数、基金、行业板块】的实时行情与历史数据。适用：问任何 A股/港股个股价格、上证/深证/恒生等指数、基金净值、板块行情。不适用：美股、加密货币等境外市场（请用网页搜索）。",
+        "description": "免费金融数据查询（无需 API Key，基于 AKShare/东方财富公开数据）。支持【A股、港股、指数、基金、行业板块】的实时行情与历史数据。适用：问任何 A股/港股个股价格、上证/深证/恒生等指数、基金净值、板块行情。支持用逗号（或顿号）分隔一次查询多个指数或板块（如\"上证指数,深证成指,创业板指\"、\"半导体板块,芯片板块\"；板块名列表如\"半导体,白酒\"无需带\"板块\"二字）。不适用：美股、加密货币等境外市场（请用网页搜索）。",
         "parameters": {
             "type": "object",
             "properties": {
@@ -199,14 +199,14 @@ async def _query_a_share_spot(query: str) -> str:
 
 
 async def _query_index(query: str) -> str:
-    """指数行情：腾讯接口（免 key、稳定），关键词映射 + suggest 兜底"""
-    code = None
+    """指数行情：腾讯接口（免 key、稳定），关键词映射 + suggest 兜底。
+    支持逗号分隔多指数一并查询（一次请求返回多标的）。"""
+    codes = []
     for key, c in _TX_INDEX_MAP.items():
-        if key in query:
-            code = c
-            break
-    if code:
-        body = await _tx_quote([code])
+        if key in query and c not in codes:
+            codes.append(c)
+    if codes:
+        body = await _tx_quote(codes)
         if body:
             return "📊 指数行情:\n" + body
     # 兜底：suggest 搜索指数
@@ -251,12 +251,16 @@ async def _query_fund(query: str) -> str:
 
 
 async def _query_board(query: str) -> str:
-    """行业板块行情"""
+    """行业板块行情。支持逗号/顿号分隔多板块（如 半导体板块,芯片板块）。"""
     import akshare as ak
 
     df = await asyncio.to_thread(ak.stock_board_industry_name_em)
-    kw = query.replace("板块", "").replace("行业", "").strip()
-    hit = df[df["板块名称"].str.contains(kw, na=False)].head(8)
+    kws = [w for w in re.split(r"[、，,;；\s]+", query.replace("板块", "").replace("行业", "")) if w]
+    mask = None
+    for w in kws:
+        m = df["板块名称"].str.contains(re.escape(w), na=False, regex=True)
+        mask = m if mask is None else (mask | m)
+    hit = df[mask].head(8) if mask is not None else df.iloc[0:0]
     if len(hit) == 0:
         return f"未找到板块: {query}"
     lines = ["🏷️ 行业板块行情:"]
@@ -308,8 +312,10 @@ async def execute(args: dict) -> str:
             r = await _query_fund(query)
             if "未找到" not in r:
                 return r
-        # 4) 板块
-        if "板块" in query or "行业" in query:
+        # 4) 板块（含"板块/行业"字样，或逗号/顿号分隔的板块名列表——
+        # 如"半导体,消费电子,白酒"省去板块二字也要能路由对，09-08 19:39
+        # 事故：无分隔词列表被落进 A股 分支全部拒掉）
+        if "板块" in query or "行业" in query or re.search(r"[、，,]", query):
             r = await _query_board(query)
             if "未找到" not in r:
                 return r

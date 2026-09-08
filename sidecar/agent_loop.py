@@ -1340,10 +1340,10 @@ async def _handle_tool_execution_inner(tc: dict, current_msgs: list, session_id:
     _dup_ok = _count_successful_duplicates(current_msgs, tool_name, args)
     if _dup_ok >= 2 and tool_name not in _REPEAT_ALLOWED_TOOLS:
         result = (
-            f"⛔ 相同调用已成功执行 {_dup_ok} 次，不再重复执行：{tool_name}。\n"
-            "不要重复同一操作——启动协议若已满足就进入下一步"
-            "（例如用 mx_query 查询行情数据），或直接把完整分析写进回复正文"
-            "（简体中文，含关键数字与结论）。"
+            f"⛔ 该调用与此前已成功执行的调用完全相同（{tool_name}，相同参数已成功 {_dup_ok} 次），"
+            "已拒绝重复执行——其结果已在上方历史中。\n"
+            "请直接基于已收集的数据写出完整分析（简体中文，含关键数字与结论）；"
+            "或改用其他工具/其他参数补充数据。不要再次发起相同调用。"
         )
         current_msgs.append({"role": "tool", "tool_call_id": call_id, "content": result})
         return False, [{"event": "tool_end", "call_id": call_id, "tool": tool_name, "result": result, "ts": int(time.time() * 1000)}]

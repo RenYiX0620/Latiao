@@ -202,13 +202,36 @@ def _tfidf_search(query: str, limit: int = 5) -> list[dict]:
 
 # ── Original functions ──
 
+def _learning_is_garbage(topic: str, content: str) -> bool:
+    """知识垃圾判定：思考碎片/半句话/工具日志碎片（09-07 清理 60 条中
+    过半为此类——refine 在思考未关时把 <think> 碎片当知识存了）。"""
+    blob = f"{topic} {content}"
+    if "<think>" in blob or "＜think＞" in blob:
+        return True
+    if content.strip().lower().startswith(("the user wants", "the user is asking")):
+        return True
+    if topic.startswith(("read_file:", "list_dir:", "tavily_search:", "mx_query:",
+                         "run_cmd:", "search_files:", "write_file:")):
+        return True  # 工具名前缀 = 工具日志碎片，不是可复用知识
+    return False
+
+
 def _retrieve_relevant_learnings(query: str, limit: int = MAX_LEARNINGS_INJECT) -> list[dict]:
     """Search past learnings using TF-IDF semantic similarity.
     Falls back to FTS5/LIKE if TF-IDF returns nothing."""
     # Priority 1: TF-IDF semantic search (handles Chinese well)
-    results = _tfidf_search(query, limit)
+    results = [r for r in _tfidf_search(query, limit)
+               if not _learning_is_garbage(r.get("topic", ""), r.get("content", ""))]
 
     if results:
+        try:
+            conn = _get_db()
+            for r in results:
+                conn.execute("UPDATE learnings SET hit_count = hit_count + 1 WHERE id = ?",
+                             (r.get("id"),))
+            conn.commit()
+        except Exception:
+            pass  # hit 计数失败不影响检索
         return results
 
     # Fallback: FTS5 + LIKE for backward compatibility
@@ -287,6 +310,10 @@ def _retrieve_relevant_learnings(query: str, limit: int = MAX_LEARNINGS_INJECT) 
                     if d["id"] in id_set:
                         d["hit_count"] += 1
 
+
+        # 统一垃圾过滤（思考碎片/工具日志碎片/半句话——09-07 清理事故）
+        results = [r for r in results
+                   if not _learning_is_garbage(str(r.get("topic", "")), str(r.get("content", "")))]
         return results
     except Exception:
         return []
@@ -426,13 +453,22 @@ async def _refine_learnings(tool_name: str, args: dict, result: str, session_id:
                 r = await client.post(api_url, json={
                 "model": refine_model,
                 "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 80,
+                "max_tokens": 150,
                 "temperature": 0.3,
                 "stream": False,
+                # 推理模型关思考：80/150 token 全进 <think> 会把思考碎片
+                # 当"知识"存库（09-07 清理出多条 <think> 垃圾，置信度 1.0）
+                "chat_template_kwargs": {"enable_thinking": False},
             }, headers=headers)
             if r.status_code == 200:
                 data = r.json()
                 summary = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+                _bad = summary and ("<think>" in summary or "＜think＞" in summary
+                                    or summary.lower().startswith("the user wants")
+                                    or summary.strip().startswith("</"))
+                if _bad:
+                    logger.info("Learning refined: 丢弃思考碎片/半句话: %r", summary[:60])
+                    return
                 if summary and len(summary) > 5:
                     # Dedup: skip if nearly identical to existing learnings
                     if not _is_duplicate_learning(summary):
@@ -578,6 +614,31 @@ def _get_recent_learnings(limit: int = 5) -> list[str]:
     except Exception:
         pass
     return learnings
+
+
+def get_recent_learnings_for_ui(limit: int = 8) -> list[dict]:
+    """知识库面板专用：返回对象格式的最近知识（topic/content/confidence）。
+
+    09-07 NaN 事故：心跳把 _get_recent_learnings 的【字符串数组】直接给了
+    前端，UI 取 l.topic/l.confidence 全是 undefined → "📝 : NaN%"。"""
+    out: list[dict] = []
+    try:
+        db = _get_db()
+        rows = db.execute(
+            "SELECT topic, content, confidence FROM learnings "
+            "WHERE length(content) > 10 "
+            "ORDER BY confidence DESC, updated_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        for topic, content, confidence in rows:
+            out.append({
+                "topic": (topic or "知识")[:60],
+                "content": (content or "")[:200],
+                "confidence": float(confidence) if confidence is not None else 0.5,
+            })
+    except Exception:
+        logger.debug("get_recent_learnings_for_ui failed", exc_info=True)
+    return out
 
 
 # ── Heuristic knowledge extraction from conversation ──
