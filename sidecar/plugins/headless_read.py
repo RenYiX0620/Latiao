@@ -5,10 +5,19 @@
 Chrome/Dokobot 扩展/bridge，开箱即用；代价是无登录态（读不了需登录的页面）。
 未安装时返回明确的安装指引。
 """
+import os
 import re
 import json
 import urllib.parse
 from pathlib import Path
+
+# 浏览器二进制固定装在应用数据目录——不依赖会被系统定期清理的
+# ~/Library/Caches/ms-playwright（09-08 17:13 事故：缓存被清后工具失效）。
+# 必须在 playwright 首次加载前设置，故放模块顶层。
+_os_environ = os.environ
+_os_environ.setdefault(
+    "PLAYWRIGHT_BROWSERS_PATH",
+    os.path.join(os.path.expanduser("~"), ".local-ai-os", "pw-browsers"))
 
 NAME = "headless_read"
 PERMISSION = "safe"
@@ -20,8 +29,9 @@ DEFINITION = {
         "description": (
             "用本地无头 Chromium 浏览器读取任意网页的完整渲染后内容——专治普通抓取失败的页面："
             "JS 动态渲染、SPA、反爬拦截（头条/知乎/微信公众号文章等）。返回页面纯文本正文。"
-            "完全本地运行，无需安装浏览器或扩展；但无登录态，读不了需要登录的页面"
-            "（那种页面改用 dokobot_read）。"
+            "无登录态，读不了需要登录的页面（那种页面改用 dokobot_read）。"
+            "⚠️ 首次使用前需一次性安装运行环境（Playwright + Chromium），"
+            "未安装时会返回安装指引；安装后永久可用。"
         ),
         "parameters": {
             "type": "object",
@@ -38,10 +48,12 @@ DEFINITION = {
 }
 
 _NOT_INSTALLED = (
-    "⚠️ Playwright 未安装（无头读取依赖它）。启用步骤：\n"
-    "1. pip install playwright -i https://pypi.tuna.tsinghua.edu.cn/simple\n"
-    "2. playwright install chromium\n"
-    "装好后本工具即可读取反爬/动态渲染页面。"
+    "⚠️ 无头浏览器运行环境未安装（Playwright 的 Chromium 二进制缺失）。启用步骤：\n"
+    "1. 打开终端执行：python3 -m playwright install chromium\n"
+    "   （应用内置环境对应命令见 sidecar 提示，或直接执行："
+    "'/Applications/Latiao.app/Contents/Resources/sidecar/python/bin/python3 -m playwright install chromium'）\n"
+    "2. 浏览器会安装到 ~/.local-ai-os/pw-browsers（本工具固定查找该目录）\n"
+    "装好后本工具即可读取反爬/动态渲染页面；若持续失败请改用 dokobot_read 或 tavily_search。"
 )
 
 _UA = (
@@ -103,6 +115,11 @@ def execute(args: dict) -> str:
                 browser.close()
     except Exception as e:
         msg = str(e)[:300]
+        if ("Executable doesn't exist" in msg or "playwright install" in msg
+                or "browserType.launch" in msg and "doesn't exist" in msg):
+            # 二进制缺失（系统缓存清理/目录被移走）→ 明确安装指引，
+            # 不再甩生涩英文报错（09-08 17:13：模型见到原生 Playwright 报错）
+            return f"Error: 无头浏览器未安装。\n{_NOT_INSTALLED}"
         return f"Error: 无头浏览器读取失败（{msg}）。可加大 wait_ms 重试，或改用 dokobot_read/tavily_search。"
 
     if not html or len(html) < 200:

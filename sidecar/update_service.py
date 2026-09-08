@@ -176,6 +176,7 @@ def _download_worker(url: str, dest: Path, version: str) -> None:
                 with _state_lock:
                     _state["total"] = total
                 mode = "ab" if offset > 0 else "wb"
+                _t0 = time.monotonic()  # 速度哨兵：直连慢而不死时主动切镜像
                 with open(part, mode) as f, _state_lock:
                     while True:
                         chunk = resp.read(256 * 1024)
@@ -183,6 +184,15 @@ def _download_worker(url: str, dest: Path, version: str) -> None:
                             break
                         f.write(chunk)
                         _state["downloaded"] = f.tell()
+                        # 速度哨兵：起步 20 秒后平均速度 <200KB/s → 主动放弃本次
+                        # 尝试（直连慢而不死，socket 超时按字节间隔算永不触发，
+                        # 镜像轮换形同虚设——09-07 实测 25KB/s 要拖 2.3 小时）
+                        _elapsed = time.monotonic() - _t0
+                        if _elapsed >= 20:
+                            _speed = (f.tell() - offset) / _elapsed
+                            if _speed < 200 * 1024:
+                                raise RuntimeError(
+                                    f"下载过慢（{_speed/1024:.0f}KB/s < 200KB/s），切换镜像重试")
                         # 状态每 2 秒落一次盘（防频繁 IO）
                         if time.time() - _state.get("_last_flush", 0) > 2:
                             _state["_last_flush"] = time.time()

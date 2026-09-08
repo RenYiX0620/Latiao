@@ -76,6 +76,7 @@ from loop_state import turn_state_for
 from memory import (
     _extract_learnings_heuristic,
     _get_recent_learnings,
+    get_recent_learnings_for_ui,
     _refine_learnings,
     _retrieve_preferences,
 )
@@ -1532,7 +1533,7 @@ async def heartbeat():
         # get_status 内含 TCP/HTTP 探测（引擎忙时可达 10s+），必须线程池化，
         # 否则心跳冻结整个事件循环——所有聊天/确认全部卡死
         "local_llm": await run_in_threadpool(local_llm.get_status),
-        "learnings": _get_recent_learnings(10),
+        "learnings": get_recent_learnings_for_ui(8),  # 对象格式（UI 需要 topic/confidence）
         "cron_events": cron.get_recent_cron_events(10),
         "subagents": _subtask_snapshot(),
     }

@@ -120,26 +120,112 @@ def setup_planning(scope):
 
 
 # ══ compaction：上下文压缩（pre_step 钩子）══════════════════════════
-def setup_compaction(scope, *, local_threshold=30000, cloud_threshold=80000):
-    """字符总量超阈值 → 裁剪历史（保 system + 最近轮次）。
+def _collapse_duplicate_assistants(msgs: list) -> list:
+    """完全相同的 assistant 声明折叠为一条（结构性去重，不猜内容）。
 
-    阈值压缩（Codex 式摘要压缩）的过渡实现：先裁剪防溢出，摘要化后续。"""
+    隔着短 user 续聊（"继续"）的重复声明同样折叠——复读事故的真实形态就是
+    「声明 → 继续 → 同一声明 → 继续 → …」。遇到长 user 消息或工具轮才重置。"""
+    out: list = []
+    last_content = None
+    foldable = False
+    for m in msgs:
+        role = m.get("role")
+        if role == "assistant":
+            c = str(m.get("content") or "").strip()
+            if m.get("tool_calls"):
+                last_content = None
+                foldable = False
+                out.append(m)
+                continue
+            if c and c == last_content and foldable:
+                out.append({**m, "content": "（同一声明已重复，已折叠）"})
+                continue
+            last_content = c
+            foldable = True
+            out.append(m)
+            continue
+        if role == "user":
+            c = str(m.get("content") or "").strip()
+            foldable = foldable and 0 < len(c) <= 10  # 短续聊不打断；长消息重置
+            out.append(m)
+            continue
+        out.append(m)
+    return out
+
+
+def setup_compaction(scope, *, local_threshold=18000, cloud_threshold=80000):
+    """字符总量超阈值 → 裁剪历史（保 system + 最近轮次）+ 轮内工具结果链压缩。
+
+    09-07 提速实验：单轮多工具任务（如板块分析 9 次查询）中，工具结果链
+    永不被跨轮裁剪覆盖 → 请求 27K→33K 每轮膨胀，prefill 占每轮耗时 80%。
+    降阈值 + 轮内裁剪 + 滞回（压完留出增长空间，避免每轮空转触发破坏
+    mlx 前缀缓存）。"""
     async def pre_step_hook(payload, ctx):
         loop = ctx.get_service("loop") if ctx is not None else None
         if loop is None:
             return payload
+        if getattr(loop, "_finalize_round", False):
+            # 停滞闸门收口轮：只做结构折叠，跳过数据压缩——压缩会截早/历轮
+            # 工具结果，终答需要原始数据（09-08 14:29 事故链路）
+            msgs = _collapse_duplicate_assistants(loop.current_msgs)
+            loop.current_msgs = msgs
+            return payload
         msgs = loop.current_msgs
         total = sum(len(str(m.get("content") or "")) for m in msgs)
         threshold = local_threshold if loop.is_local else cloud_threshold
+        # 连续重复声明折叠：始终运行（结构去重，与大小无关）——复读轮次留在
+        # 历史里的重复声明是复读吸引子（09-07 22:2x 事故：17K 字符未达阈值，
+        # 折叠被跳过 → 毒历史每轮把模型拖回复读）
+        msgs = _collapse_duplicate_assistants(msgs)
+        loop.current_msgs = msgs
+        total = sum(len(str(m.get("content") or "")) for m in msgs)
         if total <= threshold:
             return payload
+        # 滞回：距上次压缩增长不足 2000 字符 → 没有实质新增，跳过（防每轮
+        # 空转触发改写历史、打掉 mlx 前缀缓存）
+        last = getattr(loop, "_last_compact_total", 0)
+        if last and total - last < 2000:
+            return payload
         if loop.is_local:
-            loop.current_msgs = _slim_history_for_local(msgs)
-            logger.info("compaction: 本地历史 %d 字符超阈值，已裁剪", total)
+            msgs = _slim_history_for_local(msgs)
+            # 轮内压缩：当前 turn 的工具结果链——保留最近 2 条完整，更早的
+            # 压到 400 字符（头 300 + 尾 100）；中间轮 <50 字的过渡正文清空
+            # （assistant 的 tool_calls 字段原样保留，模板兼容）。
+            tool_idx = [i for i, m in enumerate(msgs) if m.get("role") == "tool"]
+            for i in tool_idx[:-2]:
+                c = str(msgs[i].get("content") or "")
+                if len(c) > 420:
+                    msgs[i] = {**msgs[i], "content": c[:300] + "\n…(轮内已压缩)…" + c[-100:]}
+            last_asst = max((i for i, m in enumerate(msgs) if m.get("role") == "assistant"), default=-1)
+            for i, m in enumerate(msgs):
+                if m.get("role") == "assistant" and i != last_asst:
+                    c = str(m.get("content") or "")
+                    if m.get("tool_calls"):
+                        continue  # native 工具轮消息保持原样（与 tool 结果配对）
+                    if 0 < len(c.strip()) < 50:
+                        msgs[i] = {**m, "content": ""}
+            # 连续完全相同的 assistant 声明折叠为一条（复读轮次留进历史的
+            # 毒数据——历史里的重复模式是复读吸引子，结构去重不断供）
+            _seen_sig = None
+            for i, m in enumerate(msgs):
+                if m.get("role") != "assistant" or m.get("tool_calls"):
+                    _seen_sig = None
+                    continue
+                c = str(m.get("content") or "").strip()
+                if not c:
+                    continue
+                if c == _seen_sig:
+                    msgs[i] = {**m, "content": f"（与前一条相同的声明，已出现多次）"}
+                else:
+                    _seen_sig = c
+            loop.current_msgs = msgs
+            loop._last_compact_total = sum(len(str(m.get("content") or "")) for m in msgs)
+            logger.info("compaction: 本地历史 %d → %d 字符（含轮内压缩）", total, loop._last_compact_total)
         else:
             sys = [m for m in msgs if m.get("role") == "system"]
             rest = [m for m in msgs if m.get("role") != "system"]
             loop.current_msgs = sys + rest[-8:]
+            loop._last_compact_total = 0
             logger.info("compaction: 云端历史 %d 字符超阈值，保留最近 8 条", total)
         return payload
 

@@ -1148,6 +1148,11 @@ class LocalLLMEngine:
         body = json.dumps({
             "model": _model_ref, "stream": False, "max_tokens": 16,
             "messages": [{"role": "user", "content": "hi"}],
+            # 探测必须关思考：推理模型（Ornith 等）16 个 token 全进 <think>
+            # → 单次探测 ~9s，超过探测超时 10s → 被放弃的请求在引擎串行队列
+            # 里积压 → 后续探测永远超时 → "启动中"卡死（09-07 20:06 事故）。
+            # 关思考后探测秒回，且 content 非空可直接判就绪。
+            "chat_template_kwargs": {"enable_thinking": False},
         }).encode()
         deadline = time.time() + timeout_sec
         while time.time() < deadline:
@@ -1445,6 +1450,13 @@ class LocalLLMEngine:
                     "exited early" if proc.poll() is not None else "HTTP timeout",
                     err_text[:500] if err_text else "no stderr",
                 )
+                # Spark 类新架构（python 引擎不支持）：自动回退原生 llama-server
+                # （XHToken fork）重试——旧模型仍走 python 路径，只有 python 加载
+                # 失败的模型才触发回退（09-08 Spark-X2.5 架构支持方案）
+                if self._find_llama_server():
+                    logger.warning("llama-cpp python 引擎加载失败，回退原生 llama-server 重试: %s", model_path)
+                    self.stop_model()
+                    return self._start_llama_native(model_path, port)
                 self.stop_model()
                 self.server_status = "error"
                 self.status_message = f"启动失败: {err_summary}" if err_summary else "模型加载超时或进程已退出"
@@ -1465,9 +1477,15 @@ class LocalLLMEngine:
             return self.get_status()
 
     def _find_llama_server(self) -> Path | None:
-        """Find native llama-server.exe (bundled with Windows package)."""
-        exe = Path(__file__).parent / "llama-server.exe"
-        return exe if exe.exists() else None
+        """Find native llama-server binary (Windows: llama-server.exe / macOS: llama-server)."""
+        for name in ("llama-server.exe", "llama-server"):
+            exe = Path(__file__).parent / name
+            try:
+                if exe.exists() and exe.is_file():
+                    return exe
+            except OSError:
+                continue
+        return None
 
     def _start_llama_native(self, model_path: str, port: int) -> dict:
         """Start llama-server.exe directly (Windows only)."""
@@ -1554,6 +1572,11 @@ class LocalLLMEngine:
 
         try:
             model_path = _resolve_mlx_path(model_id)
+            # 引擎真实 id = 解析后的完整路径（/v1/models 返回它）。就绪探测和
+            # 后续请求必须用它——短名会被 mlx 当 HF repo 解析 → 404 → 就绪
+            # 探测死循环（09-07 20:17/20:24 事故：模型页点"启动"卡 15 分钟）。
+            if model_path:
+                self.current_model_id = model_path
             if model_path != model_id and Path(model_path).is_dir():
                 # 本地 MLX 目录：权重缺失时提前给出明确错误
                 has_w = (Path(model_path) / "model.safetensors").exists() \

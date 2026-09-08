@@ -133,14 +133,15 @@ async def _final_answer_extraction(client, api_url: str, headers: dict, engine_m
         _sb = {"model": engine_model, "messages": _smsgs, "max_tokens": 4096,
                "stream": False, "temperature": 0.4,
                "stop": ["<|im_end|>", "<eos>"]}
-        # 引擎忙（主循环持有 serialized 锁）时快退——终答提取只是兜底，
-        # 等锁/读等满会拖死收尾（09-21 22:58 实测 ReadTimeout 2 分钟）
+        # 引擎忙（主循环持有 serialized 锁）时排队等待——终答提取是 turn 收口
+        # 的保证，空交付比等 1-2 分钟更糟（09-08 11:2x 事故：20 秒快退导致
+        # 闸门触发后分析仍未交付）。120s 上限仍防无限拖死。
         try:
-            async with asyncio.timeout(20):
+            async with asyncio.timeout(120):
                 async with _local_llm_serialized(api_url):
                     _sr = await client.post(api_url, json=_sb, headers=headers)
         except TimeoutError:
-            logger.info("终答提取跳过：引擎正忙（serialized 锁占用）")
+            logger.warning("终答提取等待引擎 120s 超时，放弃")
             return ""
         if _sr.status_code == 200:
             return ((_sr.json().get("choices") or [{}])[0]
