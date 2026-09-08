@@ -1455,7 +1455,13 @@ class LocalLLMEngine:
                 # 失败的模型才触发回退（09-08 Spark-X2.5 架构支持方案）
                 if self._find_llama_server():
                     logger.warning("llama-cpp python 引擎加载失败，回退原生 llama-server 重试: %s", model_path)
-                    self.stop_model()
+                    # ⚠️ 不能在此调 stop_model()：其首行 self._cancel_load.set() 会置位
+                    # 加载取消事件，导致 native 的 _wait_for_http 一进来即命中
+                    # cancel.is_set() → 立即返回 False（1 秒假超时）→ 失败处理
+                    # 再 stop_model 杀掉刚启动成功的 fork（09-08 UI 反复
+                    # "启动失败 listening" 的最终根因）。native 启动自带
+                    # _kill_port 清场，无需先停 python 引擎；仅清取消事件。
+                    self._cancel_load.clear()
                     return self._start_llama_native(model_path, port)
                 self.stop_model()
                 self.server_status = "error"
