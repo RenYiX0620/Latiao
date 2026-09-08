@@ -1530,8 +1530,10 @@ const [timeFilter, setTimeFilter] = useState("all");
             {!sidebarCollapsed && <span>{t("sidebar.sessions")}</span>}
             <button className="session-add-btn" onClick={() => {
               const ns = newSession();
-              setSessions((prev) => [...prev, ns]);
-              setCurrentIdx(sessions.length);
+              // 新会话插到列表顶部（09-08：此前 [...prev, ns] 追加到末尾，
+              // 用户在历史会话里找不到新建的会话）
+              setSessions((prev) => [ns, ...prev]);
+              setCurrentIdx(0);
               setPendingFile(null);
               setActiveView("chat");
             }} title={t("sidebar.new")}>+</button>

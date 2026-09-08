@@ -833,6 +833,29 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
         return {"status": "error", "message": str(e)}
 
 
+# ── Whisper model cache (lazy-load once, reuse across requests) ──
+_whisper_model = None
+
+_WHISPER_DIR = Path.home() / ".local-ai-os" / "whisper-tiny"
+
+
+def _get_whisper_model():
+    global _whisper_model
+    if _whisper_model is None:
+        from faster_whisper import WhisperModel
+        # 优先本地目录加载: huggingface.co 在国内不可达(502),huggingface_hub
+        # 的 httpx 也不吃 SSL_CERT_FILE 环境变量。已预下载模型文件到
+        # ~/.local-ai-os/whisper-tiny/(镜像下载,见部署脚本),离线可用。
+        local_model = _WHISPER_DIR / "model.bin"
+        if local_model.exists():
+            _whisper_model = WhisperModel(str(_WHISPER_DIR), device="cpu", compute_type="int8")
+        else:
+            # fallback: 尝试镜像在线下载
+            os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+            _whisper_model = WhisperModel("tiny", device="cpu", compute_type="int8")
+    return _whisper_model
+
+
 @app.post("/v1/recognize_speech")
 async def recognize_speech(request: Request):
     """语音识别：前端发 WAV base64 → faster-whisper 本地识别"""
