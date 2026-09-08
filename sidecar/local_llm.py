@@ -1507,7 +1507,11 @@ class LocalLLMEngine:
             "-ngl", str(self.n_gpu_layers),
         ]
         kv_k, kv_v = _auto_cache_type(model_path)
-        cmd += ["--cache-type-k", str(kv_k), "--cache-type-v", str(kv_v)]
+        # cache-type 值兼容：旧版 CLI 接受数字（8），新版（XHToken fork）要求
+        # 字符串（q8_0）——统一用字符串（llama.cpp 各版本 CLI 均接受）
+        _CACHE_TYPE_STR = {1: "f16", 2: "q4_0", 8: "q8_0"}
+        cmd += ["--cache-type-k", _CACHE_TYPE_STR.get(kv_k, str(kv_k)),
+                "--cache-type-v", _CACHE_TYPE_STR.get(kv_v, str(kv_v))]
         # -fa 兼容性：旧版 llama-server 为无值开关，新版（XHToken fork）要求
         # 带值 [on|off|auto]——省略本参数（新版默认 auto / 旧版默认 off，均可运行）
         # 09-08 Spark 回退引擎“HTTP timeout”根因即 -fa 参数不兼容
