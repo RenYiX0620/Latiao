@@ -30,7 +30,7 @@ TOOL_CATEGORIES = {
     "file_write": ["write_file"],
     "command": ["run_cmd"],
     "app": ["open_app", "open_folder"],
-    "web": ["tavily_search", "web_search", "bing_search", "dokobot_read", "headless_read", "dokobot_search"],
+    "web": ["tavily_search", "web_search", "bing_search", "headless_read", "dokobot_search"],
     "financial": ["mx_query", "ak_finance"],
     # 五控：进程/鼠标/屏幕/流程
     "control": [
