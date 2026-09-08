@@ -18,12 +18,22 @@
         "width": 1200,
         "height": 800,
         "useHttpsScheme": false,
-        "dragDropEnabled": true
+        "dragDropEnabled": true,
+        "transparent": true,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "windowEffects": {
+          "effects": [
+            "sidebar"
+          ],
+          "state": "followWindow"
+        }
       }
     ],
     "security": {
       "csp": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self' http://127.0.0.1:8765 https://huggingface.co https://api.deepseek.com https://api.openai.com https://api.anthropic.com https://generativelanguage.googleapis.com; img-src 'self' data: blob:; media-src 'self' data: blob: mediastream:; font-src 'self' data:; worker-src 'self' blob: https://github.com"
-    }
+    },
+    "macOSPrivateApi": true
   },
   "bundle": {
     "active": true,
