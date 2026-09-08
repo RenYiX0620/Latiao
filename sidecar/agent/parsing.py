@@ -192,7 +192,7 @@ _PROMPT_TOOL_RE = re.compile(
 # 默认关闭；即使开启也只允许只读类工具（可开不可误执行危险性动作）。
 _NL_TOOL_FALLBACK_ENABLED = False
 _NL_TOOL_READONLY = frozenset({"read_file", "list_dir", "search_files", "headless_read",
-                               "web_search", "tavily_search", "dokobot_read", "bing_search"})
+                               "web_search", "tavily_search", "bing_search"})
 _NL_TOOL_RE = re.compile(
     r'\b(web_search|tavily_search|search|read_file|write_file|list_dir|run_cmd|open_app|open_folder|search_files)\s*[\(\[""]\s*([^\")\]\.]+)\s*[\)\]""]',
     re.IGNORECASE,

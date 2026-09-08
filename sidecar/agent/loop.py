@@ -901,7 +901,7 @@ class ThinAgentLoop:
                 # 混有写/控制工具 → 维持串行。
                 _SAFE_PARALLEL_TOOLS = {
                     "mx_query", "ak_finance", "tavily_search", "bing_search",
-                    "dokobot_read", "dokobot_search",
+                    "dokobot_search",
                     "read_file", "list_dir", "search_files",
                 }
                 _all_safe = bool(tool_calls) and all(
