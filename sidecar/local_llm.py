@@ -1508,7 +1508,9 @@ class LocalLLMEngine:
         ]
         kv_k, kv_v = _auto_cache_type(model_path)
         cmd += ["--cache-type-k", str(kv_k), "--cache-type-v", str(kv_v)]
-        cmd += ["-fa"]
+        # -fa 兼容性：旧版 llama-server 为无值开关，新版（XHToken fork）要求
+        # 带值 [on|off|auto]——省略本参数（新版默认 auto / 旧版默认 off，均可运行）
+        # 09-08 Spark 回退引擎“HTTP timeout”根因即 -fa 参数不兼容
         chat_fmt = self._guess_chat_format(model_path)
         if chat_fmt:
             cmd += ["--chat-template", chat_fmt]
