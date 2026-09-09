@@ -40,7 +40,8 @@
   --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", system-ui, sans-serif;
   --font-mono: "SF Mono", "JetBrains Mono", "Fira Code", monospace;
   /* ── Adaptive backgrounds (dark default) ── */
-  --bg-main: linear-gradient(180deg, rgba(0, 0, 0, 0.42) 0%, rgba(0, 0, 0, 0.58) 100%);
+  --bg-main: linear-gradient(180deg, rgba(0, 0, 0, 0.70) 0%, rgba(0, 0, 0, 0.80) 100%);
+  --bg-sidebar: var(--bg-main);
   --bg-card: #2a2a2a;
   --bg-card-hover: #2b2b2b;
   --bg-log: #1c1c1c;
@@ -84,6 +85,8 @@
 }
 
 /* ── Light-theme hard overrides (belt-and-suspenders, in case variable cascade fails) ── */
+[data-theme="light"] .btn-primary,
+[data-theme="light"] .btn-send { background: #ffffff; }
 [data-theme="light"] .main {
   background: var(--bg-main);
 }
@@ -91,11 +94,10 @@
   background: transparent;
 }
 [data-theme="light"] .sidebar {
-  background: rgba(255, 255, 255, 0.55);
+  background: transparent;
 }
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
-button, select, input, textarea { -webkit-app-region: no-drag; }
 
 body {
   font-family: var(--font-sans);
@@ -113,7 +115,7 @@ body {
 .sidebar {
   width: var(--sidebar-width); min-width: var(--sidebar-width);
   height: 100vh; display: flex; flex-direction: column;
-  background: rgba(28, 28, 28, 0.45);
+  background: var(--bg-sidebar);
   border-right: 1px solid var(--border-default);
   z-index: 10;
   transition: width 0.25s cubic-bezier(0.16, 1, 0.3, 1), min-width 0.25s cubic-bezier(0.16, 1, 0.3, 1);
@@ -286,10 +288,8 @@ img.sidebar-logo {
 .topbar {
   display: flex; align-items: center; gap: 12px;
   padding: 0 20px; height: var(--topbar-height);
-  background: rgba(0, 0, 0, 0.55);
+  background: rgba(0, 0, 0, 0.22);
   border-bottom: 1px solid var(--border-default);
-  -webkit-app-region: drag;
-  user-select: none;
   backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation));
   -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation));
   border-bottom: 1px solid var(--border-default); flex-shrink: 0;
@@ -429,7 +429,7 @@ img.sidebar-logo {
   display: inline-flex; align-items: center; justify-content: center;
   font-size: 15px; line-height: 1;
 }
-.btn-circle.btn-stop { background: var(--danger, #f87171); }
+.btn-circle.btn-stop { background: #f5f5f5; color: #1a1a1a; border: 1px solid var(--border-strong); }
 .chat-statusbar {
   display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
   font-size: 12px; color: var(--text-muted); padding: 6px 6px 0;
@@ -632,8 +632,8 @@ img.sidebar-logo {
 .btn-md { padding: 7px 16px; font-size: 12px; }
 .btn-ghost { background: transparent; color: var(--text-secondary); border: 1px solid var(--border-strong); }
 .btn-ghost:hover { background: rgba(255,255,255,0.04); color: var(--text-primary); }
-.btn-primary { background: linear-gradient(135deg, var(--accent), #6366f1); color: #fff; }
-.btn-primary:hover { filter: brightness(1.1); }
+.btn-primary { background: #f5f5f5; color: #1a1a1a; border: 1px solid var(--border-strong); }
+.btn-primary:hover { background: #e8e8e8; }
 .btn-icon {
   width: 32px; height: 32px; border-radius: var(--radius-sm); border: none;
   background: transparent; color: var(--text-muted); cursor: pointer;
@@ -643,16 +643,16 @@ img.sidebar-logo {
 .btn-icon:hover { color: var(--text-primary); background: rgba(255,255,255,0.05); }
 .btn-send {
   padding: 7px 18px; border-radius: var(--radius-md); border: none;
-  background: linear-gradient(135deg, var(--accent), #6366f1); color: #fff;
+  background: #f5f5f5; color: #1a1a1a; border: 1px solid var(--border-strong);
   font-size: 12.5px; font-weight: 550; font-family: var(--font-sans); cursor: pointer;
   transition: all 0.15s ease; flex-shrink: 0;
 }
-.btn-send:hover { filter: brightness(1.15); transform: translateY(-1px); box-shadow: 0 4px 16px var(--accent-glow); }
+.btn-send:hover { background: #e8e8e8; transform: translateY(-1px); box-shadow: 0 4px 16px rgba(0,0,0,0.3); }
 .btn-send:active { transform: translateY(0); }
 .btn-send:disabled { opacity: 0.5; cursor: not-allowed; filter: none; transform: none; box-shadow: none; }
 .btn-stop {
   padding: 7px 18px; border-radius: var(--radius-md); border: none;
-  background: linear-gradient(135deg, var(--danger), #dc2626); color: #fff;
+  background: #f5f5f5; color: #1a1a1a; border: 1px solid var(--border-strong);
   font-size: 12.5px; font-weight: 550; font-family: var(--font-sans); cursor: pointer;
   transition: all 0.15s ease; flex-shrink: 0;
 }

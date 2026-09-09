@@ -1514,7 +1514,7 @@ const [timeFilter, setTimeFilter] = useState("all");
 
       {/* ═══ Sidebar ═══ */}
       <aside className="sidebar">
-        <div className="sidebar-brand">
+        <div className="sidebar-brand" data-tauri-drag-region>
           {sidebarCollapsed
             ? <img className="sidebar-logo" src={logoUrl} alt="辣条" />
             : <div className="sidebar-logo"><img src={logoUrl} alt="辣条" /></div>}
@@ -1594,7 +1594,7 @@ const [timeFilter, setTimeFilter] = useState("all");
 
       {/* ═══ Main ═══ */}
       <main className="main" style={{ position: "relative" }}>
-        <div className="topbar">
+        <div className="topbar" data-tauri-drag-region>
           <span className="topbar-title">{session.name}</span>
           <span style={{ fontSize: 10, color: "var(--text-muted)", padding: "2px 6px", borderRadius: "var(--radius-sm)", background: "var(--accent-soft)", marginRight: 8 }}>
             {t(AGENT_NAME_KEYS[activeAgent] || activeAgent)}

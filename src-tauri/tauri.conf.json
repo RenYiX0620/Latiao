@@ -24,7 +24,7 @@
         "hiddenTitle": true,
         "windowEffects": {
           "effects": [
-            "sidebar"
+            "hudWindow"
           ],
           "state": "followsWindowActiveState"
         }
