@@ -17,7 +17,8 @@ html, body, #root {
   font-size: 14px;
   line-height: 1.5;
   color: var(--text-primary);
-  background: var(--bg-root);
+  /* 透明：让窗口 vibrancy（系统侧栏磨砂）透出——左侧栏映射后面窗口的关键 */
+  background: transparent;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
