@@ -40,7 +40,7 @@
   --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", system-ui, sans-serif;
   --font-mono: "SF Mono", "JetBrains Mono", "Fira Code", monospace;
   /* ── Adaptive backgrounds (dark default) ── */
-  --bg-main: #1f1f1f;
+  --bg-main: linear-gradient(180deg, rgba(0, 0, 0, 0.42) 0%, rgba(0, 0, 0, 0.58) 100%);
   --bg-card: #2a2a2a;
   --bg-card-hover: #2b2b2b;
   --bg-log: #1c1c1c;
@@ -74,7 +74,7 @@
   --accent-glow: rgba(0, 0, 0, 0.10);
   --glass-saturation: 1;
   /* ── Adaptive backgrounds (light) ── */
-  --bg-main: #ffffff;
+  --bg-main: rgba(255, 255, 255, 0.7);
   --bg-card: #ffffff;
   --bg-card-hover: #fafafa;
   --bg-log: #ffffff;
@@ -85,7 +85,7 @@
 
 /* ── Light-theme hard overrides (belt-and-suspenders, in case variable cascade fails) ── */
 [data-theme="light"] .main {
-  background: #ffffff;
+  background: var(--bg-main);
 }
 [data-theme="light"] body {
   background: transparent;
@@ -286,7 +286,7 @@ img.sidebar-logo {
 .topbar {
   display: flex; align-items: center; gap: 12px;
   padding: 0 20px; height: var(--topbar-height);
-  background: var(--bg-main);
+  background: rgba(0, 0, 0, 0.55);
   border-bottom: 1px solid var(--border-default);
   -webkit-app-region: drag;
   user-select: none;
