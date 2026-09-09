@@ -90,6 +90,9 @@
 [data-theme="light"] body {
   background: transparent;
 }
+[data-theme="light"] .sidebar {
+  background: rgba(255, 255, 255, 0.55);
+}
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
 button, select, input, textarea { -webkit-app-region: no-drag; }
@@ -110,7 +113,7 @@ body {
 .sidebar {
   width: var(--sidebar-width); min-width: var(--sidebar-width);
   height: 100vh; display: flex; flex-direction: column;
-  background: transparent;
+  background: rgba(28, 28, 28, 0.45);
   border-right: 1px solid var(--border-default);
   z-index: 10;
   transition: width 0.25s cubic-bezier(0.16, 1, 0.3, 1), min-width 0.25s cubic-bezier(0.16, 1, 0.3, 1);
@@ -283,7 +286,8 @@ img.sidebar-logo {
 .topbar {
   display: flex; align-items: center; gap: 12px;
   padding: 0 20px; height: var(--topbar-height);
-  background: transparent;
+  background: var(--bg-main);
+  border-bottom: 1px solid var(--border-default);
   -webkit-app-region: drag;
   user-select: none;
   backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation));
