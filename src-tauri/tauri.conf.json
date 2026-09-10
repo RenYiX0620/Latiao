@@ -27,7 +27,8 @@
             "hudWindow"
           ],
           "state": "followsWindowActiveState"
-        }
+        },
+        "theme": "Dark"
       }
     ],
     "security": {
