@@ -62,11 +62,6 @@ interface Capability {
   usage_count: number;
 }
 
-const AGENT_NAME_KEYS: Record<string, string> = {
-  latiao: "agent.latiao", "code-reviewer": "agent.code_reviewer",
-  "doc-generator": "agent.doc_generator", debugger: "agent.debugger",
-  translator: "agent.translator",
-};
 
 const NAV_ITEMS: { id: ViewId; icon: LucideIcon; key: string }[] = [
   { id: "chat", icon: MessageSquare, key: "nav.chat" },
@@ -217,6 +212,13 @@ const [timeFilter, setTimeFilter] = useState("all");
     try { return (localStorage.getItem("latiao_theme") as "light" | "dark") || "dark"; }
     catch (e) { console.error(e); return "dark"; }
   });
+  // 原生窗口外观跟随主题（磨砂材质随之切换）：浅色切 Light，深色显式设回 Dark
+  // （tauri.conf 静态 Dark 之外的动态补充，深色启动路径不变）
+  useEffect(() => {
+    import("@tauri-apps/api/window").then(({ getCurrentWindow }) => {
+      getCurrentWindow().setTheme(theme === "light" ? "light" : "dark").catch(() => {});
+    });
+  }, [theme]);
   const [toast, setToast] = useState<string | null>(null);
   const [toastType, setToastType] = useState<string>("info");
   const [gatewayLogsOpen, setGatewayLogsOpen] = useState(false);
@@ -1595,10 +1597,7 @@ const [timeFilter, setTimeFilter] = useState("all");
       {/* ═══ Main ═══ */}
       <main className="main" style={{ position: "relative" }}>
         <div className="topbar" data-tauri-drag-region>
-          <span className="topbar-title">{session.name}</span>
-          <span style={{ fontSize: 10, color: "var(--text-muted)", padding: "2px 6px", borderRadius: "var(--radius-sm)", background: "var(--accent-soft)", marginRight: 8 }}>
-            {t(AGENT_NAME_KEYS[activeAgent] || activeAgent)}
-          </span>
+          <span className="topbar-title">{session.name.startsWith("session.") ? t(session.name) : session.name}</span>
           <span className={`status-dot ${sidecarStatus === "online" ? "online" : "offline"}`}></span>
           <span className="status-label">{sidecarStatus === "online" ? t("sidebar.online") : t("sidebar.offline")}</span>
           {isProcessing && (
