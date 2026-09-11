@@ -560,10 +560,10 @@ _TOOL_PRIORITY = (
     "read_file", "write_file", "list_dir", "search_files",
     "tavily_search", "headless_read", "dokobot_search", "web_search", "bing_search",
     "mx_query", "ak_finance",
+    "open_app", "open_folder", "run_cmd",
     "screen_capture", "control_list_processes", "control_process_log", "control_audit",
     "control_wait", "control_launch", "control_mouse_move", "control_mouse_click",
     "control_keyboard_type", "control_keyboard_press", "control_kill_process",
-    "open_app", "open_folder", "run_cmd",
     "use_skill", "delegate_task", "create_cron",
 )
 _TOOL_RANK = {_name: _rank for _rank, _name in enumerate(_TOOL_PRIORITY)}
