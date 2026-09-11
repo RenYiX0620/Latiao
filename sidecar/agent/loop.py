@@ -293,7 +293,13 @@ class ThinAgentLoop:
         if len(tools) > 12:
             # 元工具（委派/技能/定时）cap 保底——委派被裁掉会让模型"看不到"
             # 子代理机制而自己硬扛（09-06 真机验收 C 场景发现）
-            tools = _cap_tools(tools, 12, keep_first=("delegate_task", "use_skill", "create_cron"))
+            _keep = ["delegate_task", "use_skill", "create_cron"]
+            # app 意图保底（09-11 事故："打开相册"→意图含 open_app，但 cap 按
+            # 优先级截断把它切在第 22 位 → 模型无工具只能空谈，0 次调用）
+            _names = {t.get("function", {}).get("name") for t in tools}
+            if _names & {"open_app", "open_folder"}:
+                _keep += ["open_app", "open_folder"]
+            tools = _cap_tools(tools, 12, keep_first=tuple(_keep))
         tools = _ensure_market_tools(tools, self.last_user_text)
         # 会话级目录一致性：本会话已成功使用 / 已加载技能声明的工具，不因最后
         # 一条消息的措辞离场（意图过滤只增不删——三家共识）。白名单（子代理）
