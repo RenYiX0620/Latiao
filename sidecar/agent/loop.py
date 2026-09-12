@@ -711,6 +711,26 @@ class ThinAgentLoop:
                         self.steps -= 1
                         logger.warning("thin loop：引擎拒绝 tools 参数（400），回退围栏提示词")
                         continue
+                    # 超长上下文特判：给出可执行指引（09-12：13.7 万字符 PDF 撞 400
+                    # 只看到"模型服务返回错误"，用户无从下手）
+                    _body = ""
+                    try:
+                        _body = (e.response.text or "").lower()
+                    except Exception:
+                        pass
+                    if status == 400 and any(k in _body for k in (
+                            "context", "too long", "length", "exceed", "maximum")):
+                        try:
+                            import local_llm
+                            _tl = int(getattr(local_llm._engine, "model_token_limit", 0) or 0)
+                        except Exception:
+                            _tl = 0
+                        yield {"content": (
+                            "\n\n⚠️ 输入超出模型上下文"
+                            + (f"（当前 {_tl:,} tokens）" if _tl else "")
+                            + "。可选：① 到「模型」页调大上下文长度并点「重新加载模型」；"
+                            "② 改用云端模型；③ 把文件分段提问（如“只看资格要求部分”）。")}
+                        return
                     yield {"content": f"\n\n⚠️ 模型服务返回错误 HTTP {status}，请稍后重试。"}
                     return
                 # 引擎空生成重试：流结束且正文/思考/工具调用全空 → 引擎抽风
