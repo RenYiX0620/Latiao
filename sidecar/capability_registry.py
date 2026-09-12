@@ -325,7 +325,8 @@ def list_capabilities(kind: str | None = None) -> list[dict]:
     if kind in ("tool", "skill"):
         sql += " WHERE kind=?"
         params = (kind,)
-    sql += " ORDER BY kind, name"
+    # 首字母序（工具与技能混排，用户 09-12 要求；此前 ORDER BY kind 分成两段）
+    sql += " ORDER BY LOWER(name), name"
     try:
         rows = _query(sql, params)
     except Exception:
