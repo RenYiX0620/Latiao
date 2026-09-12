@@ -164,6 +164,24 @@ async def _json_body(request: Request) -> dict:
     return body
 
 
+def _doc_budget_chars(is_local: bool) -> int:
+    """内联文件正文预算：随引擎上下文伸缩，避免"装不下"与"prefill 过慢"两极。
+
+    本地：min(上下文 token×1.2, 24000)（27B 实测 2.4 万字符 ≈ 8-10K token）；
+    云端：60000（前沿模型上下文宽裕，但仍不宜整篇灌入）。
+    """
+    if not is_local:
+        return 60000
+    try:
+        import local_llm
+        tl = int(getattr(local_llm._engine, "model_token_limit", 0) or 0)
+        if tl > 0:
+            return max(8000, min(int(tl * 1.2), 24000))
+    except Exception:
+        pass
+    return 24000
+
+
 @app.post("/v1/chat/completions")
 async def chat_completion(request: Request):
     """Main chat endpoint. Routes to agent loop (OpenAI-compatible) or simple streaming.
@@ -248,10 +266,25 @@ async def chat_completion(request: Request):
             _thinking_level = body.get("thinking_level", "high")
 
             async def _run_agent(_protocol, _api_url, _headers, _is_local, _model):
+                # 长文档压缩（RAG-lite）：超预算的内联文件正文按问题相关性筛选——
+                # 128KB PDF=13.7 万字符整段内联会直接 400（09-12 事故）
+                _msgs = messages
+                try:
+                    from doc_condense import condense_messages
+                    _msgs, _st = condense_messages(
+                        messages, budget_chars=_doc_budget_chars(_is_local))
+                    for _x in _st:
+                        if _x.get("condensed"):
+                            logger.warning(
+                                "长文档压缩: %s %d→%d 字符（保留 %d/%d 段）",
+                                _x["name"], _x["original"], _x["kept"],
+                                _x["chunks_kept"], _x["chunks_total"])
+                except Exception:
+                    logger.warning("长文档压缩失败（按原文继续）", exc_info=True)
                 # 薄循环（唯一循环）：cloud/local 共用，模型驱动终止，机制皆插件
                 from agent.loop import ThinAgentLoop
                 async for event in ThinAgentLoop(
-                    messages, _model, _api_url, _headers, session_id,
+                    _msgs, _model, _api_url, _headers, session_id,
                     _access_mode, _thinking_level, is_local=_is_local,
                 ).run():
                     yield event
