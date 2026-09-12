@@ -593,6 +593,7 @@ def install_github_item(repo: str, skill_path: str = "", kind: str = "openclaw-s
     repo = parse_github_repo(repo)
     if not repo:
         return {"status": "error", "message": f"无法识别仓库: {repo!r}"}
+    logger.info("install github item: repo=%s skill_path=%s kind=%s", repo, skill_path or "(无)", kind)
     if kind.startswith("openclaw") and skill_path:
         zip_bytes = install_openclaw_skill(repo, skill_path)
     elif kind.startswith("claude"):
@@ -600,6 +601,8 @@ def install_github_item(repo: str, skill_path: str = "", kind: str = "openclaw-s
     else:
         zip_bytes = install_openclaw_skill(repo, skill_path) if skill_path else install_claude_plugin(repo)
     if zip_bytes is None:
+        logger.warning("install github item failed at download/pack: repo=%s skill_path=%s kind=%s",
+                       repo, skill_path or "(无)", kind)
         return {"status": "error", "message": "下载/打包失败（源不可达或格式不符）"}
     import tempfile as _tf
     label = skill_path or f"{repo}"
@@ -607,6 +610,8 @@ def install_github_item(repo: str, skill_path: str = "", kind: str = "openclaw-s
         p = Path(tmp) / "pkg.latiaoext"
         p.write_bytes(zip_bytes)
         result = install_extension(str(p), "", label=label)
+        logger.info("install github item done: repo=%s skill_path=%s → %s",
+                    repo, label, result.get("status"))
         return result
 
 

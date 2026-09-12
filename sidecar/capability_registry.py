@@ -243,7 +243,13 @@ def sync_skills() -> int:
             for f in sorted(skills_d.rglob("*.md")):
                 try:
                     meta, body = _parse_frontmatter(f.read_text(encoding="utf-8"))
-                    name = str(meta.get("name") or f.stem)
+                    # 只有"像技能"的 .md 才注册：需带 frontmatter 且声明 name
+                    # （09-12 事故：rglob 把技能包里的 references/troubleshooting.md
+                    # 也注册成了独立技能，能力列表出现多余条目）
+                    if not meta or not meta.get("name"):
+                        logger.info("扩展 %s：跳过非技能文档 %s", ext_name, f.name)
+                        continue
+                    name = str(meta.get("name"))
                     seen.add(name)
                     cur_perm, cur_ov = _read_perm_state(name)
                     if cur_ov == 1:
