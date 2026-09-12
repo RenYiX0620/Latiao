@@ -645,7 +645,7 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
             )}
             <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
               <button className="btn btn-primary" disabled={installing}
-                onClick={() => doInstall(confirming.source, confirming.sha256)}>确认安装</button>
+                onClick={() => doInstall(confirming.source, confirming.sha256)}>{installing ? "⏳ 安装中…（下载/校验）" : "确认安装"}</button>
               <button className="btn btn-ghost" onClick={() => setConfirming(null)}>取消</button>
             </div>
           </div>

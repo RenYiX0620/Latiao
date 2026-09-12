@@ -253,8 +253,14 @@ def install_openclaw_skill(repo: str, skill_path: str) -> bytes | None:
             # 只要直接挂在技能目录下（含子目录）
             content = _jsdelivr_file(repo, rel)
             if content is None:
-                read_ok = False
-                break
+                # 单文件缺失（隐藏标记/未缓存）不废掉整条路径——跳过继续；
+                # 仅 SKILL.md 缺失才判定不可用、回退整仓（09-12 事故：
+                # .security-scan-passed 404 导致"确认安装"必然失败）
+                if rel.endswith("SKILL.md") or rel.endswith("skill.md"):
+                    read_ok = False
+                    break
+                logger.info("jsDelivr 跳过缺失文件: %s/%s", repo, rel)
+                continue
             count += len(content.encode("utf-8"))
             if count > _SKILL_DIR_MAX:
                 read_ok = False  # 超限，退回整仓
@@ -275,17 +281,24 @@ def install_openclaw_skill(repo: str, skill_path: str) -> bytes | None:
 
 
 def _zip_subset(zip_bytes: bytes, prefix: str) -> dict[str, bytes]:
-    """从仓库 zip 中提取 <prefix> 子目录的文件映射 {rel_path: bytes}。"""
+    """从仓库 zip 中提取 <prefix> 子目录的文件映射 {rel_path: bytes}。
+
+    zip 条目自带外层目录（repo-main/skills/x/...）——匹配前必须先剥掉外层，
+    否则命中 0（09-12 事故：前缀 "scrapling-skill/" 对 zip 内
+    "claude-code-skills-main/scrapling-skill/..." 恒不匹配 → 空包 → 
+    "下载/打包失败（源不可达或格式不符）"）。"""
     out: dict[str, bytes] = {}
+    pfx = (prefix or "").lstrip("/")
     try:
         with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
             for info in zf.infolist():
+                if info.is_dir():
+                    continue
                 name = info.filename.replace("\\", "/")
-                if name.startswith(prefix) and not info.is_dir():
-                    # 去掉外层 repo/ 目录（repo-master/skills/x/...）
-                    parts = name.split("/", 1)
-                    key = parts[1] if len(parts) == 2 else name
-                    out[key] = zf.read(info)
+                parts = name.split("/", 1)
+                inner = parts[1] if len(parts) == 2 else name  # 剥掉 repo-main/
+                if inner.startswith(pfx):
+                    out[inner] = zf.read(info)
     except Exception:
         logger.warning("zip subset failed", exc_info=True)
         return {}
@@ -308,12 +321,20 @@ def _pack_skill_dir(files: dict[str, bytes], skill_rel: str, meta: dict | None =
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("manifest.yaml", __import__("yaml").safe_dump(manifest, allow_unicode=True))
+        skill_dirname = skill_rel.strip("/").rsplit("/", 1)[-1]
         for key, data in files.items():
-            rel = key.split("/", 1)[1] if "/" in key else key
+            # 两种调用方键形不同：jsDelivr 分支给"技能内相对路径"，
+            # codeload 分支带"技能目录/"前缀——仅当首段正是技能目录名时才剥掉，
+            # 否则原样保留（09-12：无条件砍首段把 references/ 拍平 → 参考文档
+            # 落到 skills/ 顶层被注册成独立技能）
+            k = key.lstrip("/")
+            rel = k[len(skill_dirname) + 1:] if k.startswith(skill_dirname + "/") else k
             if rel.lower().endswith("skill.md"):
                 zf.writestr(f"skills/{name}/SKILL.md", data)
             else:
-                zf.writestr(f"skills/{name}/{rel.rsplit('/', 1)[-1]}", data)
+                # 保留子目录结构（references/、scripts/ 原样进包）——拍平会让
+                # 参考文档落到 skills/ 顶层被当成技能，也会造成同名文件互相覆盖
+                zf.writestr(f"skills/{name}/{rel}", data)
     return buf.getvalue()
 
 
