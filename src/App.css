@@ -363,7 +363,29 @@ img.sidebar-logo {
   background: transparent; border: none; padding: 2px 0;
   color: var(--text-primary);
 }
-.msg-bubble table { display: block; max-width: 100%; overflow-x: auto; border-collapse: collapse; }
+/* ── Markdown 表格：四类缺陷一次修（09-13）──
+   ① 含表格的回答用满宽度（此前 68% 气泡把 4 列中文挤成竖排）
+   ② 单元格重置 white-space（.msg-bubble 的 pre-line 会被继承 → 单元格内
+      出现莫名断行/空隙）
+   ③ 边框 + 表头底色 + 斑马纹（四列长文本下靠线对齐才好读）
+   ④ 列最小宽度 + 末列放宽；超宽表保留横向滚动 */
+.msg-bubble:has(table) { max-width: 100%; width: 100%; }
+.msg-bubble table {
+  display: block; width: 100%; max-width: 100%; overflow-x: auto;
+  border-collapse: collapse; font-size: 13.5px; line-height: 1.5;
+  margin: 6px 0;
+}
+.msg-bubble table, .msg-bubble th, .msg-bubble td { white-space: normal; }
+.msg-bubble th, .msg-bubble td {
+  border: 1px solid var(--border-default); padding: 8px 10px;
+  vertical-align: top; word-break: break-word; min-width: 120px;
+}
+.msg-bubble thead th {
+  background: rgba(255, 255, 255, 0.05); font-weight: 600; text-align: left;
+}
+.msg-bubble tbody tr:nth-child(even) td { background: rgba(255, 255, 255, 0.02); }
+[data-theme="light"] .msg-bubble thead th { background: rgba(0, 0, 0, 0.04); }
+[data-theme="light"] .msg-bubble tbody tr:nth-child(even) td { background: rgba(0, 0, 0, 0.015); }
 .msg-bubble h1, .msg-bubble h2, .msg-bubble h3 { font-size: 17px; font-weight: 600; margin: 4px 0 2px; }
 .msg-bubble code {
   font-family: var(--font-mono); font-size: 11.5px;
