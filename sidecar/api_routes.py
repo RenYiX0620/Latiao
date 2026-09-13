@@ -1908,6 +1908,38 @@ async def local_llm_get_context():
     return {"status": "ok", "context_limit": local_llm._engine.model_token_limit}
 
 
+@app.post("/v1/local-llm/benchmark")
+async def local_llm_benchmark(request: Request):
+    """一键基准测试：生成速度/首字延迟/预填充/内存 + 建议（对当前已加载引擎实测）。"""
+    body = await _json_body(request)
+    large = bool(body.get("large", True))
+    from starlette.concurrency import run_in_threadpool
+    protocol, api_url, headers, is_local = await _resolve_api_target(None)
+    if not api_url:
+        return {"status": "error", "message": "模型未加载或引擎不可用"}
+    import local_llm
+    ctx = int(getattr(local_llm._engine, "model_token_limit", 0) or 0)
+    model = getattr(local_llm._engine, "current_model_id", "") or "local-model"
+    port = getattr(local_llm._engine, "server_port", 1235)
+    try:
+        import bench_service
+        res = await bench_service.run_benchmark(api_url, headers, model, ctx,
+                                                port=port, large=large)
+        return {"status": "ok", **res}
+    except httpx.HTTPStatusError as e:
+        return {"status": "error", "message": f"引擎返回 HTTP {e.response.status_code}（需先加载模型）"}
+    except Exception as e:
+        logger.warning("benchmark failed", exc_info=True)
+        return {"status": "error", "message": f"基准测试失败：{type(e).__name__}: {e}"}
+
+
+@app.get("/v1/local-llm/benchmarks")
+def local_llm_benchmarks():
+    """历史基准结果（新→旧）。"""
+    import bench_service
+    return {"status": "ok", "items": bench_service.history(20)}
+
+
 @app.post("/v1/local-llm/start")
 async def local_llm_start(request: Request):
     """Start a local model.
