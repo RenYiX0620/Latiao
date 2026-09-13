@@ -82,6 +82,14 @@ _SUBAGENT_TOOLS: dict[str, list[str]] = {
     "explore": ["read_file", "list_dir", "search_files", "run_cmd", "tavily_search"],
 }
 
+_FOCUS_PROMPT = """
+
+你是子代理（类型：{agent_type}），只负责用户消息里这一个子任务：
+- 结论优先：拿到足够信息立即给出结论式结果（关键事实/数字/文件:行号），不要复述过程；
+- 范围纪律：只读与子任务直接相关的文件，不要顺带探索无关目录；
+- 不做重复劳动：同一文件同一范围只读一次，读完就基于内容作答；
+- 不提问、不寒暄、不写"我将会…"；工具额度有限（≤14 步），超限会被强制收口。"""
+
 MAX_DEPTH = 2  # 深度预算（本期白名单恒排除 delegate_task，字段为递归预留）
 
 
@@ -140,7 +148,7 @@ async def run_sub_agent(agent_type: str, task: str, *, task_id: str | None = Non
     messages = [
         {"role": "system", "content": (
             cfg.get("identity", "").strip()
-            + "\n你是一个子 Agent。独立完成任务后返回简洁结果。最多 3 步，不要问问题，直接执行。").strip()},
+            + _FOCUS_PROMPT.format(agent_type=agent_type)).strip()},
         {"role": "user", "content": task},
     ]
     protocol, api_url, headers, is_local = await _resolve_api_target(_last_cloud_config.get())
@@ -159,6 +167,12 @@ async def run_sub_agent(agent_type: str, task: str, *, task_id: str | None = Non
     child = ThinAgentLoop(messages, sub_model, api_url, headers,
                           session_id=sub_session, access_mode="full",
                           tool_whitelist=allowed, is_local=is_local)
+    # 子代理收紧（09-13 实测：子代理与主循环共用宽松阈值，重复读同一文件、
+    # 乱翻无关文件、40 分钟不收口）——步数 14、同参 3 轮即收口、6 个工具轮
+    # 无正文即强制作答
+    child.max_steps = 14
+    child._same_sig_limit = 3
+    child._tool_rounds_limit = 6
     parts: list[str] = []
     try:
         async for ev in child.run():
@@ -198,7 +212,9 @@ async def _delegate_task(agent_type: str, task: str, task_id: str | None = None,
     if task_id and task_id in _SUBTASKS:
         s = _SUBTASKS[task_id]
         s["result"] = result
-        failed = "[Sub-agent" in result and ("错误" in result or "HTTP" in result.split("\n")[0])
+        # 只看首行是否带错误标记：正文引用工具报错（含"错误"二字）不应判失败
+        _first = result.split("\n")[0]
+        failed = _first.startswith("[Sub-agent") and ("错误" in _first or "HTTP" in _first)
         s["status"] = "error" if failed else "done"
         s["updated_at"] = _time.time()
         _SUBTASK_EVENTS.append({"id": task_id, "status": s["status"], "summary": result[:120]})
@@ -283,7 +299,9 @@ async def _delegate_task_fg(agent_type: str, task: str) -> str:
                                     "summary": "已中断（父请求取消）"})
         raise
     s = _SUBTASKS[task_id]
-    failed = "[Sub-agent" in result and ("错误" in result or "HTTP" in result.split("\n")[0])
+    # 只看首行是否带错误标记：正文引用工具报错（含"错误"二字）不应判失败
+    _first = result.split("\n")[0]
+    failed = _first.startswith("[Sub-agent") and ("错误" in _first or "HTTP" in _first)
     s["result"] = result
     s["status"] = "error" if failed else "done"
     s["updated_at"] = _time.time()
@@ -299,7 +317,9 @@ async def _run_subtask_bg(task_id: str, agent_type: str, task: str, parent_sessi
         s["updated_at"] = _time.time()
         result = await _delegate_task(agent_type, task, task_id=task_id)
         s["result"] = result
-        failed = "[Sub-agent" in result and ("错误" in result or "HTTP" in result.split("\n")[0])
+        # 只看首行是否带错误标记：正文引用工具报错（含"错误"二字）不应判失败
+        _first = result.split("\n")[0]
+        failed = _first.startswith("[Sub-agent") and ("错误" in _first or "HTTP" in _first)
         s["status"] = "error" if failed else "done"
         s["updated_at"] = _time.time()
         _SUBTASK_EVENTS.append({"id": task_id, "status": s["status"], "summary": result[:120]})

@@ -274,6 +274,10 @@ class ThinAgentLoop:
         self._finalize_round = False           # 停滞闸门收口轮：无工具直接作答
         self._finalize_retry_used = False      # 终答轮空生成温度重采（一次）
         self._quota_hint_injected = False      # 当日额度用尽提示（每 turn 一次）
+        # 可配置阈值：主循环用默认值，子代理实例化后收紧（09-13 子代理收紧）
+        self.max_steps = MAX_STEPS             # 步数上限
+        self._same_sig_limit = 5               # 同参空转收口：连续同参轮数
+        self._tool_rounds_limit = 12           # 工具轮无正文收口：连续工具轮数
         self._retry_freq = None                # 重试轮频率惩罚（压制重复 token）
         # Scope：工具目录 + waterfall 宿主；loop 自身作为服务供钩子读取
         self.scope = Scope(name=f"agent:{session_id or uuid.uuid4().hex[:8]}")
@@ -293,7 +297,7 @@ class ThinAgentLoop:
         if len(tools) > 12:
             # 元工具（委派/技能/定时）cap 保底——委派被裁掉会让模型"看不到"
             # 子代理机制而自己硬扛（09-06 真机验收 C 场景发现）
-            _keep = ["delegate_task", "use_skill", "create_cron"]
+            _keep = ["delegate_task", "use_skill", "create_cron", "create_skill"]
             # app 意图保底（09-11 事故："打开相册"→意图含 open_app，但 cap 按
             # 优先级截断把它切在第 22 位 → 模型无工具只能空谈，0 次调用）
             _names = {t.get("function", {}).get("name") for t in tools}
@@ -531,7 +535,8 @@ class ThinAgentLoop:
             self._last_sig = sig
             self._same_sig_rounds = 0
         self._tool_rounds_no_answer += 1
-        if self._same_sig_rounds < 5 and self._tool_rounds_no_answer < 12:
+        if (self._same_sig_rounds < self._same_sig_limit
+                and self._tool_rounds_no_answer < self._tool_rounds_limit):
             return None
         logger.warning("thin loop: 同参空转 %d 轮，停滞闸门收口", self._same_sig_rounds)
         if self._finalize_round:
@@ -542,8 +547,8 @@ class ThinAgentLoop:
         self._finalize_round = True
         # 保证终答轮能挤进步数上限内（闸门在最后一轮触发时，continue 后
         # while 条件会直接退出、终答轮不会执行）
-        if self.steps >= MAX_STEPS:
-            self.steps = MAX_STEPS - 1
+        if self.steps >= self.max_steps:
+            self.steps = self.max_steps - 1
         self._same_sig_rounds = 0
         self._tool_rounds_no_answer = 0
         self._step_log("停滞闸门", "收口：下一轮强制直接作答（tools=空、关思考）")
@@ -595,7 +600,7 @@ class ThinAgentLoop:
             logger.warning("thin loop: 当日额度状态预注入提示（跨 turn）")
         async with httpx.AsyncClient(timeout=httpx.Timeout(120)) as client:
             self._client = client
-            while self.steps < MAX_STEPS:
+            while self.steps < self.max_steps:
                 self.steps += 1
                 yield {"event": "round_start", "iteration": self.steps}
                 from agent_loop import _session_cancel_requested
@@ -809,8 +814,8 @@ class ThinAgentLoop:
                         if not self._finalize_retry_used:
                             self._finalize_retry_used = True
                             self._retry_temp, self._retry_freq = 0.6, 1.5
-                            if self.steps >= MAX_STEPS:
-                                self.steps = MAX_STEPS - 1
+                            if self.steps >= self.max_steps:
+                                self.steps = self.max_steps - 1
                             self.current_msgs.append({"role": "system", "content": (
                                 "📣 上一轮你没有输出分析正文。工具已全部禁用——本轮请直接"
                                 "用简体中文写出最终分析正文（基于以上已有数据，含关键数字与结论），"
@@ -1002,4 +1007,4 @@ class ThinAgentLoop:
                     yield _gate
                     return
 
-            yield {"content": f"\n\n⚠️ 已达安全步数上限（{MAX_STEPS}）。请发送新消息继续。"}
+            yield {"content": f"\n\n⚠️ 已达安全步数上限（{self.max_steps}）。请发送新消息继续。"}

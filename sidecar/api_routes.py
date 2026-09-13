@@ -2012,6 +2012,20 @@ async def api_extensions_install(request: Request):
     return result
 
 
+@app.post("/v1/extensions/source-policy")
+async def api_extensions_source_policy(request: Request):
+    """封锁/解封市场来源（最小治理：安装前拦截）。body: {url, blocked}"""
+    body = await _json_body(request)
+    from extension_manager import set_source_blocked
+    return set_source_blocked(str(body.get("url", "")), bool(body.get("blocked", True)))
+
+
+@app.get("/v1/extensions/blocked-sources")
+def api_extensions_blocked():
+    from extension_manager import blocked_sources
+    return {"status": "ok", "blocked": blocked_sources()}
+
+
 @app.post("/v1/extensions/uninstall")
 async def api_extensions_uninstall(request: Request):
     body = await _json_body(request)
@@ -2211,6 +2225,9 @@ async def api_extensions_install_github(request: Request):
     kind = str(body.get("kind", "")).strip() or "openclaw-skill"
     if not repo:
         return {"status": "error", "message": "repo 不能为空"}
+    from extension_manager import is_source_blocked
+    if is_source_blocked(repo):
+        return {"status": "error", "message": f"该来源已被封锁，拒绝安装：{repo}"}
     try:
         from starlette.concurrency import run_in_threadpool
         from extension_manager import install_github_item

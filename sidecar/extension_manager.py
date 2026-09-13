@@ -213,6 +213,11 @@ def install_extension(source: str, sha256: str = "", label: str = "") -> dict:
 
     # sha256 校验（审计 P1-10）：网络来源必须提供 sha256——扩展无签名体系，
     # 传输完整性 hash 是仅有的防线；本地文件视为管理员显式操作，允许免传。
+    # 封锁来源直接拒绝（在任何下载动作之前）
+    if not Path(source).expanduser().is_file() and is_source_blocked(source):
+        logger.warning("install blocked by policy: %s", source)
+        return {"status": "error",
+                "message": f"该来源已被封锁，拒绝安装：{source}（可在扩展页解封后重试）"}
     if not Path(source).expanduser().is_file() and not sha256:
         return {"status": "error",
                 "message": "网络来源安装必须提供 sha256（防传输篡改）；请从可信市场清单或发布页获取后重试"}
@@ -469,6 +474,48 @@ def _save_sources(state: dict):
     tmp = MARKET_SOURCES_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
     tmp.replace(MARKET_SOURCES_FILE)
+
+
+def blocked_sources() -> list[str]:
+    """被封锁的来源（repo 或 URL，统一小写存储）。"""
+    st = _load_sources()
+    b = st.get("blocked")
+    return [str(x).lower() for x in b] if isinstance(b, list) else []
+
+
+def set_source_blocked(source: str, blocked: bool = True) -> dict:
+    """封锁/解封来源（最小治理：安装前拦截，不做策略分级）。"""
+    from adapters import parse_github_repo
+    src = (source or "").strip()
+    if not src:
+        return {"status": "error", "message": "source 不能为空"}
+    key = (parse_github_repo(src) or src).lower()
+    st = _load_sources()
+    cur = st.get("blocked")
+    cur = [str(x) for x in cur] if isinstance(cur, list) else []
+    low = [x.lower() for x in cur]
+    if blocked and key not in low:
+        cur.append(key)
+    elif not blocked:
+        cur = [x for x in cur if x.lower() != key]
+    st["blocked"] = cur
+    _save_sources(st)
+    return {"status": "ok", "blocked": cur, "message":
+            f"{'已封锁' if blocked else '已解封'}：{key}"}
+
+
+def is_source_blocked(source: str) -> bool:
+    """安装前检查：该来源是否被封锁（repo 名或 URL 任一匹配即算）。"""
+    from adapters import parse_github_repo
+    src = (source or "").strip()
+    if not src:
+        return False
+    low = src.lower()
+    repo = (parse_github_repo(src) or "").lower()
+    for b in blocked_sources():
+        if b == low or (repo and b == repo):
+            return True
+    return False
 
 
 def list_market_sources() -> list[dict]:
