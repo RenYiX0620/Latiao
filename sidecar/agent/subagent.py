@@ -205,13 +205,23 @@ async def _delegate_task(agent_type: str, task: str, task_id: str | None = None,
     return result
 
 
+# 僵尸判定：running 但超过该秒数无活动 → 视为中断（09-13 事故：客户端断流
+# 取消协程后收尾代码未执行，两条记录永远停在 running，界面无限转圈）
+_STALE_RUNNING_SEC = 180
+
+
 def _subtask_snapshot() -> list[dict]:
     """后台子任务列表快照（heartbeat 附带，前端活动栏渲染）。"""
     out = []
+    now = _time.time()
     for tid, s in _SUBTASKS.items():
+        status = s["status"]
+        if status == "running" and now - float(s.get("updated_at") or 0) > _STALE_RUNNING_SEC:
+            status = "stale"
+            s["status"] = "stale"  # 回写：避免每轮心跳重复判定
         out.append({
             "id": tid, "agent": s["agent"], "task": s["task"][:60],
-            "status": s["status"], "steps": s["steps"],
+            "status": status, "steps": s["steps"],
             "activity": dict(s.get("activity") or {}),
             "last_activity": s.get("last_activity", ""),
             "started_at": s["started_at"], "updated_at": s["updated_at"],
@@ -259,7 +269,19 @@ async def _delegate_task_fg(agent_type: str, task: str) -> str:
         "agent": agent_type, "task": task, "status": "running",
         "steps": 0, "result": "", "started_at": _time.time(), "updated_at": _time.time(),
     }
-    result = await _delegate_task(agent_type, task, task_id=task_id)
+    try:
+        result = await _delegate_task(agent_type, task, task_id=task_id)
+    except BaseException:
+        # 父请求断流会取消本协程（CancelledError 不是 Exception）——必须落终态，
+        # 否则注册表永远停在 running（09-13 僵尸行事故）
+        s = _SUBTASKS.get(task_id)
+        if s is not None and s.get("status") == "running":
+            s["status"] = "error"
+            s["result"] = "[Sub-agent] 已中断（父请求取消）"
+            s["updated_at"] = _time.time()
+            _SUBTASK_EVENTS.append({"id": task_id, "status": "error",
+                                    "summary": "已中断（父请求取消）"})
+        raise
     s = _SUBTASKS[task_id]
     failed = "[Sub-agent" in result and ("错误" in result or "HTTP" in result.split("\n")[0])
     s["result"] = result
