@@ -303,6 +303,16 @@ async def chat_completion(request: Request):
                     async for event in _run_agent(protocol, api_url, headers, is_local, model):
                         yield f"data: {json.dumps(event)}\n\n"
                     yield "data: [DONE]\n\n"
+                except (GeneratorExit, asyncio.CancelledError):
+                    # 客户端断流/取消：立刻置位会话取消，主循环与子代理在其下一步停
+                    # （09-13 事故：断连后服务端仍跑满算力，子代理留下僵尸记录）
+                    try:
+                        from agent_loop import _request_session_cancel
+                        _request_session_cancel(session_id)
+                        logger.warning("客户端断流：已请求取消会话 %s", session_id)
+                    except Exception:
+                        logger.warning("断流取消置位失败", exc_info=True)
+                    raise
                 except httpx.TransportError as e:
                     logger.error(f"Agent stream 连接错误: {type(e).__name__}: {e}", exc_info=True)
                     # 优先透传底层带指引的具体原因（手动停止/自动重载失败/外部引擎等），
