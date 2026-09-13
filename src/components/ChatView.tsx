@@ -465,7 +465,7 @@ export default memo(function ChatView({
                   <span className="subagent-activity">{parts.join("　") || `· ${sa.steps} 步`}</span>
                 )}
                 <span className={`subagent-status${sa.status === "running" ? " running" : ""}`}>
-                  {sa.status === "running" ? "●" : sa.status === "done" ? "✓" : "✗"}
+                  {sa.status === "running" ? "●" : sa.status === "done" ? "✓" : sa.status === "stale" ? "⚠" : "✗"}
                 </span>
               </div>
             );

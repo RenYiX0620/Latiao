@@ -292,7 +292,17 @@ def _clear_session_cancel(session_id: str) -> None:
 
 
 def _session_cancel_requested(session_id: str) -> bool:
-    return session_id in _session_cancelled
+    """会话是否已被请求取消。
+
+    子代理会话形如 "<父会话>:sub_xxx"——父被取消（用户点停止 / 客户端断流）时
+    子代理必须同步骤内停，否则断连后仍会继续烧算力（09-13 事故）。
+    """
+    if not session_id:
+        return False
+    if session_id in _session_cancelled:
+        return True
+    root = session_id.split(":", 1)[0]
+    return root != session_id and root in _session_cancelled
 
 # PROGRESS_DIR is imported from config
 PROGRESS_FILE = PROGRESS_DIR / "PROGRESS.md"
