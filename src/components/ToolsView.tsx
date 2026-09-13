@@ -65,6 +65,7 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
   const [marketErr, setMarketErr] = useState("");
   // ── 多市场源（Phase 1） ──
   const [marketSources, setMarketSources] = useState<any[]>([]);
+  const [blockedSources, setBlockedSources] = useState<string[]>([]);
   const [newSourceUrl, setNewSourceUrl] = useState("");
   const [showSourceForm, setShowSourceForm] = useState(false);
   // ── GitHub 自动发现（Discovery Engine） ──
@@ -115,6 +116,11 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
       const resp = await authFetch("/v1/marketplace/sources");
       const data = await resp.json();
       if (data.status === "ok") setMarketSources(data.sources || []);
+      try {
+        const bresp = await authFetch("/v1/extensions/blocked-sources");
+        const bdata = await bresp.json();
+        if (bdata.status === "ok") setBlockedSources(bdata.blocked || []);
+      } catch { /* 黑名单不可用不影响源列表 */ }
     } catch { /* 静默 */ }
   }, []);
 
@@ -241,6 +247,21 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
   };
 
   // 生态条目安装：走 install-github（下载→打包→安装），复用确认流
+  // 封锁/解封来源（最小治理：安装前由后端拦截）
+  const toggleSourceBlocked = async (src: any) => {
+    const key = (src.repo || src.url || "").toLowerCase();
+    const isBlocked = blockedSources.some(b => b === key || key.endsWith("/" + b) || b === src.url?.toLowerCase());
+    try {
+      const resp = await authFetch("/v1/extensions/source-policy", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: src.url, blocked: !isBlocked }),
+      });
+      const data = await resp.json();
+      if (data.status === "ok") { showToast(data.message || "已更新"); refreshSources(); }
+      else showToast(data.message || "操作失败", "warn");
+    } catch (e) { console.error(e); showToast("操作失败", "warn"); }
+  };
+
   const installGitHubItem = async (item: any) => {
     setConfirming({
       source: `生态源: ${item.repo || item.source_url}`,
@@ -437,12 +458,25 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
                 <span style={{ flex: 1, fontSize: 10, color: "var(--text-muted)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                   {src.description || src.url}
                 </span>
-                {src.builtin ? (
-                  <span style={{ fontSize: 10, color: "var(--text-muted)" }}>内置</span>
-                ) : (
-                  <button className="btn-icon" style={{ fontSize: 12, color: "var(--danger)" }}
-                    onClick={() => removeSource(src)} title="移除源">✕</button>
-                )}
+                {(() => {
+                  const key = (src.url || "").toLowerCase();
+                  const isBlocked = blockedSources.some(b => b === key);
+                  return (
+                    <>
+                      {src.builtin && <span style={{ fontSize: 10, color: "var(--text-muted)" }}>内置</span>}
+                      <button className="btn btn-xs"
+                        style={{ color: isBlocked ? "var(--danger)" : "var(--text-muted)", padding: "1px 6px", fontSize: 10 }}
+                        onClick={() => toggleSourceBlocked(src)}
+                        title={isBlocked ? "解封该来源（恢复可安装）" : "封锁该来源（安装请求会被拒绝）"}>
+                        {isBlocked ? "已封锁" : "封锁"}
+                      </button>
+                      {!src.builtin && (
+                        <button className="btn-icon" style={{ fontSize: 12, color: "var(--danger)" }}
+                          onClick={() => removeSource(src)} title="移除源">✕</button>
+                      )}
+                    </>
+                  );
+                })()}
               </div>
             ))}
           </div>
