@@ -132,12 +132,54 @@ export default function LocalModelsTab(props: Props) {
   const { t } = useTranslation();
   const isRunning = localLLMStatus?.status === "running";
   const isStarting = localLLMStatus?.status === "starting";
+  const [benchRunning, setBenchRunning] = useState(false);
+  const [benchLatest, setBenchLatest] = useState<any>(null);
+  const [benchHistory, setBenchHistory] = useState<any[]>([]);
   const [showSearch, setShowSearch] = useState(false);
   const [searchFilter, setSearchFilter] = useState("");
   const [detailModelId, setDetailModelId] = useState("");
   const [detailData, setDetailData] = useState<Record<string, unknown> | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [localModels, setLocalModels] = useState<LocalModelInfo[]>([]);
+
+  // ── 基准测试：一键测生成速度/首字延迟/预填充/内存，并给可执行建议（09-13）──
+  const loadBenchmarks = useCallback(async () => {
+    try {
+      const resp = await authFetch("/v1/local-llm/benchmarks");
+      const data = await resp.json();
+      if (data.status === "ok") {
+        setBenchHistory(data.items || []);
+        setBenchLatest((data.items || [])[0] || null);
+      }
+    } catch { /* 基准历史不可用不影响页面 */ }
+  }, []);
+
+  const runBenchmark = useCallback(async () => {
+    if (benchRunning) return;
+    setBenchRunning(true);
+    showToast("⚡ 基准测试中：生成 256 token + 两档预填充（约 30 秒~2 分钟）", "info");
+    try {
+      const resp = await authFetch("/v1/local-llm/benchmark", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ large: true }),
+      });
+      const data = await resp.json();
+      if (data.status === "ok") {
+        setBenchLatest(data);
+        showToast(`✅ 基准完成：${data.gen_tps} tok/s · 首字 ${data.ttft_s}s · 内存 ${data.rss_gb}GB`);
+        void loadBenchmarks();
+      } else {
+        showToast(data.message || "基准测试失败（需先加载模型）", "warn");
+      }
+    } catch (e) {
+      console.error(e);
+      showToast("基准测试请求失败", "warn");
+    } finally {
+      setBenchRunning(false);
+    }
+  }, [benchRunning, showToast, loadBenchmarks]);
+
+  useEffect(() => { void loadBenchmarks(); }, [loadBenchmarks]);
 
   const fetchLocalModels = useCallback(() => {
     authFetch("/v1/local-llm/models")
@@ -213,11 +255,53 @@ export default function LocalModelsTab(props: Props) {
           <div style={{ display: "flex", gap: 8, marginTop: 8, fontSize: 10, color: "var(--text-muted)", alignItems: "center" }}>
             <button className="btn btn-sm btn-ghost" style={{ fontSize: 10, padding: "2px 8px" }} onClick={() => fetchContextEstimate(localModelId || undefined)}>{t("local.redetect")}</button>
             <button className="btn btn-sm btn-ghost" style={{ fontSize: 10, padding: "2px 8px" }} onClick={() => startLocalLLM()} disabled={!localLLMStatus.model_id}>{t("local.reload_model")}</button>
+            <button className="btn btn-sm btn-ghost" style={{ fontSize: 10, padding: "2px 8px" }}
+              onClick={() => void runBenchmark()} disabled={benchRunning || !localLLMStatus.model_id}>
+              {benchRunning ? "⚡ 测试中…" : "⚡ 基准测试"}
+            </button>
             {contextEstimate && <><span>| {t("local.max_safe")}: {contextEstimate.max_context.toLocaleString()} tokens</span><span>| {t("local.restart_effect")}</span></>}
           </div>
           {contextEstimate && contextLimit > contextEstimate.max_context && <div style={{ marginTop: 8, fontSize: 10, color: "var(--danger)" }}>{t("local.context_warning", { limit: contextEstimate.max_context.toLocaleString() })}</div>}
         </div>
       </div>
+
+      {/* 基准测试结果（一键实测：生成速度/首字延迟/预填充/内存 + 建议） */}
+      {(benchLatest || benchHistory.length > 0) && (
+        <div className="settings-group" style={{ marginBottom: 16 }}>
+          <div className="settings-group-header">⚡ 基准测试结果
+            <span style={{ marginLeft: 8, fontSize: 11, fontWeight: 400, color: "var(--text-secondary)" }}>
+              最近 {benchHistory.length} 次（新→旧）
+            </span>
+          </div>
+          <div style={{ padding: "12px 16px", fontSize: 12 }}>
+            {benchLatest && (
+              <>
+                <div style={{ fontFamily: "var(--font-mono)", fontSize: 12, lineHeight: 1.9 }}>
+                  <div>模型：{benchLatest.model}{benchLatest.backend ? ` · ${benchLatest.backend}` : ""}</div>
+                  <div>生成 {benchLatest.gen_tps} tok/s · 首字 {benchLatest.ttft_s}s · 上下文 {Number(benchLatest.context_limit || 0).toLocaleString()}</div>
+                  {(benchLatest.prefill || []).map((pf: any, i: number) => (
+                    <div key={i}>预填充 {(pf.chars / 1000).toFixed(1)}K 字符 → {pf.seconds}s（≈{pf.tps} tok/s）</div>
+                  ))}
+                  <div>内存 {benchLatest.rss_gb ?? "?"}GB / 共 {benchLatest.total_ram_gb ?? "?"}GB</div>
+                </div>
+                {(benchLatest.advice || []).length > 0 && (
+                  <div style={{ marginTop: 8, padding: "8px 10px", background: "var(--bg-tool-call)", borderRadius: "var(--radius-sm)", lineHeight: 1.7 }}>
+                    {(benchLatest.advice || []).map((a: string, i: number) => <div key={i}>· {a}</div>)}
+                  </div>
+                )}
+              </>
+            )}
+            {benchHistory.length > 1 && (
+              <div style={{ marginTop: 10, fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--text-secondary)" }}>
+                <div style={{ marginBottom: 4 }}>历史对比：</div>
+                {benchHistory.slice(1, 6).map((h: any, i: number) => (
+                  <div key={i}>{new Date(h.ts * 1000).toLocaleString()} · {h.model} · {h.gen_tps} tok/s · 首字 {h.ttft_s}s · {h.rss_gb}GB</div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       <div className="settings-group" style={{ marginBottom: 16 }}>
         <div className="settings-group-header">{t("local.hf_search")}</div>
