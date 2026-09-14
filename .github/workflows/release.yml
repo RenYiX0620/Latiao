@@ -28,6 +28,16 @@ jobs:
         run: |
           bash scripts/setup-portable-python.sh
 
+      - name: "Clean sidecar build artifacts before bundling"
+        run: |
+          # bundle.resources 把整个 sidecar 目录打进安装包：PyInstaller 产物、
+          # __pycache__、pip 缓存会白胖上百 MB（09-14：Windows 包 98→224MB）
+          rm -rf sidecar/dist sidecar/build sidecar/__pycache__ 2>/dev/null || true
+          find sidecar -name "__pycache__" -type d -prune -exec rm -rf {} + 2>/dev/null || true
+          find sidecar -name "*.pyc" -delete 2>/dev/null || true
+          rm -rf sidecar/.pytest_cache sidecar/.mypy_cache 2>/dev/null || true
+          du -sh sidecar || true
+
       - name: "Guard: signing key configured?"
         run: |
           if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
@@ -163,6 +173,20 @@ jobs:
           if (-not $exe) { Write-Error "zip 内未找到 llama-server.exe"; exit 1 }
           Copy-Item $exe.FullName -Destination "sidecar\llama-server.exe" -Force
           Write-Host "llama-server.exe ready: $($exe.FullName)"
+
+      - name: Clean sidecar build artifacts before bundling
+        shell: pwsh
+        run: |
+          # bundle.resources 递归包含 sidecar 目录：PyInstaller 的 dist/build 树
+          # 会被一起打进安装器（09-14 实测 98MB → 224MB 的根因）
+          Remove-Item -Recurse -Force sidecar\dist, sidecar\build -ErrorAction SilentlyContinue
+          Get-ChildItem -Path sidecar -Recurse -Directory -Filter "__pycache__" |
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+          Get-ChildItem -Path sidecar -Recurse -Include *.pyc -File |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+          Write-Host "sidecar size after cleanup:"
+          "{0:N1} MB" -f ((Get-ChildItem sidecar -Recurse -File |
+            Measure-Object Length -Sum).Sum / 1MB)
 
       - name: Build Tauri (NSIS + MSI，updater 自动签名)
         env:
