@@ -498,7 +498,7 @@ fn main() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_process::init())
         .manage(managed_sidecar)
-        .invoke_handler(tauri::generate_handler![sidecar_proxy, get_auth_token, restart_sidecar, store_secret, get_secret, delete_secret, open_model_dir])
+        .invoke_handler(tauri::generate_handler![sidecar_proxy, get_auth_token, restart_sidecar, stop_sidecar_for_update, store_secret, get_secret, delete_secret, open_model_dir])
         .on_window_event(|window, event| {
             // 关闭 = 隐藏到托盘（定时任务/sidecar 持续运行），托盘菜单可退出
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
@@ -523,6 +523,42 @@ fn main() {
                 kill_sidecar_on_exit(_app_handle);
             }
         });
+}
+
+/// 更新安装前停止 sidecar 与本地引擎（09-13 事故：Windows 更新时报
+/// "Error opening file for writing: ...\sidecar\sidecar.exe"——安装程序只强杀
+/// 主程序，残留 sidecar/llama-server 锁住文件导致覆盖失败）。
+/// 先请 sidecar 优雅停掉引擎，再终止其子进程；NSIS 钩子另有一层 taskkill 兜底。
+#[tauri::command]
+fn stop_sidecar_for_update(state: tauri::State<'_, SidecarProcess>) -> Result<String, String> {
+    let token = AUTH_TOKEN.get().map(|s| s.as_str()).unwrap_or("").to_string();
+    let auth_header = format!("Authorization: Bearer {}", token);
+    // 停本地引擎（Windows 上 llama-server.exe 也在安装目录里，同样会锁文件）
+    let _ = Command::new("curl")
+        .args(["-s", "-m", "3", "-X", "POST",
+               "-H", "Content-Type: application/json",
+               "-H", &auth_header,
+               "--data-binary", "@-",
+               "http://127.0.0.1:8765/v1/local-llm/stop"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    let mut guard = state.0.lock().map_err(|e| format!("Lock failed: {}", e))?;
+    if let Some(mut child) = guard.take() {
+        #[cfg(unix)]
+        {
+            let pid = child.id();
+            let _ = Command::new("kill").arg("-TERM").arg(pid.to_string()).output();
+            for _ in 0..20 {
+                if let Ok(Some(_)) = child.try_wait() { return Ok("stopped".into()); }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    Ok("stopped".into())
 }
 
 /// 应用退出时的进程清理。App::run() 内部以 std::process::exit 结束进程，
