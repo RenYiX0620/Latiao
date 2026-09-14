@@ -115,6 +115,14 @@ export async function checkForUpdates(
       onStatus("更新包已准备好，下次手动检查或稍后重启时安装");
       return "prepared";
     }
+    // 安装前先停 sidecar 与本地引擎：Windows 上残留进程会锁住 sidecar.exe，
+    // 导致安装程序报 "Error opening file for writing"（09-13 事故）
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      await invoke("stop_sidecar_for_update");
+      onStatus("已停止后台进程，开始安装…");
+    } catch { /* 命令不可用（旧版本/移动端）时忽略，NSIS 钩子仍会兜底 */ }
+
     let finished = false;
     await update.downloadAndInstall((ev) => {
       if (ev.event === "Started") {
