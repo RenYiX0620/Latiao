@@ -208,6 +208,15 @@ const [timeFilter, setTimeFilter] = useState("all");
   const [restartingSidecar, setRestartingSidecar] = useState(false);
   const [testingModel, setTestingModel] = useState<string | null>(null);
   const [testResult, setTestResult] = useState("");
+  // Windows 无 macOS 的系统磨砂材质（sidebar/hudWindow 为 macOS 专属），
+  // 透明窗会直接透出桌面（09-14 事故）。此处标记平台，CSS 据此用不透明底色。
+  useEffect(() => {
+    try {
+      if (navigator.userAgent.includes("Windows")) {
+        document.documentElement.setAttribute("data-platform", "win");
+      }
+    } catch { /* 忽略 */ }
+  }, []);
   const [theme, setTheme] = useState<"light" | "dark">(() => {
     try { return (localStorage.getItem("latiao_theme") as "light" | "dark") || "dark"; }
     catch (e) { console.error(e); return "dark"; }

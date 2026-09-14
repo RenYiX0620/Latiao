@@ -904,3 +904,17 @@ img.sidebar-logo {
 .sidebar-model-select { font-size: 12px; color: #ffffff; }
 .sidebar-collapse-btn { color: #ffffff; }
 .sidebar .sidebar-online, .sidebar .sidebar-offline { color: #ffffff; }
+
+
+/* ── Windows：无系统磨砂材质，改用不透明底色（避免桌面透进 UI）──
+   macOS 继续走窗口 vibrancy（sidebar/hudWindow），Windows 走这里的三块实色。 */
+[data-platform="win"] body,
+[data-platform="win"] #root { background: #1e1e1e; }
+[data-platform="win"] .sidebar { background: #1e1e1e; }
+[data-platform="win"] .main { background: #1a1a1a; }
+[data-platform="win"] .topbar { background: #1e1e1e; }
+[data-platform="win"][data-theme="light"] body,
+[data-platform="win"][data-theme="light"] #root,
+[data-platform="win"][data-theme="light"] .sidebar,
+[data-platform="win"][data-theme="light"] .topbar { background: #fbfbfb; }
+[data-platform="win"][data-theme="light"] .main { background: #f5f5f5; }
