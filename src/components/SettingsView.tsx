@@ -107,7 +107,7 @@ export default function SettingsView({
             <div className="settings-row-right">
               <span className={`status-dot ${sidecarStatus === "online" ? "online" : "offline"}`}></span>
               <span style={{ fontSize: 12, color: sidecarStatus === "online" ? "var(--success)" : "var(--danger)", fontWeight: 500 }}>
-                {sidecarStatus === "online" ? t("settings.status_running") : t("settings.status_offline")}
+                {sidecarStatus === "online" ? t("sidebar.online") : t("sidebar.offline")}
               </span>
             </div>
           </div>
