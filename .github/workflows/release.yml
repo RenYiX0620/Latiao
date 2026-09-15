@@ -39,6 +39,8 @@ jobs:
           du -sh sidecar || true
 
       - name: "Fetch upstream llama.cpp engine (dual-engine dispatch)"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # 09-15：macOS 内置双引擎——sidecar/llama-server 是 Spark 专用 fork，
           # 上游引擎由本步骤抓预编译包到 sidecar/llama-upstream/（普通模型走上游）

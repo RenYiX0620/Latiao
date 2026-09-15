@@ -13,12 +13,26 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DEST="$ROOT/sidecar/llama-upstream"
 TAG="${1:-}"
 
+# 认证：CI 共享 runner IP 的匿名配额极小，未认证时会返回限流消息而不是列表
+# （09-15 实测：匿名请求返回 {message: ...} → 解析报 'str' object has no attribute 'get'）
+TOKEN="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
+AUTH=()
+[ -n "$TOKEN" ] && AUTH=(-H "Authorization: Bearer $TOKEN")
+
 if [ -z "$TAG" ]; then
   echo "→ 扫描上游最近 release 中的 macOS arm64 预编译包…"
-  TAG=$(curl -s -m 30 "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=15" \
+  TAG=$(curl -s -m 30 "${AUTH[@]}" \
+      "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=15" \
     | python3 -c "
 import sys, json
-for r in json.load(sys.stdin):
+try:
+    rels = json.load(sys.stdin)
+except Exception as e:
+    print('', end=''); sys.stderr.write(f'✗ 无法解析 releases 响应: {e}\n'); sys.exit(0)
+if not isinstance(rels, list):
+    sys.stderr.write(f'✗ releases 响应非列表（可能被限流/未认证）: {str(rels)[:160]}\n')
+    sys.exit(0)
+for r in rels:
     names = [a['name'] for a in (r.get('assets') or [])]
     if any(n.endswith('bin-macos-arm64.tar.gz') for n in names):
         print(r['tag_name']); break
