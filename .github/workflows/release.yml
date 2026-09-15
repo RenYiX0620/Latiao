@@ -38,6 +38,17 @@ jobs:
           rm -rf sidecar/.pytest_cache sidecar/.mypy_cache 2>/dev/null || true
           du -sh sidecar || true
 
+      - name: "Build Spark fork engine (XHToken llama.cpp)"
+        run: |
+          # 09-15 事故：fork 二进制在 .gitignore 里（不入库），CI 从干净仓库构建
+          # → 打出的 macOS 包从来没有 sidecar/llama-server → Spark 类模型
+          # “启动失败: Failed to load model”（python 引擎不支持其架构，而回退
+          # 引擎缺失）。此步骤在 CI 内现编，并在编译失败时立刻终止发版。
+          command -v cmake >/dev/null 2>&1 || brew install cmake
+          bash scripts/build-spark-llama.sh
+          test -x sidecar/llama-server || { echo "::error::Spark fork 未产出 sidecar/llama-server"; exit 1; }
+          echo "Spark fork engine:"; ./sidecar/llama-server --version | head -2
+
       - name: "Fetch upstream llama.cpp engine (dual-engine dispatch)"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -77,6 +88,16 @@ jobs:
             npx @tauri-apps/cli signer sign --password "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" "$ARCHIVE"
           fi
           ls -la "$BUNDLE/macos"
+
+      - name: "Verify bundled engines (fork + upstream)"
+        run: |
+          # 硬性校验：包里必须同时有 Spark fork 与上游引擎，否则失败而不是静默发布
+          APP=$(ls -d src-tauri/target/release/bundle/macos/*.app | head -1)
+          RES="$APP/Contents/Resources/sidecar"
+          for e in "$RES/llama-server" "$RES/llama-upstream/llama-server"; do
+            if [ ! -x "$e" ]; then echo "::error::缺少引擎: $e"; exit 1; fi
+            "$e" --version | head -1
+          done
 
       - name: Generate latest.json (darwin 条目)
         run: |

@@ -1453,7 +1453,15 @@ class LocalLLMEngine:
                 # Spark 类新架构（python 引擎不支持）：自动回退原生 llama-server
                 # （XHToken fork）重试——旧模型仍走 python 路径，只有 python 加载
                 # 失败的模型才触发回退（09-08 Spark-X2.5 架构支持方案）
-                if self._find_llama_server(model_path):
+                _native = self._find_llama_server(model_path)
+                if not _native:
+                    _hint = ("该模型需要原生 llama.cpp 引擎（Spark 类新架构），"
+                             "但本安装包未包含它：请更新到 v0.3.25+ 或重新安装")
+                    logger.error("python 引擎加载失败且无原生引擎可用: %s | %s", model_path, _hint)
+                    self.server_status = "error"
+                    self.status_message = _hint
+                    return self.get_status()
+                if _native:
                     logger.warning("llama-cpp python 引擎加载失败，回退原生 llama-server 重试: %s", model_path)
                     # ⚠️ 不能在此调 stop_model()：其首行 self._cancel_load.set() 会置位
                     # 加载取消事件，导致 native 的 _wait_for_http 一进来即命中
@@ -1495,7 +1503,11 @@ class LocalLLMEngine:
         base = Path(__file__).parent
         is_spark = "spark" in (model_path or "").lower()
         if is_spark:
-            cands = [base / "llama-server", base / "llama-server.exe"]
+            # fork 优先；缺失时仍试上游与 exe（宁可尝试也不硬失败——
+            # 09-15 事故：CI 包缺 fork 且直接报 python 的 ValueError，
+            # 用户只看到 "Failed to load model" 一头雾水）
+            cands = [base / "llama-server", base / "llama-upstream" / "llama-server",
+                     base / "llama-server.exe"]
         else:
             cands = [base / "llama-upstream" / "llama-server",
                      base / "llama-server.exe",
