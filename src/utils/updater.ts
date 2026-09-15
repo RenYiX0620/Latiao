@@ -115,28 +115,56 @@ export async function checkForUpdates(
       onStatus("更新包已准备好，下次手动检查或稍后重启时安装");
       return "prepared";
     }
-    // 安装前先停 sidecar 与本地引擎：Windows 上残留进程会锁住 sidecar.exe，
-    // 导致安装程序报 "Error opening file for writing"（09-13 事故）
-    try {
-      const { invoke } = await import("@tauri-apps/api/core");
-      await invoke("stop_sidecar_for_update");
-      onStatus("已停止后台进程，开始安装…");
-    } catch { /* 命令不可用（旧版本/移动端）时忽略，NSIS 钩子仍会兜底 */ }
+    // 安装前停 sidecar/引擎：**仅 Windows 需要**（残留 sidecar.exe 会锁住自身
+    // 文件，安装程序报 "Error opening file for writing"，09-13 事故）。
+    // ⚠️ 09-15 回归：此前不分平台都停，macOS 上安装未走到重启时把 sidecar 停死
+    // → 界面显示"辣条需要恢复"。macOS 无文件锁问题，且重启时 start_sidecar
+    // 本就有"按 PID 文件清残留"逻辑，因此这里按平台跳过。
+    const isWindows = navigator.userAgent.includes("Windows");
+    let stoppedSidecar = false;
+    if (isWindows) {
+      try {
+        const { invoke } = await import("@tauri-apps/api/core");
+        await invoke("stop_sidecar_for_update");
+        stoppedSidecar = true;
+        onStatus("已停止后台进程，开始安装…");
+      } catch { /* 命令不可用（旧版本）时忽略，NSIS 钩子仍会兜底 */ }
+    }
 
     let finished = false;
-    await update.downloadAndInstall((ev) => {
-      if (ev.event === "Started") {
-        onStatus("校验签名完成，开始安装…");
-      } else if (ev.event === "Finished") {
-        finished = true;
-        onStatus("更新已安装，即将重启应用…");
+    try {
+      await update.downloadAndInstall((ev) => {
+        if (ev.event === "Started") {
+          onStatus("校验签名完成，开始安装…");
+        } else if (ev.event === "Finished") {
+          finished = true;
+          onStatus("更新已安装，即将重启应用…");
+        }
+      });
+    } catch (e) {
+      // 安装失败/取消：立即把 sidecar 拉回来，避免"需要恢复"的假死状态
+      if (stoppedSidecar) {
+        try {
+          const { invoke } = await import("@tauri-apps/api/core");
+          await invoke("restart_sidecar");
+          onStatus("安装未完成，已恢复后台进程");
+        } catch { /* 用户可手动点"重启后端进程" */ }
       }
-    });
+      throw e;
+    }
     if (finished) {
       setTimeout(() => {
         relaunch().catch(() => { /* 用户可手动重启 */ });
       }, 1800);
       return "installed";
+    }
+    // 走到这里说明安装未完成（无 Finished 事件）：恢复后台进程
+    if (stoppedSidecar) {
+      try {
+        const { invoke } = await import("@tauri-apps/api/core");
+        await invoke("restart_sidecar");
+        onStatus("更新未应用，已恢复后台进程");
+      } catch { /* 同上 */ }
     }
     return "none";
   } catch (e) {
