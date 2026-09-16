@@ -131,6 +131,41 @@ def _resolve_mlx_path(model_id: str, models_dir: Path = MODELS_DIR, hf_hub: Path
 
 
 
+def _gguf_architecture(model_path: str) -> str:
+    """从 GGUF 头读 general.architecture（用于把"未知架构"报错翻成人话）。"""
+    import struct as _st
+    try:
+        with open(model_path, "rb") as f:
+            if f.read(4) != b"GGUF":
+                return ""
+            f.read(4)                                  # version
+            _st.unpack("<Q", f.read(8))                # tensor count
+            n_kv = _st.unpack("<Q", f.read(8))[0]
+            def _str():
+                n = _st.unpack("<Q", f.read(8))[0]
+                return f.read(n).decode("utf-8", "replace")
+            for _ in range(min(n_kv, 16)):
+                k = _str()
+                t = _st.unpack("<I", f.read(4))[0]
+                if t == 8:
+                    v = _str()
+                elif t == 4:
+                    v = str(_st.unpack("<I", f.read(4))[0])
+                elif t == 10:
+                    v = str(_st.unpack("<Q", f.read(8))[0])
+                elif t == 6:
+                    v = str(_st.unpack("<f", f.read(4))[0])
+                elif t == 7:
+                    v = str(_st.unpack("<?", f.read(1))[0])
+                else:
+                    break
+                if k == "general.architecture":
+                    return v
+    except Exception:
+        return ""
+    return ""
+
+
 def _auto_cache_type(model_path: str) -> tuple[int, int]:
     """Return (type_k, type_v) as ggml_type ints based on model quantization level.
     KV cache precision should never exceed model precision.
@@ -1596,7 +1631,18 @@ class LocalLLMEngine:
                 "exited early" if proc.poll() is not None else "HTTP timeout")
             self.stop_model()
             self.server_status = "error"
-            self.status_message = f"启动失败: {err_summary}" if err_summary else "模型加载超时"
+            # 引擎原始报错对用户没意义（尤其"failed to read magic"这种误导文案，
+            # 实际是"架构不被支持"）。读 GGUF 架构名换成可执行的提示。
+            _low = ("".join(err_lines) or "").lower()
+            if ("failed to read magic" in _low or "unknown model architecture" in _low
+                    or "model loading error" in _low):
+                _arch = _gguf_architecture(model_path) or "未知"
+                self.status_message = (
+                    f"该模型架构（{_arch}）暂不被 llama.cpp 支持——"
+                    "上游已知问题，须等引擎更新。可改用同模型的 MLX 版本"
+                    "（在模型页搜索 mlx-community 对应仓库），或换其他模型。")
+            else:
+                self.status_message = f"启动失败: {err_summary}" if err_summary else "模型加载超时"
             self.current_model_id = ""
             self.current_model_name = ""
             return self.get_status()
