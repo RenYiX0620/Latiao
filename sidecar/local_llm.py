@@ -1638,9 +1638,10 @@ class LocalLLMEngine:
                     or "model loading error" in _low):
                 _arch = _gguf_architecture(model_path) or "未知"
                 self.status_message = (
-                    f"该模型架构（{_arch}）暂不被 llama.cpp 支持——"
-                    "上游已知问题，须等引擎更新。可改用同模型的 MLX 版本"
-                    "（在模型页搜索 mlx-community 对应仓库），或换其他模型。")
+                    f"该模型架构（{_arch}）暂不被 llama.cpp 支持（上游尚未实现该架构）。"
+                    "可选：① 改用该模型的 MLX 转换（社区常以 -MLX-4bit/8bit 命名，"
+                    "其 config.json 需含 model_file 指向 MLX 实现），走 MLX 引擎即可运行；"
+                    "② 换用其他模型；③ 等待 llama.cpp 上游支持后更新引擎。")
             else:
                 self.status_message = f"启动失败: {err_summary}" if err_summary else "模型加载超时"
             self.current_model_id = ""
