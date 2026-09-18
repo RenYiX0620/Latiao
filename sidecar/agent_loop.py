@@ -1716,6 +1716,8 @@ def _build_chat_messages(body: dict, messages: list) -> list:
     try:  # 上下文统计：记录系统提示词各段（供面板按类别展示）
         import context_stats
         context_stats.record_system_parts(body.get('session_id', ''), part_tags)
+        # 新一轮用户消息开始：重置"本轮"运行指标（步数/耗时/TTFT/tok-s）
+        context_stats.begin_turn(body.get('session_id', ''))
     except Exception:
         logger.debug('记录系统提示词分段失败', exc_info=True)
 

@@ -1,7 +1,7 @@
 import { memo, lazy, Suspense, useCallback, useState, useMemo, useRef, useEffect } from "react";
 import type { Message, PendingFile } from "../types";
 import { useTranslation } from "../i18n";
-import ContextMeter from "./ContextMeter";
+import RunMetrics from "./RunMetrics";
 import ToolCallBubble from "./ToolCallBubble";
 import ToolbarSelect from "./ToolbarSelect";
 import {
@@ -770,18 +770,14 @@ export default memo(function ChatView({
         {/* 会话状态栏 */}
         <div className="chat-statusbar">
           {userTurns > 0 ? (
-            <>
-              <span>{userTurns} 轮 · {toolCalls} 次工具调用</span>
-              <span className="statusbar-sep">|</span>
-              <span>{messages.length} 条消息</span>
-              <span className="statusbar-sep">|</span>
-              <span className="statusbar-sep">|</span>
-              <ContextMeter
-                sessionId={sessionId}
-                fallbackTokens={estTokens}
-                fallbackLimit={contextEstimate?.max_context ?? null}
-              />
-            </>
+            <RunMetrics
+              sessionId={sessionId}
+              refreshKey={messages.length}
+              fallbackTurns={userTurns}
+              fallbackToolCalls={toolCalls}
+              fallbackTokens={estTokens}
+              fallbackLimit={contextEstimate?.max_context ?? null}
+            />
           ) : (
             <span>{t("chat.status_hint")}</span>
           )}
