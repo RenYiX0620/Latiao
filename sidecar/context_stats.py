@@ -281,11 +281,20 @@ def stats(session_id: str, limit: int = 0, limit_source: str = "") -> dict:
     counts = snap.get("counts") or {}
     est_total = int(snap.get("estimated_total") or 0)
     real_total = int(sess.get("real_prompt_tokens") or 0)
-    # 有真实输入 token 就用真实值（引擎口径含模板开销），否则用各部分之和 + 模板近似
+    # 有真实输入 token 就用真实值（引擎口径含聊天模板为每个工具包裹的特殊 token）
     total = real_total or est_total
+    counts = dict(counts)
+    # 归一：把"真实总量 − 各部分之和"的差额补给对应类别，否则面板里各行相加
+    # 会小于标题的总量（工具包裹 token 实测每个约 24 个，属系统工具）
+    delta = real_total - sum(counts.values()) if real_total else 0
+    if delta > 0:
+        if counts.get("system_tools", 0) or counts.get("mcp_tools", 0):
+            counts["system_tools"] = counts.get("system_tools", 0) + delta
+        else:
+            counts["other"] = counts.get("other", 0) + delta
     snap_limit = int(snap.get("limit") or 0) or int(limit or 0)
     snap_src = snap.get("limit_source") or limit_source
-    denom = sum(counts.values()) or 1
+    denom = (total if real_total else sum(counts.values())) or 1
     breakdown = [
         {"key": cat, "tokens": int(counts.get(cat, 0)),
          "percent": round(counts.get(cat, 0) * 100.0 / denom, 1)}
