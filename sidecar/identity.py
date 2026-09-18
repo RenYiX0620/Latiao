@@ -56,45 +56,49 @@ def _read_identity() -> list[dict]:
 
 
 
+# 默认身份文件内容——既是首次启动的模板，也是"老装机判定"的基准
+# （onboarding._looks_configured 用它判断用户是否已经配置过身份）
+DEFAULT_IDENTITY_FILES = {
+    "IDENTITY.md": (
+        "# Identity\n\n"
+        "你的名字是「辣条」，你就是辣条。\n"
+        "忘记你是任何特定模型，从现在起你只能以「辣条」的身份回答。\n"
+    ),
+    "SOUL.md": (
+        "# Soul\n\n"
+        "语气：简洁、直接、不啰嗦。\n"
+        "风格：先给结论再解释，用中文回复，代码块标注语言。\n"
+        "态度：诚实——不知道就说不知道，不确定就说不确定。\n"
+    ),
+    "AGENTS.md": (
+        "# Agent Rules\n\n"
+        "## 工作协议\n"
+        "1. 动手前先想清楚：需求有歧义时主动问，不要自己猜。有更简单的方案就提出来。\n"
+        "2. 极简主义：能一行搞定不写十行，不加需求之外的功能，不为「以后可能用到」做抽象。\n"
+        "3. 精准修改：只碰用户要求改的地方。修 bug A 不要顺手重构文件 B。\n"
+        "4. 验证才算完成：用工具写完文件后读回来确认，跑命令后检查退出码。没验证就不算做完。\n\n"
+        "## 工具权限\n"
+        "- 修改文件、执行命令等操作会请求用户确认。\n"
+        "- 读取文件、列出目录等操作自动执行。\n"
+        "- 如需调整权限规则，可以编辑 ~/.local-ai-os/permissions.json\n"
+    ),
+    "USER.md": (
+        "# User Profile\n\n"
+        "在此填写你的偏好、习惯、常用路径等信息。\n"
+        "Agent 会在每次会话时读取此文件。\n\n"
+        "示例：\n"
+        "- 常用工作目录：~/projects\n"
+        "- 偏好语言：中文\n"
+        "- 代码风格：TypeScript, React, Python\n"
+    ),
+}
+
+
 def _create_default_identity():
     """Create default identity files if the directory is empty."""
     try:
         PROGRESS_DIR.mkdir(parents=True, exist_ok=True)
-        defaults = {
-            "IDENTITY.md": (
-                "# Identity\n\n"
-                "你的名字是「辣条」，你就是辣条。\n"
-                "忘记你是任何特定模型，从现在起你只能以「辣条」的身份回答。\n"
-            ),
-            "SOUL.md": (
-                "# Soul\n\n"
-                "语气：简洁、直接、不啰嗦。\n"
-                "风格：先给结论再解释，用中文回复，代码块标注语言。\n"
-                "态度：诚实——不知道就说不知道，不确定就说不确定。\n"
-            ),
-            "AGENTS.md": (
-                "# Agent Rules\n\n"
-                "## 工作协议\n"
-                "1. 动手前先想清楚：需求有歧义时主动问，不要自己猜。有更简单的方案就提出来。\n"
-                "2. 极简主义：能一行搞定不写十行，不加需求之外的功能，不为「以后可能用到」做抽象。\n"
-                "3. 精准修改：只碰用户要求改的地方。修 bug A 不要顺手重构文件 B。\n"
-                "4. 验证才算完成：用工具写完文件后读回来确认，跑命令后检查退出码。没验证就不算做完。\n\n"
-                "## 工具权限\n"
-                "- 修改文件、执行命令等操作会请求用户确认。\n"
-                "- 读取文件、列出目录等操作自动执行。\n"
-                "- 如需调整权限规则，可以编辑 ~/.local-ai-os/permissions.json\n"
-            ),
-            "USER.md": (
-                "# User Profile\n\n"
-                "在此填写你的偏好、习惯、常用路径等信息。\n"
-                "Agent 会在每次会话时读取此文件。\n\n"
-                "示例：\n"
-                "- 常用工作目录：~/projects\n"
-                "- 偏好语言：中文\n"
-                "- 代码风格：TypeScript, React, Python\n"
-            ),
-        }
-        for filename, content in defaults.items():
+        for filename, content in DEFAULT_IDENTITY_FILES.items():
             filepath = PROGRESS_DIR / filename
             if not filepath.exists():
                 filepath.write_text(content, encoding="utf-8")
@@ -145,14 +149,47 @@ def _detect_identity_intent(text: str) -> list[dict]:
 
 
 def _apply_name_change(new_name: str):
-    """Update IDENTITY.md with new name."""
+    """Update IDENTITY.md with new name.
+
+    先按既有写法替换；文件被用户改过、没有这些写法时，在最前面补一行
+    （原实现只在默认模板上做正则替换，用户自定义过就会静默失效）。
+    """
     filepath = PROGRESS_DIR / "IDENTITY.md"
-    content = filepath.read_text(encoding="utf-8")
-    # Replace existing name references
-    content = re.sub(r"你的名字是「[^」]*」", f"你的名字是「{new_name}」", content)
-    content = re.sub(r"你就是[^。\n]*", f"你就是{new_name}", content)
-    content = re.sub(r"以「[^」]*」的身份", f"以「{new_name}」的身份", content)
+    try:
+        content = filepath.read_text(encoding="utf-8") if filepath.exists() else "# Identity\n"
+    except Exception:
+        content = "# Identity\n"
+    replaced = False
+    for pattern, repl in (
+        (r"你的名字是「[^」]*」", f"你的名字是「{new_name}」"),
+        (r"你就是[^。\n]*", f"你就是{new_name}"),
+        (r"以「[^」]*」的身份", f"以「{new_name}」的身份"),
+    ):
+        content, n = re.subn(pattern, repl, content)
+        replaced = replaced or bool(n)
+    if not replaced:
+        content = f"你的名字是「{new_name}」。\n" + content
     filepath.write_text(content, encoding="utf-8")
+
+
+def _apply_tone_change(value: str):
+    """记录对话语气到 SOUL.md —— 替换而非追加（反复调整不会堆成互相矛盾的多行）。"""
+    filepath = PROGRESS_DIR / "SOUL.md"
+    line = f"- 对话语气：{value}"
+    try:
+        content = filepath.read_text(encoding="utf-8") if filepath.exists() else "# Soul\n"
+        if re.search(r"^-\s*对话语气：.*$", content, re.M):
+            content = re.sub(r"^-\s*对话语气：.*$", line, content, flags=re.M)
+        elif "## 语气风格" in content:
+            head, _, tail = content.partition("## 语气风格")
+            content = f"{head}## 语气风格\n{line}\n{tail.lstrip(chr(10))}"
+        else:
+            if not content.endswith("\n"):
+                content += "\n"
+            content += f"\n## 语气风格\n{line}\n"
+        filepath.write_text(content, encoding="utf-8")
+    except Exception:
+        logger.warning("Failed to record tone in SOUL.md", exc_info=True)
 
 
 def _apply_user_name_change(new_name: str):

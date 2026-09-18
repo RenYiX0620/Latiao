@@ -26,6 +26,7 @@ from config import PROGRESS_DIR
 from cron import _create_cron
 from db import _db_write_lock, _get_db
 from identity import _load_agent_identity, _process_identity_intents, _read_identity
+from onboarding import process_message as _process_onboarding
 from session_log import SessionLog
 from loop_state import turn_state_for
 from memory import (
@@ -1503,9 +1504,22 @@ def _build_chat_messages(body: dict, messages: list) -> list:
     # 技能目录由 capability_registry 提供（统一能力模型）→ lazy import 避免循环依赖
     import capability_registry
     last_user_text = _extract_last_user_text(messages)
-    intent_result = _process_identity_intents(last_user_text)
+    # 首启引导（新安装专用）优先消费本轮消息：它的答案归一化更宽松（短回答即名字）。
+    # 被消费时跳过常规身份意图识别，避免同一句话被两套规则重复写盘。
+    onboard_directive, onboard_handled = _process_onboarding(
+        last_user_text, _detect_user_language(last_user_text))
+    intent_result = None if onboard_handled else _process_identity_intents(last_user_text)
 
     system_parts = []
+
+    # 首启引导指令放在最前面：本地小模型对长提示的中段指令容易忽略
+    # （22:31 实测 9B 模型拿到引导指令仍只回寒暄），位置与措辞都要够显眼。
+    if onboard_directive:
+        system_parts.append(
+            "## ⚠️ 本轮最重要的动作：首次使用引导\n"
+            "忽略其它寒暄模板。你的回复必须严格按下面执行：\n"
+            + onboard_directive
+        )
 
     # Agent identity — system rules from developer (highest priority)
     agent_id = body.get("agent", "latiao")

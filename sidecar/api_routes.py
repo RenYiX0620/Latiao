@@ -64,6 +64,10 @@ from agent_loop import (
 from config import PROGRESS_DIR
 from db import MEMORY_DB, _db_write_lock, _get_db
 from identity import IDENTITY_FILES
+from onboarding import complete as _onboarding_complete
+from onboarding import pending_question_suffix as _onboarding_suffix
+from onboarding import reset as _onboarding_reset
+from onboarding import status as _onboarding_status
 from main import (
     MAX_UPLOAD_SIZE,
     SUBAGENT_MODEL,
@@ -300,8 +304,16 @@ async def chat_completion(request: Request):
                     #（未选模型）时会冒出假名 gpt-4o-mini → 前端误弹"未在云端配置"警告。
                     # 模型名真实发给引擎仍用 model（208/214）；仅 UI 展示层不再暴露默认兜底名。
                     yield f"data: {json.dumps({'event': 'engine_route', 'is_local': is_local, 'engine': 'local' if is_local else 'cloud', 'declared_model': user_selected_model or '', 'resolved_endpoint': api_url}, ensure_ascii=False)}\n\n"
+                    # 首启引导兜底：本地小模型服从性不稳，实测会把该问的问题换成寒暄
+                    # （22:40 9B 把"语气"那一问丢了）——模型没问出来就由后端在流末尾补上。
+                    _turn_text: list[str] = []
                     async for event in _run_agent(protocol, api_url, headers, is_local, model):
+                        if isinstance(event, dict) and event.get("content"):
+                            _turn_text.append(str(event["content"]))
                         yield f"data: {json.dumps(event)}\n\n"
+                    _onb_suffix = _onboarding_suffix("".join(_turn_text))
+                    if _onb_suffix:
+                        yield f"data: {json.dumps({'content': _onb_suffix}, ensure_ascii=False)}\n\n"
                     yield "data: [DONE]\n\n"
                 except (GeneratorExit, asyncio.CancelledError):
                     # 客户端断流/取消：立刻置位会话取消，主循环与子代理在其下一步停
@@ -1006,6 +1018,26 @@ async def get_identity():
             logger.debug(f"Failed to read identity file {filename}", exc_info=True)
             files.append({"name": filename, "exists": False, "content": ""})
     return {"status": "ok", "files": files}
+
+
+# ── 首启引导（新安装第一次对话时自我介绍并收集 称呼/名字/语气）──
+
+@app.get("/v1/onboarding")
+async def get_onboarding():
+    """引导状态 + 当前生效的 用户称呼/我的名字/对话语气（设置页卡片）。"""
+    return {"status": "ok", **_onboarding_status()}
+
+
+@app.post("/v1/onboarding/reset")
+async def reset_onboarding():
+    """重新运行引导：重置进度，下一轮对话即开始提问（不改动现有身份文件）。"""
+    return {"status": "ok", **_onboarding_reset()}
+
+
+@app.post("/v1/onboarding/complete")
+async def complete_onboarding():
+    """标记引导完成（用户选择跳过）。"""
+    return {"status": "ok", **_onboarding_complete()}
 
 
 # ── Agent management endpoints ──
