@@ -131,6 +131,32 @@ def _resolve_mlx_path(model_id: str, models_dir: Path = MODELS_DIR, hf_hub: Path
 
 
 
+def _mlx_arch_supported(model_dir: str) -> tuple[bool, str]:
+    """MLX 启动前预检：mlx-lm 是否支持该架构（或仓库自带 MLX 实现）。
+
+    背景（09-18 事故）：LM Studio 下载的 "…-MLX-8bit" 实为 Transformers 格式
+    （config.model_type=zdtaichu5_0、无 model_file、仓库内 py 无任何 mlx 引用），
+    mlx_lm.server 接单后直接挂死 → 就绪探测轮询到超时，界面永远"正在加载"。
+    预检把这种必然失败提前成一句明确错误。
+    """
+    import json as _json
+    try:
+        cfg = _json.loads((Path(model_dir) / "config.json").read_text(encoding="utf-8"))
+    except Exception:
+        return True, ""            # 读不到 config 不拦截（交给引擎报错）
+    mt = str(cfg.get("model_type") or "")
+    if not mt:
+        return True, ""
+    if cfg.get("model_file"):
+        return True, ""            # 仓库自带 MLX 实现（mlx-lm 的 model_file 机制）
+    try:
+        import importlib as _imp
+        _imp.import_module(f"mlx_lm.models.{mt}")
+        return True, ""
+    except Exception:
+        return False, mt
+
+
 def _gguf_architecture(model_path: str) -> str:
     """从 GGUF 头读 general.architecture（用于把"未知架构"报错翻成人话）。"""
     import struct as _st
@@ -1654,6 +1680,16 @@ class LocalLLMEngine:
         return self.get_status()
 
     def _start_mlx(self, model_id: str, port: int) -> dict:
+        _ok, _mt = _mlx_arch_supported(model_id)
+        if not _ok:
+            self.server_status = "error"
+            self.status_message = (
+                f"MLX 引擎不支持该模型架构（{_mt}）——该仓库大概率是 Transformers 格式"
+                "（尽管名称含 MLX；其 config.json 无 model_file、仓库内代码无 mlx 依赖）。"
+                "请改用真正的 MLX 转换（config.json 含 model_file 且指向 MLX 实现）、"
+                "或 GGUF 版本、或其它模型。")
+            logger.warning("MLX 架构预检拦截: %s (model_type=%s)", model_id, _mt)
+            return self.get_status()
         self.current_model_id = model_id
         self.current_model_name = model_id.split("/")[-1] if "/" in model_id else model_id
         self.server_status = "starting"
