@@ -90,13 +90,10 @@ export default function ContextMeter({ sessionId, fallbackTokens, fallbackLimit 
   return (
     <span className="ctx-meter" onMouseEnter={show} onMouseLeave={() => setOpen(false)}>
       <button type="button" className="ctx-meter-btn" title={t("chat.ctx_title")}>
-        {percent !== null
-          ? t("chat.ctx_label", { percent: `${percent}` })
-          : `${fmtTokens(total, lang)} tokens`}
+        {cache === null
+          ? t("chat.ctx_cache_na")
+          : t("chat.ctx_cache_rate", { percent: (cache * 100).toFixed(0) })}
       </button>
-      <span className="ctx-bar" aria-hidden="true">
-        <i style={{ width: `${Math.min(100, percent ?? 0)}%` }} />
-      </span>
       {open && (
         <div className="ctx-panel" role="tooltip">
           <div className="ctx-head">

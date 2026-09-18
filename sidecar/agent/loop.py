@@ -717,6 +717,7 @@ class ThinAgentLoop:
                     self._step_log("request 插件改写",
                                    f"键变化 {body_keys_before} → {sorted(body.keys())}")
                 t_sample = time.monotonic()
+                t_first_token = None
                 result = None
                 raw_deltas = 0
                 try:
@@ -724,6 +725,8 @@ class ThinAgentLoop:
                         if "__result__" in evt:
                             result = evt["__result__"]
                             continue
+                        if t_first_token is None and (evt.get("content") or evt.get("reasoning")):
+                            t_first_token = time.monotonic()   # 首 token（TTFT）计时点
                         raw_deltas += 1
                         yield evt
                     if result is None:
@@ -814,6 +817,13 @@ class ThinAgentLoop:
                         yield {"event": "heartbeat"}
                         continue
                     logger.warning("thin loop: 引擎连续空生成，交付诊断")
+                try:
+                    import context_stats
+                    context_stats.record_step(
+                        self.session_id, time.monotonic() - t_sample,
+                        (t_first_token - t_sample) if t_first_token else None)
+                except Exception:
+                    logger.debug("记录采样步耗时失败", exc_info=True)
                 self._step_log("流结束",
                                f"delta={raw_deltas} 思考={len(reasoning)}字 "
                                f"正文={len(body_text)}字 耗时={time.monotonic()-t_sample:.1f}s")
@@ -979,7 +989,13 @@ class ThinAgentLoop:
                             targs.get("agent", "code-reviewer"), targs.get("task", ""))
 
                     self._step_log("并行委派", f"{len(tool_calls)} 个子代理并发启动")
+                    _t_del = time.monotonic()
                     _outs = await _aio.gather(*[_run_delegate(tc) for tc in tool_calls])
+                    try:
+                        import context_stats
+                        context_stats.record_tool_time(self.session_id, time.monotonic() - _t_del)
+                    except Exception:
+                        logger.debug("记录子代理耗时失败", exc_info=True)
                     for tc, out in zip(tool_calls, _outs):
                         self.current_msgs.append({"role": "tool",
                                                   "tool_call_id": tc.get("id"),
@@ -1045,9 +1061,15 @@ class ThinAgentLoop:
                             and not _confirm_bypassed(tname, self.access_mode):
                         pre = await _start_tool_confirmation(tc["id"], tname, targs)
                         yield pre["event"]
+                    _t_tool = time.monotonic()
                     verify_failed, events = await _handle_tool_execution(
                         tc, self.current_msgs, self.session_id, "latiao",
                         self.access_mode, pre_started=pre)
+                    try:
+                        import context_stats
+                        context_stats.record_tool_time(self.session_id, time.monotonic() - _t_tool)
+                    except Exception:
+                        logger.debug("记录工具耗时失败", exc_info=True)
                     _res = next((str(e.get("result", "")) for e in events
                                  if isinstance(e, dict) and "result" in e), "")
                     self._maybe_quota_hint(_res)

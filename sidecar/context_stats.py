@@ -125,7 +125,55 @@ def _session(session_id: str) -> dict:
         "cache_samples": [],     # 最近 N 次缓存命中率
         "real_prompt_tokens": 0, # 引擎返回的真实输入 token（校准用）
         "model_path": "",
+        # ── 运行指标（状态栏展示；除缓存外均按"本轮"累计，见 begin_turn）──
+        "turns": 0,              # 当前上下文里的用户轮数
+        "steps": 0,              # 本轮采样步数
+        "llm_seconds": 0.0,      # 本轮 LLM 采样总耗时
+        "tool_seconds": 0.0,     # 本轮工具执行总耗时
+        "ttft_samples": [],      # 本轮每步的首 token 延迟（秒）
+        "gen_tokens": 0,         # 本轮生成的 completion token 数
+        "gen_seconds": 0.0,      # 扣除首 token 等待后的生成耗时
     })
+
+
+def begin_turn(session_id: str) -> None:
+    """新一轮用户消息开始：重置"本轮"运行指标（缓存命中率与真实 token 保持滚动）。"""
+    if not session_id:
+        return
+    with _lock:
+        sess = _session(session_id)
+        sess.update(steps=0, llm_seconds=0.0, tool_seconds=0.0,
+                    ttft_samples=[], gen_tokens=0, gen_seconds=0.0)
+
+
+def record_step(session_id: str, seconds: float, ttft: float | None = None) -> None:
+    """记录一次采样步：总耗时 + 首 token 延迟（TTFT）。"""
+    if not session_id:
+        return
+    try:
+        sec = float(seconds)
+        tt = float(ttft) if ttft is not None else None
+    except (TypeError, ValueError):
+        return
+    with _lock:
+        sess = _session(session_id)
+        sess["steps"] += 1
+        sess["llm_seconds"] += max(0.0, sec)
+        if tt is not None and 0 <= tt <= sec:
+            sess["ttft_samples"].append(tt)
+            sess["gen_seconds"] += max(0.0, sec - tt)
+
+
+def record_tool_time(session_id: str, seconds: float) -> None:
+    """记录工具执行耗时（并发执行时由调用方传入该批次的墙钟耗时）。"""
+    if not session_id:
+        return
+    try:
+        sec = float(seconds)
+    except (TypeError, ValueError):
+        return
+    with _lock:
+        _session(session_id)["tool_seconds"] += max(0.0, sec)
 
 
 def record_system_parts(session_id: str, parts: list) -> None:
@@ -201,6 +249,7 @@ def record_request(session_id: str, messages: list, tools: list,
             continue
         bucket_texts["mcp_tools" if name.startswith("mcp__") else "system_tools"].append(text)
 
+    turns = sum(1 for m in (messages or []) if m.get("role") == "user")
     counts: dict[str, int] = {}
     sources: set[str] = set()
     for cat in CATEGORIES:
@@ -214,6 +263,7 @@ def record_request(session_id: str, messages: list, tools: list,
     with _lock:
         sess = _session(session_id)
         sess["model_path"] = model_path
+        sess["turns"] = turns
         sess["snapshot"] = {
             "counts": counts,
             "estimated_total": sum(counts.values()) + TEMPLATE_OVERHEAD,
@@ -249,15 +299,20 @@ def record_usage(session_id: str, usage: dict | None = None, timings: dict | Non
     if not session_id:
         return
     prompt_tokens = 0
+    completion_tokens = 0
     if isinstance(usage, dict):
         prompt_tokens = int(usage.get("prompt_tokens") or 0)
+        completion_tokens = int(usage.get("completion_tokens") or 0)
     elif isinstance(timings, dict):
         prompt_tokens = int(timings.get("prompt_n") or 0)
+        completion_tokens = int(timings.get("predicted_n") or 0)
     rate = _extract_cache_rate(usage, timings)
     with _lock:
         sess = _session(session_id)
         if prompt_tokens:
             sess["real_prompt_tokens"] = prompt_tokens
+        if completion_tokens:
+            sess["gen_tokens"] += completion_tokens
         if rate is not None:
             sess["cache_samples"].append(rate)
             if len(sess["cache_samples"]) > CACHE_SAMPLES:
@@ -277,6 +332,12 @@ def stats(session_id: str, limit: int = 0, limit_source: str = "") -> dict:
             "total": 0, "percent": None, "breakdown": [],
             "cache_hit_rate": (sum(samples) / len(samples)) if samples else None,
             "cache_samples": len(samples), "token_source": "none", "updated_at": None,
+            "turns": int(sess.get("turns") or 0), "steps": int(sess.get("steps") or 0),
+            "llm_seconds": round(float(sess.get("llm_seconds") or 0.0), 1),
+            "tool_seconds": round(float(sess.get("tool_seconds") or 0.0), 1),
+            "ttft_avg": (round(sum(sess.get("ttft_samples") or []) / len(sess["ttft_samples"]), 2)
+                         if sess.get("ttft_samples") else None),
+            "tps": (round(sess["gen_tokens"] / sess["gen_seconds"]) if sess.get("gen_seconds") else None),
         }
     counts = snap.get("counts") or {}
     est_total = int(snap.get("estimated_total") or 0)
@@ -313,6 +374,14 @@ def stats(session_id: str, limit: int = 0, limit_source: str = "") -> dict:
         "breakdown": breakdown,
         "cache_hit_rate": round(sum(samples) / len(samples), 4) if samples else None,
         "cache_samples": len(samples),
+        # 运行指标（状态栏）：本轮步数/耗时/TTFT/生成速度 + 上下文轮数
+        "turns": int(sess.get("turns") or 0),
+        "steps": int(sess.get("steps") or 0),
+        "llm_seconds": round(float(sess.get("llm_seconds") or 0.0), 1),
+        "tool_seconds": round(float(sess.get("tool_seconds") or 0.0), 1),
+        "ttft_avg": (round(sum(sess.get("ttft_samples") or []) / len(sess["ttft_samples"]), 2)
+                     if sess.get("ttft_samples") else None),
+        "tps": (round(sess["gen_tokens"] / sess["gen_seconds"]) if sess.get("gen_seconds") else None),
         "token_source": snap.get("token_source", "estimated"),
         "model_path": sess.get("model_path", ""),
         "updated_at": snap.get("updated_at"),
