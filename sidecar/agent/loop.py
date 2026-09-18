@@ -236,6 +236,32 @@ def _clear_steer(session_id: str) -> None:
     _steer_inbox.pop(session_id, None)
 
 
+def _record_engine_usage(session_id: str, line: str) -> None:
+    """从原始 SSE 行提取引擎真实用量（云端 usage / llama.cpp timings）→ 上下文统计。
+
+    薄循环此前把这些字段整体丢弃；缓存命中率与真实输入 token 数只能从这里来。
+    """
+    try:
+        payload = line[6:].strip()
+        if not payload or payload == "[DONE]":
+            return
+        event = json.loads(payload)
+    except Exception:
+        logger.debug("引擎用量行解析失败", exc_info=True)
+        return
+    if not isinstance(event, dict):
+        return
+    usage, timings = event.get("usage"), event.get("timings")
+    if not usage and not timings:
+        return
+    try:
+        import context_stats
+        context_stats.record_usage(session_id, usage if isinstance(usage, dict) else None,
+                                   timings if isinstance(timings, dict) else None)
+    except Exception:
+        logger.debug("上下文统计记录用量失败", exc_info=True)
+
+
 class ThinAgentLoop:
     """单一 agent 循环：cloud/local 共用，差异只体现在请求组装与辅助层开关。"""
 
@@ -335,6 +361,7 @@ class ThinAgentLoop:
 
     # ── 请求组装（request waterfall 之前的宿主编排）──────────
     def _build_request(self, engine_model: str) -> dict:
+        import local_llm  # 懒加载：与文件内其它用法一致，避免模块级循环依赖
         light = self.is_local and _is_light_query(self.last_user_text, self.current_msgs)
         native_ok = self.is_local and _local_native_tools_ok() and not self.native_fallback_used
         tools = self._active_tools() if not light else []
@@ -359,6 +386,17 @@ class ThinAgentLoop:
             body["tools"] = [dict(t) for t in tools]
             if self.parallel_disabled:
                 body["parallel_tool_calls"] = False
+            # OpenAI 兼容端点要显式声明才在流式响应里回传 usage（缓存命中率来源）；
+            # Anthropic 风格端点（/v1/messages）不接受该字段，按 URL 判别。
+            if self.api_url.rstrip("/").endswith("/chat/completions"):
+                body["stream_options"] = {"include_usage": True}
+            try:
+                import context_stats
+                context_stats.record_request(
+                    self.session_id, msgs, tools, model_path="",
+                    limit=0, limit_source="unknown")
+            except Exception:
+                logger.debug("上下文统计快照失败（云端）", exc_info=True)
             return body
 
         # 本地：原生 tools + 精简纪律；legacy 回退围栏提示词；闲聊不加提示
@@ -386,6 +424,29 @@ class ThinAgentLoop:
             body["chat_template_kwargs"] = {"enable_thinking": False}
         if self.parallel_disabled:
             body["parallel_tool_calls"] = False
+        # MLX 引擎（mlx_lm.server）同样只在 include_usage 时才回传 usage（含 cached_tokens）；
+        # python/原生 llama.cpp 引擎不认识该字段，不下发。
+        if str(getattr(local_llm._engine, "_active_backend", "") or "") == "mlx":
+            body["stream_options"] = {"include_usage": True}
+        # 上下文统计：记录本轮实际发出的内容（分类快照；finalize 轮是数据摘要视图，
+        # 不代表真实上下文，故在此之前记录）
+        try:
+            import context_stats
+            if self.is_local:
+                _lim = int(getattr(local_llm._engine, "model_token_limit", 0) or 0)
+                # 精确计数要的是模型文件路径：engine_model 是解析后的引擎模型（GGUF 路径），
+                # self.model 可能只是声明名（latiao-local-default）
+                _mp = str(engine_model) if ("/" in str(engine_model)) else str(
+                    getattr(local_llm._engine, "current_model_id", "") or "")
+                context_stats.record_request(
+                    self.session_id, msgs, tools, model_path=_mp,
+                    limit=_lim, limit_source="local_engine")
+            else:
+                context_stats.record_request(
+                    self.session_id, msgs, tools, model_path="",
+                    limit=0, limit_source="unknown")
+        except Exception:
+            logger.debug("上下文统计快照失败", exc_info=True)
         if self._finalize_round:
             # 终答轮：彻底换用数据摘要视图（09-08 19:28 实况：12 轮工具形态
             # 历史锁死模型——tools=[] 且温度抖动后仍 30s 只出 1 个工具调用、
@@ -441,6 +502,9 @@ class ThinAgentLoop:
                 raise _GenerationLoopError("单步生成超时(900s)，已截断")
             if not line.startswith("data: "):
                 continue
+            if '"usage"' in line or '"timings"' in line:
+                # 上下文统计：真实输入 token 数与缓存命中（云端 usage / llama.cpp timings）
+                _record_engine_usage(self.session_id, line)
             try:
                 done, delta = _parse_delta_line(line)
             except Exception:

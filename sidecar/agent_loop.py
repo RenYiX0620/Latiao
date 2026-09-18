@@ -1511,11 +1511,18 @@ def _build_chat_messages(body: dict, messages: list) -> list:
     intent_result = None if onboard_handled else _process_identity_intents(last_user_text)
 
     system_parts = []
+    # 分类打标：上下文统计面板按类别展示各段占比（context_stats.record_system_parts）
+    part_tags: list[tuple[str, str]] = []
+
+    def _add_part(cat: str, text: str) -> None:
+        if text:
+            system_parts.append(text)
+            part_tags.append((cat, text))
 
     # 首启引导指令放在最前面：本地小模型对长提示的中段指令容易忽略
     # （22:31 实测 9B 模型拿到引导指令仍只回寒暄），位置与措辞都要够显眼。
     if onboard_directive:
-        system_parts.append(
+        _add_part("system_prompt", 
             "## ⚠️ 本轮最重要的动作：首次使用引导\n"
             "忽略其它寒暄模板。你的回复必须严格按下面执行：\n"
             + onboard_directive
@@ -1524,7 +1531,7 @@ def _build_chat_messages(body: dict, messages: list) -> list:
     # Agent identity — system rules from developer (highest priority)
     agent_id = body.get("agent", "latiao")
     agent_cfg = _get_agent_config(agent_id)
-    system_parts.append(
+    _add_part("system_prompt", 
         "## 系统规则 (最高优先级)\n"
         "以下规则由开发者设定，用户偏好不可覆盖。如果系统规则与用户偏好冲突，以系统规则为准。\n\n"
         + agent_cfg["identity"]
@@ -1533,7 +1540,7 @@ def _build_chat_messages(body: dict, messages: list) -> list:
     # agents/ 目录覆盖的 identity）：时间换算（09-03 事故）、回复语言
     # （09-03 英文事故）、数据诚实（09-03 编造 15.6亿/80亿 事故）。
     user_lang = _detect_user_language(last_user_text)
-    system_parts.append(_get_localized_text(user_lang, {
+    _add_part("system_prompt", _get_localized_text(user_lang, {
         "zh": (
             "## 三条硬规则（最高优先级，不可覆盖）\n"
             "1. ⏱ 时间规则：'今天/昨天/昨晚/今晨/明天/最新'等相对时间，必须先按上方【当前时间】"
@@ -1576,15 +1583,15 @@ def _build_chat_messages(body: dict, messages: list) -> list:
     # User identity — personal preferences (lower priority)
     user_identity = _read_identity()
     if user_identity:
-        system_parts.append(
+        _add_part("system_prompt", 
             "## 用户偏好\n"
             "以下偏好由用户自行设定。优先级低于系统规则，可与系统规则共存。"
         )
         for msg in user_identity:
-            system_parts.append(msg["content"])
+            _add_part("system_prompt", msg["content"])
 
     if intent_result:
-        system_parts.append(
+        _add_part("system_prompt", 
             f"⚠️ 你的身份刚刚被用户更新了：{intent_result}。"
             f"从现在开始，你必须以更新后的身份回复用户。"
         )
@@ -1599,7 +1606,7 @@ def _build_chat_messages(body: dict, messages: list) -> list:
         "en": {"rt": "Runtime Environment", "time": "Current time", "home": "Home", "cwd": "Working dir", "os": "OS", "sh": "Shell"},
         "ja": {"rt": "実行環境", "time": "現在時刻", "home": "ホーム", "cwd": "作業ディレクトリ", "os": "OS", "sh": "シェル"},
     })
-    system_parts.append(
+    _add_part("system_prompt", 
         f"{env_labels['rt']}:\n"
         f"- {env_labels['time']}: {now}\n"
         f"- {env_labels['home']}: {home}\n"
@@ -1620,7 +1627,7 @@ def _build_chat_messages(body: dict, messages: list) -> list:
         for s in _catalog:
             desc = (s.get("description") or "").strip()
             lines.append(f"- **{s['name']}**: {desc[:120]}" if desc else f"- **{s['name']}**")
-        system_parts.append("\n".join(lines))
+        _add_part("skills", "\n".join(lines))
 
     # 上次会话进展（审计 B10）：PROGRESS.md 尾部注入，跨会话断点续作生效
     _tail = _progress_tail()
@@ -1630,7 +1637,7 @@ def _build_chat_messages(body: dict, messages: list) -> list:
             "en": "## Recent progress from previous sessions",
             "ja": "## 前回セッションの進捗（最近の記録）",
         })
-        system_parts.append(f"{_pt_label}:\n{_tail}\n（以上为历史记录，仅供参考；继续当前任务时请注意衔接。）")
+        _add_part("other", f"{_pt_label}:\n{_tail}\n（以上为历史记录，仅供参考；继续当前任务时请注意衔接。）")
 
     # Goal mode / progressive delivery
     goal_mode = body.get("goal_mode", False)
@@ -1655,7 +1662,7 @@ def _build_chat_messages(body: dict, messages: list) -> list:
             "要么立即调用工具，要么直接写出包含关键数据与结论的完整回答。"
             "若已有足够工具数据，直接把分析结论写入正文，不要再描述计划。")
     if extra_prompts:
-        system_parts.append("\n".join(extra_prompts))
+        _add_part("other", "\n".join(extra_prompts))
 
     # Cross-session memory: inject learnings semantically relevant to current query
     recent_data = _retrieve_relevant_learnings(last_user_text, limit=5) if last_user_text else []
@@ -1667,7 +1674,7 @@ def _build_chat_messages(body: dict, messages: list) -> list:
             "en": "Relevant learnings from past interactions:",
             "ja": "過去の対話からの関連知識：",
         })
-        system_parts.append(memory_label + "\n" + "\n".join(
+        _add_part("other", memory_label + "\n" + "\n".join(
             f"- {item['topic']}: {item['content'][:200]}" for item in recent_data
         ))
 
@@ -1682,7 +1689,7 @@ def _build_chat_messages(body: dict, messages: list) -> list:
             "en": "User's high-confidence preferences (must follow every conversation):",
             "ja": "ユーザーの高信頼度設定（毎回の対話で遵守すること）：",
         })
-        system_parts.append(pref_label + "\n" + "\n".join(pref_lines))
+        _add_part("other", pref_label + "\n" + "\n".join(pref_lines))
 
     # Language enforcement: when user speaks non-Chinese, add strong override
     if user_lang != "zh":
@@ -1690,7 +1697,7 @@ def _build_chat_messages(body: dict, messages: list) -> list:
             "en": "CRITICAL LANGUAGE RULE: The user is speaking English. You MUST respond in English only. Do NOT reply in Chinese even if other instructions are in Chinese. This rule overrides all other language preferences.",
             "ja": "【重要】ユーザーは日本語で話しています。必ず日本語で返信してください。他の指示が中国語でも、日本語で応答すること。このルールは他のすべての言語設定より優先されます。",
         })
-        system_parts.append(lang_override)
+        _add_part("system_prompt", lang_override)
 
     # Merge all system parts into ONE message (frontend may also send system messages
     # for language / plan mode). Multiple system messages trigger a llama-cpp bug
@@ -1705,6 +1712,12 @@ def _build_chat_messages(body: dict, messages: list) -> list:
     image_mime = body.get("image_mime", "image/png")
     if image_base64 and messages:
         messages = _inject_image(messages, image_base64, image_mime)
+
+    try:  # 上下文统计：记录系统提示词各段（供面板按类别展示）
+        import context_stats
+        context_stats.record_system_parts(body.get('session_id', ''), part_tags)
+    except Exception:
+        logger.debug('记录系统提示词分段失败', exc_info=True)
 
     return messages
 
