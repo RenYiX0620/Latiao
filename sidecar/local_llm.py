@@ -1665,9 +1665,11 @@ class LocalLLMEngine:
                 _arch = _gguf_architecture(model_path) or "未知"
                 self.status_message = (
                     f"该模型架构（{_arch}）暂不被 llama.cpp 支持（上游尚未实现该架构）。"
-                    "可选：① 改用该模型的 MLX 转换（社区常以 -MLX-4bit/8bit 命名，"
-                    "其 config.json 需含 model_file 指向 MLX 实现），走 MLX 引擎即可运行；"
-                    "② 换用其他模型；③ 等待 llama.cpp 上游支持后更新引擎。")
+                    "可选：① 换用该模型的 MLX 转换（社区常以 -MLX-4bit/8bit 命名）——"
+                    "能否运行取决于架构是否被 Latiao 的 MLX 引擎（mlx-lm）收录："
+                    "config.json 的 model_type 需在 mlx-lm 内置列表内，或仓库用 model_file "
+                    "自带 MLX 实现（只被 mlx-vlm 收录的架构不在此列）；"
+                    "② 换用其他模型；③ 等上游支持后更新引擎（每次发版会自动抓最新的上游引擎）。")
             else:
                 self.status_message = f"启动失败: {err_summary}" if err_summary else "模型加载超时"
             self.current_model_id = ""
@@ -1692,16 +1694,16 @@ class LocalLLMEngine:
                                      "preprocessor_config.json", "processor_config.json"})
             if _is_vlm:
                 self.status_message = (
-                    f"该模型是多模态（MLX-VLM）格式（架构 {_mt}），需要 mlx-vlm 运行时，"
-                    "Latiao 当前的 MLX 引擎（mlx-lm，纯文本）不支持。"
-                    "建议：改用该模型的 GGUF 版本（Latiao 的 llama.cpp 引擎可跑，"
-                    "但转换后通常只保留文本能力）；或换其它模型。")
+                    f"该模型是多模态（MLX-VLM）格式（架构 {_mt}），需要 mlx-vlm 运行时；"
+                    "Latiao 的 MLX 引擎（mlx-lm）未收录该架构，也未内置 mlx-vlm。"
+                    "建议：① 改用该模型的 GGUF 版本（若其架构被 llama.cpp 支持；"
+                    "转 GGUF 后通常只保留文本能力）；② 换其它模型。")
             else:
                 self.status_message = (
                     f"MLX 引擎不支持该模型架构（{_mt}）。"
                     "可用条件：该架构被 mlx-lm 内置支持，或 config.json 含 model_file "
-                    "指向 MLX 实现。建议改用 GGUF 版本（若其架构被 llama.cpp 支持）"
-                    "或其它模型。")
+                    "指向 MLX 实现（部分架构只被另一个运行时 mlx-vlm 收录，Latiao 未内置）。"
+                    "建议改用 GGUF 版本（若其架构被 llama.cpp 支持）或其它模型。")
             logger.warning("MLX 架构预检拦截: %s (model_type=%s)", model_id, _mt)
             return self.get_status()
         self.current_model_id = model_id
