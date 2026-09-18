@@ -1,4 +1,6 @@
+import { useCallback, useEffect, useState } from "react";
 import { useTranslation } from "../i18n";
+import { authFetch } from "../utils/api";
 
 interface SettingsViewProps {
   theme: "light" | "dark";
@@ -33,6 +35,80 @@ function toggleOnChange(setter: (v: boolean) => void, storageKey: string) {
     setter(v);
     localStorage.setItem(storageKey, String(v));
   };
+}
+
+/** 人格与称呼：显示当前的 称呼/名字/语气，并可重新运行首启引导。 */
+function PersonaCard() {
+  const { t } = useTranslation();
+  const [info, setInfo] = useState<{ done: boolean; user_name: string; agent_name: string; tone: string } | null>(null);
+  const [note, setNote] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(async () => {
+    try {
+      const r = await authFetch("/v1/onboarding");
+      const d = await r.json();
+      setInfo({
+        done: !!d.done,
+        user_name: d.user_name || "",
+        agent_name: d.agent_name || "",
+        tone: d.tone || "",
+      });
+    } catch { /* 侧车未就绪时卡片留空 */ }
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  const post = async (path: string, okKey: string) => {
+    setBusy(true);
+    try {
+      await authFetch(path, { method: "POST" });
+      setNote(t(okKey));
+      await load();
+    } catch {
+      setNote(t("local.failed"));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const val = (v: string) => v || t("settings.persona_unset");
+  const rows: [string, string][] = [
+    [t("settings.persona_user"), val(info?.user_name || "")],
+    [t("settings.persona_agent"), val(info?.agent_name || "")],
+    [t("settings.persona_tone"), val(info?.tone || "")],
+  ];
+
+  return (
+    <div className="settings-group">
+      <div className="settings-group-header">{t("settings.persona_title")}</div>
+      {rows.map(([label, value]) => (
+        <div className="settings-row" key={label}>
+          <div><div className="settings-row-label">{label}</div></div>
+          <span style={{ fontSize: 12, color: value === t("settings.persona_unset") ? "var(--text-muted)" : "var(--text-primary)" }}>{value}</span>
+        </div>
+      ))}
+      <div className="settings-row" style={{ alignItems: "flex-start" }}>
+        <div>
+          <div className="settings-row-desc" style={{ maxWidth: 380 }}>{t("settings.persona_desc")}</div>
+          {info && !info.done && (
+            <div style={{ fontSize: 11, color: "var(--warning)", marginTop: 6 }}>{t("settings.persona_pending")}</div>
+          )}
+          {note && <div style={{ fontSize: 11, color: "var(--success)", marginTop: 6 }}>{note}</div>}
+        </div>
+        <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
+          <button className="btn btn-sm btn-ghost" disabled={busy}
+            onClick={() => post("/v1/onboarding/reset", "settings.persona_reset_done")}>
+            {t("settings.persona_rerun")}
+          </button>
+          <button className="btn btn-sm btn-ghost" disabled={busy}
+            onClick={() => post("/v1/onboarding/complete", "settings.persona_skipped")}>
+            {t("settings.persona_skip")}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 export default function SettingsView({
@@ -208,6 +284,8 @@ export default function SettingsView({
             </div>
           )}
         </div>
+
+        <PersonaCard />
 
       </div>
     </div>

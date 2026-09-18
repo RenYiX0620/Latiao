@@ -140,6 +140,7 @@ from config import PROGRESS_DIR, SUBAGENT_MODEL
 from cron import _cron_loop, _seed_default_cron
 from db import _init_db
 from identity import _create_default_identity
+from onboarding import init_onboarding
 from tool_executor import _resolve_permission  # noqa: F401 — 门面 re-export
 
 logger = logging.getLogger("latiao-sidecar")
@@ -267,6 +268,9 @@ PROJECT_ROOT = Path(__file__).parent  # sidecar/
 async def lifespan(app: FastAPI):
     """FastAPI lifespan: startup + shutdown hooks."""
     _load_permissions()
+    # 首启引导的状态初始化必须在创建默认身份文件之前——它靠"文件是否还是默认模板"
+    # 判定老装机，文件一旦被创建就无从区分
+    init_onboarding()
     _create_default_identity()
     _init_db()
     from cron import _load_cron_state, run_cron_catchup
