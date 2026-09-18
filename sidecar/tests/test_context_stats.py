@@ -155,6 +155,32 @@ class TestUsageAndCache(unittest.TestCase):
         self.assertEqual(st["cache_samples"], cs.CACHE_SAMPLES)
         self.assertAlmostEqual(st["cache_hit_rate"], 0.5, places=4)
 
+
+    def _msgs(self):
+        return [{"role": "system", "content": "## 系统规则\n你是助手。"},
+                {"role": "user", "content": "帮我看看这个文件。"}]
+
+    def test_rows_sum_to_real_total_after_delta(self):
+        """真实总量大于各部分之和时，差额补给系统工具（模板为每个工具包裹的特殊 token）。"""
+        tools = [{"type": "function", "function": {"name": "read_file", "description": "read"}}]
+        cs.record_request(self.SESSION, self._msgs(), tools, limit=64000)
+        est = sum(b["tokens"] for b in cs.stats(self.SESSION)["breakdown"])
+        cs.record_usage(self.SESSION, {"prompt_tokens": est + 300}, None)
+        st = cs.stats(self.SESSION)
+        by_key = {b["key"]: b["tokens"] for b in st["breakdown"]}
+        self.assertEqual(sum(by_key.values()), st["total"])       # 各行相加 = 标题总量
+        self.assertGreaterEqual(by_key["system_tools"], 300)      # 差额归到系统工具
+        self.assertAlmostEqual(sum(b["percent"] for b in st["breakdown"]), 100.0, delta=1.0)
+
+    def test_delta_without_tools_goes_to_other(self):
+        cs.record_request(self.SESSION, self._msgs(), [], limit=64000)
+        est = sum(b["tokens"] for b in cs.stats(self.SESSION)["breakdown"])
+        cs.record_usage(self.SESSION, {"prompt_tokens": est + 120}, None)
+        st = cs.stats(self.SESSION)
+        by_key = {b["key"]: b["tokens"] for b in st["breakdown"]}
+        self.assertEqual(by_key["system_tools"], 0)
+        self.assertEqual(sum(by_key.values()), st["total"])
+
     def test_usage_without_cache_fields_is_ignored(self):
         cs.record_usage(self.SESSION, {"prompt_tokens": 10}, None)
         st = cs.stats(self.SESSION)
