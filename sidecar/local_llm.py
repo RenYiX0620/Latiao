@@ -1683,11 +1683,25 @@ class LocalLLMEngine:
         _ok, _mt = _mlx_arch_supported(model_id)
         if not _ok:
             self.server_status = "error"
-            self.status_message = (
-                f"MLX 引擎不支持该模型架构（{_mt}）——该仓库大概率是 Transformers 格式"
-                "（尽管名称含 MLX；其 config.json 无 model_file、仓库内代码无 mlx 依赖）。"
-                "请改用真正的 MLX 转换（config.json 含 model_file 且指向 MLX 实现）、"
-                "或 GGUF 版本、或其它模型。")
+            # 多模态（MLX-VLM）判别：仓库带视觉相关文件 → 需要 mlx-vlm 运行时
+            try:
+                _names = {f.name for f in Path(model_id).iterdir()}
+            except Exception:
+                _names = set()
+            _is_vlm = bool(_names & {"vision_utils.py", "image_processing.py",
+                                     "preprocessor_config.json", "processor_config.json"})
+            if _is_vlm:
+                self.status_message = (
+                    f"该模型是多模态（MLX-VLM）格式（架构 {_mt}），需要 mlx-vlm 运行时，"
+                    "Latiao 当前的 MLX 引擎（mlx-lm，纯文本）不支持。"
+                    "建议：改用该模型的 GGUF 版本（Latiao 的 llama.cpp 引擎可跑，"
+                    "但转换后通常只保留文本能力）；或换其它模型。")
+            else:
+                self.status_message = (
+                    f"MLX 引擎不支持该模型架构（{_mt}）。"
+                    "可用条件：该架构被 mlx-lm 内置支持，或 config.json 含 model_file "
+                    "指向 MLX 实现。建议改用 GGUF 版本（若其架构被 llama.cpp 支持）"
+                    "或其它模型。")
             logger.warning("MLX 架构预检拦截: %s (model_type=%s)", model_id, _mt)
             return self.get_status()
         self.current_model_id = model_id
