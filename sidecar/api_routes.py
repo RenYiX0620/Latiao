@@ -1020,8 +1020,30 @@ async def get_identity():
     return {"status": "ok", "files": files}
 
 
-# ── 首启引导（新安装第一次对话时自我介绍并收集 称呼/名字/语气）──
+# ── 上下文统计（聊天状态栏悬浮面板）──
 
+@app.get("/v1/context/stats")
+async def get_context_stats(session_id: str = ""):
+    """当前会话"上一轮实际发出内容"的 token 用量分类与缓存命中率。
+
+    数据由 agent 循环在组装请求时快照（context_stats），这里只做读取与容量补全。
+    """
+    import context_stats
+    is_local = True
+    limit, limit_source = 0, "unknown"
+    try:
+        engine = getattr(local_llm, "_engine", None)
+        if engine is not None and not getattr(engine, "_external_engine", ""):
+            limit = int(getattr(engine, "model_token_limit", 0) or 0)
+            limit_source = "local_engine" if limit else "unknown"
+        else:
+            is_local = False
+    except Exception:
+        logger.debug("读取本地引擎上下文上限失败", exc_info=True)
+    return context_stats.stats(session_id, limit=limit, limit_source=limit_source)
+
+
+# ── 首启引导（新安装第一次对话时自我介绍并收集 称呼/名字/语气）──
 @app.get("/v1/onboarding")
 async def get_onboarding():
     """引导状态 + 当前生效的 用户称呼/我的名字/对话语气（设置页卡片）。"""

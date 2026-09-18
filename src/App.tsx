@@ -1646,6 +1646,7 @@ const [timeFilter, setTimeFilter] = useState("all");
             accessMode={accessMode} setAccessMode={setAccessMode}
             thinkingLevel={thinkingLevel} setThinkingLevel={setThinkingLevel}
             contextEstimate={contextEstimate}
+            sessionId={session.id}
             showToast={showToast}
             activeTask={activeTask}
             taskStartAt={taskStartAt}

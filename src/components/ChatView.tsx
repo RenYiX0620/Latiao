@@ -1,6 +1,7 @@
 import { memo, lazy, Suspense, useCallback, useState, useMemo, useRef, useEffect } from "react";
 import type { Message, PendingFile } from "../types";
 import { useTranslation } from "../i18n";
+import ContextMeter from "./ContextMeter";
 import ToolCallBubble from "./ToolCallBubble";
 import ToolbarSelect from "./ToolbarSelect";
 import {
@@ -121,6 +122,7 @@ interface ChatViewProps {
   thinkingLevel: "off" | "high" | "max";
   setThinkingLevel: (l: "off" | "high" | "max") => void;
   contextEstimate?: { max_context: number; recommended_context: number } | null;
+  sessionId?: string;   // 上下文统计面板按会话取数
   showToast: (msg: string, type?: string) => void;
   activeTask: string | null;
   taskStartAt: number | null;
@@ -137,7 +139,7 @@ export default memo(function ChatView({
   fileInputRef, mediaRecorderRef, isRecording,
   sendMessage, onStop, handleFileSelect, startRecording, confirmTool,
   chatEndRef, handleDrop, onPasteImage,
-  cloudModels, selectedModel, onSelectModel,
+  cloudModels, selectedModel, onSelectModel, sessionId,
   accessMode, setAccessMode, thinkingLevel, setThinkingLevel,
   contextEstimate, showToast, activeTask, taskStartAt, streamingThink, subagents,
   routeInfo, localModelId, localModelName,
@@ -773,13 +775,12 @@ export default memo(function ChatView({
               <span className="statusbar-sep">|</span>
               <span>{messages.length} 条消息</span>
               <span className="statusbar-sep">|</span>
-              <span>~{estTokens.toLocaleString()} tokens</span>
-              {contextEstimate?.max_context ? (
-                <>
-                  <span className="statusbar-sep">|</span>
-                  <span>上下文 {Math.round((estTokens / contextEstimate.max_context) * 100)}%</span>
-                </>
-              ) : null}
+              <span className="statusbar-sep">|</span>
+              <ContextMeter
+                sessionId={sessionId}
+                fallbackTokens={estTokens}
+                fallbackLimit={contextEstimate?.max_context ?? null}
+              />
             </>
           ) : (
             <span>{t("chat.status_hint")}</span>
