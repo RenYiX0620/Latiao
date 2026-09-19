@@ -136,6 +136,28 @@ class TestThreeSteps(OnboardingBase):
         self.assertFalse(handled)
         self.assertNotIn("用户称呼：", self.read("USER.md"))
 
+
+    def test_english_agent_name_phrasing(self):
+        """英文起名句式（"you can call yourself Nova"）必须能识别。"""
+        self._walk_to("agent_name")
+        onboarding.process_message("you can call yourself Nova", "en")
+        self.assertIn("「Nova」", self.read("IDENTITY.md"))
+
+    def test_tone_answer_not_stored_as_name(self):
+        """把语气描述当名字存（实测把 "keep it concise" 记成名字）必须被挡住。"""
+        self._walk_to("agent_name")
+        _, handled = onboarding.process_message("keep it concise please", "en")
+        self.assertFalse(handled)
+        self.assertNotIn("keep it concise", self.read("IDENTITY.md"))
+
+    def test_english_tone_preset_stored_in_english(self):
+        """英文用户的语气存英文写法（人设文件不该出现中文句）。"""
+        self._walk_to("tone")
+        onboarding.process_message("be concise and direct", "en")
+        soul = self.read("SOUL.md")
+        self.assertIn("concise and direct", soul)
+        self.assertNotIn("简洁直接", soul)
+
     def test_tone_preset_normalized(self):
         self._walk_to("tone")
         onboarding.process_message("简洁一点", "zh")
@@ -188,6 +210,16 @@ class TestWiring(OnboardingBase):
         msgs = _build_chat_messages(body, body["messages"])
         self.assertIn("首次使用引导", msgs[0]["content"])
         self.assertIn("我该怎么称呼你？", msgs[0]["content"])
+
+
+    def test_english_user_gets_english_onboarding_wrapper(self):
+        """英文用户的首启引导外壳必须是英文（中文外壳会把模型带成中文提问）。"""
+        onboarding.init_onboarding()
+        body = {"messages": [{"role": "user", "content": "hello there, what can you do for me"}]}
+        msgs = _build_chat_messages(body, body["messages"])
+        sys_content = msgs[0]["content"]
+        self.assertIn("first-run onboarding", sys_content)
+        self.assertNotIn("本轮最重要的动作", sys_content)
 
     def test_no_onboarding_block_once_done(self):
         onboarding.init_onboarding()

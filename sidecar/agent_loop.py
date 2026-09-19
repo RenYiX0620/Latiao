@@ -1522,11 +1522,14 @@ def _build_chat_messages(body: dict, messages: list) -> list:
     # 首启引导指令放在最前面：本地小模型对长提示的中段指令容易忽略
     # （22:31 实测 9B 模型拿到引导指令仍只回寒暄），位置与措辞都要够显眼。
     if onboard_directive:
-        _add_part("system_prompt", 
-            "## ⚠️ 本轮最重要的动作：首次使用引导\n"
-            "忽略其它寒暄模板。你的回复必须严格按下面执行：\n"
-            + onboard_directive
-        )
+        # 外壳必须随用户语言：英文/日文用户被中文外壳包着，模型很可能改用中文提问
+        _add_part("system_prompt", _get_localized_text(_detect_user_language(last_user_text), {
+            "zh": "## ⚠️ 本轮最重要的动作：首次使用引导\n忽略其它寒暄模板。你的回复必须严格按下面执行：\n",
+            "en": "## ⚠️ Most important action this turn: first-run onboarding\n"
+                  "Ignore other greeting templates and follow the instructions below exactly:\n",
+            "ja": "## ⚠️ 今回もっとも重要な動作：初回ガイド\n"
+                  "他の挨拶テンプレートは無視し、以下の指示に厳密に従ってください：\n",
+        }) + onboard_directive)
 
     # Agent identity — system rules from developer (highest priority)
     agent_id = body.get("agent", "latiao")

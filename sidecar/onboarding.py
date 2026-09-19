@@ -115,6 +115,9 @@ _NAME_TAILS = (
 # 给"我的名字"这一问专用的前缀（回答常是"叫你小助手吧""以后叫你X"）
 _AGENT_NAME_PREFIXES = (
     "给你起名叫", "给你起名", "给你取名", "以后叫你", "你的名字是", "名字是", "你叫", "叫你",
+    # 英文用户常见表达（实测 "you can call yourself Nova" 原先不识别）
+    "you can call yourself", "i'll call you", "i will call you", "let's call you", "lets call you",
+    "call yourself", "name yourself", "your name is", "your name's", "name's",
 )
 _GREETINGS = (
     "你好", "您好", "哈喽", "在吗", "在么", "喂", "嗯", "哦", "好的", "好", "行", "谢谢",
@@ -130,18 +133,21 @@ _SKIP_FIELD = ("跳过", "不用", "不需要", "随便", "无所谓", "都行",
 
 # 语气关键词 → 规范写法（先匹配关键词，再退回用户原话）
 _TONE_PRESETS = (
+    # (关键词, (中文规范写法, 英文规范写法))——按用户回答的语言二选一，
+    # 避免英文用户的人设文件里出现一句中文
     (("简洁", "简短", "简单", "直接", "精炼", "干练", "concise", "brief", "short"),
-     "简洁直接，先给结论再解释"),
+     ("简洁直接，先给结论再解释", "concise and direct: conclusion first, then the reasoning")),
     (("幽默", "搞笑", "风趣", "俏皮", "playful", "humor", "humour", "funny"),
-     "轻松幽默，可以开玩笑但不影响信息密度"),
+     ("轻松幽默，可以开玩笑但不影响信息密度",
+      "light and playful, jokes are fine as long as the information stays dense")),
     (("正式", "专业", "严谨", "严肃", "formal", "professional", "serious"),
-     "正式专业，措辞严谨"),
+     ("正式专业，措辞严谨", "formal and professional, precise wording")),
     (("轻松", "随意", "口语", "casual", "relaxed", "chill"),
-     "轻松随意，像朋友聊天一样"),
+     ("轻松随意，像朋友聊天一样", "relaxed and casual, like talking with a friend")),
     (("耐心", "详细", "细致", "多解释", "patient", "detailed", "thorough"),
-     "耐心细致，多解释背景与原因"),
+     ("耐心细致，多解释背景与原因", "patient and thorough, explaining background and reasons")),
     (("温柔", "体贴", "gentle", "kind"),
-     "温和体贴，语气柔软"),
+     ("温和体贴，语气柔软", "warm and gentle")),
 )
 
 _QUESTION_LIKE = ("？", "?", "怎么", "如何", "为什么", "为什么", "what", "how", "why", "when")
@@ -385,16 +391,30 @@ def _clean_tone(raw: str):
     if _has_kw(v, _SKIP_FIELD) and len(v) <= 6:
         return ""
     low = v.lower()
+    # 回答以拉丁字母为主 → 取英文写法（英文用户的人设文件里不该出现中文句）
+    ascii_dominant = len(re.findall(r"[a-zA-Z]", v)) > len(re.findall(r"[\u4e00-\u9fff]", v))
     for keys, preset in _TONE_PRESETS:
         if any(k in low for k in keys):
-            return preset
+            return preset[1] if ascii_dominant else preset[0]
     if any(ch in v for ch in "？?\n") or len(v) > 24:
         return None
     return v
 
 
+def _looks_like_tone(raw: str) -> bool:
+    """文本是在描述语气偏好（而非名字）——引导问名字时用户先答了语气属常见错位。"""
+    low = (raw or "").strip().lower()
+    if not low or len(low) > 24:
+        return False
+    return any(k in low for keys, _preset in _TONE_PRESETS for k in keys)
+
+
 def _normalize(field: str, raw: str):
     if field in ("user_name", "agent_name"):
+        # 防错位：把"keep it concise"记成名字（实测）——语气描述且无起名线索时不算答案
+        if _looks_like_tone(raw) and not _has_kw(raw, _NAME_CUES if field == "user_name"
+                                                 else _AGENT_NAME_PREFIXES):
+            return None
         return _clean_name(raw, field)
     if field == "tone":
         return _clean_tone(raw)
