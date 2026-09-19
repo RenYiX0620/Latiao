@@ -235,35 +235,6 @@ jobs:
           }
           Get-ChildItem -Path "$BUNDLE\nsis" | Select-Object Name
 
-      - name: Append windows-x86_64 to latest.json and upload
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          $VERSION = $env:GITHUB_REF_NAME.TrimStart('v')
-          $BUNDLE = "src-tauri\target\x86_64-pc-windows-msvc\release\bundle"
-          $exe = Get-ChildItem -Path "$BUNDLE\nsis" -Filter "*-setup.exe" | Select-Object -First 1
-          if (-not $exe) { Write-Host "No NSIS installer - skipping manifest entry"; exit 0 }
-          # 等 mac job 先上传 latest.json（重试 10 次 × 10s）
-          for ($i = 0; $i -lt 10; $i++) {
-            gh release download $env:GITHUB_REF_NAME --repo RenYiX0620/Latiao --pattern latest.json --clobber 2>$null
-            if ($LASTEXITCODE -eq 0 -and (Test-Path latest.json)) { break }
-            Start-Sleep -Seconds 10
-          }
-          if (-not (Test-Path latest.json)) {
-            # mac job 未产出清单：自建仅 windows 条目（mac 条目由 mac job 补）
-            $man = @{ version = $VERSION; notes = "Latiao v$VERSION";
-                      pub_date = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ");
-                      platforms = @{} }
-          } else {
-            $man = Get-Content latest.json -Raw | ConvertFrom-Json
-          }
-          $sig = (Get-Content "$($exe.FullName).sig" -Raw) -replace "`r|`n", ""
-          $url = "https://github.com/RenYiX0620/Latiao/releases/download/$env:GITHUB_REF_NAME/$($exe.Name)"
-          $entry = [ordered]@{ signature = $sig; url = $url }
-          $man.platforms | Add-Member -NotePropertyName "windows-x86_64" -NotePropertyValue $entry -Force
-          $man | ConvertTo-Json -Depth 5 | Set-Content latest.json -Encoding UTF8
-          gh release upload $env:GITHUB_REF_NAME latest.json --repo RenYiX0620/Latiao --clobber
-
       - name: Upload Windows artifacts
         uses: softprops/action-gh-release@v2
         with:
@@ -274,3 +245,26 @@ jobs:
           draft: false
           generate_release_notes: true
           overwrite_files: true
+
+  # 清单合并：macOS 与 Windows 并行产出各自签名，历史实现两边都写 latest.json
+  # → 后完成者覆盖先完成者。v0.3.30 实测：Windows 补的 windows-x86_64 条目
+  # 被随后执行的 macOS 上传覆盖，Windows 用户收不到更新。现在两个 job 都完成
+  # 后由本 job 一次性生成，缺任一平台即失败（不再发布残缺清单）。
+  release-manifest:
+    needs: [release-macos, release-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "Assemble latest.json from both platforms"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p sigs
+          gh release download "$GITHUB_REF_NAME" --pattern "*.sig" --dir sigs --clobber
+          ls -la sigs
+          python3 .github/scripts/assemble_latest_json.py "$VERSION" "$GITHUB_REF_NAME" sigs latest.json
+          gh release upload "$GITHUB_REF_NAME" latest.json --clobber
