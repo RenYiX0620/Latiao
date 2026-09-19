@@ -562,7 +562,10 @@ _TRANSIENT_REMINDER_MARKERS = (
 
 
 def _detect_user_language(text: str) -> str:
-    """Detect the language of user input: 'zh', 'en', or 'ja'."""
+    """Detect the language of user input: 'zh', 'en', 'ja', or 'ru'.
+
+    俄语此前落进 zh 兜底 → 俄语用户被套上"必须用简体中文"的硬规则（09-19 实测），
+    故补西里尔字母判定；无法判定时仍回落 zh（保持既有行为）。"""
     if not text:
         return "zh"
     # 剥离 URL/网址再计数：链接里的字母远多于中文消息的汉字数，
@@ -572,8 +575,11 @@ def _detect_user_language(text: str) -> str:
     zh = len(re.findall(r'[\u4e00-\u9fff\u3400-\u4dbf]', text))
     ja_kana = len(re.findall(r'[\u3040-\u309f\u30a0-\u30ff]', text))
     en = len(re.findall(r'[a-zA-Z]', text))
+    ru = len(re.findall(r'[\u0400-\u04ff]', text))
     if ja_kana > zh and ja_kana > en:
         return "ja"
+    if ru > max(zh, ja_kana, en):
+        return "ru"
     if en > zh + ja_kana:
         return "en"
     return "zh"
