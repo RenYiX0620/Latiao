@@ -154,6 +154,18 @@ async def _final_answer_extraction(client, api_url: str, headers: dict, engine_m
 _LANG_RETRY_HINT = "⚠️ 模型本次生成了英文回复（翻译暂不可用）。"
 
 
+def lang_retry_hint(user_lang: str) -> str:
+    """翻译失败时的交付提示（四语）。措辞不假定"模型说了英文"——用户也可能是英文/日文/俄语用户。"""
+    return {
+        "zh": "⚠️ 模型本轮没有用中文作答，自动翻译也没成功。可以回复「请用中文重新说一下」重试。",
+        "en": "⚠️ The model did not answer in English and auto-translation failed. "
+              "Reply \"please answer in English\" to retry.",
+        "ja": "⚠️ モデルが日本語で回答せず、自動翻訳も失敗しました。「日本語で答えて」と送ると再試行します。",
+        "ru": "⚠️ Модель ответила не на русском, и автоперевод не удался. "
+              "Напишите «ответь по-русски», чтобы повторить.",
+    }.get(user_lang, _LANG_RETRY_HINT)
+
+
 async def _ensure_final_language(client, api_url: str, headers: dict, engine_model: str,
                                  text: str, user_text: str) -> str:
     """交付前语言确保：回复语言与用户消息不符时走翻译轮，返回可交付文本。
@@ -196,7 +208,7 @@ async def _force_translate(client, api_url: str, headers: dict, engine_model: st
     模型对翻译任务的执行远比"用某语言重新分析"稳定——语言兜底的最后一公里
     （09-03 事故：两轮中文规则+3 次 nudge 后 27B 模型仍输出英文）。失败时
     返回原文（不阻断交付）。"""
-    lang_name = {"zh": "简体中文", "en": "English", "ja": "日本語"}.get(user_lang, "简体中文")
+    lang_name = {"zh": "简体中文", "en": "English", "ja": "日本語", "ru": "русский"}.get(user_lang, "简体中文")
     _tmsgs = [
         {"role": "system",
          "content": (f"你是翻译器。把用户提供的文本完整翻译成{lang_name}，"

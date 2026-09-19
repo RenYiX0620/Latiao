@@ -61,3 +61,44 @@ class TestProgressTail(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class TestLanguageAnchor(unittest.TestCase):
+    """语言锚（09-19）：每轮按用户消息语言生成、置于系统提示最前，且四语齐备。"""
+
+    CASES = [
+        ("读取这个文件", "简体中文"),
+        ("read this file for me", "English"),
+        ("このファイルを読んで", "日本語"),
+        ("прочитай этот файл", "русском"),
+    ]
+
+    def test_anchor_present_and_first(self):
+        for text, marker in self.CASES:
+            body = {"messages": [{"role": "user", "content": text}]}
+            sys_content = _build_chat_messages(body, body["messages"])[0]["content"]
+            self.assertIn(marker, sys_content, f"{text!r} 缺少 {marker} 语言锚")
+            self.assertLess(sys_content.index(marker), 1200,
+                            f"{text!r} 的语言锚不在提示前部（位置 {sys_content.index(marker)}）")
+
+    def test_no_anchor_without_user_text(self):
+        # 首轮无文本（如仅图片）时不注入，避免误判成中文
+        body = {"messages": [{"role": "user", "content": ""}]}
+        sys_content = _build_chat_messages(body, body["messages"])[0]["content"]
+        self.assertNotIn("覆盖下方所有语言规则", sys_content)
+
+
+class TestRussianSupport(unittest.TestCase):
+    def test_russian_detected(self):
+        self.assertEqual(_detect_user_language("прочитай этот файл и скажи что там"), "ru")
+
+    def test_russian_hard_rules_and_hint(self):
+        from agent.gates import lang_retry_hint
+        self.assertIn("русском", lang_retry_hint("ru"))
+        body = {"messages": [{"role": "user", "content": "прочитай файл"}]}
+        sys_content = _build_chat_messages(body, body["messages"])[0]["content"]
+        self.assertIn("Три жёстких правила", sys_content)   # 俄语硬规则，而非回落中文
+
+    def test_retry_hint_languages(self):
+        from agent.gates import lang_retry_hint
+        for lang, marker in (("zh", "中文"), ("en", "English"), ("ja", "日本語"), ("ru", "русском")):
+            self.assertIn(marker, lang_retry_hint(lang))

@@ -75,7 +75,13 @@ def setup_assists(scope):
                     payload["handled"] = True
                     return payload
             except Exception:
-                logger.debug("语言闸门翻译失败，按已流出原文交付", exc_info=True)
+                logger.warning("语言闸门翻译失败，改为交付提示（不再静默交付外语正文）", exc_info=True)
+            # 翻译没成功：明确告知用户并给出重试动作，而不是把外语正文默默留给用户
+            from agent.gates import lang_retry_hint
+            events.append({"event": "content_revised",
+                           "content": text + "\n\n" + lang_retry_hint(payload["user_lang"])})
+            payload["handled"] = True
+            return payload
         return payload
 
     async def guard(payload, ctx):
