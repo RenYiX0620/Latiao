@@ -125,8 +125,12 @@ _IDENTITY_INTENTS = [
     (re.compile(r"(?:回复|说话)(?:要|再|更)([^，。,！!]{2,30})", re.IGNORECASE), "SOUL.md", "style"),
     # Rule: "以后不要XX" / "从现在开始XX"
     (re.compile(r"(?:以后|从现在开始)[，,]*((?:不要|别|禁止|要|请|必须).{1,50})", re.IGNORECASE), "AGENTS.md", "rule"),
-    # Preference: "我喜欢用XX" / "我常用XX"
-    (re.compile(r"我(?:喜欢用|常用|习惯用|偏好|用)(.{2,50})", re.IGNORECASE), "USER.md", "pref"),
+    # Preference: "我喜欢用XX" / "我常用XX" / "我偏好XX"
+    # 09-20 修正：原写法把裸"用"也算偏好动词 → "帮我用一句话总结你自己" 命中
+    # "我用" → 把用户提问写进 USER.md（持久化污染）+ 每轮注入"身份已更新"→ 头部
+    # 逐轮变化 → 缓存 0%。现在要求：偏好动词明确、且位于句首或标点之后。
+    (re.compile(r"(?:^|[，。！？、；\s])我(?:喜欢用|常用|习惯用|更?偏好|更?倾向于|一般用|平时用|想要|要求)(.{2,40})",
+                re.IGNORECASE), "USER.md", "pref"),
 ]
 
 
@@ -137,6 +141,12 @@ def _detect_identity_intent(text: str) -> list[dict]:
     Returns list of {file, action, content} dicts.
     """
     if not text or len(text) > 200:
+        return []
+    # 请求句一律不当身份/偏好意图（09-20）：问句与"帮我/请问/怎么…"这类是任务，
+    # 不是长期设定。原实现把"帮我用一句话总结你自己"当成 pref 写进 USER.md。
+    _t = text.strip()
+    if _t.endswith(("？", "?")) or re.search(
+            r"帮我|请问|请帮|能不能|可不可以|如何|怎么|为什么|你有没有|我想知道", _t):
         return []
     results = []
     for pattern, filename, action in _IDENTITY_INTENTS:
@@ -263,6 +273,13 @@ def _process_identity_intents(user_text: str):  # -> str | None
     changes = []
     for intent in intents:
         try:
+            # 幂等（09-20）：文件里已有同样一行 → 不再写、也不再注入"身份已更新"
+            # （重复写会让提示头逐轮变化、缓存全丢）
+            _fp = PROGRESS_DIR / intent["file"]
+            _line = f"- {intent['value']}"
+            _existing = _fp.read_text(encoding="utf-8") if _fp.exists() else ""
+            if intent["action"] == "pref" and _line in _existing:
+                continue
             applier = _INTENT_APPLIERS.get(intent["action"])
             if applier:
                 applier(intent["value"])

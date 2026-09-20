@@ -157,6 +157,212 @@ def _mlx_arch_supported(model_dir: str) -> tuple[bool, str]:
         return False, mt
 
 
+# ggml 张量类型的 (每块元素数, 每块字节数)。用于从张量表算出"文件应有的最小长度"，
+# 从而识别"下载未完成/被截断"。只列上游已知类型；遇到表外类型则该张量不计入长度
+# （宁可算小也不误报——预检的完整性判断另有 1% 余量门限）。
+_GGML_BLOCK = {
+    0: (1, 1), 1: (1, 1), 2: (32, 18), 3: (32, 20), 6: (32, 22), 7: (32, 24),
+    8: (32, 34), 9: (32, 36), 10: (256, 84), 11: (256, 110), 12: (256, 144),
+    13: (256, 176), 14: (256, 210), 15: (256, 292), 16: (256, 66), 17: (256, 74),
+    18: (256, 98), 19: (256, 50), 20: (32, 18), 21: (256, 110), 22: (256, 82),
+    23: (256, 136), 24: (1, 1), 25: (1, 2), 26: (1, 4), 27: (1, 8), 28: (1, 8),
+    29: (256, 56), 30: (1, 2), 34: (256, 54), 35: (256, 66), 39: (32, 17),
+}
+_GGML_TYPE_NAMES = {
+    0: "F32", 1: "F16", 2: "Q4_0", 3: "Q4_1", 6: "Q5_0", 7: "Q5_1", 8: "Q8_0",
+    9: "Q8_1", 10: "Q2_K", 11: "Q3_K", 12: "Q4_K", 13: "Q5_K", 14: "Q6_K",
+    15: "Q8_K", 16: "IQ2_XXS", 17: "IQ2_XS", 18: "IQ3_XXS", 19: "IQ1_S",
+    20: "IQ4_NL", 21: "IQ3_S", 22: "IQ2_S", 23: "IQ4_XS", 24: "I8", 25: "I16",
+    26: "I32", 27: "I64", 28: "F64", 29: "IQ1_M", 30: "BF16", 34: "TQ1_0",
+    35: "TQ2_0", 39: "MXFP4",
+}
+# 预检拦截门限：上游类型号目前 ~40，fork 私有量化常用大得多的编号（如 PQ2_0=142）。
+# 只拦"明显不在任何上游枚举里"的编号，灰区（41–64）交给引擎判定 + 错误分类诊断。
+_GGML_TYPE_SUSPECT = int(os.environ.get("LATIAO_GGML_TYPE_SUSPECT", "64") or 64)
+
+
+def _config_file() -> Path:
+    """config.json 路径（= PROGRESS_DIR/config.json）。
+
+    local_llm 是底层模块，不能在顶层 import agent_loop（循环依赖），故惰性取。
+    09-20 修正：此前本模块直接引用 CONFIG_FILE 却没导入 → NameError 被
+    `except Exception` 吞掉 → **config.json 里的开关（external_engine / gguf_engine /
+    custom_engine）实际从未生效**，只有环境变量那条路能用。
+    """
+    try:
+        import agent_loop
+        return agent_loop.CONFIG_FILE
+    except Exception:
+        return Path.home() / ".local-ai-os" / "config.json"
+
+
+def _read_config() -> dict:
+    """读 config.json（读不到/坏文件 → 空 dict，绝不抛）。"""
+    try:
+        return json.loads(_config_file().read_text("utf-8")) or {}
+    except Exception:
+        return {}
+
+
+def _custom_engine_spec(model_path: str = "") -> dict:
+    """自定义引擎（"路线 A"）：把任何 llama.cpp 系的可执行文件当辣条的本地引擎后端。
+
+    场景：上游引擎读不了的模型（如 Prism/Bonsai 的三值包，私有 ggml 类型 142）——
+    他们自带 fork 的 llama-server，辣条只负责起进程 + 按 OpenAI 协议对话，于是
+    模型页加载/停止、状态、工具调用、缓存指标全部照常。
+
+    config.json：
+      "custom_engine": {
+        "enabled": true,
+        "binary": "/path/to/their/llama-server",
+        "args": ["--jinja", "-ngl", "999"],   // 可选，追加在标准参数之后
+        "name": "prism",                       // 可选，状态/日志显示用
+        "match": "Bonsai"                      // 可选，仅当模型路径含该子串时启用
+      }
+    环境变量（覆盖配置）：LATIAO_CUSTOM_ENGINE_BIN / LATIAO_CUSTOM_ENGINE_ARGS；
+    LATIAO_CUSTOM_ENGINE=0 临时关闭。返回 {} = 未启用（走辣条自带引擎）。
+    """
+    _cfg_all = _read_config()
+    cfg = _cfg_all.get("custom_engine") if isinstance(_cfg_all, dict) else None
+    if not isinstance(cfg, dict):
+        cfg = {}
+    if os.environ.get("LATIAO_CUSTOM_ENGINE", "").strip().lower() in ("0", "false", "off", "no"):
+        return {}
+    if cfg.get("enabled") is False:
+        return {}   # 显式 enabled:false → 保持关闭（配好路径先放着、要用时再开）
+    _bin = os.environ.get("LATIAO_CUSTOM_ENGINE_BIN", "") or str(cfg.get("binary") or "")
+    if not _bin:
+        return {}
+    binary = Path(_bin).expanduser()
+    if not binary.exists():
+        logger.warning("自定义引擎二进制不存在，忽略 custom_engine: %s", binary)
+        return {}
+    _match = str(cfg.get("match") or "")
+    if _match and _match.lower() not in str(model_path).lower():
+        return {}
+    _args_env = os.environ.get("LATIAO_CUSTOM_ENGINE_ARGS", "")
+    if _args_env:
+        import shlex
+        args = shlex.split(_args_env)
+    else:
+        args = [str(a) for a in (cfg.get("args") or []) if str(a).strip()]
+    return {"binary": str(binary), "args": args,
+            "name": str(cfg.get("name") or "custom")}
+
+
+def _gguf_scan(model_path: str) -> dict | None:
+    """读 GGUF：架构、张量类型直方图、张量数据所需的最小文件长度。
+
+    本地模型最高频的两类失败都能在这里识别：
+      ① fork 私有量化类型（引擎报 "has invalid ggml type N"，如 Ternary-Bonsai 的 PQ2_0=142）；
+      ② 下载未完成/被截断（引擎报 "data is not within the file bounds"）。
+    解析不动就返回 None —— **fail-open**：绝不因为读不懂文件而拦住加载。
+    """
+    import struct as _st
+    try:
+        with open(model_path, "rb") as f:
+            if f.read(4) != b"GGUF":
+                return None
+            _st.unpack("<I", f.read(4))                     # version
+            n_tensors, n_kv = _st.unpack("<QQ", f.read(16))
+
+            def _rs() -> bytes:
+                n = _st.unpack("<Q", f.read(8))[0]
+                if n > 1 << 24:                              # 异常长度 → 放弃
+                    raise ValueError("bad string length")
+                return f.read(n)
+
+            _fixed = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1,
+                      10: 8, 11: 8, 12: 8}
+            arch = ""
+            for _ in range(n_kv):
+                key = _rs().decode("utf-8", "replace")
+                t = _st.unpack("<I", f.read(4))[0]
+                if t == 8:
+                    val = _rs().decode("utf-8", "replace")
+                elif t == 9:                                 # 数组
+                    et = _st.unpack("<I", f.read(4))[0]
+                    cnt = _st.unpack("<Q", f.read(8))[0]
+                    if et == 8:
+                        for _ in range(cnt):
+                            _rs()
+                    elif et in _fixed:
+                        f.seek(_fixed[et] * cnt, 1)
+                    else:
+                        return None
+                    val = ""
+                elif t in _fixed:
+                    # 只看架构（字符串）；其余值按长度跳过——不要再按 4 字节解包
+                    # （bool=1 字节会把缓冲区解崩，09-20 修正）
+                    _raw = f.read(_fixed[t])
+                    val = str(_st.unpack("<I", _raw)[0]) if t == 4 else ""
+                else:
+                    return None
+                if key == "general.architecture":
+                    arch = str(val)
+
+            _data_start = f.tell()
+            types: dict[int, int] = {}
+            max_end = 0
+            for _ in range(n_tensors):
+                _rs()                                        # 名称
+                nd = _st.unpack("<I", f.read(4))[0]
+                numel = 1
+                for _ in range(nd):
+                    numel *= _st.unpack("<Q", f.read(8))[0]
+                tt = _st.unpack("<I", f.read(4))[0]
+                off = _st.unpack("<Q", f.read(8))[0]
+                types[tt] = types.get(tt, 0) + 1
+                blk = _GGML_BLOCK.get(tt)
+                if blk and numel % blk[0] == 0:
+                    max_end = max(max_end, off + (numel // blk[0]) * blk[1])
+        import os as _os
+        return {
+            "arch": arch,
+            "types": types,
+            "data_start": _data_start,
+            "need_bytes": _data_start + max_end if max_end else 0,
+            "size": _os.path.getsize(model_path),
+        }
+    except Exception:
+        logger.debug("GGUF 扫描失败（fail-open）: %s", model_path, exc_info=True)
+        return None
+
+
+def _gguf_precheck(model_path: str) -> str:
+    """加载前的 GGUF 预检：返回错误提示（空串=放行）。
+
+    把两类**注定失败**的情况提前拦住，避免"启动引擎 → 失败 → 猜原因"：
+      ① 量化类型号明显不在上游枚举内（fork 私有的低位量化，如 Ternary-Bonsai 的
+         PQ2_0 = 类型 142，共 402/851 个张量）——引擎只会说 "invalid ggml type 142"；
+      ② 文件长度明显短于张量表要求（下载未完成/被截断）——引擎只会说
+         "data is not within the file bounds"。
+    两者在 09-20 都被错误地归因成"架构不支持"，把用户引向"换 MLX / 等上游支持架构"。
+    读不动文件时一律放行（fail-open，绝不因为我们解析失败而拦住加载）。
+    """
+    r = _gguf_scan(model_path)
+    if not r:
+        return ""
+    bad = {t: c for t, c in r["types"].items() if t > _GGML_TYPE_SUSPECT}
+    if bad:
+        _d = "、".join(f"{_ggml_type_label(t)}（{c} 个张量）" for t, c in sorted(bad.items()))
+        return ("该模型的量化格式不被当前引擎支持：" + _d + "。"
+                "这通常不是架构问题，而是某个 fork 自造的私有量化（上游 llama.cpp 未收录该类型号）。"
+                "可选：① 换用产出该量化的那个 fork 的引擎；"
+                "② 换用同一模型的常规量化版本（Q4_K_M / Q8_0 等）；"
+                "③ 若确实要低位/三值量化，请选上游标准写法（如 TQ2_0）。")
+    need, size = int(r.get("need_bytes") or 0), int(r.get("size") or 0)
+    if need and size < need * 0.995:
+        return (f"模型文件不完整（下载未完成或文件损坏）：按张量表至少需要 {need/1e9:.2f} GB，"
+                f"当前 {size/1e9:.2f} GB，还缺 {(need-size)/1e9:.2f} GB。"
+                "请等下载完成（或重新下载）后再加载。")
+    return ""
+
+
+def _ggml_type_label(t: int) -> str:
+    return f"{_GGML_TYPE_NAMES[t]}({t})" if t in _GGML_TYPE_NAMES else f"类型 {t}"
+
+
 def _gguf_architecture(model_path: str) -> str:
     """从 GGUF 头读 general.architecture（用于把"未知架构"报错翻成人话）。"""
     import struct as _st
@@ -1434,12 +1640,79 @@ class LocalLLMEngine:
             self.current_model_name = ""
             return self.get_status()
 
+        # ── 自定义引擎（路线 A，09-20）────────────────────────────────
+        # 配了 custom_engine 就用它加载这个 GGUF：**跳过**量化类型/完整性预检
+        # （那两道闸门的存在理由正是"上游读不了这种文件"，而它就是要交给第三方引擎
+        # 去读的），只做最基本的"是不是 GGUF"检查，避免把目录喂给进程。
+        _custom = _custom_engine_spec(model_path)
+        if _custom:
+            try:
+                with open(model_path, "rb") as _cf:
+                    _magic_ok = _cf.read(4) == b"GGUF"
+            except Exception:
+                _magic_ok = False
+            if not _magic_ok:
+                self.server_status = "error"
+                self.status_message = f"不是有效的 GGUF 文件: {model_path}"
+                self.current_model_id = ""
+                self.current_model_name = ""
+                return self.get_status()
+            logger.info("使用自定义引擎 '%s': %s", _custom["name"], _custom["binary"])
+            self.current_model_id = model_id
+            self.current_model_name = Path(model_path).stem
+            self.server_status = "starting"
+            self.status_message = f"正在用自定义引擎 {_custom['name']} 加载 {self.current_model_name}..."
+            return self._start_llama_native(
+                model_path, port, exe=_custom["binary"], extra_args=_custom["args"],
+                backend="llama-cpp-custom", backend_name=_custom["name"])
+
+        # 加载前预检（09-20）：量化类型不受支持 / 文件不完整 → 直接给出可执行结论，
+        # 不必等引擎失败后再由错误分类猜原因
+        _pre_err = _gguf_precheck(model_path)
+        if _pre_err:
+            logger.warning("GGUF 预检拦截: %s", _pre_err)
+            self.server_status = "error"
+            self.status_message = _pre_err
+            self.current_model_id = ""
+            self.current_model_name = ""
+            return self.get_status()
+
         self.current_model_id = model_id
         self.current_model_name = Path(model_path).stem
         self.server_status = "starting"
         self.status_message = f"正在加载 {self.current_model_name}..."
 
-        if platform.system() == "Windows":
+        # ── 引擎顺序（09-20 改：原生 llama-server 优先）────────────────
+        # 原生引擎：支持模板级原生工具调用（tools 字段真的被读、按模型模板解析
+        # tool_calls）、提供 timings（缓存命中率等指标的唯一来源）、加载快
+        # （本机 18.5GB GGUF 实测 3.4s）。
+        # python 引擎（llama-cpp-python）：**完全忽略 tools 字段**（实测带/不带
+        # tools，prompt_tokens 都是 36）→ 模型看不到工具清单，只能靠文字提示猜
+        # 工具名（实测它编出 web_search / get_historical_data），也没有 usage。
+        # 故默认先原生，失败再回退 python。回旧顺序：LATIAO_GGUF_ENGINE=python
+        # 或 config.json {"gguf_engine": "python"}。
+        if platform.system() != "Windows":
+            _pref = ""
+            try:
+                _pref = str(_read_config().get("gguf_engine", "") or "")
+            except Exception:
+                pass
+            _pref = (os.environ.get("LATIAO_GGUF_ENGINE", "") or _pref).strip().lower()
+            if _pref != "python" and self._find_llama_server(model_path):
+                logger.info("GGUF 引擎顺序：原生 llama-server 优先（LATIAO_GGUF_ENGINE=python 可回退）")
+                _native_res = self._start_llama_native(model_path, port)
+                if _native_res.get("status") == "running":
+                    return _native_res
+                logger.warning("原生引擎启动失败，回退 python 引擎: %s",
+                               _native_res.get("message"))
+                # _start_llama_native 失败路径调过 stop_model()，会置取消事件；
+                # 不清掉的话下面的 _wait_for_http(cancel=...) 会立刻失败
+                self._cancel_load.clear()
+                self.server_status = "starting"
+                self.current_model_id = model_id
+                self.current_model_name = Path(model_path).stem
+                self.status_message = f"正在加载 {self.current_model_name}..."
+        elif platform.system() == "Windows":
             self.server_status = "starting"
             self.status_message = f"正在加载 {self.current_model_name}..."
             return self._start_llama_native(model_path, port)
@@ -1583,12 +1856,21 @@ class LocalLLMEngine:
                 continue
         return None
 
-    def _start_llama_native(self, model_path: str, port: int) -> dict:
-        """Start llama-server.exe directly (Windows only)."""
-        exe = self._find_llama_server(model_path)
+    def _start_llama_native(self, model_path: str, port: int,
+                            exe=None, extra_args: list | None = None,
+                            backend: str = "llama-cpp-native",
+                            backend_name: str = "") -> dict:
+        """启动原生 llama-server（自带上游引擎，或 custom_engine 指定的第三方引擎）。
+
+        exe/extra_args 由"自定义引擎"路径传入（第三方 fork 的二进制 + 其私有参数）；
+        不传则用辣条自带的上游 llama-server。两种情况的进程管理/健康检查完全一致。
+        """
+        _custom = backend != "llama-cpp-native"
+        exe = exe or self._find_llama_server(model_path)
         if not exe:
             self.server_status = "error"
-            self.status_message = "找不到 llama-server.exe，请重装 Latiao"
+            self.status_message = ("自定义引擎路径无效（检查 config.json 的 custom_engine.binary）"
+                                   if _custom else "找不到 llama-server.exe，请重装 Latiao")
             return self.get_status()
 
         self.server_status = "starting"
@@ -1615,9 +1897,18 @@ class LocalLLMEngine:
         # -fa 兼容性：旧版 llama-server 为无值开关，新版（XHToken fork）要求
         # 带值 [on|off|auto]——省略本参数（新版默认 auto / 旧版默认 off，均可运行）
         # 09-08 Spark 回退引擎“HTTP timeout”根因即 -fa 参数不兼容
-        chat_fmt = self._guess_chat_format(model_path)
-        if chat_fmt:
-            cmd += ["--chat-template", chat_fmt]
+        # 09-20：不再用 --chat-template 覆盖模型自带模板。_guess_chat_format 返回的是
+        # **格式名**（如 "qwen"）而非 jinja 模板串，覆盖会把模型的工具区/思考区模板
+        # 一起替换掉——而原生工具调用正是靠模型模板解析出来的（本版 --jinja 默认开）。
+        # 需要旧行为时设 LATIAO_NATIVE_CHAT_TEMPLATE_OVERRIDE=1。
+        if os.environ.get("LATIAO_NATIVE_CHAT_TEMPLATE_OVERRIDE", ""):
+            chat_fmt = self._guess_chat_format(model_path)
+            if chat_fmt:
+                cmd += ["--chat-template", chat_fmt]
+        # 自定义引擎：追加用户配置的私有参数（如 Prism fork 需要的开关）
+        if extra_args:
+            cmd += [str(a) for a in extra_args]
+            logger.info("自定义引擎额外参数: %s", " ".join(str(a) for a in extra_args))
         # 注意：原生 llama-server 的 interrupt-requests 默认即关闭（新请求排队
         # 而非掐断当前生成），与 macOS 路径显式 --interrupt_requests False
         # 行为一致，无需额外参数。
@@ -1660,8 +1951,51 @@ class LocalLLMEngine:
             # 引擎原始报错对用户没意义（尤其"failed to read magic"这种误导文案，
             # 实际是"架构不被支持"）。读 GGUF 架构名换成可执行的提示。
             _low = ("".join(err_lines) or "").lower()
-            if ("failed to read magic" in _low or "unknown model architecture" in _low
-                    or "model loading error" in _low):
+            # 09-20 重写分类：把三种成因分开——量化类型不支持 / 文件不完整 /
+            # 架构真的不支持。旧实现把前两种（尤其 "model loading error" 这条
+            # 兜底串）都归到第三种，提示"换 MLX / 等上游支持架构"，全是误导。
+            import re as _re
+            _m_type = _re.search(r"invalid ggml type (\d+)", _low)
+            _m_bounds = ("not within the file bounds" in _low
+                         or "corrupted or incomplete" in _low)
+            _m_arch = ("unknown model architecture" in _low
+                       or "unsupported model architecture" in _low
+                       or "architecture is not supported" in _low)
+            _m_magic = "failed to read magic" in _low
+            _scan = _gguf_scan(model_path) if (_m_type or _m_bounds or _m_magic) else None
+            if _custom:
+                self.status_message = (
+                    f"自定义引擎（{backend_name or 'custom'}）启动失败: "
+                    f"{err_summary or '无输出'}。请检查该引擎的二进制与参数"
+                    "（config.json 的 custom_engine）。")
+            elif _m_type or _m_bounds or _m_magic:
+                _bad = {t: c for t, c in (_scan or {}).get("types", {}).items()
+                        if t > _GGML_TYPE_SUSPECT}
+                _need = int((_scan or {}).get("need_bytes") or 0)
+                _size = int((_scan or {}).get("size") or 0)
+                if _bad:
+                    _d = "、".join(f"{_ggml_type_label(t)}（{c} 个张量）"
+                                   for t, c in sorted(_bad.items()))
+                    self.status_message = (
+                        f"该模型的量化格式不被当前引擎支持：{_d}。"
+                        "这通常不是架构问题，而是某个 fork 自造的私有量化（上游 llama.cpp "
+                        "未收录该类型号）。可选：① 换用产出该量化的那个 fork 的引擎；"
+                        "② 换用同一模型的常规量化版本（Q4_K_M / Q8_0 等）；"
+                        f"③ 若确实要低位量化，请选上游标准写法（如 TQ2_0）。"
+                        f"（引擎原始报错：{_m_type.group(0)}）" if _m_type else
+                        (f"该模型的量化格式不被当前引擎支持"
+                         f"（引擎在读取张量表时失败）。可选：① 换用产出该量化的 fork 引擎；"
+                         "② 换用同一模型的常规量化版本（Q4_K_M / Q8_0 等）。"))
+                elif _need and _size and _size < _need * 0.995:
+                    self.status_message = (
+                        f"模型文件不完整（下载未完成或文件损坏）：按张量表至少需要 "
+                        f"{_need/1e9:.2f} GB，当前 {_size/1e9:.2f} GB，"
+                        f"还缺 {(_need-_size)/1e9:.2f} GB。请等下载完成（或重新下载）后再加载。")
+                else:
+                    self.status_message = (
+                        "模型文件读取失败：不是有效的 GGUF，或文件不完整（下载未完成/被截断）。"
+                        "请确认下载已完成后重试。")
+            elif _m_arch:
                 _arch = _gguf_architecture(model_path) or "未知"
                 self.status_message = (
                     f"该模型架构（{_arch}）暂不被 llama.cpp 支持（上游尚未实现该架构）。"
@@ -1677,8 +2011,9 @@ class LocalLLMEngine:
             return self.get_status()
 
         self.server_status = "running"
-        self.status_message = f"{self.current_model_name} 运行中"
-        self._active_backend = "llama-cpp-native"
+        self.status_message = (f"{self.current_model_name} 运行中"
+                               + (f"（自定义引擎 {backend_name}）" if _custom else ""))
+        self._active_backend = backend
         return self.get_status()
 
     def _start_mlx(self, model_id: str, port: int) -> dict:
@@ -1845,7 +2180,7 @@ class LocalLLMEngine:
             # 希望秒级就绪"的场景（8 月底此前用户即体验此模式）。
             _ext_cfg = ""
             try:
-                _ext_cfg = json.loads(CONFIG_FILE.read_text("utf-8")).get("external_engine", "")
+                _ext_cfg = _read_config().get("external_engine", "")
             except Exception:
                 pass
             if os.environ.get("LATIAO_EXTERNAL_ENGINE", "") or _ext_cfg:

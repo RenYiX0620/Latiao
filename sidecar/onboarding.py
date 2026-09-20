@@ -301,7 +301,8 @@ def status() -> dict:
         "awaiting": bool(state.get("awaiting")),
         "user_name": _read_user_name(),
         "agent_name": _read_agent_name(),
-        "tone": _read_tone() },
+        "tone": _read_tone(),
+    }
 
 
 def _read_first(path: Path, pattern: str) -> str:

@@ -6,6 +6,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from agent_loop import _build_chat_messages, _detect_user_language, _progress_tail
+from agent.context import detect_language_decision as _detect_lang_decision
 
 
 class TestDetectUserLanguage(unittest.TestCase):
@@ -102,3 +103,63 @@ class TestRussianSupport(unittest.TestCase):
         from agent.gates import lang_retry_hint
         for lang, marker in (("zh", "中文"), ("en", "English"), ("ja", "日本語"), ("ru", "русском")):
             self.assertIn(marker, lang_retry_hint(lang))
+
+class TestLanguageDetectionWords(unittest.TestCase):
+    """09-19 根因回归：口径改为「汉字字数 vs 拉丁词数」。
+
+    旧口径按字母个数比较，"你的SOUL.md是什么"（5 汉字 / 6 字母）被判成英文用户，
+    导致提示词、语言锚、翻译方向全按英文走 —— 中文用户收到英文回答的根因。
+    """
+
+    ZH_CASES = ["你的SOUL.md是什么", "你的IDENTITY.md是什么", "读取 SOUL.md 告诉我语气设定",
+                "这轮 LLM 花了多久", "解释一下 GPTQ 量化", "帮我看看 MCP 工具",
+                "你的 tok/s 是多少", "这个 bug 怎么修", "读取这个文件"]
+
+    def test_chinese_with_latin_terms_stays_chinese(self):
+        for text in self.ZH_CASES:
+            self.assertEqual(_detect_user_language(text), "zh", text)
+
+    def test_english_still_detected(self):
+        for text in ("read the SOUL.md file for me", "your tok/s is too slow",
+                     "hello there, what can you do"):
+            self.assertEqual(_detect_user_language(text), "en", text)
+
+    def test_four_languages_unchanged(self):
+        self.assertEqual(_detect_user_language("このファイルを読んで、何が書いてあるか教えて"), "ja")
+        self.assertEqual(_detect_user_language("прочитай этот файл и скажи что там"), "ru")
+        self.assertEqual(_detect_user_language("读取这个文件"), "zh")
+
+    def test_url_case_still_chinese(self):
+        self.assertEqual(_detect_user_language("https://example.com/some/long/path 看看这个"), "zh")
+
+    def test_decision_reports_confidence(self):
+        lang, confident = _detect_lang_decision("你的SOUL.md是什么")
+        self.assertEqual((lang, confident), ("zh", True))
+        self.assertFalse(_detect_lang_decision("12345")[1])      # 纯数字：不表态
+        self.assertFalse(_detect_lang_decision("!!!???")[1])     # 纯符号：不表态
+
+    def test_history_rescues_ambiguous_message(self):
+        # 当前消息全是拉丁术语、汉字很少，但历史明显中文 → 按中文
+        lang, confident = _detect_lang_decision(
+            "SOUL.md IDENTITY.md tok/s MCP", ["帮我看看这个文件", "再读一下那个配置"])
+        self.assertEqual(lang, "zh")
+        self.assertTrue(confident)
+
+
+class TestGateDirection(unittest.TestCase):
+    """闸门方向：中文用户 + 中文回答绝不触发翻译（09-19 实际误触发点）。"""
+
+    def test_chinese_user_chinese_reply(self):
+        from agent.gates import _reply_lang_mismatch
+        zh_long = "这段话用于测试语言闸门方向，内容足够长以超过阈值。" * 6
+        en_long = "This paragraph exists to exercise the gate thresholds. " * 6
+        self.assertFalse(_reply_lang_mismatch("你的SOUL.md是什么", zh_long))
+        self.assertTrue(_reply_lang_mismatch("你的SOUL.md是什么", en_long))
+        self.assertTrue(_reply_lang_mismatch("read the SOUL.md file", zh_long))
+
+    def test_rewrite_instruction_localized(self):
+        from agent.gates import _rewrite_lang_instruction
+        self.assertIn("简体中文", _rewrite_lang_instruction("zh"))
+        self.assertIn("English", _rewrite_lang_instruction("en"))
+        self.assertIn("日本語", _rewrite_lang_instruction("ja"))
+        self.assertIn("русском", _rewrite_lang_instruction("ru"))

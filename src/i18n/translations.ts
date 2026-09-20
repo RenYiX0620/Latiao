@@ -43,6 +43,7 @@ const T: Record<string, Record<Lang, string>> = {
   "chat.more_tools": { zh: "还有 {count} 个工具调用（点击展开）", en: "{count} more tool calls (click to expand)", ja: "他{count}件のツール", ru: "Ещё {count} вызовов" },
   "chat.thinking_title": { zh: "思考强度", en: "Thinking level", ja: "思考レベル", ru: "Уровень мышления" },
   "chat.thinking_off": { zh: "关闭", en: "Off", ja: "オフ", ru: "Выкл" },
+  "chat.thinking_low": { zh: "低", en: "Low", ja: "低", ru: "Низкий" },
   "chat.thinking_high": { zh: "高", en: "High", ja: "高", ru: "Высокий" },
   "chat.thinking_max": { zh: "最高", en: "Max", ja: "最大", ru: "Макс" },
   "chat.thinking_cannot_off": { zh: "当前模型强制思考（API 不支持关闭），已保持默认思考", en: "This model always thinks (API has no off switch); keeping default", ja: "このモデルは思考が必須です（オフ不可）", ru: "Модель всегда думает (выключить нельзя)" },

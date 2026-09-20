@@ -69,6 +69,7 @@ from agent.context import (  # noqa: F401
     _NATIVE_FOLLOWUP_PROMPT, _NATIVE_LEAN_PROMPT, _NativeToolsUnsupported,
     _TASK_KW, _TRANSIENT_REMINDER_MARKERS, _cap_tools, _candidate_tool_names,
     _check_access, _detect_user_language, _ensure_market_tools,
+    detect_language_decision,
     _extract_last_user_text, _filter_tools, _filter_tools_by_access,
     _get_localized_text, _inject_image, _inject_thinking_disabled,
     _is_chat_query, _is_light_query, _local_native_tools_ok,
@@ -1139,7 +1140,7 @@ async def _wait_plan_confirmation(plan_id: str, event_obj: asyncio.Event,
     except asyncio.TimeoutError:
         approved = False
         events.append({
-            "content": "\n\n⚠️ 计划等待确认超时（5 分钟无人操作），任务已暂停未执行。可重新发起任务。",
+            "content": "\n\n" + _msg("plan_timeout", lang_of(msgs)),
         })
     finally:
         async with _pending_lock:
@@ -1241,6 +1242,26 @@ def _tool_end_result(events: list[dict]) -> str:
     return ""
 
 
+# 工具执行超时（09-19）：此前工具执行**没有任何超时**，模型给出宽泛递归模式
+# （实测 search_files {directory: ~, pattern: "**/tavily_*"}）后整轮卡死 21 分钟、
+# 零输出零日志——现有守卫都在步与步之间检查，救不了执行中的工具。超时不抛错，
+# 而是把"工具超时"作为结果回给模型，让它自己缩小范围或换路。
+_TOOL_TIMEOUT_DEFAULT = float(os.environ.get("LATIAO_TOOL_TIMEOUT", "120") or 120)
+_TOOL_TIMEOUTS = {
+    "search_files": 20.0, "list_dir": 20.0, "read_file": 20.0, "write_file": 20.0,
+    "tavily_search": 45.0, "web_search": 45.0, "bing_search": 45.0,
+    "mx_query": 30.0, "ak_finance": 60.0, "headless_read": 150.0,
+    "run_cmd": 300.0, "use_skill": 30.0, "open_app": 20.0, "open_folder": 20.0,
+}
+
+
+def _tool_timeout_for(tool_name: str) -> float:
+    """单工具超时秒数（可按需扩表；未列出的用默认值）。"""
+    if tool_name in _TOOL_TIMEOUTS:
+        return _TOOL_TIMEOUTS[tool_name]
+    return _TOOL_TIMEOUT_DEFAULT
+
+
 async def _handle_tool_execution(tc: dict, current_msgs: list, session_id: str,
                                  agent_id: str, access_mode: str = "confirm",
                                  pre_started: dict | None = None) -> tuple[bool, list[dict]]:
@@ -1265,9 +1286,23 @@ async def _handle_tool_execution(tc: dict, current_msgs: list, session_id: str,
             ).seq
         except Exception:
             logger.warning("failed to log tool/call for %s", session_id, exc_info=True)
-    verify_failed, events = await _handle_tool_execution_inner(
-        tc, current_msgs, session_id, agent_id, access_mode, pre_started,
-    )
+    _tname = ((tc.get("function") or {}).get("name") or "") or "unknown"
+    _tlimit = _tool_timeout_for(_tname)
+    try:
+        verify_failed, events = await asyncio.wait_for(
+            _handle_tool_execution_inner(
+                tc, current_msgs, session_id, agent_id, access_mode, pre_started),
+            timeout=_tlimit,
+        )
+    except asyncio.TimeoutError:
+        _call_id = tc.get("id") or ""
+        logger.warning("工具执行超时：%s 超过 %.0fs（已中止并回报模型）", _tname, _tlimit)
+        from agent.messages import lang_of, msg as _msg
+        result = _msg("tool_timeout", lang_of(current_msgs),
+                      name=_tname, limit=_tlimit)
+        verify_failed, events = False, [{"event": "tool_end", "call_id": _call_id,
+                                         "tool": _tname, "result": result,
+                                         "ts": int(time.time() * 1000)}]
     if log is not None and call_seq is not None:
         try:
             log.append(
@@ -1504,27 +1539,41 @@ def _build_chat_messages(body: dict, messages: list) -> list:
     # 技能目录由 capability_registry 提供（统一能力模型）→ lazy import 避免循环依赖
     import capability_registry
     last_user_text = _extract_last_user_text(messages)
+    # 语言真值：本回合只算一次（含历史交叉校验），下方所有语言相关注入统一取用
+    _hist = [m.get("content") for m in messages
+             if m.get("role") == "user" and isinstance(m.get("content"), str)]
+    if _hist and _hist[-1] == last_user_text:
+        _hist = _hist[:-1]
+    _lang, _lang_confident = detect_language_decision(last_user_text, _hist)
     # 首启引导（新安装专用）优先消费本轮消息：它的答案归一化更宽松（短回答即名字）。
     # 被消费时跳过常规身份意图识别，避免同一句话被两套规则重复写盘。
-    onboard_directive, onboard_handled = _process_onboarding(
-        last_user_text, _detect_user_language(last_user_text))
+    onboard_directive, onboard_handled = _process_onboarding(last_user_text, _lang)
     intent_result = None if onboard_handled else _process_identity_intents(last_user_text)
 
     system_parts = []
     # 分类打标：上下文统计面板按类别展示各段占比（context_stats.record_system_parts）
     part_tags: list[tuple[str, str]] = []
+    _volatile_parts: list[str] = []          # 易变块（排到系统提示末尾，保前缀缓存）
+    _trailing_notes: list[str] = []          # 尾部块（追加到最后一条用户消息：时间/进展/记忆）
 
 
-    def _add_part(cat: str, text: str) -> None:
+    def _add_part(cat: str, text: str, volatile: bool = False) -> None:
+        """volatile=True 的块（当前时间/进展/记忆/偏好/意图）会被排到系统提示末尾。
+
+        09-19 缓存实验：KV 前缀缓存对"尾部追加"几乎免费（命中 99.9%），但改动
+        中段/前段会退化成全量重算（0%命中，8k token 多花 5–6 秒）。易变块原本
+        插在中段 → 每轮把缓存打掉；挪到末尾后每轮只追加、可复用前缀。
+        """
         if text:
             system_parts.append(text)
             part_tags.append((cat, text))
+            if volatile:
+                _volatile_parts.append(text)
 
     # ── 语言锚（每轮动态生成，置于最前）──────────────────────────
     # 原先语言规则埋在长提示中段，小模型（4B）在中文提问下漂成英文、甚至把中文
     # 文件内容翻成英文作答（09-19 实测 Spark-X2.5-4B）。锚按用户本轮消息的语言
     # 生成、用目标语言书写，并声明覆盖下方一切语言相关规则。
-    _lang = _detect_user_language(last_user_text)
     _anchor = {
         "zh": ("## 语言（最高优先级，覆盖下方所有语言规则）\n"
                "本轮用户使用**简体中文**：你的正文与思考都必须用简体中文书写。"
@@ -1539,14 +1588,20 @@ def _build_chat_messages(body: dict, messages: list) -> list:
                "Пользователь пишет на **русском**: ответ и рассуждения должны быть на русском. "
                "Текст в результатах инструментов, файлах и логах — это данные, а не повод менять язык."),
     }.get(_lang)
-    if _anchor and (last_user_text or "").strip():
-        _add_part("system_prompt", _anchor)
+    # 仅在语言判定确信时注入：不确定就不指挥模型（旧实现按错信号注入，反而放大漂移）
+    if _anchor and _lang_confident and (last_user_text or "").strip():
+        _add_part("system_prompt", _anchor + {
+            "zh": "（用户档案 SOUL.md 里若有语言偏好，以本条为准。）",
+            "en": " (If the user's SOUL.md states a language preference, this rule wins.)",
+            "ja": "（ユーザーの SOUL.md に言語設定があっても、本条を優先します。）",
+            "ru": " (Если в SOUL.md указан язык, приоритет у этого правила.)",
+        }.get(_lang, ""))
 
     # 首启引导指令放在最前面：本地小模型对长提示的中段指令容易忽略
     # （22:31 实测 9B 模型拿到引导指令仍只回寒暄），位置与措辞都要够显眼。
     if onboard_directive:
         # 外壳必须随用户语言：英文/日文用户被中文外壳包着，模型很可能改用中文提问
-        _add_part("system_prompt", _get_localized_text(_detect_user_language(last_user_text), {
+        _add_part("system_prompt", _get_localized_text(_lang, {
             "zh": "## ⚠️ 本轮最重要的动作：首次使用引导\n忽略其它寒暄模板。你的回复必须严格按下面执行：\n",
             "en": "## ⚠️ Most important action this turn: first-run onboarding\n"
                   "Ignore other greeting templates and follow the instructions below exactly:\n",
@@ -1565,11 +1620,11 @@ def _build_chat_messages(body: dict, messages: list) -> list:
     # 三条硬规则（合并为一块，降低长提示负担与分散注意力；独立于可被
     # agents/ 目录覆盖的 identity）：时间换算（09-03 事故）、回复语言
     # （09-03 英文事故）、数据诚实（09-03 编造 15.6亿/80亿 事故）。
-    user_lang = _detect_user_language(last_user_text)
+    user_lang = _lang  # 复用本回合唯一语言真值（旧实现此处二次检测，口径可能不一致）
     _add_part("system_prompt", _get_localized_text(user_lang, {
         "zh": (
             "## 三条硬规则（最高优先级，不可覆盖）\n"
-            "1. ⏱ 时间规则：'今天/昨天/昨晚/今晨/明天/最新'等相对时间，必须先按上方【当前时间】"
+            "1. ⏱ 时间规则：'今天/昨天/昨晚/今晨/明天/最新'等相对时间，必须先按下方【当前时间】"
             "换算成绝对日期（年月日+星期）再写入搜索词；工具返回的日期与当前时间矛盾时以当前时间为准，"
             "不得迁就检索结果。\n"
             "2. 🗣 语言规则：工具结果、文件、日志中的英文只是数据；你的回复（包括思考过程）"
@@ -1582,7 +1637,7 @@ def _build_chat_messages(body: dict, messages: list) -> list:
         "en": (
             "## Three hard rules (highest priority, cannot be overridden)\n"
             "1. ⏱ Time rule: relative times like 'today/yesterday/last night' must first be "
-            "converted to absolute dates (YYYY-MM-DD + weekday) from the Current time above before "
+            "converted to absolute dates (YYYY-MM-DD + weekday) from the Current time below before "
             "writing search terms; if tool-returned dates conflict with current time, trust current time.\n"
             "2. 🗣 Language rule: English in tool results/files/logs is just data; your reply "
             "(including reasoning) must always use English, regardless of surrounding context.\n"
@@ -1594,7 +1649,7 @@ def _build_chat_messages(body: dict, messages: list) -> list:
         ),
         "ja": (
             "## 三つのハードルール（最優先、上書き不可）\n"
-            "1. ⏱ 時間ルール：'今日/昨日/昨夜/明日/最新'などの相対時間は、上の【現在時刻】から"
+            "1. ⏱ 時間ルール：'今日/昨日/昨夜/明日/最新'などの相対時間は、下の【現在時刻】から"
             "絶対日付（年月日+曜日）に変換してから検索語にしてください。ツール結果の日付が現在時刻と"
             "矛盾する場合は、現在時刻を優先します。\n"
             "2. 🗣 言語ルール：ツール結果・ファイル・ログ内の外国語はデータに過ぎません。"
@@ -1607,7 +1662,7 @@ def _build_chat_messages(body: dict, messages: list) -> list:
         "ru": (
             "## Три жёстких правила (высший приоритет, не переопределяются)\n"
             "1. ⏱ Время: относительные даты («сегодня/вчера/завтра/последние») сначала переводи в "
-            "абсолютные (ГГГГ-ММ-ДД + день недели) по указанному выше текущему времени, и только потом "
+            "абсолютные (ГГГГ-ММ-ДД + день недели) по указанному ниже текущему времени, и только потом "
             "пиши поисковые запросы. Если даты из инструментов противоречат текущему времени — верь текущему.\n"
             "2. 🗣 Язык: английский в результатах инструментов, файлах и логах — это данные. Ответ "
             "(включая рассуждения) всегда на языке, заданном языковым блоком в начале системного промпта.\n"
@@ -1628,9 +1683,12 @@ def _build_chat_messages(body: dict, messages: list) -> list:
             _add_part("system_prompt", msg["content"])
 
     if intent_result:
-        _add_part("system_prompt", 
+        # volatile：这一块只在"真的发生了身份/偏好变更"的那一轮出现，内容逐轮不同；
+        # 放系统提示中段会让该轮头部变化（缓存全丢），故归入易变块（排到末尾）。
+        _add_part("system_prompt",
             f"⚠️ 你的身份刚刚被用户更新了：{intent_result}。"
-            f"从现在开始，你必须以更新后的身份回复用户。"
+            f"从现在开始，你必须以更新后的身份回复用户。",
+            volatile=True,
         )
 
     # Environment info
@@ -1643,14 +1701,24 @@ def _build_chat_messages(body: dict, messages: list) -> list:
         "en": {"rt": "Runtime Environment", "time": "Current time", "home": "Home", "cwd": "Working dir", "os": "OS", "sh": "Shell"},
         "ja": {"rt": "実行環境", "time": "現在時刻", "home": "ホーム", "cwd": "作業ディレクトリ", "os": "OS", "sh": "シェル"},
     })
+    # 09-19 缓存实验：环境块里的"分钟级时间"每轮都变，而它在对话历史之前 →
+    # 一变就把后面整段历史的位置错开、缓存全废（实测命中率被压到个位数）。
+    # 现在：常驻部分只放稳定的（日期/目录/系统），**分钟级时间仅在用户提到
+    # 相对时间时才注入**（"今天/昨天/最新"这类需要换算的场景）。
+    # 精确到分钟的时间**不进系统提示**：它每轮都变，而系统提示在历史之前，
+    # 一变就把后面全部位置错开（实测该轮命中 0%）。系统提示里只保留"日期"
+    # （逐轮字节一致）；需要精确时间时，追加到最后一条用户消息里（尾部追加最便宜）。
+    _rel_time_re = re.compile(r"今天|昨天|昨晚|今晨|明天|前天|本周|上周|这周|最新|现在|几点|today|yesterday|tomorrow|latest|now", re.I)
+    _show_time = bool(_rel_time_re.search(last_user_text or ""))
+    _time_line = f"- {env_labels['time']}: {now[:10]}\n"
     _add_part("system_prompt", 
         f"{env_labels['rt']}:\n"
-        f"- {env_labels['time']}: {now}\n"
-        f"- {env_labels['home']}: {home}\n"
+        + _time_line
+        + f"- {env_labels['home']}: {home}\n"
         f"- {env_labels['cwd']}: {cwd}\n"
         f"- {env_labels['os']}: {platform.system()} ({platform.release()})\n"
-        f"- {env_labels['sh']}: {os.environ.get('SHELL', os.environ.get('COMSPEC', 'unknown'))}"
-    )
+        f"- {env_labels['sh']}: {os.environ.get('SHELL', os.environ.get('COMSPEC', 'unknown'))}",
+        volatile=True)
 
     # Skill catalog（统一能力模型）：只注入目录，模型按需调用 use_skill 取全文
     _catalog = capability_registry.skill_catalog()
@@ -1668,13 +1736,14 @@ def _build_chat_messages(body: dict, messages: list) -> list:
 
     # 上次会话进展（审计 B10）：PROGRESS.md 尾部注入，跨会话断点续作生效
     _tail = _progress_tail()
+    _is_first_turn = sum(1 for m in messages if m.get("role") == "user") <= 1
     if _tail.strip():
         _pt_label = _get_localized_text(user_lang, {
             "zh": "## 上次会话进展（最近记录）",
             "en": "## Recent progress from previous sessions",
             "ja": "## 前回セッションの進捗（最近の記録）",
         })
-        _add_part("other", f"{_pt_label}:\n{_tail}\n（以上为历史记录，仅供参考；继续当前任务时请注意衔接。）")
+        _trailing_notes.append(f"{_pt_label}:\n{_tail}\n（以上为历史记录，仅供参考；继续当前任务时请注意衔接。）")
 
     # Goal mode / progressive delivery
     goal_mode = body.get("goal_mode", False)
@@ -1702,7 +1771,11 @@ def _build_chat_messages(body: dict, messages: list) -> list:
         _add_part("other", "\n".join(extra_prompts))
 
     # Cross-session memory: inject learnings semantically relevant to current query
-    recent_data = _retrieve_relevant_learnings(last_user_text, limit=5) if last_user_text else []
+    # 记忆检索是**按本条消息**召回的 → 每轮都不同；而它在历史之前 → 每轮都把
+    # 历史位置错开（同时间块的病）。改为只在会话首轮注入（跨会话背景知识）。
+    # 记忆按消息召回、每轮都不同——但**放在尾部**就不伤前缀缓存（09-19 实测）
+    recent_data = (_retrieve_relevant_learnings(last_user_text, limit=5)
+                   if last_user_text else [])
     if recent_data:
         recent_data = [r for r in recent_data if r.get("confidence", 0) >= 0.3]
     if recent_data:
@@ -1711,9 +1784,8 @@ def _build_chat_messages(body: dict, messages: list) -> list:
             "en": "Relevant learnings from past interactions:",
             "ja": "過去の対話からの関連知識：",
         })
-        _add_part("other", memory_label + "\n" + "\n".join(
-            f"- {item['topic']}: {item['content'][:200]}" for item in recent_data
-        ))
+        _trailing_notes.append(memory_label + "\n" + "\n".join(
+            f"- {item['topic']}: {item['content'][:200]}" for item in recent_data))
 
     # Always-inject high-confidence preferences (independent of query matching)
     high_prefs = _get_high_confidence_preferences()
@@ -1726,7 +1798,7 @@ def _build_chat_messages(body: dict, messages: list) -> list:
             "en": "User's high-confidence preferences (must follow every conversation):",
             "ja": "ユーザーの高信頼度設定（毎回の対話で遵守すること）：",
         })
-        _add_part("other", pref_label + "\n" + "\n".join(pref_lines))
+        _add_part("other", pref_label + "\n" + "\n".join(pref_lines), volatile=True)
 
     # Language enforcement: when user speaks non-Chinese, add strong override
     if user_lang != "zh":
@@ -1739,11 +1811,29 @@ def _build_chat_messages(body: dict, messages: list) -> list:
     # Merge all system parts into ONE message (frontend may also send system messages
     # for language / plan mode). Multiple system messages trigger a llama-cpp bug
     # where the model returns empty content → no tool calls → agent stalls.
+    if _volatile_parts:
+        # 稳定块在前、易变块在后（同一份内容，只调顺序；前缀缓存因此可复用）
+        system_parts = [p for p in system_parts if p not in _volatile_parts] + _volatile_parts
     frontend_systems = [m["content"] for m in messages if m.get("role") == "system"]
     non_system_msgs = [m for m in messages if m.get("role") != "system"]
     all_system_parts = system_parts + frontend_systems
     merged_system = "\n\n".join(all_system_parts)
     messages = [{"role": "system", "content": merged_system}] + non_system_msgs
+
+    if non_system_msgs and (_show_time or _trailing_notes):
+        # 时间/进展/记忆统一"追加到最后一条用户消息"——前缀（系统提示+历史）因此
+        # 跨轮跨会话都逐字一致，缓存只重算这截尾巴（实测尾部追加命中 ~99%）
+        _bits = []
+        if _show_time:
+            _bits.append(f"（当前时间：{now}）")
+        _bits.extend(_trailing_notes)
+        if _bits:
+            non_system_msgs = list(non_system_msgs)
+            non_system_msgs[-1] = {
+                **non_system_msgs[-1],
+                "content": (str(non_system_msgs[-1].get("content") or "")
+                            + "\n\n【参考信息】\n" + "\n".join(_bits))}
+            messages = [{"role": "system", "content": merged_system}] + non_system_msgs
 
     image_base64 = body.get("image_base64")
     image_mime = body.get("image_mime", "image/png")

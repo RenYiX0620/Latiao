@@ -53,6 +53,11 @@ def _strip_nonprose_for_lang(t: str) -> str:
     10Eros_T2V_Simple.json…）把纯中文答案的字母计数拉到 en>zh，
     误判成英文回复 → 强制翻译（返回原文）→ 语言修正轮重跑全模型，
     正确答案被扔掉、180s 看门狗超时。文件名/路径/代码是数据不是语言。"""
+    try:
+        from agent.parsing import _scrub_tool_markup
+        t = _scrub_tool_markup(t)                                # 任意形状的调用标记
+    except Exception:
+        t = re.sub(r"<tool_call>.*?</tool_call>", " ", t, flags=re.DOTALL)
     t = re.sub(r"https?://\S+|www\.\S+", " ", t)            # URL
     t = re.sub(r"`[^`\n]*`", " ", t)                        # 行内代码
     t = re.sub(r"(?<![\w])[\w.\-]*[\w\-]/[\w.\-/]{1,}", " ", t)   # 路径
@@ -60,7 +65,7 @@ def _strip_nonprose_for_lang(t: str) -> str:
     return t
 
 
-def _reply_lang_mismatch(user_text: str, reply_text: str) -> bool:
+def _reply_lang_mismatch(user_text: str, reply_text: str, user_lang: str = "") -> bool:
     """回复语言与用户语言明显不符（中文用户收到英文/英文占优回复）→ True。
 
     判定：回复中用户语言的字符数，远少于外来语言字母数（英文占优）。
@@ -69,7 +74,9 @@ def _reply_lang_mismatch(user_text: str, reply_text: str) -> bool:
     股票名镶入）也命中（en>zh 即判，不要求 3 倍——此前 3 倍阈值放过 2.6 倍
     的漏网）；"NVIDIA涨5%"（字母 6 < 80）与中文为主的正常回答（汉字多于
     字母）不误伤。计数前剥离文件名/路径/代码（_strip_nonprose_for_lang）。"""
-    user_lang = _detect_user_language(user_text)
+    # 语言真值优先由调用方传入（与提示词同一口径）；未传才自检——避免
+    # "判据同时充当指令与验收"导致的误触发（09-19：中文回答被拿去翻译成英文）
+    user_lang = user_lang or _detect_user_language(user_text)
     if not reply_text:
         return False
     # 尾部段落窗口（09-21 实测）：nudge 轮的英文尾巴以段落为单位接在长中文
@@ -152,6 +159,7 @@ async def _final_answer_extraction(client, api_url: str, headers: dict, engine_m
 
 
 _LANG_RETRY_HINT = "⚠️ 模型本次生成了英文回复（翻译暂不可用）。"
+_LANG_RETRY_HINT_EN = "⚠️ The model replied in an unexpected language and translation is unavailable."
 
 
 def lang_retry_hint(user_lang: str) -> str:
@@ -163,20 +171,30 @@ def lang_retry_hint(user_lang: str) -> str:
         "ja": "⚠️ モデルが日本語で回答せず、自動翻訳も失敗しました。「日本語で答えて」と送ると再試行します。",
         "ru": "⚠️ Модель ответила не на русском, и автоперевод не удался. "
               "Напишите «ответь по-русски», чтобы повторить.",
-    }.get(user_lang, _LANG_RETRY_HINT)
+    }.get(user_lang, _LANG_RETRY_HINT_EN)   # 未知语言回落英文（比中文更可能被读懂）
+
+def _rewrite_lang_instruction(user_lang: str) -> str:
+    """语言修正轮的重写指令（四语；原为硬编码中文，会把英文/日文/俄文用户掰回中文）。"""
+    return {
+        "zh": "必须用简体中文重新输出正文（不要英文，不要解释，直接重写完整回答）。",
+        "en": "Rewrite the answer in English only (no other language, no explanations — output the full answer).",
+        "ja": "本文を日本語で書き直してください（他言語禁止・説明不要・完全な回答をそのまま出力）。",
+        "ru": "Перепишите ответ на русском языке (без других языков, без пояснений — сразу полный ответ).",
+    }.get(user_lang or "zh", "必须用简体中文重新输出正文（不要英文，不要解释，直接重写完整回答）。")
+
 
 
 async def _ensure_final_language(client, api_url: str, headers: dict, engine_model: str,
-                                 text: str, user_text: str) -> str:
+                                 text: str, user_text: str, user_lang: str = "") -> str:
     """交付前语言确保：回复语言与用户消息不符时走翻译轮，返回可交付文本。
 
     缓冲交付后所有 return 路径统一经过这里——即使收尾闸门被跳过
     （如工具失败分支），英文也不会原样到达用户（16:55 事故）。
     翻译轮失败时返回短提示 _LANG_RETRY_HINT 并记日志（09-21 实测：此前把
     整段英文"原文如下"贴给用户——改为短提示，各调用点据此触发语言修正轮）。"""
-    if text and _reply_lang_mismatch(user_text, text):
+    if text and _reply_lang_mismatch(user_text, text, user_lang):
         translated = await _force_translate(client, api_url, headers, engine_model, text,
-                                            _detect_user_language(user_text))
+                                            user_lang or _detect_user_language(user_text))
         if translated == text:
             logger.warning("语言确保失败（翻译返回原文），触发语言修正轮: %.200s",
                            text.replace("\n", " "))
@@ -187,18 +205,36 @@ async def _ensure_final_language(client, api_url: str, headers: dict, engine_mod
 
 async def _ensure_final_language_with_retry(client, api_url: str, headers: dict,
                                             engine_model: str, text: str, user_text: str,
-                                            msgs: list, *, lang_retry_done: bool) -> tuple[str, bool]:
+                                            msgs: list, *, lang_retry_done: bool,
+                                            user_lang: str = "") -> tuple[str, bool]:
     """语言确保 + 语言修正轮（一次性）：翻译失败返回短提示时注入重写指令。
 
     返回 (deliver_text, retry_now)。retry_now=True 且未做过修正轮时，调用方
     应继续下一轮（注入的提醒已在 msgs 中）；否则以短提示交付。"""
     deliver = await _ensure_final_language(client, api_url, headers, engine_model,
-                                           text, user_text)
+                                           text, user_text, user_lang)
     if deliver.startswith(_LANG_RETRY_HINT) and not lang_retry_done:
         msgs.append({"role": "system", "content":
-                     "必须用简体中文重新输出正文（不要英文，不要解释，直接重写完整回答）。"})
+                     _rewrite_lang_instruction(user_lang or _detect_user_language(user_text))})
         return deliver, True
     return deliver, False
+
+
+def _split_translation_chunks(text: str, limit: int = 2500) -> list:
+    """按段落把长文本切成 ≤limit 的块（长文本一次性翻译会超输出预算而失败）。"""
+    text = text or ""
+    if len(text) <= 3000:
+        return [text]
+    chunks, buf = [], ""
+    for para in re.split(r"(\n\s*\n)", text):
+        if len(buf) + len(para) > limit and buf.strip():
+            chunks.append(buf)
+            buf = para
+        else:
+            buf += para
+    if buf.strip():
+        chunks.append(buf)
+    return chunks or [text]
 
 
 async def _force_translate(client, api_url: str, headers: dict, engine_model: str,
@@ -209,6 +245,14 @@ async def _force_translate(client, api_url: str, headers: dict, engine_model: st
     （09-03 事故：两轮中文规则+3 次 nudge 后 27B 模型仍输出英文）。失败时
     返回原文（不阻断交付）。"""
     lang_name = {"zh": "简体中文", "en": "English", "ja": "日本語", "ru": "русский"}.get(user_lang, "简体中文")
+    # 长文本分块翻译：一次性翻译 16k 字会超出输出预算（实测"强制翻译轮失败，返回原文"）
+    _chunks = _split_translation_chunks(text)
+    if len(_chunks) > 1:
+        outs = []
+        for _ch in _chunks:
+            outs.append(await _force_translate(client, api_url, headers, engine_model, _ch, user_lang))
+        joined = "".join(outs)
+        return joined if joined != text else text
     _tmsgs = [
         {"role": "system",
          "content": (f"你是翻译器。把用户提供的文本完整翻译成{lang_name}，"

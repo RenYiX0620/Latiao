@@ -265,3 +265,51 @@ class TestPendingQuestionSuffix(OnboardingBase):
         onboarding.complete()
         onboarding.process_message("你好", "zh")
         self.assertIsNone(onboarding.pending_question_suffix("好的。"))
+
+class TestStatusShape(unittest.TestCase):
+    """status() 必须是 dict（09-19 回归：一次全文件正则把它改成返回元组 → /v1/onboarding 500）。"""
+
+    def setUp(self):
+        import tempfile, pathlib as _pl
+        self.tmp = _pl.Path(tempfile.mkdtemp(prefix="onb-status-"))
+        self._dirs = (onboarding.PROGRESS_DIR, onboarding.STATE_FILE, identity.PROGRESS_DIR)
+        onboarding.PROGRESS_DIR = self.tmp
+        onboarding.STATE_FILE = self.tmp / ".onboarding.json"
+        identity.PROGRESS_DIR = self.tmp
+        identity._create_default_identity()
+        onboarding.init_onboarding()
+
+    def tearDown(self):
+        import shutil
+        onboarding.PROGRESS_DIR, onboarding.STATE_FILE, identity.PROGRESS_DIR = self._dirs
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_status_returns_dict(self):
+        st = onboarding.status()
+        self.assertIsInstance(st, dict)
+        for key in ("done", "field", "awaiting", "user_name", "agent_name", "tone"):
+            self.assertIn(key, st)
+
+    def test_api_shape_can_be_unpacked(self):
+        payload = {"status": "ok", **onboarding.status()}   # 接口层就是这么拼的
+        self.assertEqual(payload["status"], "ok")
+        self.assertIn("agent_name", payload)
+
+class TestIdentityIntentFalsePositives(unittest.TestCase):
+    """身份/偏好意图的误判（09-20）：请求句不得写进 USER.md。
+
+    实际事故："帮我用一句话总结你自己" 命中旧正则 `我(?:…|用)(.+)` 里的裸"用"，
+    把用户提问当成偏好写进 USER.md → 提示头每轮变化 → 缓存 0%（实测连续 4 轮全 0%）。
+    """
+
+    def test_request_sentence_is_not_a_preference(self):
+        from identity import _detect_identity_intent
+        for text in ("帮我用一句话总结你自己", "用 Python 写个脚本", "请问怎么配置？",
+                     "你能帮我读一下这个文件吗", "今天心情不错"):
+            self.assertEqual(_detect_identity_intent(text), [], f"误判: {text}")
+
+    def test_real_preference_still_detected(self):
+        from identity import _detect_identity_intent
+        hits = _detect_identity_intent("我喜欢用深色主题，代码缩进用空格")
+        self.assertTrue(any(i["action"] == "pref" and i["file"] == "USER.md" for i in hits))
+

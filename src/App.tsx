@@ -140,8 +140,8 @@ const [timeFilter, setTimeFilter] = useState("all");
 
   // 权限模式五档（从保守到放手）：read_only / confirm / auto_edit / plan / full
   // 思考强度三档（🧠 选择器）：off / high(默认) / max
-  const [thinkingLevel, setThinkingLevel] = useState<"off" | "high" | "max">(
-    () => (localStorage.getItem("latiao_thinking") as "off" | "high" | "max") || "high"
+  const [thinkingLevel, setThinkingLevel] = useState<"off" | "low" | "high" | "max">(
+    () => (localStorage.getItem("latiao_thinking") as "off" | "low" | "high" | "max") || "high"
   );
   useEffect(() => { localStorage.setItem("latiao_thinking", thinkingLevel); }, [thinkingLevel]);
 

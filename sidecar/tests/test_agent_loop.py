@@ -33,7 +33,8 @@ class TestParsePromptToolCalls(unittest.TestCase):
         self.assertEqual(clean, "")
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["function"]["name"], "run_cmd")
-        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"command": "ls -la"})
+        # 09-19：参数名归一后 command → cmd（run_cmd 的 schema 用 cmd，旧断言是归一前的形状）
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"cmd": "ls -la"})
 
     def test_multiple_fences(self):
         text = (

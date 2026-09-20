@@ -19,7 +19,7 @@ import threading
 import time
 from collections import defaultdict
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("latiao-sidecar")   # 与 App 的 handler 一致（__name__ 不带 handler，日志会静默丢失）
 
 CACHE_SAMPLES = 20      # 缓存命中率滚动窗口
 TEMPLATE_OVERHEAD = 30  # 聊天模板/特殊 token 的近似开销（llama.cpp 实测最小对话差 4 个）
@@ -264,6 +264,15 @@ def record_request(session_id: str, messages: list, tools: list,
         sess = _session(session_id)
         sess["model_path"] = model_path
         sess["turns"] = turns
+        # 提示头指纹：下一轮 0% 时一眼看出是"头部变了"还是"引擎没复用"
+        _fp = _head_fp(messages, tools)
+        _ht = _head_sys_text(messages)
+        _prev_ht = sess.get("head_text")
+        if _prev_ht is not None and _prev_ht != _ht:
+            logger.info("提示头变化：%s", _head_diff_hint(_prev_ht, _ht))
+        sess["head_text"] = _ht
+        sess["head_prev"] = sess.get("head_fp")
+        sess["head_fp"] = _fp
         sess["snapshot"] = {
             "counts": counts,
             "estimated_total": sum(counts.values()) + TEMPLATE_OVERHEAD,
@@ -280,10 +289,15 @@ def _extract_cache_rate(usage: dict | None, timings: dict | None) -> float | Non
     否则会把"引擎没报缓存"误显示成 0%——那是在编造一个否定的结论。
     """
     if isinstance(timings, dict) and "prompt_n" in timings and "cache_n" in timings:
-        prompt_n = int(timings.get("prompt_n") or 0)
-        cache_n = int(timings.get("cache_n") or 0)
-        if prompt_n > 0:
-            return max(0.0, min(1.0, cache_n / prompt_n))
+        # llama.cpp 语义（09-19 实测校准）：prompt_n = 本次真正重算的 token，
+        # cache_n = 从 KV 缓存复用的 token，两者相加才是完整 prompt。
+        # 此前用 cache_n / prompt_n：全命中时（prompt_n=1, cache_n=1153）会算出
+        # 1153/1 = 115300%（被截成 100%），部分命中时（883/271=326%）同样失真。
+        recomputed = int(timings.get("prompt_n") or 0)
+        cached = int(timings.get("cache_n") or 0)
+        total = recomputed + cached
+        if total > 0:
+            return max(0.0, min(1.0, cached / total))
     if isinstance(usage, dict):
         details = usage.get("prompt_tokens_details")
         if isinstance(details, dict) and details.get("cached_tokens") is not None:
@@ -292,6 +306,42 @@ def _extract_cache_rate(usage: dict | None, timings: dict | None) -> float | Non
                 cached = int(details.get("cached_tokens") or 0)
                 return max(0.0, min(1.0, cached / prompt))
     return None
+
+
+def _head_sys_text(messages: list) -> str:
+    """系统消息拼接（头部指纹对应的原文，用于定位"哪一段变了"）。"""
+    return "\n".join(str((m or {}).get("content") or "")
+                      for m in (messages or []) if (m or {}).get("role") == "system")
+
+
+def _head_diff_hint(old: str, new: str) -> str:
+    """两个系统提示的首个差异点（各取上下文 50/70 字），用于定位头部变化来源。"""
+    n = min(len(old), len(new))
+    i = 0
+    while i < n and old[i] == new[i]:
+        i += 1
+    return (f"第 {i} 字符处起不同（{len(old)}→{len(new)} 字符）\n"
+            f"    旧: …{old[max(0, i - 50):i + 70]}…\n"
+            f"    新: …{new[max(0, i - 50):i + 70]}…")
+
+
+def _head_fp(messages: list, tools: list) -> str:
+    """提示头指纹：系统消息 + 工具表（决定前缀缓存能否命中的那部分）。
+
+    缓存读 0% 时只能有两种成因：①提示头变了（我们的问题）②引擎没复用（引擎/模型
+    的问题）。没有指纹时两种在日志里长得一模一样——09-19 排查时就被这两条 0% 卡住。
+    """
+    import hashlib
+    h = hashlib.md5()
+    for m in messages or []:
+        if (m or {}).get("role") == "system":
+            h.update(str(m.get("content") or "").encode("utf-8", "replace"))
+            h.update(b"\x00")   # 分隔符只跟随系统消息：追加对话消息不改变头部指纹
+    for t in tools or []:
+        fn = (t or {}).get("function") or {}
+        h.update(str(fn.get("name") or "").encode("utf-8", "replace"))
+        h.update(str(fn.get("parameters") or "").encode("utf-8", "replace"))
+    return h.hexdigest()[:8]
 
 
 def record_usage(session_id: str, usage: dict | None = None, timings: dict | None = None) -> None:
@@ -314,6 +364,18 @@ def record_usage(session_id: str, usage: dict | None = None, timings: dict | Non
         if completion_tokens:
             sess["gen_tokens"] += completion_tokens
         if rate is not None:
+            _fp = sess.get("head_fp") or "-"
+            _prev = sess.get("head_prev")
+            _note = ("同上" if _prev == _fp else
+                     f"与上次不同（上次 {_prev}）" if _prev else "本次会话首次")
+            logger.info("缓存命中：本轮 %.0f%%（复用 %d / 共 %d token｜头部 %s %s）",
+                        rate * 100,
+                        int((timings or {}).get("cache_n") or (usage or {}).get(
+                            "prompt_tokens_details", {}).get("cached_tokens") or 0),
+                        int((timings or {}).get("cache_n") or 0)
+                        + int((timings or {}).get("prompt_n") or 0)
+                        or int((usage or {}).get("prompt_tokens") or 0),
+                        _fp, _note)
             sess["cache_samples"].append(rate)
             if len(sess["cache_samples"]) > CACHE_SAMPLES:
                 del sess["cache_samples"][:-CACHE_SAMPLES]
