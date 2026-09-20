@@ -55,7 +55,8 @@ from agent.context import (
     _slim_history_for_local,
     _strip_transient_reminders,
 
-    _is_custom_engine,)
+    _is_custom_engine,
+    _custom_engine_max_tokens,)
 from agent.gates import _build_local_tools_prompt
 from agent.context import _NATIVE_LEAN_PROMPT
 from agent.plugins.builtin import setup_all
@@ -307,6 +308,18 @@ def _clear_quota_marker(tool: str) -> None:
 _PLAN_VERB_RE = re.compile(r"查询|检索|调取|查看|获取|读取|搜索|搜集|抓取|调数据|调用工具")
 _PLAN_INTENT_RE = re.compile(
     r"我来|让我|我先|我将|我会|接下来|下面我|现在(让我|我来)|先(去|来)?(查|调|搜|读|看看)")
+
+
+def _needs_length_retry(finish_reason, native_calls, empty_body: bool,
+                        retry_used: bool) -> bool:
+    """是否该因"长度截断"重跑本轮（关思考）。
+
+    两种情况：① 解析出了 native 工具调用但被截断（半截 JSON 不可执行）；
+    ② 正文为空而思考非空（思考吃光预算 —— 09-20 实测 Bonsai 6144/6144）。
+    """
+    if finish_reason != "length" or retry_used:
+        return False
+    return bool(native_calls) or empty_body
 
 
 def _looks_like_plan_only(text: str, has_tools: bool) -> bool:
@@ -641,7 +654,8 @@ class ThinAgentLoop:
             "stream": True,
             "temperature": self._retry_temp if self._retry_temp is not None else 0.0,
             "frequency_penalty": self._retry_freq if self._retry_freq is not None else 0.6,
-            "max_tokens": _resolve_max_tokens(self.model),
+            "max_tokens": _resolve_max_tokens(self.model, local=self.is_local,
+                                              override=_custom_engine_max_tokens()),
             "stop": ["<|im_end|>", "<|endoftext|>", "<end_of_turn>", "<eos>"],
         }
 
@@ -1195,14 +1209,25 @@ class ThinAgentLoop:
                     # finish=length 时模型"说到一半"，半截参数 JSON 不可执行——
                     # 丢弃全部 native 调用，关思考重跑本轮一次（思考是预算杀手，
                     # 09-06/09-07 推理模型 token 全进 <think> 同族根因）
-                    if finish_reason == "length" and native:
-                        if not self._len_retry_used:
-                            self._len_retry_used = True
-                            self._force_thinking_off_next = True
-                            self.steps -= 1
+                    _empty_body = not body_text.strip() and bool(reasoning)
+                    if _needs_length_retry(finish_reason, bool(native), _empty_body,
+                                           self._len_retry_used):
+                        self._len_retry_used = True
+                        self._force_thinking_off_next = True
+                        self.steps -= 1
+                        if native:
                             logger.warning("thin loop: finish=length 截断 %d 个 tool-call，"
                                            "已丢弃；关思考重跑本轮", len(native))
-                            continue
+                            native = {}
+                        else:
+                            # 09-20：预算被思考吃光、正文为空（实测 Bonsai delta=6144、
+                            # 思考 20864 字、正文 0 字 → "只输出了思考过程"）→关思考重跑，
+                            # 并追加尾部要求直接给答案（不让用户手动点「继续」）
+                            self.current_msgs.append(
+                                _note_msg(_msg("length_retry", self.user_lang)))
+                            logger.warning("thin loop: finish=length 且正文为空（思考吃光预算），"
+                                           "关思考重跑本轮")
+                        continue
                         logger.warning("thin loop: finish=length 重试仍截断，丢弃 %d 个 tool-call",
                                        len(native))
                         native = {}
@@ -1487,8 +1512,11 @@ class ThinAgentLoop:
                 # 本轮全部是并发安全只读工具且 ≥2 个 → asyncio.gather 并发，
                 # 事件按调用顺序回灌（结果消息各自带 tool_call_id，顺序无关）。
                 # 混有写/控制工具 → 维持串行。
+                # mx_query 移出并行名单（09-20 实测）：同一步里 3 个 mx_query 并发时
+                # 偶发 `'NoneType' object has no attribute 'get'`（单独调用同一查询正常）
+                # —— 该工具在并发下不安全（共享状态或上游返回空时未兜底）。
                 _SAFE_PARALLEL_TOOLS = {
-                    "mx_query", "ak_finance", "tavily_search", "bing_search",
+                    "ak_finance", "tavily_search", "bing_search",
                     "dokobot_search",
                     "read_file", "list_dir", "search_files",
                 }

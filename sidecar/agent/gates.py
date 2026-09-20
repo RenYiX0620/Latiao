@@ -1,6 +1,7 @@
 """弱模型辅助层与语言链：交付闸门、终答提取、翻译、规划识别、本地工具提示词。"""
 import asyncio
 import json
+import os
 import re
 import time
 import logging
@@ -137,18 +138,31 @@ async def _final_answer_extraction(client, api_url: str, headers: dict, engine_m
             f"任务收尾：用户还在等待回答。请基于上方用户消息里的内容（以及工具结果）直接写出最终回答"
             f"（必须用{_name}，包含关键数字与结论）。不要规划、不要提及任何工具/命令/脚本/执行过程，"
             f"不要写'让我…''我先…'。限制思考，把分析直接写进回答正文。"}] + _smsgs
-        _sb = {"model": engine_model, "messages": _smsgs, "max_tokens": 4096,
+        _local = _is_local_llm_url(api_url)
+        _sb = {"model": engine_model, "messages": _smsgs,
+               # 本地模型多为推理型：4096 会让思考再吃光一次预算（09-20 实测）
+               "max_tokens": 8192 if _local else 4096,
                "stream": False, "temperature": 0.4,
                "stop": ["<|im_end|>", "<eos>"]}
+        if _local:
+            # 收口轮关思考：这一轮只要正文，思考只会再烧一遍预算
+            # （实测 Bonsai：6144 上限全进思考 → 正文 0 字）
+            _sb["chat_template_kwargs"] = {"enable_thinking": False}
         # 引擎忙（主循环持有 serialized 锁）时排队等待——终答提取是 turn 收口
         # 的保证，空交付比等 1-2 分钟更糟（09-08 11:2x 事故：20 秒快退导致
         # 闸门触发后分析仍未交付）。120s 上限仍防无限拖死。
+        # 慢模型要等更久：本地 420s（Bonsai 三值 27B 实测 ~17 tok/s，一轮 300+ 秒），
+        # 云端沿用 120s；LATIAO_EXTRACT_WAIT 可覆盖
         try:
-            async with asyncio.timeout(120):
+            _wait = float(os.environ.get("LATIAO_EXTRACT_WAIT") or (420 if _local else 120))
+        except Exception:
+            _wait = 120.0
+        try:
+            async with asyncio.timeout(_wait):
                 async with _local_llm_serialized(api_url):
                     _sr = await client.post(api_url, json=_sb, headers=headers)
         except TimeoutError:
-            logger.warning("终答提取等待引擎 120s 超时，放弃")
+            logger.warning("终答提取等待引擎 %.0fs 超时，放弃", _wait)
             return ""
         if _sr.status_code == 200:
             return ((_sr.json().get("choices") or [{}])[0]

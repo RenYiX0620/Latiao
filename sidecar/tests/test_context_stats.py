@@ -775,6 +775,98 @@ class TestGgufPrecheck(unittest.TestCase):
             self.assertEqual(_gguf_precheck(str(path)), "")   # 读不懂 → 放行
 
 
+class TestParallelToolSafety(unittest.TestCase):
+    """并发工具名单（09-20）：mx_query 在并发下会偶发 NoneType 失败，必须串行。"""
+
+    def test_mx_query_not_parallel(self):
+        import inspect
+        from agent import loop as L
+        src = inspect.getsource(L.ThinAgentLoop.run)
+        start = src.index("_SAFE_PARALLEL_TOOLS")
+        block = src[start:start + 260]
+        self.assertNotIn("\"mx_query\"", block)
+
+
+class TestMlxRejectReason(unittest.TestCase):
+    """MLX 拒绝加载的原因必须准确（09-20）：旧实现只看 preprocessor_config.json，
+    把"需要自带运行时"的包（Prism Bonsai MLX，无视觉塔）说成"多模态 MLX-VLM"。"""
+
+    def _mk(self, files: dict) -> str:
+        import json, tempfile, pathlib as _pl
+        d = _pl.Path(tempfile.mkdtemp())
+        for name, content in files.items():
+            f = d / name.replace("__", "/")
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(content if isinstance(content, str) else json.dumps(content), encoding="utf-8")
+        return str(d)
+
+    def test_self_contained_runtime_pack(self):
+        from local_llm import _mlx_reject_reason
+        kind, msg = _mlx_reject_reason(self._mk({
+            "files.json": "{}", "hadamard.json": "{}", "preprocessor_config.json": "{}",
+            "config.json": {"model_type": "prism_hadamard_qwen35"}}), "prism_hadamard_qwen35")
+        self.assertEqual(kind, "runtime")
+        self.assertIn("自带的运行时", msg)
+        self.assertNotIn("MLX-VLM", msg)
+
+    def test_plain_text_with_preprocessor_config_is_not_vlm(self):
+        """回归：纯文本模型也常带 preprocessor_config.json，不能被判成多模态。"""
+        from local_llm import _mlx_reject_reason
+        kind, msg = _mlx_reject_reason(self._mk({
+            "preprocessor_config.json": "{}",
+            "config.json": {"model_type": "some_text_arch"}}), "some_text_arch")
+        self.assertEqual(kind, "arch")
+        self.assertNotIn("MLX-VLM", msg)
+
+    def test_real_vlm_detected_by_config_or_weights(self):
+        from local_llm import _mlx_reject_reason
+        k1, _ = _mlx_reject_reason(self._mk({
+            "config.json": {"model_type": "qwen2_vl", "vision_config": {}}}), "qwen2_vl")
+        self.assertEqual(k1, "vlm")
+        k2, _ = _mlx_reject_reason(self._mk({
+            "config.json": {"model_type": "x"},
+            "model.safetensors.index.json": {"weight_map": {"visual.patch_embed.weight": "a"}}}), "x")
+        self.assertEqual(k2, "vlm")
+
+
+class TestMaxTokensAndLengthRetry(unittest.TestCase):
+    """生成长度上限与"思考吃光预算"的自动重试（09-20 实测 Bonsai 6144/6144）。"""
+
+    def test_local_engine_gets_room_for_thinking(self):
+        from agent.context import _resolve_max_tokens
+        self.assertEqual(_resolve_max_tokens("Ternary-Bonsai-2-27B-PQ2_0", local=True), 16384)
+        self.assertEqual(_resolve_max_tokens("Whatever", local=False), 6144)      # 云端小预算
+        self.assertEqual(_resolve_max_tokens("deepseek-r1", local=False), 12288)  # 云端推理名
+        self.assertEqual(_resolve_max_tokens("x", local=True, override=32768), 32768)  # 配置优先
+
+    def test_custom_engine_max_tokens_from_config(self):
+        import json, tempfile, pathlib as _pl
+        import agent_loop as A
+        from agent.context import _custom_engine_max_tokens
+        old = A.CONFIG_FILE
+        with tempfile.TemporaryDirectory() as tmp:
+            f = _pl.Path(tmp) / "config.json"
+            try:
+                f.write_text(json.dumps({"custom_engine": {"max_tokens": 24576}}), encoding="utf-8")
+                A.CONFIG_FILE = f
+                self.assertEqual(_custom_engine_max_tokens(), 24576)
+                f.write_text(json.dumps({}), encoding="utf-8")
+                self.assertEqual(_custom_engine_max_tokens(), 0)
+            finally:
+                A.CONFIG_FILE = old
+
+    def test_length_retry_conditions(self):
+        from agent.loop import _needs_length_retry
+        # 思考吃光预算（正文空、有思考）→ 该重试
+        self.assertTrue(_needs_length_retry("length", 0, True, False))
+        # 工具调用被截断（半截 JSON 不可执行）→ 该重试
+        self.assertTrue(_needs_length_retry("length", 3, False, False))
+        # 正常结束 / 已重试过 / 空正文但无思考（另有闸门管）→ 不重试
+        self.assertFalse(_needs_length_retry("stop", 0, True, False))
+        self.assertFalse(_needs_length_retry("length", 0, True, True))
+        self.assertFalse(_needs_length_retry("length", 0, False, False))
+
+
 class TestHeadFingerprint(unittest.TestCase):
     """提示头指纹（09-19）：缓存 0% 必须能分清"头部变了"还是"引擎没复用"。"""
 

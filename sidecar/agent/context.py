@@ -529,14 +529,33 @@ def _is_light_query(text: str, msgs: list) -> bool:
     return True
 
 
-def _resolve_max_tokens(model: str) -> int:
-    """Pick max_tokens by model family.
+def _custom_engine_max_tokens() -> int:
+    """custom_engine.max_tokens（config.json）：第三方引擎需要的生成长度上限。"""
+    try:
+        import json
+        from agent_loop import CONFIG_FILE
+        cfg = json.loads(CONFIG_FILE.read_text("utf-8")).get("custom_engine") or {}
+        return int(cfg.get("max_tokens") or 0)
+    except Exception:
+        return 0
 
-    Reasoning models (DeepSeek-R1, Qwen3-QwQ, OpenAI o-series, *-think/*-reason)
-    emit long <think> blocks that can exhaust a 4096 cap and truncate the
-    trailing tool_call JSON. Give them a larger budget so the JSON survives;
-    non-reasoning models get a smaller, cheaper budget.
+
+def _resolve_max_tokens(model: str, local: bool = False, override: int = 0) -> int:
+    """生成长度上限。
+
+    09-20 修正：**本地引擎给更大的上限**。本地模型现在多为推理型，思考会把 6144
+    上限吃满、正文一个字都写不出来（实测 Ternary-Bonsai：delta=6144 = 上限、思考
+    20864 字、正文 0 字 → 用户看到"本地模型本轮只输出了思考过程"）。上限只是上限，
+    模型不用就不会花成本。
+
+    - override（`custom_engine.max_tokens`）优先；
+    - 本地引擎 16384；
+    - 云端沿用按模型名判定的启发式（推理类名字 12288，其余 6144）。
     """
+    if override:
+        return int(override)
+    if local:
+        return 16384
     m = (model or "").lower()
     if any(k in m for k in ("r1", "o1", "o3", "o4", "reason", "qwq", "qwen3", "think", "muse", "glimmer", "deepseek")):
         return 12288

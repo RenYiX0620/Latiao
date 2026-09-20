@@ -131,6 +131,64 @@ def _resolve_mlx_path(model_id: str, models_dir: Path = MODELS_DIR, hf_hub: Path
 
 
 
+def _mlx_reject_reason(model_id: str, model_type: str) -> tuple[str, str]:
+    """MLX 引擎拒绝加载的**准确**原因（kind, 给用户看的话）。
+
+    09-20 重写：旧实现只检查仓库里有没有 `preprocessor_config.json` 这类文件就断言
+    "多模态（MLX-VLM）"——而很多**纯文本**模型也带这个文件（它只是处理器配置）。
+    实测因此把 Prism 的 Bonsai MLX 包（**不含视觉塔**，但需要它自带的 runtime 与
+    Hadamard codec）说成"需要 mlx-vlm 运行时"，把用户引到完全错误的方向。
+
+    判据顺序（先因后果）：
+      ① 自带运行时：`files.json` / `codec.py` / `artifact.py` / `runtime/*.py`；
+      ② 真·多模态：`vision_utils.py` / `image_processing.py`，或 config.json 里有
+         vision_config / vision_tower / image_token_index，或权重索引含 vision_tower./visual. 前缀；
+      ③ 其它：架构未被 mlx-lm 收录。
+    """
+    d = Path(model_id)
+    try:
+        names = {f.name for f in d.iterdir()}
+    except Exception:
+        names = set()
+    _rt_py = False
+    try:
+        _rt = d / "runtime"
+        _rt_py = _rt.is_dir() and any(f.suffix == ".py" for f in _rt.iterdir())
+    except Exception:
+        _rt_py = False
+    if _rt_py or ({"files.json", "codec.py", "artifact.py", "hadamard.json"} & names):
+        return ("runtime",
+                f"该模型需要它自带的运行时才能加载（架构 {model_type}）：仓库里带着自己的"
+                "加载/解码实现（如 files.json / codec / hadamard 变换），而辣条的 MLX 引擎"
+                "（mlx-lm）不执行仓库自带代码，也没有集成该运行时。"
+                "建议：① 改用该模型的 GGUF 版本（这类模型转 GGUF 后通常保留文本能力）；"
+                "② 换其它模型。")
+    _vlm = bool(names & {"vision_utils.py", "image_processing.py"})
+    cfg = {}
+    try:
+        cfg = json.loads((d / "config.json").read_text("utf-8"))
+        if any(k in cfg for k in ("vision_config", "vision_tower", "image_token_index")):
+            _vlm = True
+    except Exception:
+        pass
+    if not _vlm:
+        try:
+            _idx = json.loads((d / "model.safetensors.index.json").read_text("utf-8"))
+            _vlm = any(str(k).startswith(("vision_tower", "visual."))
+                       for k in (_idx.get("weight_map") or {}))
+        except Exception:
+            pass
+    if _vlm:
+        return ("vlm",
+                f"该模型是多模态（MLX-VLM）格式（架构 {model_type}），需要 mlx-vlm 运行时；"
+                "Latiao 的 MLX 引擎（mlx-lm）未收录该架构，也未内置 mlx-vlm。"
+                "建议：① 改用该模型的 GGUF 版本（转 GGUF 后通常只保留文本能力）；② 换其它模型。")
+    return ("arch",
+            f"MLX 引擎不支持该模型架构（{model_type}）。"
+            "可用条件：该架构被 mlx-lm 内置支持，或 config.json 含 model_file 指向 MLX 实现。"
+            "建议改用 GGUF 版本（若其架构被 llama.cpp 支持）或其它模型。")
+
+
 def _mlx_arch_supported(model_dir: str) -> tuple[bool, str]:
     """MLX 启动前预检：mlx-lm 是否支持该架构（或仓库自带 MLX 实现）。
 
@@ -2020,26 +2078,11 @@ class LocalLLMEngine:
         _ok, _mt = _mlx_arch_supported(model_id)
         if not _ok:
             self.server_status = "error"
-            # 多模态（MLX-VLM）判别：仓库带视觉相关文件 → 需要 mlx-vlm 运行时
-            try:
-                _names = {f.name for f in Path(model_id).iterdir()}
-            except Exception:
-                _names = set()
-            _is_vlm = bool(_names & {"vision_utils.py", "image_processing.py",
-                                     "preprocessor_config.json", "processor_config.json"})
-            if _is_vlm:
-                self.status_message = (
-                    f"该模型是多模态（MLX-VLM）格式（架构 {_mt}），需要 mlx-vlm 运行时；"
-                    "Latiao 的 MLX 引擎（mlx-lm）未收录该架构，也未内置 mlx-vlm。"
-                    "建议：① 改用该模型的 GGUF 版本（若其架构被 llama.cpp 支持；"
-                    "转 GGUF 后通常只保留文本能力）；② 换其它模型。")
-            else:
-                self.status_message = (
-                    f"MLX 引擎不支持该模型架构（{_mt}）。"
-                    "可用条件：该架构被 mlx-lm 内置支持，或 config.json 含 model_file "
-                    "指向 MLX 实现（部分架构只被另一个运行时 mlx-vlm 收录，Latiao 未内置）。"
-                    "建议改用 GGUF 版本（若其架构被 llama.cpp 支持）或其它模型。")
-            logger.warning("MLX 架构预检拦截: %s (model_type=%s)", model_id, _mt)
+            # 09-20：判别原因的判据重写（见 _mlx_reject_reason）。旧实现只看
+            # preprocessor_config.json → 把"需要自带运行时"的包说成"多模态 MLX-VLM"。
+            _kind, self.status_message = _mlx_reject_reason(model_id, _mt)
+            logger.warning("MLX 架构预检拦截: %s (model_type=%s, 原因=%s)",
+                           model_id, _mt, _kind)
             return self.get_status()
         self.current_model_id = model_id
         self.current_model_name = model_id.split("/")[-1] if "/" in model_id else model_id
