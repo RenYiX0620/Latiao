@@ -1298,3 +1298,41 @@ class TestPromptCacheFriendly(unittest.TestCase):
         from agent.plugins import builtin
         src = inspect.getsource(builtin.setup_compaction)
         self.assertIn('getattr(loop, "steps", 0) > 1', src)
+
+
+# ── GGUF 路径解析（09-21）─────────────────────────────────────────
+# 背景：LM Studio 的布局是「目录名以 .gguf 结尾、文件在目录里同名」，此前只判后缀
+# 就把目录当文件喂给 llama_cpp → 每轮一条 ValueError Traceback + 永远退回估算。
+def test_resolve_gguf_in_lmstudio_directory(tmp_path):
+    from context_stats import _resolve_gguf_file
+    d = tmp_path / "Spark-X2.5-4B-uncensored-Q8_0.gguf"
+    d.mkdir()
+    inner = d / "Spark-X2.5-4B-uncensored-Q8_0.gguf"   # 目录内同名文件
+    inner.write_bytes(b"GGUF")
+    assert _resolve_gguf_file(str(d)) == str(inner)
+
+
+def test_resolve_gguf_directory_with_differently_named_file(tmp_path):
+    from context_stats import _resolve_gguf_file
+    d = tmp_path / "some-model.gguf"
+    d.mkdir()
+    inner = d / "weights-q4.gguf"
+    inner.write_bytes(b"GGUF")
+    assert _resolve_gguf_file(str(d)) == str(inner)
+
+
+def test_resolve_gguf_directory_without_gguf_is_none(tmp_path):
+    from context_stats import _resolve_gguf_file
+    d = tmp_path / "mlx-pack.gguf"      # 目录里只有 MLX 权重
+    d.mkdir()
+    (d / "model.safetensors").write_bytes(b"x")
+    assert _resolve_gguf_file(str(d)) is None
+
+
+def test_resolve_gguf_plain_file_and_non_gguf(tmp_path):
+    from context_stats import _resolve_gguf_file
+    f = tmp_path / "model.gguf"
+    f.write_bytes(b"GGUF")
+    assert _resolve_gguf_file(str(f)) == str(f)
+    assert _resolve_gguf_file(str(tmp_path / "nope.txt")) is None
+    assert _resolve_gguf_file("") is None

@@ -11,6 +11,7 @@ import {
   MousePointer2, Keyboard, Camera, ListTree, Play, History, ScanLine,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
+import { COMPOSE_GRACE_MS, COMPOSING_BACKSTOP_MS, shouldSendOnEnter } from "../utils/composer";
 
 // 活动类别：工具名 → (类别标签, 数量名词, 图标)。标签英文对齐 DSH/Codex
 // 活动行样式（Think/Bash/Search/Read/Write/Data…），noun 保留中文计数
@@ -147,18 +148,26 @@ export default memo(function ChatView({
   const { t } = useTranslation();
   // WebKit (WKWebView) 下 compositionend 先于最终 keydown 派发，
   // 仅靠 e.nativeEvent.isComposing 会在按 Enter 确认候选词时已变 false
-  // → 半句话被发送。用 compositionend 时间戳做缓冲（VSCode 同款方案）。
+  // → 半句话被发送。用 compositionend 时间戳做一小段缓冲（VSCode 同款方案）。
+  // 09-21 修：原来组词开始时把缓冲设成 Number.MAX_SAFE_INTEGER，一旦某次
+  // compositionend 没派发就**永久锁死回车**（症状：回车只换行、点按钮才发送）；
+  // 且 300ms 窗口会连"打完字紧接着按的回车"一起吞掉。判定逻辑见 utils/composer.ts。
   const composingUntilRef = useRef(0);
   const handleCompositionStart = useCallback(() => {
-    composingUntilRef.current = Number.MAX_SAFE_INTEGER;
+    composingUntilRef.current = Date.now() + COMPOSING_BACKSTOP_MS;
   }, []);
   const handleCompositionEnd = useCallback(() => {
-    composingUntilRef.current = Date.now() + 300;
+    composingUntilRef.current = Date.now() + COMPOSE_GRACE_MS;
   }, []);
   const handleEditableKeyDown = useCallback((e: React.KeyboardEvent) => {
     // 输入法组词中按 Enter 是确认候选，不是发送（中文输入法高频误发送）
-    if (e.nativeEvent.isComposing || Date.now() < composingUntilRef.current) return;
-    if (e.key === "Enter" && !e.shiftKey && !isProcessing) {
+    const send = shouldSendOnEnter(Date.now(), composingUntilRef.current, isProcessing, {
+      key: e.key,
+      shiftKey: e.shiftKey,
+      isComposing: e.nativeEvent.isComposing,
+      keyCode: e.nativeEvent.keyCode,
+    });
+    if (send) {
       e.preventDefault();
       sendMessage();
     }
