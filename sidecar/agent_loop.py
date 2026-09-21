@@ -1230,10 +1230,18 @@ _WEEK_ZH = "一二三四五六日"
 
 
 def _stamp_time_sensitive() -> str:
-    """生成当前时刻锚行，注入时间敏感工具结果头部（截断后追加，不会被截掉）。"""
+    """生成当前时刻锚行，注入时间敏感工具结果头部（截断后追加，不会被截掉）。
+
+    09-21 修措辞：原来写「[数据时刻] 当前时间」——两者并不等价（盘中查、收盘查、
+    隔夜再看同一份结果，数字含义完全不同），实测用户看到"上午涨 0.89%、下午又变
+    1.2%"的分歧就是这么来的。现在明确：这是**发起查询**的时刻，数据自身时点看结果
+    里的 date/时间列，并要求回答时原样引用。
+    """
     now = datetime.now()
-    return (f"⏱ [数据时刻] {now.strftime('%Y-%m-%d')} (周{_WEEK_ZH[now.weekday()]}) "
-            f"{now.strftime('%H:%M:%S')} —— 下方结果内日期若与此矛盾，以当前时间为准\n\n")
+    return (f"⏱ [查询时刻] {now.strftime('%Y-%m-%d')} (周{_WEEK_ZH[now.weekday()]}) "
+            f"{now.strftime('%H:%M:%S')} —— 这是**发起查询**的时刻，不等于数据本身的时点；"
+            f"数据时点以结果里的 date/时间列为准，回答时必须原样引用（结果内日期若与此矛盾，"
+            f"以当前时间为准）\n\n")
 
 
 def _tool_end_result(events: list[dict]) -> str:
@@ -1659,8 +1667,12 @@ def _build_chat_messages(body: dict, messages: list) -> list:
             "工具未返回的数据（如北向资金净流入、主力资金净流出、板块资金流等）严禁凭印象给出具体数值——"
             "必须写明'工具未返回该数据'，或先调用工具查询（资金流向优先 mx_query，查不到再 tavily_search）；"
             "不得沿用其他会话或训练记忆中的数字（查资金流向优先 mx_query，查不到再 tavily_search）。"
-            "引用**网页/新闻**里的数字时，必须同时写明该数字的**发布日期与来源""（如“据 XX 网 9/18 报道”）；若检索结果的日期与你需要的日期不符，"
+            "引用**网页/新闻**里的数字时，必须同时写明该数字的**发布日期与来源**（如“据 XX 网 9/18 报道”）；若检索结果的日期与你需要的日期不符，"
             "必须写明「未获取到该日数据」，**禁止用近似或旧数据替代**。"
+            "**来源与时点一致性**：同一个指标只查一次、只用一个来源——优先 mx_query，仅当它明确返回"
+            "不支持或为空时才改用 ak_finance，并在该数字旁注明已换来源；回答中每个关键数字都要带来源与"
+            "数据时刻（如「东方财富 9/21 收盘」），不要给出没有时点的数字；两个来源对同一指标数值不一致时，"
+            "把两者各自的值与时点都写出来，不要混用、不要取平均。"
         ),
         "en": (
             "## Three hard rules (highest priority, cannot be overridden)\n"
@@ -1673,7 +1685,12 @@ def _build_chat_messages(body: dict, messages: list) -> list:
             "session. Never invent figures the tools did not return (northbound inflow, main-force "
             "outflows, sector flows) — state 'the tools did not return this data' or query first "
             "(mx_query for fund flows, tavily_search as fallback). Never reuse numbers from other "
-            "sessions or training memory."
+            "sessions or training memory. "
+            "Source & timestamp consistency: query each metric ONCE from ONE source — prefer mx_query, "
+            "switch to ak_finance only when mx_query clearly reports unsupported/empty, and say so beside "
+            "that number; every key number carries its source and data timestamp (e.g. \"Eastmoney, 9/21 "
+            "close\") — never a timeless number; when two sources disagree on one metric, state both values "
+            "with their timestamps instead of mixing or averaging them."
         ),
         "ja": (
             "## 三つのハードルール（最優先、上書き不可）\n"
@@ -1686,6 +1703,10 @@ def _build_chat_messages(body: dict, messages: list) -> list:
             "ツールが返さなかったデータ（北向資金流入、主力資金流出、セクター資金フロー等）に"
             "具体的な数値をでっち上げてはいけません——「ツールはこのデータを返していない」と明記するか、"
             "先にツールで照会してください。他セッションや学習メモリの数字を使用しないこと。"
+            "【出典と時点の一貫性】同じ指標は一度・一つの出典だけで照会してください——優先は mx_query、"
+            "それが明確に「非対応／空」を返したときだけ ak_finance に切り替え、その数字の横に切替を明記します。"
+            "回答中の主要な数字には出典とデータ時点（例「東方財富 9/21 終値」）を必ず添え、時点のない数字を"
+            "出してはいけません。二つの出典が食い違う場合は、混ぜたり平均したりせず、両方の値と時点を併記してください。"
         ),
         "ru": (
             "## Три жёстких правила (высший приоритет, не переопределяются)\n"
@@ -1696,7 +1717,12 @@ def _build_chat_messages(body: dict, messages: list) -> list:
             "(включая рассуждения) всегда на языке, заданном языковым блоком в начале системного промпта.\n"
             "3. 📊 Честность данных: каждое ключевое число должно опираться на результат инструмента из ЭТОЙ "
             "сессии. Не придумывай цифры, которых инструменты не вернули — напиши, что данных нет, или сначала "
-            "вызови инструмент. Не переноси числа из других сессий или из памяти модели.\n"
+            "вызови инструмент. Не переноси числа из других сессий или из памяти модели. "
+            "Согласованность источника и времени: каждый показатель запрашивай один раз и из ОДНОГО "
+            "источника — приоритет mx_query; переходи на ak_finance только если mx_query явно вернул "
+            "«не поддерживается»/пусто, и укажи это рядом с числом. Каждое ключевое число сопровождай "
+            "источником и временем данных (например, «Eastmoney, закрытие 09-21»); чисел без времени не давай. "
+            "Если два источника расходятся, приведи оба значения с их временем, не смешивай и не усредняй."
         ),
     }))
 
