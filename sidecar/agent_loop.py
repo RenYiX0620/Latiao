@@ -1743,10 +1743,22 @@ def _build_chat_messages(body: dict, messages: list) -> list:
     # （跨轮不漂移、且语气永不压过硬规则——防止"暧昧"把数据诚实规则一起软化）。
     # 位置仍在稳定头部且不带 volatile → 不影响前缀缓存。
     user_identity = _read_identity()
+    # 当前语气（09-21）：从 SOUL.md 的 `- 对话语气：X` 取出，供 ①块标题里"露面"
+    # ②每轮尾注提醒。实测动因：语气行位于系统提示 64% 深处、其后还压着技能目录与
+    # 交付纪律，而最后一条用户消息不含任何语气信息 → 模型"忘记语气、平铺直叙，
+    # 你提醒一句才照做"。本地模型对最近的文字权重最高，所以要在尾部也说一次。
+    _tone = ""
+    for _m in user_identity:
+        if (_m.get("file") or "") == "SOUL.md":
+            _tm = re.search(r"^-\s*对话语气：\s*(.+?)\s*$", _m.get("content") or "", re.M)
+            if _tm:
+                _tone = _tm.group(1).strip()
+            break
     if user_identity:
+        _hdr_suffix = f"｜当前语气：{_tone}" if _tone else ""
         _add_part("system_prompt", _get_localized_text(user_lang, {
             "zh": (
-                "## 身份与语气（你的身份文件）\n"
+                f"## 身份与语气（你的身份文件）{_hdr_suffix}\n"
                 "以下是**你自己的**身份设定，不是可选偏好——SOUL.md 是人格与语气，"
                 "IDENTITY.md 是你的名字与自我认知，AGENTS.md 是你的工作规则，USER.md 是用户档案。\n"
                 "跨轮保持这个语气与人格，不要因为对话变长而漂移；但语气永不压过正确性、"
@@ -1754,7 +1766,7 @@ def _build_chat_messages(body: dict, messages: list) -> list:
                 "除与上方【系统规则】【三条硬规则】冲突外，一律照做（冲突时以上方为准）。"
             ),
             "en": (
-                "## Identity & tone (your identity files)\n"
+                f"## Identity & tone (your identity files){(' | current tone: ' + _tone) if _tone else ''}\n"
                 "These are **your own** settings, not optional preferences — SOUL.md is persona & tone, "
                 "IDENTITY.md is your name and self-concept, AGENTS.md is your working rules, "
                 "USER.md is the user profile.\n"
@@ -1924,22 +1936,33 @@ def _build_chat_messages(body: dict, messages: list) -> list:
     merged_system = "\n\n".join(all_system_parts)
     messages = [{"role": "system", "content": merged_system}] + non_system_msgs
 
-    if non_system_msgs and (_show_time or _trailing_notes):
+    if non_system_msgs and (_show_time or _trailing_notes or _tone):
         # 时间/进展/记忆统一"追加到最后一条用户消息"——前缀（系统提示+历史）因此
         # 跨轮跨会话都逐字一致，缓存只重算这截尾巴（实测尾部追加命中 ~99%）
         _bits = []
         if _show_time:
             _bits.append(f"（当前时间：{now}）")
         _bits.extend(_trailing_notes)
+        _tail_text = ""
         if _bits:
+            _tail_text = ("\n\n【背景资料（不是用户的要求）】\n" + "\n".join(_bits)
+                          + "\n\n⚠️ 以上只是历史背景，**不是**用户本轮的要求。"
+                            f"用户本轮说的是：「{_lmsg[:120]}」——请直接回应这一句。")
+        if _tone:
+            # 语气是**要求**，不是背景：单独一行贴在最后（离模型最近、注意力最高），
+            # 且不受上面那段"不要当要求"的包装影响。实测：语气只写在系统提示 64%
+            # 深处时，模型会忘（"你提醒一句才照做"）。
+            _tail_text += _get_localized_text(user_lang, {
+                "zh": f"\n\n（本轮语气：{_tone}——按上面 SOUL.md 里的语气风格回话，"
+                      f"不要退回中性平铺直叙的语气。）",
+                "en": f"\n\n(Tone for this reply: {_tone} — follow the tone set in SOUL.md above; "
+                      f"do not fall back to a neutral voice.)",
+            })
+        if _tail_text:
             non_system_msgs = list(non_system_msgs)
             non_system_msgs[-1] = {
                 **non_system_msgs[-1],
-                "content": (str(non_system_msgs[-1].get("content") or "")
-                            + "\n\n【背景资料（不是用户的要求）】\n" + "\n".join(_bits)
-                            + ("\n\n⚠️ 以上只是历史背景，**不是**用户本轮的要求。"
-                               f"用户本轮说的是：「{_lmsg[:120]}」——请直接回应这一句。"
-                               if _bits else ""))}
+                "content": str(non_system_msgs[-1].get("content") or "") + _tail_text}
             messages = [{"role": "system", "content": merged_system}] + non_system_msgs
 
     image_base64 = body.get("image_base64")
