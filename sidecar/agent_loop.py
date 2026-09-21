@@ -1673,6 +1673,8 @@ def _build_chat_messages(body: dict, messages: list) -> list:
             "不支持或为空时才改用 ak_finance，并在该数字旁注明已换来源；回答中每个关键数字都要带来源与"
             "数据时刻（如「东方财富 9/21 收盘」），不要给出没有时点的数字；两个来源对同一指标数值不一致时，"
             "把两者各自的值与时点都写出来，不要混用、不要取平均。"
+            "工具结果里的『当前』快照行与『日线/历史』行是两个口径，引用时写明用的是哪一段、不得混用；"
+            "查不到的字段必须写「未查询到该日数据」，**禁止填 “—” 或留空**。"
         ),
         "en": (
             "## Three hard rules (highest priority, cannot be overridden)\n"
@@ -1690,7 +1692,10 @@ def _build_chat_messages(body: dict, messages: list) -> list:
             "switch to ak_finance only when mx_query clearly reports unsupported/empty, and say so beside "
             "that number; every key number carries its source and data timestamp (e.g. \"Eastmoney, 9/21 "
             "close\") — never a timeless number; when two sources disagree on one metric, state both values "
-            "with their timestamps instead of mixing or averaging them."
+            "with their timestamps instead of mixing or averaging them. "
+            "A tool result's \"current\" snapshot row and its daily/history rows are different measures — "
+            "never mix them, and say which one you quote. Any field you could not fetch must be written as "
+            "\"no data retrieved for that day\" — never as \"—\" or blank."
         ),
         "ja": (
             "## 三つのハードルール（最優先、上書き不可）\n"
@@ -1707,6 +1712,8 @@ def _build_chat_messages(body: dict, messages: list) -> list:
             "それが明確に「非対応／空」を返したときだけ ak_finance に切り替え、その数字の横に切替を明記します。"
             "回答中の主要な数字には出典とデータ時点（例「東方財富 9/21 終値」）を必ず添え、時点のない数字を"
             "出してはいけません。二つの出典が食い違う場合は、混ぜたり平均したりせず、両方の値と時点を併記してください。"
+            "ツール結果の「現在」スナップショット行と「日足/履歴」行は別の口径です——混ぜず、どちらを引用したか明記してください。"
+            "取得できなかった項目は「その日のデータは未取得」と明記し、**「—」や空欄で済ませないこと**。"
         ),
         "ru": (
             "## Три жёстких правила (высший приоритет, не переопределяются)\n"
@@ -1722,7 +1729,10 @@ def _build_chat_messages(body: dict, messages: list) -> list:
             "источника — приоритет mx_query; переходи на ak_finance только если mx_query явно вернул "
             "«не поддерживается»/пусто, и укажи это рядом с числом. Каждое ключевое число сопровождай "
             "источником и временем данных (например, «Eastmoney, закрытие 09-21»); чисел без времени не давай. "
-            "Если два источника расходятся, приведи оба значения с их временем, не смешивай и не усредняй."
+            "Если два источника расходятся, приведи оба значения с их временем, не смешивай и не усредняй. "
+            "Строка «текущий снимок» и строки «дневная история» в результате инструмента — это разные меры: "
+            "не смешивай их и указывай, какую цитируешь. Поле, которое не удалось получить, пиши как "
+            "«данные за этот день не получены», а не «—» и не пустым."
         ),
     }))
 

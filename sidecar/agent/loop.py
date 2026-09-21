@@ -71,7 +71,10 @@ MAX_STEPS = 40          # 安全网（compaction 插件落地后放宽）
 # 精确签名永不重复 → 只能等 12 轮上限，一次提问跑十几分钟。这里改用**信息增量**：
 # 比较本轮检索结果相对已收集信息的新增比例，连续走低即判饱和并收口。
 _INFO_GAIN_RATIO = float(os.environ.get("LATIAO_INFO_GAIN_RATIO", "0.25") or 0.25)
-_SEARCH_BUDGET_CALLS = int(os.environ.get("LATIAO_SEARCH_BUDGET", "3") or 3)
+# 检索预算（09-21：3 → 6）。"分析今天大盘"这类任务要覆盖 5–8 个指标，而两个财经
+# 工具都支持**逗号一次查多个标的**（一张表多列），正常 2–3 次调用就够；预算 3 会在
+# 第三次就撤下检索工具，属于提前封门。6 是给"批量没用好"的模型留的余量。
+_SEARCH_BUDGET_CALLS = int(os.environ.get("LATIAO_SEARCH_BUDGET", "6") or 6)
 # 指纹口径（09-19 实测调过两轮）：日期归一成单点、中文切二元组、数字归一——
 # 否则"9月18日"里的 9/18 会被当成新数字、"道琼斯指数下跌"换个词就算新增，
 # 同一批数据的复述会拿到 0.5 的假增量，判据永远不触发。
@@ -905,7 +908,15 @@ class ThinAgentLoop:
         logger.warning("thin loop: 检测到工具当日额度已用尽，注入事前提示")
 
     def _note_tool_counts(self, tool_calls: list) -> bool:
-        """同一检索类工具调用 ≥N 次 → 视为饱和（换 query 重搜绕开签名守卫的兜底）。"""
+        """同一检索类工具是否已调用到"可疑次数"（≥ _SEARCH_TOOL_REPEAT_LIMIT）。
+
+        09-21 修正（用户实测"数据老是查不全"）：**次数本身不是饱和**。"大盘 + 板块
+        + 资金"这类覆盖查询天然要调好几次（实测：同一轮 3 次 mx_query 分别查上证
+        主力净流入、北证50 涨跌幅、三个板块涨跌幅），而这条规则把第 3 次直接判成
+        hard 饱和 → 强制收口作答 → 没查到的字段全成了 "—"。现在只把次数当作
+        "值得收紧"的信号，是否真饱和由**信息增量**决定（原地换措辞重搜 = 零新增，
+        那才是空转）；本函数不再单独触发收口。
+        """
         names = _search_tool_names()
         for tc in tool_calls or []:
             nm = ((tc.get("function") or {}).get("name") or "")
@@ -931,6 +942,17 @@ class ThinAgentLoop:
         if self._info_rounds >= 2 and gain < _INFO_GAIN_RATIO:
             return "soft", gain
         return None, gain
+
+    def _apply_search_budget(self) -> None:
+        """检索预算用尽 → 下一轮撤下检索类工具（09-21：补一条可检索的日志）。
+
+        原来这里只默默置 `_narrow_search`，事后无法从日志判断"是穷死了还是查完了"。
+        """
+        if self._search_used >= _SEARCH_BUDGET_CALLS and not self._narrow_search:
+            self._narrow_search = True
+            self._step_log("检索预算",
+                           f"已用 {self._search_used}/{_SEARCH_BUDGET_CALLS} 次"
+                           f" → 下一轮撤下检索类工具；如仍缺数据，请直接写明缺口")
 
     def _count_search_calls(self, tool_calls: list) -> int:
         names = _search_tool_names()
@@ -1590,15 +1612,22 @@ class ThinAgentLoop:
                         [str(_e.get("result", "")) for _vf, _evts in _safe_results
                          for _e in _evts if isinstance(_e, dict) and "result" in _e])
                     if self._search_used >= _SEARCH_BUDGET_CALLS:
-                        self._narrow_search = True   # 预算耗尽＝软饱和：下轮撤检索工具
-                    if self._note_tool_counts(tool_calls):
-                        _sat = "hard"    # 同一检索工具反复调用（换 query 也算）
+                        self._apply_search_budget()
+                    _hot = self._note_tool_counts(tool_calls)
+                    if _hot and _gain < _INFO_GAIN_RATIO:
+                        # 次数可疑 + 增量低 = 真的在原地换措辞重搜 → 才算硬饱和
+                        _sat = "hard"
+                        _why = (f"同一检索工具已调用 "
+                                f"{max(self._search_calls_by_name.values() or [0])} 次"
+                                f"且本轮信息增量仅 {_gain:.0%}")
+                    else:
+                        _why = (f"信息增量连续 {self._gain_low_streak} 轮低于 "
+                                f"{_INFO_GAIN_RATIO:.0%}（本轮 {_gain:.0%}）")
                     if _sat == "hard" and not self._finalize_round:
                         self._finalize_round = True
                         if self.steps >= self.max_steps:
                             self.steps = self.max_steps - 1
-                        self._step_log("饱和收口", f"信息增量连续 {self._gain_low_streak} 轮低于 "
-                                                   f"{_INFO_GAIN_RATIO:.0%}（本轮 {_gain:.0%}）→ 强制直接作答")
+                        self._step_log("饱和收口", f"{_why} → 强制直接作答")
                         continue
                     if _sat == "soft":
                         self._narrow_search = True
@@ -1650,18 +1679,27 @@ class ThinAgentLoop:
                             mark_session_tools(self.session_id, SKILL_DEPENDENT_TOOLS.get(_sn, set()))
                         except Exception:
                             pass
+                # ↓ 每轮一次（16 格＝工具循环之外）。此前误缩进到 20 格会落进
+                # "每个工具"的循环里：3 个工具就把本轮计数加 3 遍（实测 3 次调用
+                # 记成 9），预算按 3 倍速度烧掉 → 检索工具被提前撤下。
                 self._search_used += self._count_search_calls(tool_calls)
                 _sat, _gain = self._note_round_info(_round_results)
                 if self._search_used >= _SEARCH_BUDGET_CALLS:
-                    self._narrow_search = True   # 预算耗尽＝软饱和：下轮撤检索工具
-                if self._note_tool_counts(tool_calls):
-                    _sat = "hard"                # 同一检索工具反复调用（换 query 也算）
+                    self._apply_search_budget()
+                _hot = self._note_tool_counts(tool_calls)
+                if _hot and _gain < _INFO_GAIN_RATIO:
+                    _sat = "hard"                    # 次数可疑 + 增量低 = 真空转
+                    _why = (f"同一检索工具已调用 "
+                            f"{max(self._search_calls_by_name.values() or [0])} 次"
+                            f"且本轮信息增量仅 {_gain:.0%}")
+                else:
+                    _why = (f"信息增量连续 {self._gain_low_streak} 轮低于 "
+                            f"{_INFO_GAIN_RATIO:.0%}（本轮 {_gain:.0%}）")
                 if _sat == "hard" and not self._finalize_round:
                     self._finalize_round = True
                     if self.steps >= self.max_steps:
                         self.steps = self.max_steps - 1
-                    self._step_log("饱和收口", f"信息增量连续 {self._gain_low_streak} 轮低于 "
-                                               f"{_INFO_GAIN_RATIO:.0%}（本轮 {_gain:.0%}）→ 强制直接作答")
+                    self._step_log("饱和收口", f"{_why} → 强制直接作答")
                     continue
                 if _sat == "soft":
                     self._narrow_search = True
