@@ -49,7 +49,7 @@ DEFINITION = {
     "type": "function",
     "function": {
         "name": "ak_finance",
-        "description": "免费金融数据查询（无需 API Key，基于 AKShare/东方财富公开数据）。支持【A股、港股、指数、基金、行业板块】的实时行情与历史数据。适用：问任何 A股/港股个股价格、上证/深证/恒生等指数、基金净值、板块行情。支持用逗号（或顿号）分隔一次查询多个指数或板块（如\"上证指数,深证成指,创业板指\"、\"半导体板块,芯片板块\"；板块名列表如\"半导体,白酒\"无需带\"板块\"二字）。不适用：美股、加密货币等境外市场（请用网页搜索）。",
+        "description": "免费金融数据查询（无需 API Key，基于 AKShare/东方财富公开数据）。支持【A股、港股、指数、基金、行业板块】的实时行情与历史数据。适用：问任何 A股/港股个股价格、上证/深证/恒生等指数、基金净值、板块行情。支持用逗号（或顿号）分隔一次查询多个指数或板块（如\"上证指数,深证成指,创业板指\"、\"半导体板块,芯片板块\"；板块名列表如\"半导体,白酒\"无需带\"板块\"二字）。美股指数（道指/标普500/纳指/罗素2000）也支持，走新浪财经日线接口，返回带日期的精确收盘点位；加密货币等仍请用网页搜索。",
         "parameters": {
             "type": "object",
             "properties": {
@@ -291,12 +291,85 @@ async def _query_a_share_hist(query: str) -> str:
     return "\n".join(lines)
 
 
+# ── 美股指数（09-20 新增）──────────────────────────────────────────
+# 背景：mx_query/ak_finance 原本只覆盖境内市场 → 美股只能靠网页搜索，而新闻正文
+# 常缺精确点位（实测把 3 月的旧新闻当周五收盘，数字错了好几个月）。新浪财经的
+# 美股日线接口（AKShare index_us_stock_sina）能给**带日期的精确收盘价**。
+_US_INDEX_MAP = (
+    (("道琼斯", "道指", "dow", "dji"), ".DJI", "道琼斯工业平均指数"),
+    (("标普", "s&p", "s&p500", "sp500"), ".INX", "标普500指数"),
+    (("纳斯达克", "纳指", "nasdaq", "ixic"), ".IXIC", "纳斯达克综合指数"),
+    (("罗素", "russell", "rut"), ".RUT", "罗素2000指数"),
+)
+
+
+def _us_index_targets(query: str) -> list[tuple[str, str]]:
+    """从 query 里识别美股指数（可一次多个：道指/标普/纳指）。"""
+    q = (query or "").lower()
+    out = []
+    for keys, sym, name in _US_INDEX_MAP:
+        if any(k in q for k in keys):
+            out.append((sym, name))
+    return out
+
+
+async def _query_us_index(query: str) -> str:
+    """美股指数近期日线（精确收盘点位；数据源：新浪财经 / AKShare）。"""
+    targets = _us_index_targets(query)
+    if not targets:
+        return ""
+    import akshare as ak
+    blocks = []
+    for sym, name in targets:
+        # 接口偶发拒连（09-20 实测：同一接口一次 ConnectionError、下一次正常）→ 重试 3 次
+        df = None
+        err = None
+        for attempt in range(3):
+            try:
+                df = ak.index_us_stock_sina(symbol=sym)
+                break
+            except Exception as e:
+                err = e
+                await asyncio.sleep(0.6 * (attempt + 1))
+        try:
+            if df is None:
+                raise err or RuntimeError("no data")
+            if len(df) < 2:
+                blocks.append(f"📊 {name} ({sym}): 未返回数据")
+                continue
+            rows = df.tail(6)
+            lines = [f"📊 {name} ({sym}) 近 {len(rows)} 个交易日收盘（数据源：新浪财经/AKShare）:"]
+            prev = None
+            for _, r in rows.iterrows():
+                d = str(r.get("date"))[:10]
+                try:
+                    c = float(r.get("close"))
+                except (TypeError, ValueError):
+                    continue
+                chg = ""
+                if prev:
+                    pts = c - prev
+                    chg = f"  {pts:+,.2f} ({pts / prev * 100:+.2f}%)"
+                lines.append(f"  {d}: 收 {c:,.2f}{chg}")
+                prev = c
+            blocks.append("\n".join(lines))
+        except Exception as e:
+            blocks.append(f"📊 {name} ({sym}): 查询失败（{type(e).__name__}，已重试 3 次）。"
+                          "请改用 tavily_search 获取该指数的报道口径数字，并在答案里写明来源与日期。")
+    return "\n\n".join(blocks)
+
+
 async def execute(args: dict) -> str:
     """按 query 智能路由到对应 akshare 接口"""
     query = (args.get("query", "") or "").strip()
     if not query:
         return "Error: query 参数必填"
     try:
+        # 0) 美股指数（09-20）：道指/标普/纳指/罗素 → 新浪美股日线（精确收盘点位）
+        if _us_index_targets(query):
+            r = await _query_us_index(query)
+            if r and "查询失败" not in r:
+                return r
         # 1) 历史行情：含 6 位代码 + 历史/走势关键词
         if re.search(r"历史|走势|近期|k线|K线|日线", query) and re.search(r"\b\d{6}\b", query):
             r = await _query_a_share_hist(query)

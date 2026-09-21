@@ -109,6 +109,11 @@ _MARKUP_MARKERS = (
 )
 
 _DUP_PROBE_CHARS = int(os.environ.get("LATIAO_DUP_PROBE_CHARS", "60") or 60)
+# 复读缓冲时限（09-21）。判定要攒够 _DUP_PROBE_CHARS 才做，实测后果是**每轮正文
+# 开头**先被扣住约 0.9 秒（生成 60 个字的时间）再整块蹦出，短于 60 字的回复更是
+# 整轮不显示、轮末才一次性出现——用户看到的就是"字一段一段蹦"。这里给缓冲加时间
+# 上限：到点就用已攒到的部分判定（判不出复读即放行），跳变从 60 字降到十几字。
+_DUP_HOLD_SECS = float(os.environ.get("LATIAO_DUP_HOLD_MS", "150") or 150) / 1000.0
 
 
 _ROUND_CONTENT_MAX = int(os.environ.get("LATIAO_ROUND_CONTENT_MAX", "1200") or 1200)
@@ -130,6 +135,16 @@ def _trim_process_narration(text: str, limit: int = 0, lang: str = "zh") -> str:
         return text
     head = text[: int(limit * 0.6)].rstrip()
     return head + "\n\n" + _msg("narration_folded", lang, n=f"{len(text) - len(head):,}")
+
+
+def _replay_possible(prev_text: str) -> bool:
+    """上一轮正文是否长到**可能**被判为复读（与 `_looks_like_replay` 的前置条件一致）。
+
+    09-21：判定函数在上一轮不足 60 字时必然返回 False（"避免'好的''收到'这类短句
+    误伤"）。那种情况下扣住本轮正文毫无意义，却让首轮/短回复完全不流式，闸门据此
+    直接放行。
+    """
+    return len(re.sub(r"\s+", "", (prev_text or ""))) >= 60
 
 
 def _looks_like_replay(prev_text: str, current_prefix: str) -> bool:
@@ -540,6 +555,7 @@ class ThinAgentLoop:
         self._markup_closer = ""               # 当前状态的闭合标记
         self._think_carry = ""                 # 可能是标签前缀的尾巴（<thi + nk>）
         self._round_buf: list = []             # 本轮已缓冲但未下发的正文
+        self._round_buf_t0 = 0.0               # 缓冲起点（时限放行判定用）
         self._round_dup = False
         self._round_dup_decided = False
         self._retry_freq = None                # 重试轮频率惩罚（压制重复 token）
@@ -1000,10 +1016,23 @@ class ThinAgentLoop:
         """返回要下发的文本；None = 暂不发送（缓冲中/判定为复读）。"""
         if self._round_dup_decided:
             return None if self._round_dup else text
+        # 没有可比基准时不缓冲（09-21）：上一轮正文不足 60 字时判定必然为 False，
+        # 原来仍无条件扣字 → 每轮开头 60 字被扣约 0.9 秒再整块放出、短回复整轮
+        # 不显示。跳过缓冲对复读判定零影响（那种情况本来也判不出来）。
+        if not _replay_possible(self._last_round_text):
+            self._round_dup_decided = True
+            self._round_dup = False
+            return text
+        if not self._round_buf:
+            self._round_buf_t0 = time.monotonic()
         self._round_buf.append(text)
         buffered = "".join(self._round_buf)
         if len(buffered) < _DUP_PROBE_CHARS:
-            return None                       # 采样太少，先缓冲（几十毫秒级）
+            if time.monotonic() - getattr(self, "_round_buf_t0", 0.0) < _DUP_HOLD_SECS:
+                return None                   # 采样太少，先缓冲（几十毫秒级）
+            # 到时限：用已攒到的部分判定（不足 40 字时 _looks_like_replay 同样判 False）
+            self._step_log("复读缓冲放行",
+                           f"{len(buffered)}字 未攒满 {_DUP_PROBE_CHARS}，按时限先放行")
         self._round_dup_decided = True
         self._round_dup = _looks_like_replay(self._last_round_text, buffered)
         if self._round_dup:
@@ -1063,6 +1092,7 @@ class ThinAgentLoop:
         self._last_round_had_tools = False
         self._search_calls_by_name = {}
         self._round_buf = []
+        self._round_buf_t0 = 0.0
         self._round_dup = False
         self._round_dup_decided = False
         mode = "native" if (self.is_local and _local_native_tools_ok()) else (
@@ -1086,7 +1116,13 @@ class ThinAgentLoop:
         # ——09-07 接回）：按当前问题语义检索学习库，高置信条目注入参考
         try:
             from memory import _retrieve_relevant_learnings
-            if self.last_user_text:
+            # 09-20：短消息/寒暄不做知识注入。"嗯"这种无内容消息 + 弱模型（4B）时，
+            # 注入的"相关学习"会成为唯一可答的素材 → 答非所问（实测：只发一个字，
+            # 它讲起了"电脑速度看 CPU 和内存"）。检索本来就是按消息做的，短消息的
+            # 语义匹配也基本是噪声。
+            _lq = (self.last_user_text or "").strip()
+            _notes_ok = len(_lq) >= 6 and not _is_chat_query(_lq)
+            if self.last_user_text and _notes_ok:
                 _rel = [r for r in _retrieve_relevant_learnings(self.last_user_text, limit=5)
                         if r.get("confidence", 0) >= 0.3]
                 if _rel:
@@ -1095,6 +1131,8 @@ class ThinAgentLoop:
                         + "\n".join(f"- {r['topic']}: {str(r['content'])[:200]}" for r in _rel),
                         label="【参考知识】"))
                     self._step_log("知识注入", f"{len(_rel)} 条相关学习")
+                elif self.last_user_text and not _notes_ok:
+                    self._step_log("知识注入", "跳过（短消息/寒暄，避免劫持本轮）")
         except Exception:
             logger.debug("learnings retrieval skipped", exc_info=True)
         # 当日额度状态预注入：今天已知 mx_query 用尽（持久标记，跨 turn/跨
@@ -1164,6 +1202,7 @@ class ThinAgentLoop:
                                    f"键变化 {body_keys_before} → {sorted(body.keys())}")
                 t_sample = time.monotonic()
                 self._round_buf = []
+                self._round_buf_t0 = 0.0
                 self._round_dup = False
                 self._round_dup_decided = False
                 t_first_token = None

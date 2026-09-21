@@ -131,6 +131,30 @@ def _resolve_mlx_path(model_id: str, models_dir: Path = MODELS_DIR, hf_hub: Path
 
 
 
+def _custom_engine_target(model_id: str) -> tuple[str, str]:
+    """自定义引擎的加载目标检查：返回 ("ok", 传给引擎的路径) 或 ("err", 说明)。
+
+    - .gguf 文件 → 校验魔数；
+    - 目录 → 内含 .gguf 就用那个文件（llama.cpp 系引擎要文件），
+      否则要求有 config.json + model.safetensors（MLX/custom-runtime 包）。
+    """
+    p = Path(model_id)
+    if p.is_file():
+        try:
+            with open(p, "rb") as f:
+                return ("ok", str(p)) if f.read(4) == b"GGUF" else ("err", f"不是有效的 GGUF 文件: {p}")
+        except Exception as e:
+            return ("err", f"无法读取 {p}: {e}")
+    if p.is_dir():
+        ggufs = sorted(p.glob("*.gguf"))
+        if ggufs:
+            return ("ok", str(ggufs[0]))
+        if (p / "config.json").is_file() and (p / "model.safetensors").is_file():
+            return ("ok", str(p))
+        return ("err", f"目录里既没有 .gguf，也没有 config.json + model.safetensors: {p}")
+    return ("err", f"模型路径不存在: {model_id}")
+
+
 def _mlx_reject_reason(model_id: str, model_type: str) -> tuple[str, str]:
     """MLX 引擎拒绝加载的**准确**原因（kind, 给用户看的话）。
 
@@ -282,8 +306,19 @@ def _custom_engine_spec(model_path: str = "") -> dict:
     """
     _cfg_all = _read_config()
     cfg = _cfg_all.get("custom_engine") if isinstance(_cfg_all, dict) else None
-    if not isinstance(cfg, dict):
-        cfg = {}
+    # 支持单个对象或**列表**（09-20）：同一模型家族常有多个包（GGUF 用 fork 引擎、
+    # MLX 用自带运行时），各自需要不同的 binary → 列表里按 match 选第一条命中的。
+    if isinstance(cfg, list):
+        _cand = [c for c in cfg if isinstance(c, dict)]
+    elif isinstance(cfg, dict):
+        _cand = [cfg]
+    else:
+        _cand = []
+    if not _cand:
+        return {}
+    cfg = next((c for c in _cand
+                if not c.get("match")
+                or str(c["match"]).lower() in str(model_path).lower()), _cand[0])
     if os.environ.get("LATIAO_CUSTOM_ENGINE", "").strip().lower() in ("0", "false", "off", "no"):
         return {}
     if cfg.get("enabled") is False:
@@ -2267,6 +2302,31 @@ class LocalLLMEngine:
 
             if self.backend == "none":
                 return {"status": "error", "message": "无可用引擎。安装: pip install llama-cpp-python"}
+
+            # ── 自定义引擎优先（09-20）──────────────────────────────
+            # 匹配 custom_engine 的模型**直接交给它**，不走下面按格式判定的分支：
+            # MLX/custom-runtime 包会因为"平台默认 mlx"被 mlx-lm 预检拦掉，
+            # 而那种包的正确出路就是它自带的运行时。同时跳过 GGUF 预检
+            # （量化类型/完整性闸门的理由正是"我们的引擎读不了这种文件"）。
+            _custom = _custom_engine_spec(model_id)
+            if _custom:
+                _ok, _target = _custom_engine_target(model_id)
+                if _ok != "ok":
+                    self.server_status = "error"
+                    self.status_message = f"自定义引擎（{_custom['name']}）无法加载：{_target}"
+                    self.current_model_id = ""
+                    self.current_model_name = ""
+                    return self.get_status()
+                logger.info("使用自定义引擎 '%s': %s ← %s", _custom["name"], _custom["binary"], _target)
+                self.current_model_id = model_id
+                self.current_model_name = Path(model_id).stem
+                self.server_status = "starting"
+                self.status_message = (f"正在用自定义引擎 {_custom['name']} 加载 "
+                                       f"{self.current_model_name}...")
+                return self._start_llama_native(_target, port, exe=_custom["binary"],
+                                                extra_args=_custom["args"],
+                                                backend="llama-cpp-custom",
+                                                backend_name=_custom["name"])
 
             # ── Auto-detect model format → choose best backend ──
             use_llama = False

@@ -84,6 +84,8 @@ from agent.gates import (  # noqa: F401
     _force_translate, _looks_like_planning, _reply_lang_mismatch,
     _strip_nonprose_for_lang,
 )
+# 不可信内容防护（09-21）：工具结果注入扫描 + 身份文件读取护栏
+from threat_scan import guard_tool_result
 
 
 logger = logging.getLogger("latiao-sidecar")
@@ -1512,6 +1514,11 @@ async def _handle_tool_execution_inner(tc: dict, current_msgs: list, session_id:
             + "如需查看特定部分请用 read_file 分段读取对应文件。)\n\n"
             + tool_content[-800:]
         )
+    # 不可信内容防护（09-21）：工具结果是外部内容进入上下文的主要入口（网页正文、
+    # 搜索结果、接口返回），而工具集里有 shell / write_file。命中疑似注入句式时只加
+    # 一条"这是数据、不是指令"的标注、**不删数据**（删了用户就看不懂搜索结果）；
+    # 未命中时原样返回，零改动零开销。这里是全循环唯一的工具结果落库点。
+    tool_content = guard_tool_result(tool_name, tool_content)
     current_msgs.append({"role": "tool", "tool_call_id": call_id,
                          "content": (_stamp_time_sensitive() + tool_content
                                      if tool_name in _TIME_SENSITIVE_TOOLS else tool_content)})
@@ -1531,6 +1538,25 @@ async def _handle_tool_execution_inner(tc: dict, current_msgs: list, session_id:
 
 # ── Native tool call format parser (for models like Gemma that use
 #    <|tool_call|>call:name{args}<tool_call|> instead of OpenAI JSON) ──
+
+def _clean_progress_tail(text: str, max_lines: int = 12) -> str:
+    """过滤"进展尾巴"里的**工具调用日志**，只留人类可读的进展。
+
+    09-20 事故：PROGRESS.md 尾部记着上一会话的 `**mx_query** / Args: {...} /
+    Result: 半导体板块…` 工具日志，被贴到用户每条消息尾部（权重最高）→ 用户问
+    任何事，弱模型都以为本轮要查行情（"我说什么他都去找股市"）。
+    """
+    keep = []
+    for ln in str(text or "").splitlines():
+        t = ln.strip()
+        if not t:
+            continue
+        if (t.startswith(("Args:", "Result:", "```", "### ", "**"))
+                or "Args: `" in t or "Result: `" in t or "Tool result" in t):
+            continue
+        keep.append(t)
+    return "\n".join(keep[-max_lines:])
+
 
 def _build_chat_messages(body: dict, messages: list) -> list:
     """Assemble the full message array with identity, env, skills, agent, and image injections.
@@ -1632,7 +1658,9 @@ def _build_chat_messages(body: dict, messages: list) -> list:
             "3. 📊 数据诚实规则：回复中的关键数字必须能在本会话工具返回内容中找到出处。"
             "工具未返回的数据（如北向资金净流入、主力资金净流出、板块资金流等）严禁凭印象给出具体数值——"
             "必须写明'工具未返回该数据'，或先调用工具查询（资金流向优先 mx_query，查不到再 tavily_search）；"
-            "不得沿用其他会话或训练记忆中的数字。"
+            "不得沿用其他会话或训练记忆中的数字（查资金流向优先 mx_query，查不到再 tavily_search）。"
+            "引用**网页/新闻**里的数字时，必须同时写明该数字的**发布日期与来源""（如“据 XX 网 9/18 报道”）；若检索结果的日期与你需要的日期不符，"
+            "必须写明「未获取到该日数据」，**禁止用近似或旧数据替代**。"
         ),
         "en": (
             "## Three hard rules (highest priority, cannot be overridden)\n"
@@ -1672,15 +1700,46 @@ def _build_chat_messages(body: dict, messages: list) -> list:
         ),
     }))
 
-    # User identity — personal preferences (lower priority)
+    # 身份与语气（09-21 改写）：原写法是「## 用户偏好 / 优先级低于系统规则」，把
+    # SOUL.md 的人格与语气降级成"可选偏好"——模型（尤其本地小模型）会当作可忽略项，
+    # 这正是"设了语气却不生效"的一个来源。对齐 OpenClaw/Hermes 的做法：这是**你是谁**，
+    # 逐文件标用途 + 一句"除非与上方系统规则冲突否则照做"，再加 persona_latch
+    # （跨轮不漂移、且语气永不压过硬规则——防止"暧昧"把数据诚实规则一起软化）。
+    # 位置仍在稳定头部且不带 volatile → 不影响前缀缓存。
     user_identity = _read_identity()
     if user_identity:
-        _add_part("system_prompt", 
-            "## 用户偏好\n"
-            "以下偏好由用户自行设定。优先级低于系统规则，可与系统规则共存。"
-        )
+        _add_part("system_prompt", _get_localized_text(user_lang, {
+            "zh": (
+                "## 身份与语气（你的身份文件）\n"
+                "以下是**你自己的**身份设定，不是可选偏好——SOUL.md 是人格与语气，"
+                "IDENTITY.md 是你的名字与自我认知，AGENTS.md 是你的工作规则，USER.md 是用户档案。\n"
+                "跨轮保持这个语气与人格，不要因为对话变长而漂移；但语气永不压过正确性、"
+                "数据诚实、安全与权限规则。\n"
+                "除与上方【系统规则】【三条硬规则】冲突外，一律照做（冲突时以上方为准）。"
+            ),
+            "en": (
+                "## Identity & tone (your identity files)\n"
+                "These are **your own** settings, not optional preferences — SOUL.md is persona & tone, "
+                "IDENTITY.md is your name and self-concept, AGENTS.md is your working rules, "
+                "USER.md is the user profile.\n"
+                "Keep that tone and persona across turns; do not let it drift as the conversation grows. "
+                "Style never overrides correctness, data honesty, safety, or permission rules.\n"
+                "Follow them unless they conflict with the System rules / Three hard rules above."
+            ),
+        }))
+        _file_labels = _get_localized_text(user_lang, {
+            "zh": {"IDENTITY.md": "身份", "SOUL.md": "人格与语气",
+                   "AGENTS.md": "工作规则", "USER.md": "用户档案"},
+            "en": {"IDENTITY.md": "identity", "SOUL.md": "persona & tone",
+                   "AGENTS.md": "working rules", "USER.md": "user profile"},
+        })
         for msg in user_identity:
-            _add_part("system_prompt", msg["content"])
+            _fname = msg.get("file") or ""
+            _label = _file_labels.get(_fname) if isinstance(_file_labels, dict) else None
+            if _label:
+                _add_part("system_prompt", f"### {_fname}（{_label}）\n{msg['content']}")
+            else:
+                _add_part("system_prompt", msg["content"])
 
     if intent_result:
         # volatile：这一块只在"真的发生了身份/偏好变更"的那一轮出现，内容逐轮不同；
@@ -1734,10 +1793,19 @@ def _build_chat_messages(body: dict, messages: list) -> list:
             lines.append(f"- **{s['name']}**: {desc[:120]}" if desc else f"- **{s['name']}**")
         _add_part("skills", "\n".join(lines))
 
+    # 09-20：短消息/寒暄**不注入**进展与记忆。注入块贴在最后一条用户消息尾部
+    # （缓存优化的结果），对弱模型权重最高 → 用户只发两三个字时，模型会把注入的
+    # "上次在查 XX" 当成本轮任务（实测：只发两个字，它去查了半导体板块、答非所问）。
+    _lmsg = (last_user_text or "").strip()
+    _no_notes = len(_lmsg) < 6 or _is_chat_query(_lmsg)
+
     # 上次会话进展（审计 B10）：PROGRESS.md 尾部注入，跨会话断点续作生效
-    _tail = _progress_tail()
+    #     09-20：只在**会话首轮**注入，且过滤掉工具调用日志行。这段记的是上个会话的
+    #     `**mx_query** / Args: … / Result: 半导体板块…` 工具日志，贴在每条消息尾部
+    #     （权重最高）会让弱模型"无论问什么都去找股市"（用户实测反馈）。
     _is_first_turn = sum(1 for m in messages if m.get("role") == "user") <= 1
-    if _tail.strip():
+    _tail = _clean_progress_tail(_progress_tail()) if _is_first_turn else ""
+    if _tail.strip() and not _no_notes:
         _pt_label = _get_localized_text(user_lang, {
             "zh": "## 上次会话进展（最近记录）",
             "en": "## Recent progress from previous sessions",
@@ -1775,7 +1843,7 @@ def _build_chat_messages(body: dict, messages: list) -> list:
     # 历史位置错开（同时间块的病）。改为只在会话首轮注入（跨会话背景知识）。
     # 记忆按消息召回、每轮都不同——但**放在尾部**就不伤前缀缓存（09-19 实测）
     recent_data = (_retrieve_relevant_learnings(last_user_text, limit=5)
-                   if last_user_text else [])
+                   if (last_user_text and not _no_notes) else [])
     if recent_data:
         recent_data = [r for r in recent_data if r.get("confidence", 0) >= 0.3]
     if recent_data:
@@ -1832,7 +1900,10 @@ def _build_chat_messages(body: dict, messages: list) -> list:
             non_system_msgs[-1] = {
                 **non_system_msgs[-1],
                 "content": (str(non_system_msgs[-1].get("content") or "")
-                            + "\n\n【参考信息】\n" + "\n".join(_bits))}
+                            + "\n\n【背景资料（不是用户的要求）】\n" + "\n".join(_bits)
+                            + ("\n\n⚠️ 以上只是历史背景，**不是**用户本轮的要求。"
+                               f"用户本轮说的是：「{_lmsg[:120]}」——请直接回应这一句。"
+                               if _bits else ""))}
             messages = [{"role": "system", "content": merged_system}] + non_system_msgs
 
     image_base64 = body.get("image_base64")

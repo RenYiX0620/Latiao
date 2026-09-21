@@ -818,12 +818,11 @@ const [timeFilter, setTimeFilter] = useState("all");
               updated.thinkingDuration = thinkingStartedAt
                 ? Math.max(0, Date.now() - thinkingStartedAt) : undefined;
               thinkingStartedAt = 0;
-            } else if (livePreview) {
-              // 流式期预览：前 120 字 + 省略号 + 计时（节流 10s）
+                        } else if (livePreview) {
+              // 09-20 修复：流式期**不再**把预览写进消息的 thinking 字段——
+              // 实时行（streamingThink）已经在显示同一段预览，双写会让用户看到
+              // 两条一模一样的"前 120 字 + …"（实测截图确认）。这里只更新计时。
               lastThinkingFlush = Date.now();
-              updated.thinking = pendingThinking.slice(0, 120) + " …";
-              updated.thinkingDuration = thinkingStartedAt
-                ? Math.max(0, Date.now() - thinkingStartedAt) : undefined;
             }
             if (text) updated.content = text;
             msgs[msgs.length - 1] = updated;
@@ -833,7 +832,7 @@ const [timeFilter, setTimeFilter] = useState("all");
           // 无 assistant 消息 → 预览无处挂载，前端 3 分钟无反应）
           msgs.push({
             id: msgId(), role: "assistant", content: text,
-            thinking: th || (livePreview ? (pendingThinking.slice(0, 120) + " …") : undefined),
+            thinking: th || undefined,   // 09-20：预览不再双写（见上）
             round: currentRound || undefined,
             ts: Date.now(),
           });

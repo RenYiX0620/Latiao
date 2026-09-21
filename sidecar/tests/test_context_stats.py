@@ -787,6 +787,137 @@ class TestParallelToolSafety(unittest.TestCase):
         self.assertNotIn("\"mx_query\"", block)
 
 
+class TestCustomEngineTarget(unittest.TestCase):
+    """自定义引擎的加载目标检查（09-20）：GGUF 文件 / MLX 目录都要能识别。"""
+
+    def test_gguf_file_and_directory(self):
+        import tempfile, pathlib as _pl
+        from local_llm import _custom_engine_target
+        with tempfile.TemporaryDirectory() as tmp:
+            d = _pl.Path(tmp)
+            (d / "m.gguf").write_bytes(b"GGUF" + b"\0" * 32)
+            self.assertEqual(_custom_engine_target(str(d / "m.gguf"))[0], "ok")
+            self.assertEqual(_custom_engine_target(str(d))[0], "ok")          # 目录里有 gguf
+            self.assertEqual(_custom_engine_target(str(d))[1], str(d / "m.gguf"))
+            bad = d / "bad.gguf"
+            bad.write_bytes(b"NOPE" + b"\0" * 32)
+            self.assertEqual(_custom_engine_target(str(bad))[0], "err")
+
+    def test_mlx_pack_directory(self):
+        import tempfile, pathlib as _pl, json
+        from local_llm import _custom_engine_target
+        with tempfile.TemporaryDirectory() as tmp:
+            d = _pl.Path(tmp)
+            (d / "config.json").write_text(json.dumps({"model_type": "prism_hadamard_qwen35"}))
+            (d / "model.safetensors").write_bytes(b"")
+            ok, target = _custom_engine_target(str(d))
+            self.assertEqual(ok, "ok")
+            self.assertEqual(target, str(d))
+            empty = _pl.Path(tmp) / "empty"
+            empty.mkdir()
+            self.assertEqual(_custom_engine_target(str(empty))[0], "err")
+
+
+class TestShortMessageNoInjection(unittest.TestCase):
+    """短消息/寒暄不注入"上次进展/记忆"（09-20 事故：用户只发两个字，模型跑去查了
+    上个会话的半导体板块 —— 因为注入块贴在最后一条用户消息尾部，权重最高）。"""
+
+    def setUp(self):
+        import agent_loop as A
+        self.A = A
+        self._tail, self._mem, self._onb = (
+            A._progress_tail, A._retrieve_relevant_learnings, A._process_onboarding)
+        A._progress_tail = lambda *a, **k: "- 上次在查半导体板块的资金流向"
+        A._retrieve_relevant_learnings = lambda *a, **k: []
+        A._process_onboarding = lambda t, l: ("", False)
+
+    def tearDown(self):
+        self.A._progress_tail = self._tail
+        self.A._retrieve_relevant_learnings = self._mem
+        self.A._process_onboarding = self._onb
+
+    def _last(self, text):
+        b = {"messages": [{"role": "user", "content": text}]}
+        out = self.A._build_chat_messages(b, b["messages"])
+        return str(out[-1].get("content") or "")
+
+    def test_short_or_chat_no_injection(self):
+        import agent_loop as A
+        for t in ("骚货", "在吗", "你好", "谢谢", "嗯"):
+            last = self._last(t)
+            self.assertNotIn("【背景资料", last, f"短消息不应注入: {t}")
+            self.assertNotIn("半导体", last, f"短消息不应带出历史主题: {t}")
+
+    def test_task_message_still_injects_with_guard(self):
+        last = self._last("分析周五大盘走势，给出关键数字和结论")
+        self.assertIn("【背景资料", last)          # 正常任务仍注入背景
+        self.assertIn("以上只是历史背景", last)      # 且明确标注"不是任务"
+
+
+class TestUsIndexRouting(unittest.TestCase):
+    """美股指数识别（09-20）：道指/标普/纳指/罗素 要能识别，A股/个股不能误判。"""
+
+    def _targets(self, q):
+        import sys, pathlib as _pl
+        sys.path.insert(0, str(_pl.Path(__file__).resolve().parents[1]))
+        sys.path.insert(0, str(_pl.Path(__file__).resolve().parents[1] / "plugins"))
+        from plugins.ak_finance import _us_index_targets
+        return [n for _, n in _us_index_targets(q)]
+
+    def test_detects_us_indices(self):
+        self.assertEqual(len(self._targets("道指 标普500 纳指 9月18日收盘")), 3)
+        self.assertEqual(self._targets("纳斯达克指数最新"), ["纳斯达克综合指数"])
+        self.assertEqual(self._targets("Dow Jones closing price"), ["道琼斯工业平均指数"])
+
+    def test_does_not_misfire_on_cn(self):
+        for q in ("上证指数", "苹果股价", "半导体板块", "今天天气", "帮我写代码"):
+            self.assertEqual(self._targets(q), [], f"误判: {q}")
+
+
+class TestMultiCustomEngines(unittest.TestCase):
+    """同一模型家族多个包（GGUF→fork 引擎、MLX→自带运行时）各用各的 binary（09-20）。"""
+
+    def setUp(self):
+        import tempfile, pathlib as _pl, os
+        self.tmp = tempfile.TemporaryDirectory()
+        self.a = _pl.Path(self.tmp.name) / "fork-llama-server"
+        self.b = _pl.Path(self.tmp.name) / "mlx-shim.sh"
+        self.a.write_text("#!/bin/sh\n"); self.b.write_text("#!/bin/sh\n")
+        self.cfg = _pl.Path(self.tmp.name) / "config.json"
+        import local_llm
+        self._ll = local_llm
+        self._old = local_llm._config_file
+        local_llm._config_file = lambda: self.cfg
+        self._env = dict(os.environ)
+        os.environ.pop("LATIAO_CUSTOM_ENGINE_BIN", None)
+
+    def tearDown(self):
+        import os
+        self._ll._config_file = self._old
+        os.environ.clear(); os.environ.update(self._env)
+        self.tmp.cleanup()
+
+    def test_picks_entry_by_match(self):
+        import json
+        from local_llm import _custom_engine_spec
+        self.cfg.write_text(json.dumps({"custom_engine": [
+            {"enabled": True, "binary": str(self.a), "name": "fork", "match": "PQ2_0"},
+            {"enabled": True, "binary": str(self.b), "name": "mlx", "match": "mlx-2bit"},
+        ]}), encoding="utf-8")
+        gguf = "/m/Ternary-Bonsai-2-27B-PQ2_0.gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf"
+        mlx = "/m/prism-ml:Ternary-Bonsai-2-27B-mlx-2bit"
+        self.assertEqual(_custom_engine_spec(gguf)["name"], "fork")
+        self.assertEqual(_custom_engine_spec(mlx)["name"], "mlx")
+        self.assertEqual(_custom_engine_spec(mlx)["binary"], str(self.b))
+
+    def test_single_object_still_works(self):
+        import json
+        from local_llm import _custom_engine_spec
+        self.cfg.write_text(json.dumps({"custom_engine": {
+            "enabled": True, "binary": str(self.a), "name": "solo"}}), encoding="utf-8")
+        self.assertEqual(_custom_engine_spec("/any/model")["name"], "solo")
+
+
 class TestMlxRejectReason(unittest.TestCase):
     """MLX 拒绝加载的原因必须准确（09-20）：旧实现只看 preprocessor_config.json，
     把"需要自带运行时"的包（Prism Bonsai MLX，无视觉塔）说成"多模态 MLX-VLM"。"""

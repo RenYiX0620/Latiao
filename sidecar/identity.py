@@ -4,6 +4,7 @@ import re
 from pathlib import Path
 
 from config import PROGRESS_DIR
+from threat_scan import read_text_with_timeout, scan_context_file, truncate_content
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +24,8 @@ def _load_agent_identity(agent_id: str, fallback: str) -> str:
             txt = sf.read_text(encoding="utf-8").strip()
             header = f"# {agent_id} - {section}"
             if txt and txt != header and txt != f"{header}\n\n（此部分内容待补充）":
+                # 随程序分发的内容（非用户自己写的）→ 命中注入即拦下（09-21）
+                txt = scan_context_file(txt, sf.name, user_authored=False)
                 parts.append(f"## {section}\n{txt}")
 
     if parts:
@@ -34,24 +37,35 @@ def _load_agent_identity(agent_id: str, fallback: str) -> str:
         return fallback
     if agent_file.exists():
         try:
-            return agent_file.read_text(encoding="utf-8")
+            return scan_context_file(agent_file.read_text(encoding="utf-8"),
+                                     agent_file.name, user_authored=False)
         except Exception as e:
             logger.warning("Failed to load agent identity from %s: %s", agent_file, e)
     return fallback
 
 
 def _read_identity() -> list[dict]:
-    """Read all identity files from ~/.local-ai-os/ and return system messages."""
+    """Read all identity files from ~/.local-ai-os/ and return system messages.
+
+    09-21 加固（对齐 Hermes/OpenClaw）：读超时（网络盘冷读会卡住整轮）、注入扫描
+    （这四个是**用户自己的**文件 → 命中只警告仍加载）、超长头尾截断。每条消息带
+    ``file`` 字段，供上层逐文件标注用途（SOUL.md=人格与语气 等）。
+    """
     msgs = []
     for filename in IDENTITY_FILES:
         filepath = PROGRESS_DIR / filename
         try:
-            if filepath.exists():
-                content = filepath.read_text(encoding="utf-8").strip()
-                if content:
-                    msgs.append({"role": "system", "content": content})
+            if not filepath.exists():
+                continue
+            content = (read_text_with_timeout(filepath) or "").strip()
+            if not content:
+                continue
+            content = scan_context_file(content, filename, user_authored=True)
+            content = truncate_content(content, filename)
+            if content:
+                msgs.append({"role": "system", "content": content, "file": filename})
         except Exception:
-            logger.warning("Failed to read identity file", exc_info=True)
+            logger.warning("Failed to read identity file %s", filename, exc_info=True)
     return msgs
 
 
@@ -121,8 +135,18 @@ _IDENTITY_INTENTS = [
     # User's own name: "叫我XX" / "称呼我为XX" / "call me XX" → USER.md (not an agent rename)
     (re.compile(r"(?:以后)?(?:叫|称呼)我(?:为|是)?[「『\s]*([^\s，。,.]{1,20})[」』]*", re.IGNORECASE), "USER.md", "user_name"),
     (re.compile(r"(?:call|name)\s+me\s+['\"]?(\w{1,20})['\"]?", re.IGNORECASE), "USER.md", "user_name"),
-    # Style/tone: only explicit "回复要XX" or "说话风格XX"
-    (re.compile(r"(?:回复|说话)(?:要|再|更)([^，。,！!]{2,30})", re.IGNORECASE), "SOUL.md", "style"),
+    # 语气/风格（09-20 放宽）。原先只认"回复要X"/"说话要X"，而用户自然说法
+    # （"跟我说话温柔一点""语气要严肃""用暧昧的口吻"）全部不命中 → 语气设置形同虚设。
+    (re.compile(r"(?:语气|风格)\s*(?:要|改|换|用|为|是|应该|请|：|:)\s*([^，。,！!？?\n]{2,20})",
+                re.IGNORECASE), "SOUL.md", "style"),
+    (re.compile(r"用([^，。,！!？?\n]{1,12})的(?:语气|口吻|腔调)", re.IGNORECASE), "SOUL.md", "style"),
+    (re.compile(r"(?:回复|回答|说话|聊天|讲话|跟我说话|回我)(?:我的时候|的时候|我)?\s*"
+                r"(?:要|再|更|得|请|像)\s*([^，。,！!？?\n]{2,20})",
+                re.IGNORECASE), "SOUL.md", "style"),
+    # "跟我说话温柔暧昧一点" / "回复我的时候轻松点" —— 语气词在前、量词在后
+    (re.compile(r"(?:回复|回答|说话|聊天|讲话|跟我说话|回我)(?:我的时候|的时候|我)?\s*"
+                r"([^，。,！!？?\n]{2,14}?)\s*(?:一点|一些|点|些|就好|即可)",
+                re.IGNORECASE), "SOUL.md", "style"),
     # Rule: "以后不要XX" / "从现在开始XX"
     (re.compile(r"(?:以后|从现在开始)[，,]*((?:不要|别|禁止|要|请|必须).{1,50})", re.IGNORECASE), "AGENTS.md", "rule"),
     # Preference: "我喜欢用XX" / "我常用XX" / "我偏好XX"
@@ -149,10 +173,15 @@ def _detect_identity_intent(text: str) -> list[dict]:
             r"帮我|请问|请帮|能不能|可不可以|如何|怎么|为什么|你有没有|我想知道", _t):
         return []
     results = []
+    _BAD_TONE = ("什么", "如何", "怎么", "吗", "呢", "？", "?", "多少", "区别", "意思")
     for pattern, filename, action in _IDENTITY_INTENTS:
         m = pattern.search(text)
         if m:
             value = m.group(1).strip()
+            if action == "style":
+                value = re.sub(r"^(?:要|再|更|得|请|像|用|把|我的|我|的)+", "", value).strip()
+                if not value or any(b in value for b in _BAD_TONE) or len(value) < 2:
+                    continue   # 问句/垃圾值不当语气（"你的语气是什么"）
             if value and len(value) >= 1:
                 results.append({"file": filename, "action": action, "value": value, "match": m.group(0)})
     return results
@@ -223,7 +252,11 @@ def _apply_user_name_change(new_name: str):
 
 
 def _apply_style_change(value: str):
-    """Append style preference to SOUL.md (no duplicates)."""
+    """Append style preference to SOUL.md (no duplicates).
+
+    ⚠️ 09-21 起 `style` 意图不再走这里：语气要落到 `## 语气风格` 下并**替换**，
+    所以映射到 `_apply_tone_change`。本函数保留给"只追加一行备注"的调用方。
+    """
     filepath = PROGRESS_DIR / "SOUL.md"
     line = f"- {value}\n"
     if filepath.exists() and line in filepath.read_text(encoding="utf-8"):
@@ -255,7 +288,9 @@ def _apply_pref_change(value: str):
 _INTENT_APPLIERS = {
     "name": _apply_name_change,
     "user_name": _apply_user_name_change,
-    "style": _apply_style_change,
+    # 09-21：语气改走结构化写入（`## 语气风格` 下的 `- 对话语气：X`，替换而非追加）。
+    # 原来指向 _apply_style_change，会在文件末尾追加一条裸行——位置错、越攒越乱。
+    "style": _apply_tone_change,
     "rule": _apply_rule_change,
     "pref": _apply_pref_change,
 }
@@ -275,10 +310,13 @@ def _process_identity_intents(user_text: str):  # -> str | None
         try:
             # 幂等（09-20）：文件里已有同样一行 → 不再写、也不再注入"身份已更新"
             # （重复写会让提示头逐轮变化、缓存全丢）
+            # 09-21：语气（style）现在也是**替换式**写入，同样要幂等——否则用户
+            # 重复同一句语气时，每轮都会认为"身份被更新"并注入易变块。
             _fp = PROGRESS_DIR / intent["file"]
-            _line = f"- {intent['value']}"
             _existing = _fp.read_text(encoding="utf-8") if _fp.exists() else ""
-            if intent["action"] == "pref" and _line in _existing:
+            _expected = (f"- 对话语气：{intent['value']}" if intent["action"] == "style"
+                         else f"- {intent['value']}")
+            if intent["action"] in ("pref", "style") and _expected in _existing:
                 continue
             applier = _INTENT_APPLIERS.get(intent["action"])
             if applier:
