@@ -138,11 +138,19 @@ def _parse_delta_line(line: str) -> tuple[bool, dict | None]:
     # finish_reason 透传（09-07 提速/完整性：max-tokens 截断的 tool-call
     # 必须在执行层丢弃——DSH BlockAssembler 同款语义。引擎有时把 finish
     # 放在 usage-only 行，故在 usage 过滤之前提取）
-    for c in chunks:
-        if c.kind == "finish" and c.finish_reason:
-            return False, {"finish_reason": c.finish_reason}
-    if all(c.kind == "usage" for c in chunks):
-        return False, None  # usage-only chunk（旧: if not choices: continue）
+    #
+    # 09-21 修：**同一行既有增量又有 finish_reason 时不能提前返回**。mlx 的原生
+    # function calling 就是把 tool_calls 与 finish_reason 放在同一个收尾包里
+    # （fake_engine.native_tool_response 记的就是这个形态），提前返回会把 tool_calls
+    # 整包丢掉 → 循环判成"引擎空生成"，重采一轮而工具永不执行；附带影响是任何把
+    # finish_reason 和最后一个正文增量放同一行的引擎，回复末段都会少一块。
+    # 现在 finish_reason 与增量一起返回（调用方按 `delta.pop("finish_reason")` 取，
+    # 只有收尾/用量信息时才单独返回）。
+    finish_reason = next((c.finish_reason for c in chunks
+                          if c.kind == "finish" and c.finish_reason), None)
+    if all(c.kind in ("finish", "usage") for c in chunks):
+        # usage-only → None（旧语义）；含 finish 的收尾行 → 单独透传
+        return False, ({"finish_reason": finish_reason} if finish_reason else None)
     delta: dict = {}
     texts = [c.text for c in chunks if c.kind == "text" and c.text]
     reasons = [c.reasoning for c in chunks if c.kind == "reasoning" and c.reasoning]
@@ -157,6 +165,8 @@ def _parse_delta_line(line: str) -> tuple[bool, dict | None]:
              "function": {"name": t.name, "arguments": t.arguments}}
             for t in tcs
         ]
+    if finish_reason:
+        delta["finish_reason"] = finish_reason
     return False, delta
 
 

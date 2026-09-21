@@ -132,3 +132,37 @@ class TestLoopDeltaShape:
 
     def test_empty_delta_counts_like_before(self):
         assert self._parse('data: {"choices":[{"delta":{}}]}') == (False, {})
+
+    # ── 09-21：finish_reason 与增量同处一行时不得丢掉增量 ──────────────
+    # mlx 的原生 function calling 就是把 tool_calls 和 finish_reason 放在同一个
+    # 收尾包里；原实现见到 finish 就提前返回，整包 tool_calls 被丢 → 循环判成
+    # "引擎空生成"重采一轮，工具永不执行（实测 test_thin_native_tool_round_trip）。
+    def test_finish_reason_alone(self):
+        done, delta = self._parse(
+            'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}'
+        )
+        assert (done, delta) == (False, {"finish_reason": "stop"})
+
+    def test_finish_reason_with_tool_calls_keeps_both(self):
+        done, delta = self._parse(
+            'data: {"choices":[{"delta":{"role":"assistant","content":"",'
+            '"tool_calls":[{"index":0,"id":"call_native_1","type":"function",'
+            '"function":{"name":"list_dir","arguments":"{\\"path\\": \\".\\"}"}}]},'
+            '"finish_reason":"tool_calls","index":0}]}'
+        )
+        assert done is False
+        assert delta["finish_reason"] == "tool_calls"
+        assert delta["tool_calls"][0]["function"]["name"] == "list_dir"
+        assert delta["tool_calls"][0]["id"] == "call_native_1"
+
+    def test_finish_reason_with_text_keeps_both(self):
+        done, delta = self._parse(
+            'data: {"choices":[{"delta":{"content":"最后一段"},"finish_reason":"stop"}]}'
+        )
+        assert (done, delta) == (False, {"content": "最后一段", "finish_reason": "stop"})
+
+    def test_finish_reason_with_usage_only_still_yields_finish(self):
+        done, delta = self._parse(
+            'data: {"choices":[{"delta":{},"finish_reason":"length"}],"usage":{"a":1}}'
+        )
+        assert (done, delta) == (False, {"finish_reason": "length"})
