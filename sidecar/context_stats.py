@@ -14,6 +14,7 @@
 """
 import json
 import logging
+import os
 import re
 import threading
 import time
@@ -72,6 +73,27 @@ def _hf_counter(model_dir: str):
     return _count
 
 
+def _resolve_gguf_file(model_path: str) -> str | None:
+    """把模型路径解析到真正的 .gguf 文件；取不到返回 None。
+
+    LM Studio 的布局是「目录名以 .gguf 结尾、文件在目录里同名」（`X.gguf/X.gguf`）。
+    此前只判 `endswith(".gguf")` 就把目录当文件喂给 llama_cpp → 每轮抛一次
+    ValueError 再退回估算（实测 10 分钟 561 条 Traceback，而且这些模型的"精确
+    计数"永远拿不到）。`local_llm.start_model` 早已会解析目录，这里补上同一步。
+    """
+    import glob
+    p = os.path.expanduser((model_path or "").strip())
+    if not p:
+        return None
+    if os.path.isdir(p):
+        cands = sorted(glob.glob(os.path.join(p, "*.gguf")))
+        if not cands:
+            return None
+        same = [c for c in cands if os.path.basename(c).lower() == os.path.basename(p).lower()]
+        return (same or cands)[0]
+    return p if p.lower().endswith(".gguf") else None
+
+
 def _get_counter(model_path: str):
     """按模型路径取精确计数器；不可用返回 None（调用方退回估算）。"""
     if not model_path:
@@ -84,12 +106,11 @@ def _get_counter(model_path: str):
             return _counters[model_path]
     counter = None
     try:
-        if model_path.endswith(".gguf"):
-            counter = _gguf_counter(model_path)
-        else:
-            import os
-            if os.path.isfile(f"{model_path.rstrip('/')}/tokenizer.json"):
-                counter = _hf_counter(model_path)
+        _gguf = _resolve_gguf_file(model_path)
+        if _gguf:
+            counter = _gguf_counter(_gguf)
+        elif os.path.isfile(f"{model_path.rstrip('/')}/tokenizer.json"):
+            counter = _hf_counter(model_path)
     except Exception:
         logger.info("精确计数不可用，退回估算: %s", model_path, exc_info=True)
         counter = None
