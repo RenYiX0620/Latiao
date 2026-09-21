@@ -61,7 +61,10 @@ class TestStampTimeSensitive(unittest.TestCase):
         self.assertIn("tavily_search", _TIME_SENSITIVE_TOOLS)
         self.assertIn("headless_read", _TIME_SENSITIVE_TOOLS)
         stamp = _stamp_time_sensitive()
-        self.assertTrue(stamp.startswith("⏱ [数据时刻] "))
+        # 09-21：锚行文案由「[数据时刻] 当前时间」改为「[查询时刻]」——两者不等价，
+        # 混为一谈正是用户看到"上午涨 0.89%、下午变 1.2%"却无从分辨的原因。
+        self.assertTrue(stamp.startswith("⏱ [查询时刻] "))
+        self.assertIn("不等于数据本身的时点", stamp)
         self.assertIn("以当前时间为准", stamp)
 
     def test_read_file_not_in_set(self):

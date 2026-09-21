@@ -21,6 +21,23 @@ from cmd_safety import check_cmd, reject_sensitive_read
 
 logger = logging.getLogger("latiao-sidecar")
 
+
+def __getattr__(name: str):
+    """兼容层：扩展包从本模块导入 `execute_tool`（实际定义在 agent_loop）。
+
+    09-21 实测：官方 finance-pack 的 market_insight 工具写的是
+    `from tool_executor import execute_tool`，而该函数从来只存在于 agent_loop.py
+    → 每次调用都报 `cannot import name 'execute_tool' from 'tool_executor'`，
+    模型只能退回手动多次查询（用户侧表现为"数据来源/时点全乱"）。第三方的聚合型
+    工具包很可能照抄同一个写法，所以在**调用点**做惰性转发，而不是让每个包各自改。
+    用模块级 __getattr__ 而不是顶层 import：agent_loop 会 import 本模块，
+    顶层转发会形成循环导入。
+    """
+    if name == "execute_tool":
+        from agent_loop import execute_tool as _execute_tool
+        return _execute_tool
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 # ═══════════════════════════════════════════════════════
 #  Harness: 工具权限分级 + 状态持久化
 # ═══════════════════════════════════════════════════════
