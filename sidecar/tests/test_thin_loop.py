@@ -96,8 +96,10 @@ async def test_thin_native_tool_round_trip():
         asst = [m for m in body["messages"]
                 if m.get("role") == "assistant" and m.get("tool_calls")]
         assert asst, "原生模式 assistant 消息必须携带 tool_calls"
-        assert (body.get("chat_template_kwargs") or {}).get("enable_thinking") is False, \
-            "工具后续轮必须关闭思考"
+        # 09-19 起不再"工具后续轮一律关思考"——那等于界面上的档位只在第一回合生效。
+        # 现在所有轮次都沿用用户档位；本用例未指定档位 → 默认（高）→ 保持开启。
+        assert (body.get("chat_template_kwargs") or {}).get("enable_thinking") is True, \
+            "未指定档位时沿用默认（高）档：工具后续轮不再强制关思考"
         return engine.text_response(NEUTRAL_TEXT)
 
     with FakeEngine() as engine:

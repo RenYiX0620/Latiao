@@ -392,7 +392,10 @@ class TestToolTimeoutWrapper(unittest.TestCase):
         agent_loop._TOOL_TIMEOUTS["read_file"] = 0.2
         try:
             tc = {"id": "call-1", "function": {"name": "read_file", "arguments": "{}"}}
-            verify_failed, events = asyncio.get_event_loop().run_until_complete(
+            # asyncio.run 而非 get_event_loop().run_until_complete：后者自 Python 3.12
+            # 起不再隐式创建事件循环，在 3.14（本仓测试 venv）上直接抛 RuntimeError
+            # （产品自带解释器是 3.11，所以这条只在测试环境炸）。
+            verify_failed, events = asyncio.run(
                 _handle_tool_execution(tc, [], "sess-timeout", "latiao", "read_only"))
         finally:
             agent_loop._handle_tool_execution_inner = orig_inner

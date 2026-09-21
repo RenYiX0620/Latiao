@@ -632,7 +632,15 @@ class TestEmptyNameRecovery:
         # 空 → 守卫反馈循环 3 连击中止；现确定性择优（exact 键匹配优先，注册表
         # 顺序兜底）——执行结果会引导模型，优于中止
         assert _recover_tool_name({"path": "."}) == "read_file"
-        assert _recover_tool_name({"url": "https://github.com/x"}) == "dokobot_read"
+        # URL 型读取工具由注册表取现役名字，别把名字写死：dokobot_read 已在 817f6c1
+        # 移除（本地从不可用），改由 headless_read 承担；写死会让每次改名都变成假失败。
+        from agent_loop import TOOLS
+        _url_tools = {
+            t["function"]["name"] for t in TOOLS
+            if "url" in ((t["function"].get("parameters") or {}).get("properties") or {})
+        }
+        _picked = _recover_tool_name({"url": "https://github.com/x"})
+        assert _picked and _picked in _url_tools, f"应从 URL 型工具里恢复，实得 {_picked!r}（候选 {_url_tools}）"
 
     def test_recover_empty_args_no_recovery(self):
         from agent_loop import _recover_tool_name
