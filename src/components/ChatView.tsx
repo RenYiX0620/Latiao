@@ -5,7 +5,7 @@ import RunMetrics from "./RunMetrics";
 import ToolCallBubble from "./ToolCallBubble";
 import ToolbarSelect from "./ToolbarSelect";
 import {
-  Eye, ShieldCheck, PencilRuler, ListChecks, Zap, CircleOff, Brain, BrainCircuit,
+  Eye, ShieldCheck, PencilRuler, ListChecks, Zap, CircleOff, Circle, Brain, BrainCircuit,
   Bot, User, ChevronRight, ChevronDown, Wrench, Search, Database, FileText,
   FolderOpen, FilePen, Terminal, AppWindow, Users, Clock,
   MousePointer2, Keyboard, Camera, ListTree, Play, History, ScanLine,
@@ -119,8 +119,8 @@ interface ChatViewProps {
   onSelectModel: (m: string) => void;
   accessMode: "read_only" | "confirm" | "auto_edit" | "plan" | "full";
   setAccessMode: (m: "read_only" | "confirm" | "auto_edit" | "plan" | "full") => void;
-  thinkingLevel: "off" | "high" | "max";
-  setThinkingLevel: (l: "off" | "high" | "max") => void;
+  thinkingLevel: "off" | "low" | "high" | "max";
+  setThinkingLevel: (l: "off" | "low" | "high" | "max") => void;
   contextEstimate?: { max_context: number; recommended_context: number } | null;
   sessionId?: string;   // 上下文统计面板按会话取数
   showToast: (msg: string, type?: string) => void;
@@ -727,11 +727,12 @@ export default memo(function ChatView({
               <ToolbarSelect value={thinkingLevel}
                 options={[
                   { value: "off", label: t("chat.thinking_off"), icon: <CircleOff size={15} /> },
+                  { value: "low", label: t("chat.thinking_low"), icon: <Circle size={15} /> },
                   { value: "high", label: t("chat.thinking_high"), icon: <Brain size={15} /> },
                   { value: "max", label: t("chat.thinking_max"), icon: <BrainCircuit size={15} /> },
                 ]}
                 onChange={(v) => {
-                  setThinkingLevel(v as "off" | "high" | "max");
+                  setThinkingLevel(v as "off" | "low" | "high" | "max");
                   // 强制思考模型（DeepSeek 推理系等）API 层面无法关闭思考——
                   // 诚实提示，避免用户设了 off 却不见效果以为工具坏了
                   if (v === "off") {

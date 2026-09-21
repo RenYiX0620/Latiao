@@ -52,19 +52,19 @@ def setup_assists(scope):
                 events.append({"content": "\n\n" + final})
                 payload["handled"] = True
                 return payload
-            events.append({"content": ("\n\n⚠️ 本地模型本轮只输出了思考过程。"
-                                       "请回复「继续」重试，或换用其他模型。")})
+            from agent.messages import msg as _msg
+            events.append({"content": "\n\n" + _msg("thinking_only", payload["user_lang"])})
             payload["handled"] = True
             return payload
         # 空响应诊断
         if not text:
-            events.append({"content": ("\n\n⚠️ 模型返回了空响应。可能原因：上下文超限被截断、"
-                                       "模型不支持当前请求格式。建议换用更大的模型或重试。")})
+            from agent.messages import msg as _msg
+            events.append({"content": "\n\n" + _msg("empty_response", payload["user_lang"])})
             payload["handled"] = True
             return payload
         # 辅助 2：语言交付闸门（本地引擎英文漂移）——正文已实时流出，
         # 用 content_revised 整体替换（前端把最后一条回答替换为译文）
-        if _reply_lang_mismatch(payload["user_text"], text):
+        if _reply_lang_mismatch(payload["user_text"], text, payload.get("user_lang", "")):
             try:
                 async with httpx.AsyncClient(timeout=httpx.Timeout(60)) as c2:
                     translated = await _force_translate(
@@ -176,6 +176,11 @@ def setup_compaction(scope, *, local_threshold=18000, cloud_threshold=80000):
             msgs = _collapse_duplicate_assistants(loop.current_msgs)
             loop.current_msgs = msgs
             return payload
+        # 轮内不压缩（09-19）：mid-turn 改写历史会把 KV 前缀缓存整段打掉——
+        # 实测"中段改一行 → 全量重算"，8k token 多花 5–6 秒；而尾部追加只要 ~90ms。
+        # 压缩改为只在轮首（steps<=1）做，多工具轮的上下文靠"追加"增长。
+        if getattr(loop, "steps", 0) > 1:
+            return payload
         msgs = loop.current_msgs
         total = sum(len(str(m.get("content") or "")) for m in msgs)
         threshold = local_threshold if loop.is_local else cloud_threshold
@@ -187,13 +192,23 @@ def setup_compaction(scope, *, local_threshold=18000, cloud_threshold=80000):
         total = sum(len(str(m.get("content") or "")) for m in msgs)
         if total <= threshold:
             return payload
-        # 滞回：距上次压缩增长不足 2000 字符 → 没有实质新增，跳过（防每轮
-        # 空转触发改写历史、打掉 mlx 前缀缓存）
+        # 滞回（09-19 加大）：改写历史中段会让 KV 前缀缓存从改写点起全废，实测
+        # 改一行 → 0% 命中、8k token 多花 5–6 秒。原滞回只有 2000 字符，而阈值
+        # 18000 → 历史每轮都超过阈值 → 每轮开头压缩一次 → 命中率被压到个位数。
+        # 现在要求"距上次压缩增长 ≥ 阈值的三分之一"才压：压缩变少但更深。
         last = getattr(loop, "_last_compact_total", 0)
-        if last and total - last < 2000:
+        _growth_gate = int(threshold * 0.35)
+        if last and total - last < _growth_gate:
             return payload
         if loop.is_local:
             msgs = _slim_history_for_local(msgs)
+            # 压深一档：把更早的整轮直接丢掉（只保留最近 3 轮），否则压完仍在阈值
+            # 附近 → 下一轮又触发 → 每轮都改写历史（09-19 实测的 8% 命中率根因）
+            _sys = [m for m in msgs if m.get("role") == "system"]
+            _rest = [m for m in msgs if m.get("role") != "system"]
+            _turns = [i for i, m in enumerate(_rest) if m.get("role") == "user"]
+            if len(_turns) > 3:
+                msgs = _sys + _rest[_turns[-3]:]
             # 轮内压缩：当前 turn 的工具结果链——保留最近 2 条完整，更早的
             # 压到 400 字符（头 300 + 尾 100）；中间轮 <50 字的过渡正文清空
             # （assistant 的 tool_calls 字段原样保留，模板兼容）。

@@ -425,15 +425,44 @@ _NATIVE_COMPLETION_CHECK_PROMPT = (
 
 
 def _local_native_tools_ok() -> bool:
-    """本地引擎是否支持原生 function calling（自管 mlx 引擎；LM Studio/
-    llama.cpp 外部引擎不启用——未验证，保持围栏路径）。"""
+    """本地引擎是否支持原生 function calling。
+
+    09-20 修正（本次"只预告不行动"的根因）：只看**当前实际运行的后端**
+    `_active_backend`。旧实现把 `engine.backend`（*默认*后端——装了 mlx-lm 就是
+    "mlx"）也算作支持 → 当实际跑的是 python 引擎（llama_cpp.server，**完全忽略
+    tools 字段**）时，应用误判为"支持原生工具"：既不给工具 schema（引擎忽略），
+    也不发围栏工具说明 → 模型对工具清单一无所知，只能编造工具名（实测编出
+    web_search / get_historical_data），并只回一句"我来帮你分析…先调取数据"，
+    循环把它当终答交付 → 用户看到"执行到一半就停"。
+
+    支持原生工具的后端：mlx（自管）、llama-cpp-native（llama-server 按模型
+    模板解析 tool_calls）。python 引擎（llama-cpp）走围栏提示词路径。
+    """
     if _LOCAL_NATIVE_TOOLS_OVERRIDE is not None:
         return _LOCAL_NATIVE_TOOLS_OVERRIDE
     eng = getattr(local_llm, "_engine", None)
     if eng is None or getattr(eng, "_external_engine", ""):
         return False
-    return (getattr(eng, "_active_backend", "") == "mlx"
-            or getattr(eng, "backend", "") == "mlx")
+    _active = str(getattr(eng, "_active_backend", "") or "")
+    if _active:
+        # llama-cpp-custom = config.json 里 custom_engine 指定的第三方 llama.cpp 系引擎
+        # （如 Prism fork）：同为 llama-server，按模型模板解析 tool_calls + 回 timings
+        return _active in ("mlx", "llama-cpp-native", "llama-cpp-custom")
+    # 尚未加载模型（无 active 后端）时才看默认后端；加载后本函数会被重新求值
+    return getattr(eng, "backend", "") == "mlx"
+
+
+def _is_custom_engine() -> bool:
+    """当前是否由 custom_engine（第三方 llama.cpp fork）在服务。
+
+    这类模型的自带采样推荐值写在 GGUF 元数据里（Bonsai 2：thinking 模式
+    temp 1.0 / top_p 0.95 / top_k 20；instruct 模式 temp 0.7 / top_p 0.80 /
+    presence_penalty 1.5）。辣条的默认是 temp 0.0 + frequency_penalty 0.6（为本地
+    小模型压复读用的），对推理型模型会明显降质 —— 所以走自定义引擎时省略这两个
+    字段，让引擎按模型自带默认采样。
+    """
+    eng = getattr(local_llm, "_engine", None)
+    return str(getattr(eng, "_active_backend", "") or "") == "llama-cpp-custom"
 
 
 def _slim_history_for_local(msgs: list, keep_recent_turns: int = 3) -> list:
@@ -500,14 +529,33 @@ def _is_light_query(text: str, msgs: list) -> bool:
     return True
 
 
-def _resolve_max_tokens(model: str) -> int:
-    """Pick max_tokens by model family.
+def _custom_engine_max_tokens() -> int:
+    """custom_engine.max_tokens（config.json）：第三方引擎需要的生成长度上限。"""
+    try:
+        import json
+        from agent_loop import CONFIG_FILE
+        cfg = json.loads(CONFIG_FILE.read_text("utf-8")).get("custom_engine") or {}
+        return int(cfg.get("max_tokens") or 0)
+    except Exception:
+        return 0
 
-    Reasoning models (DeepSeek-R1, Qwen3-QwQ, OpenAI o-series, *-think/*-reason)
-    emit long <think> blocks that can exhaust a 4096 cap and truncate the
-    trailing tool_call JSON. Give them a larger budget so the JSON survives;
-    non-reasoning models get a smaller, cheaper budget.
+
+def _resolve_max_tokens(model: str, local: bool = False, override: int = 0) -> int:
+    """生成长度上限。
+
+    09-20 修正：**本地引擎给更大的上限**。本地模型现在多为推理型，思考会把 6144
+    上限吃满、正文一个字都写不出来（实测 Ternary-Bonsai：delta=6144 = 上限、思考
+    20864 字、正文 0 字 → 用户看到"本地模型本轮只输出了思考过程"）。上限只是上限，
+    模型不用就不会花成本。
+
+    - override（`custom_engine.max_tokens`）优先；
+    - 本地引擎 16384；
+    - 云端沿用按模型名判定的启发式（推理类名字 12288，其余 6144）。
     """
+    if override:
+        return int(override)
+    if local:
+        return 16384
     m = (model or "").lower()
     if any(k in m for k in ("r1", "o1", "o3", "o4", "reason", "qwq", "qwen3", "think", "muse", "glimmer", "deepseek")):
         return 12288
@@ -561,28 +609,85 @@ _TRANSIENT_REMINDER_MARKERS = (
 )
 
 
-def _detect_user_language(text: str) -> str:
-    """Detect the language of user input: 'zh', 'en', 'ja', or 'ru'.
+_LANG_STRIP_RE = re.compile(
+    r"```.*?```"                      # 围栏代码块
+    r"|`[^`\n]*`"                     # 行内代码
+    r"|https?://\S+|www\.\S+"         # 链接（09-03 事故：中文+链接曾被误判 en）
+    r"|(?:/|~/?)[\w.\-/@]+",          # 文件路径（/Users/x/SOUL.md、~/.local-ai-os/…）
+    re.S)
+_CJK_RE = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf]")
+_KANA_RE = re.compile(r"[\u3040-\u309f\u30a0-\u30ff]")
+_LATIN_WORD_RE = re.compile(r"[A-Za-z]+")
+_CYR_WORD_RE = re.compile(r"[\u0400-\u04ff]+")
 
-    俄语此前落进 zh 兜底 → 俄语用户被套上"必须用简体中文"的硬规则（09-19 实测），
-    故补西里尔字母判定；无法判定时仍回落 zh（保持既有行为）。"""
-    if not text:
-        return "zh"
-    # 剥离 URL/网址再计数：链接里的字母远多于中文消息的汉字数，
-    # 不剥离会把"中文+链接"误判为 en，触发强制英文回复规则（09-03 事故）
-    text = re.sub(r"https?://\S+|www\.\S+", "", text)
-    # Count characters in each language range
-    zh = len(re.findall(r'[\u4e00-\u9fff\u3400-\u4dbf]', text))
-    ja_kana = len(re.findall(r'[\u3040-\u309f\u30a0-\u30ff]', text))
-    en = len(re.findall(r'[a-zA-Z]', text))
-    ru = len(re.findall(r'[\u0400-\u04ff]', text))
-    if ja_kana > zh and ja_kana > en:
-        return "ja"
-    if ru > max(zh, ja_kana, en):
-        return "ru"
-    if en > zh + ja_kana:
-        return "en"
-    return "zh"
+
+_EN_FUNCTION_WORDS = frozenset({
+    "the", "is", "are", "am", "was", "were", "be", "been", "you", "your", "yours", "i", "me", "my",
+    "mine", "we", "our", "he", "she", "it", "its", "they", "them", "for", "of", "and", "or", "to",
+    "a", "an", "this", "that", "these", "those", "how", "what", "why", "when", "where", "which",
+    "who", "please", "can", "could", "would", "should", "do", "does", "did", "not", "no", "yes",
+    "hi", "hello", "hey", "thanks", "thank", "with", "on", "in", "at", "have", "has", "had", "will",
+    "about", "from", "into", "if", "then", "there", "here", "so", "but", "as", "by",
+})
+
+
+def _lang_counts(text: str) -> tuple[int, int, int, int]:
+    """(汉字数, 假名数, 拉丁词数, 西里尔词数)——先剥离代码/链接/路径。"""
+    clean = _LANG_STRIP_RE.sub(" ", text or "")
+    return (len(_CJK_RE.findall(clean)), len(_KANA_RE.findall(clean)),
+            len(_LATIN_WORD_RE.findall(clean)), len(_CYR_WORD_RE.findall(clean)))
+
+
+def detect_language_decision(text: str, history: list | None = None) -> tuple[str, bool]:
+    """判定用户语言，返回 (lang, confident)。
+
+    口径（09-19 修正）：**汉字字数 vs 拉丁词数**，而不是字母个数。
+    旧口径下"你的SOUL.md是什么"（5 汉字 / 6 字母：SOUL+md）被判成英文用户，
+    进而让系统提示词、语言锚、翻译方向全按英文走 —— 这是中文用户收到英文回答、
+    以及"中文回答被拿去翻译成英文"的根因。中文夹杂英文术语/文件名/报错日志
+    是本产品的常态，按词数比较才稳。
+
+    confident=False：语言不明显（纯符号、纯数字、零星字母）。调用方不应据此
+    下发语言指令，也不应据此判断回答是否符合用户语言。
+    """
+    if not (text or "").strip():
+        return "zh", False
+    han, kana, latin_words, cyr_words = _lang_counts(text)
+    words = [w.lower() for w in _LATIN_WORD_RE.findall(_LANG_STRIP_RE.sub(" ", text))]
+    latin_letters = sum(len(w) for w in words)
+
+    if kana >= 2 and kana > latin_words * 2 and kana > han:
+        return "ja", True
+    if cyr_words >= 2 and cyr_words >= max(han, latin_words):
+        # 与中文同口径：西里尔词"不弱于"拉丁词即判俄文——俄语消息里夹 SOUL.md
+        # 这类拉丁文件名时，此前用严格大于会翻成英文（09-19 实测）
+        return "ru", True
+
+    if han > 0:
+        # 汉字数量至少与拉丁词相当，或本身就是一段中文（≥3 汉字）→ 中文
+        if han >= latin_words or han >= 3:
+            return "zh", True
+    elif latin_letters >= 3 and (any(w in _EN_FUNCTION_WORDS for w in words) or not history):
+        # 无汉字、有英文功能词（或用户首条消息无历史可参考）→ 英文
+        return "en", True
+
+    # 存疑（如"SOUL.md IDENTITY.md tok/s"、1~2 汉字夹一堆术语）→ 看历史
+    for prev in (history or [])[-5:]:
+        p_han, _p_kana, p_latin, _p_cyr = _lang_counts(prev)
+        if p_han >= 3 and p_han >= p_latin:
+            return "zh", True
+        if p_han == 0 and p_latin >= 3:
+            return "en", True
+    if han > 0:
+        return "zh", True
+    if latin_letters >= 3:
+        return "en", True
+    return "zh", False
+
+
+def _detect_user_language(text: str) -> str:
+    """兼容入口：返回 'zh' | 'en' | 'ja' | 'ru'（不确定按 zh，保持既有行为）。"""
+    return detect_language_decision(text)[0]
 
 
 def _get_localized_text(lang: str, texts: dict[str, str | dict]) -> str | dict:

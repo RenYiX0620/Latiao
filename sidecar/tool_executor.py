@@ -249,30 +249,66 @@ def open_app(name: str) -> str:
         return f"无法打开应用 {resolved}: {e}"
 
 
+# 有界扫描（09-19 事故）：原实现用 glob(recursive=True) 把匹配全量物化后再截断显示，
+# 模型给 `**/tavily_*` + 家目录时递归扫过 100GB+ 模型文件 → 整轮卡死 21 分钟。
+# 改为带剪枝的有界遍历：跳过已知大目录、限制深度与结果数，并在结果里说明已截断。
+_SEARCH_EXCLUDE_DIRS = frozenset({
+    ".lmstudio", "Library", "node_modules", ".git", ".cache", "__pycache__",
+    "site-packages", ".venv", "venv", ".Trash", ".npm", ".cargo", ".rustup",
+    "Applications", ".zcode", ".cursor", ".vscode", ".docker", ".gradle", ".m2",
+    ".ollama", ".cache", "Photos Library.photoslibrary", "Movies", "Music",
+})
+_SEARCH_MAX_RESULTS = int(os.environ.get("LATIAO_SEARCH_MAX_RESULTS", "200") or 200)
+_SEARCH_MAX_DEPTH = int(os.environ.get("LATIAO_SEARCH_MAX_DEPTH", "6") or 6)
+
+
 def search_files(directory: str, pattern: str) -> str:
-    """Search for files matching a glob pattern in a directory."""
+    """Search for files matching a glob pattern in a directory (bounded)."""
     if ".." in directory.split("/"):
         return "⛔ Blocked: path traversal not allowed"
-    import glob as glob_mod
+    import fnmatch
     try:
         base = os.path.expanduser(directory)
-        matches = glob_mod.glob(os.path.join(base, pattern), recursive=True)
-        if not pattern.startswith("."):
-            # Python glob 的 * 不匹配点开头的隐藏文件/目录（.zcode、.ssh…）——
-            # 09-06 14:34 事故：search_files "~/*zcode*" 找不到 ~/.zcode，
-            # 模型误判"本地没装 zcode"，转去网上搜回垃圾结果。始终合并隐藏变体。
-            hidden = glob_mod.glob(
-                os.path.join(base, ".*" + pattern.lstrip("*")), recursive=True)
-            matches = list(dict.fromkeys(matches + hidden))
+        if not os.path.isdir(base):
+            return f"No such directory: {directory}"
+        pat = pattern.strip()
+        if pat.startswith("**/"):
+            pat = pat[3:]
+        base_depth = base.rstrip("/").count("/")
+        matches, skipped, truncated = [], [], False
+        for root, dirs, files in os.walk(base, topdown=True):
+            kept = []
+            for d in dirs:
+                if d in _SEARCH_EXCLUDE_DIRS or d.endswith(".photoslibrary"):
+                    skipped.append(d)
+                else:
+                    kept.append(d)
+            dirs[:] = kept
+            if root.count("/") - base_depth >= _SEARCH_MAX_DEPTH:
+                dirs[:] = []
+            for name in list(files) + list(dirs):
+                full = os.path.join(root, name)
+                rel = os.path.relpath(full, base)
+                if fnmatch.fnmatch(name, pat) or fnmatch.fnmatch(rel, pat):
+                    matches.append(full)
+                    if len(matches) >= _SEARCH_MAX_RESULTS:
+                        truncated = True
+                        break
+            if truncated:
+                break
         if not matches:
-            return f"No files matching '{pattern}' found in {directory}"
-        lines = []
-        for m in sorted(matches)[:50]:
-            icon = "📁" if os.path.isdir(m) else "📄"
-            lines.append(f"  {icon} {m}")
+            note = (f"\n（已跳过 {len(set(skipped))} 类大目录，如 {', '.join(sorted(set(skipped))[:4])}）"
+                    if skipped else "")
+            return f"No files matching '{pattern}' found in {directory}{note}"
+        lines = [f"  {'📁' if os.path.isdir(m) else '📄'} {m}" for m in sorted(matches)[:50]]
         result = f"Search results for '{pattern}' in {directory}:\n" + "\n".join(lines)
         if len(matches) > 50:
             result += f"\n  ... and {len(matches) - 50} more results"
+        if truncated:
+            result += (f"\n⚠️ 结果已达上限 {_SEARCH_MAX_RESULTS} 条并截断（或深度超过 {_SEARCH_MAX_DEPTH} 层），"
+                       "请缩小目录或把模式写得更具体。")
+        if skipped:
+            result += f"\n（已跳过 {', '.join(sorted(set(skipped))[:5])} 等大目录）"
         return result
     except Exception as e:
         return f"Error searching files: {e}"
