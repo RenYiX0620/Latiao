@@ -5,7 +5,7 @@ import logoUrl from "./assets/logo.png";
 import type { Message, PendingFile, SessionInfo, ViewId, CloudModel, DownloadState, HFModelResult, LLMStatus } from "./types";
 import { parseSSEDataLine } from "./utils/sse";
 import { saveSessionsWithFallback } from "./utils/storage";
-import { pickVoice, speechSupported, splitSentences, stripForSpeech, voicesForLang } from "./utils/speech";
+import { localVoicesForLang, pickVoice, speechSupported, splitSentences, stripForSpeech, voicesForLang } from "./utils/speech";
 // API keys stored in OS keychain via Rust commands (store_secret/get_secret/delete_secret)
 import { useSessions } from "./hooks/useSessions";
 import { sidecarFetch, waitForSidecar, authFetch, uploadSidecarFile, uploadLocalPath } from "./utils/api";
@@ -157,9 +157,18 @@ const [timeFilter, setTimeFilter] = useState("all");
   const [ttsTimeoutMs, setTtsTimeoutMs] = useState(8000);
   // 本地语音服务的音色 id（与系统语音列表是两套命名，不能混用）
   const [ttsLocalVoices, setTtsLocalVoices] = useState<string[]>([]);
+  // 音色 → 语言（服务给的 details）：按界面语言只列该语言的音色
+  const [ttsLocalVoiceLangs, setTtsLocalVoiceLangs] = useState<Record<string, string>>({});
+  const [ttsPitch, setTtsPitch] = useState<number>(() => Number(localStorage.getItem("latiao_tts_pitch")) || 1);
+  const [ttsEmotion, setTtsEmotion] = useState<string>(() => localStorage.getItem("latiao_tts_emotion") || "");
+  const [ttsAutoRead, setTtsAutoRead] = useState<boolean>(() => localStorage.getItem("latiao_tts_autoread") === "1");
+  // 「本地音色」下拉只列当前界面语言的音色（157 个混在一起没法挑）；
+  // 语言判不出来（""）的一律显示，筛空了也回落全表 —— 不能把音色藏没。
   const [ttsLocalVoice, setTtsLocalVoice] = useState<string>(
     () => localStorage.getItem("latiao_tts_local_voice") || ""
   );
+
+  const localVoicesShown = localVoicesForLang(ttsLocalVoices, ttsLocalVoiceLangs, lang, ttsLocalVoice);
   const [speakingId, setSpeakingId] = useState<string | null>(null);
 
   // 权限模式五档（从保守到放手）：read_only / confirm / auto_edit / plan / full
@@ -1258,7 +1267,11 @@ const [timeFilter, setTimeFilter] = useState("all");
 
       const controller = new AbortController();
       abortControllerRef.current = controller;
-      await streamChat(apiMessages, opts, controller.signal);
+      const finalText = await streamChat(apiMessages, opts, controller.signal);
+      // 自动朗读：只在整轮成功结束时念一次正文。报错（❌ 开头）和用户中止的都不念。
+      if (ttsAutoRead && finalText && finalText.trim() && !finalText.trimStart().startsWith("❌")) {
+        void speak(finalText, assistantPlaceholder.id);
+      }
     } catch (e) {
       // Tauri plugin-http teardown after abort rejects with "The resource id
       // ... is invalid" instead of a standard AbortError — treat it the same.
@@ -1559,6 +1572,12 @@ const [timeFilter, setTimeFilter] = useState("all");
           const data = await resp.json();
           const secs = Number(data?.timeout);
           if (alive && Number.isFinite(secs) && secs > 0) setTtsTimeoutMs(Math.round(secs * 1000));
+          // 用户没手动设过滑杆时，采用服务端配置的音高（否则滑杆和服务端各说各话）
+          const svcPitch = Number(data?.pitch);
+          if (alive && Number.isFinite(svcPitch) && svcPitch > 0
+              && localStorage.getItem("latiao_tts_pitch") === null) {
+            setTtsPitch(svcPitch);
+          }
         }
       } catch { /* 拿不到就用默认 8s */ }
       try {
@@ -1566,12 +1585,51 @@ const [timeFilter, setTimeFilter] = useState("all");
         if (resp.ok) {
           const data = await resp.json();
           const list = Array.isArray(data?.voices) ? data.voices : [];
-          if (alive) setTtsLocalVoices(list.map((v: unknown) => String(v)));
+          const details = Array.isArray(data?.details) ? data.details : [];
+          if (alive) {
+            setTtsLocalVoices(list.map((v: unknown) => String(v)));
+            const map: Record<string, string> = {};
+            for (const d of details) {
+              const name = String((d as { name?: unknown })?.name ?? "");
+              if (name) map[name] = String((d as { lang?: unknown })?.lang ?? "");
+            }
+            setTtsLocalVoiceLangs(map);
+          }
         }
       } catch { /* 服务不在 → 空表，走系统语音 */ }
     })();
     return () => { alive = false; };
-  }, [ttsEnabled]);
+    // 依赖里带上「是否停在设置页」：音色列表原来只在开启朗读那一刻抓一次，
+    // 若那次服务恰好没起来（比如刚开机、服务正在重启），列表会一直空着 ——
+    // 用户看到的就是"音色没了"。现在每次打开设置页都会重抓一次。
+  }, [ttsEnabled, activeView === "settings"]);
+
+  // 抓空了就过几秒自己再试一次（服务刚起来/正在重启时最有用），最多试 3 轮
+  useEffect(() => {
+    if (!ttsEnabled || ttsLocalVoices.length > 0) return;
+    let tries = 0;
+    const timer = setInterval(async () => {
+      tries += 1;
+      if (tries > 3) { clearInterval(timer); return; }
+      try {
+        const resp = await authFetch("/v1/tts/voices", { signal: AbortSignal.timeout(4000) });
+        if (!resp.ok) return;
+        const data = await resp.json();
+        const list = Array.isArray(data?.voices) ? data.voices : [];
+        if (list.length) {
+          setTtsLocalVoices(list.map((v: unknown) => String(v)));
+          const map: Record<string, string> = {};
+          for (const d of Array.isArray(data?.details) ? data.details : []) {
+            const name = String((d as { name?: unknown })?.name ?? "");
+            if (name) map[name] = String((d as { lang?: unknown })?.lang ?? "");
+          }
+          setTtsLocalVoiceLangs(map);
+          clearInterval(timer);
+        }
+      } catch { /* 还没起来，下一轮再试 */ }
+    }, 5000);
+    return () => clearInterval(timer);
+  }, [ttsEnabled, ttsLocalVoices.length]);
 
   const stopSpeaking = useCallback(() => {
     try { window.speechSynthesis?.cancel(); } catch { /* ignore */ }
@@ -1592,6 +1650,9 @@ const [timeFilter, setTimeFilter] = useState("all");
       const utter = new SpeechSynthesisUtterance(chunk);
       if (voice) utter.voice = voice;
       utter.rate = ttsRate;
+      // 系统语音也支持音高（0~2，默认 1）：本地服务不可用时回退到这里，
+      // 音高滑杆不该跟着失效 —— 变调方向与本地路径一致（1.15 = 升 15%）
+      utter.pitch = Math.min(2, Math.max(0.1, ttsPitch));
       utter.lang = voice?.lang || lang;
       if (idx === chunks.length - 1) {
         utter.onend = () => {
@@ -1600,7 +1661,7 @@ const [timeFilter, setTimeFilter] = useState("all");
       }
       window.speechSynthesis.speak(utter);
     });
-  }, [ttsVoices, lang, ttsRate]);
+  }, [ttsVoices, lang, ttsRate, ttsPitch]);
 
   /** 朗读一条回复。同一个消息再点一次＝停止。 */
   const speak = useCallback(async (raw: string, id?: string) => {
@@ -1622,6 +1683,10 @@ const [timeFilter, setTimeFilter] = useState("all");
           // 本地音色优先；系统音色名服务不认，发过去只会 500（见 ttsLocalVoices 的说明）
           voice: ttsLocalVoices.includes(ttsLocalVoice) ? ttsLocalVoice : undefined,
           speed: ttsRate,
+          // 音高永远发：滑杆是唯一真相源。之前"等于 1 就不发"会让 config 里的
+          // 旧值（1.15）偷偷生效 —— 滑杆拉回 1.00 却还是变调的，所见非所得。
+          pitch: ttsPitch,
+          emotion: ttsEmotion || undefined,
         }),
         signal: AbortSignal.timeout(ttsTimeoutMs),
       });
@@ -1646,7 +1711,8 @@ const [timeFilter, setTimeFilter] = useState("all");
       return;
     }
     systemSpeak(text);
-  }, [ttsEnabled, ttsVoice, ttsRate, ttsTimeoutMs, ttsLocalVoices, ttsLocalVoice, stopSpeaking, systemSpeak, showToast, t]);
+  }, [ttsEnabled, ttsVoice, ttsRate, ttsTimeoutMs, ttsLocalVoices, ttsLocalVoice,
+      ttsPitch, ttsEmotion, stopSpeaking, systemSpeak, showToast, t]);
 
   // 切会话/新会话时停掉上一轮的朗读，别让它在后台继续念
   useEffect(() => { stopSpeaking(); }, [session.id, stopSpeaking]);
@@ -1911,9 +1977,12 @@ const [timeFilter, setTimeFilter] = useState("all");
             ttsVoice={ttsVoice} setTtsVoice={setTtsVoice}
             ttsVoices={voicesForLang(
               ttsVoices.map(v => ({ name: v.name, lang: v.lang })), lang)}
-            ttsLocalVoices={ttsLocalVoices}
+            ttsLocalVoices={localVoicesShown}
             ttsLocalVoice={ttsLocalVoice}
             setTtsLocalVoice={setTtsLocalVoice}
+            ttsPitch={ttsPitch} setTtsPitch={setTtsPitch}
+            ttsEmotion={ttsEmotion} setTtsEmotion={setTtsEmotion}
+            ttsAutoRead={ttsAutoRead} setTtsAutoRead={setTtsAutoRead}
           />
         </div>
 

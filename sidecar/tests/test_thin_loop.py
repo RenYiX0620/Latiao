@@ -23,30 +23,6 @@ async def _collect(agen):
     return out
 
 
-def _run_loop(engine, messages, *, access_mode="full", session_suffix=""):
-    """构造 ThinAgentLoop（本地引擎模式）。"""
-    import agent_loop
-    import agent.transport as transport
-    from agent.loop import ThinAgentLoop
-    from tests.test_loop_scenarios import _StubEngine
-    import local_llm
-
-    old = local_llm._engine
-    local_llm._engine = _StubEngine()
-    old_override = getattr(transport, "_LOCAL_NATIVE_TOOLS_OVERRIDE", None)
-    agent_loop_stub = agent_loop
-    agent_loop_stub._LOCAL_NATIVE_TOOLS_OVERRIDE = None
-    agent_context._LOCAL_NATIVE_TOOLS_OVERRIDE = True  # 测试强制原生（假引擎当 mlx）
-    sid = f"thin-{time.time()}-{session_suffix}"
-    return sid, ThinAgentLoop(messages, "fake-model", engine.url, HEADERS,
-                              session_id=sid, access_mode=access_mode)
-
-
-def _finally_restore():
-    pass
-    # 占位：真正的恢复在测试体内 try/finally 完成
-
-
 @pytest.mark.asyncio
 async def test_thin_local_text_round_trip():
     import local_llm

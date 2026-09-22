@@ -176,9 +176,9 @@ async def test_synthesize_truncates_to_max_chars(tmp_path, monkeypatch):
 async def test_list_voices_unions_all_models(tmp_path, monkeypatch):
     """下拉里是各模型音色的并集（本机：Kokoro 100 + v1.0 49 + 克隆 1）。"""
     monkeypatch.setattr(tts_service, "model_voice_routes",
-                        lambda conf: {"女声001": ("kokoro", "女声001"),
-                                      "女声-晓晓": ("kokoro_v10", "女声-晓晓"),
-                                      "克隆·婷婷": ("indextts", "克隆·婷婷")})
+                        lambda conf: {"女声001": ("kokoro", "zf_001", "kokoro_tts"),
+                                      "女声-晓晓": ("kokoro_v10", "zf_xiaoxiao", "kokoro_tts"),
+                                      "克隆·婷婷": ("indextts", "", "index_tts2")})
     data = await tts_service.list_voices(_cfg(tmp_path))
     assert data["status"] == "success"
     assert data["voices"] == ["克隆·婷婷", "女声-晓晓", "女声001"]   # 按码点排序
@@ -190,7 +190,9 @@ def test_voice_routes_map_by_model(monkeypatch):
     def fake_fetch(url, conf, timeout=5.0):
         calls.append(url)
         if url.endswith("/v1/models"):
-            return {"data": [{"id": "kokoro"}, {"id": "indextts"}]}
+            # 真实服务会带 family —— 语言归类里克隆族靠它判中文
+            return {"data": [{"id": "kokoro", "family": "kokoro_tts"},
+                             {"id": "indextts", "family": "index_tts2"}]}
         if "model=kokoro" in url:
             return {"voices": ["女声001"]}
         if "model=indextts" in url:
@@ -200,8 +202,8 @@ def test_voice_routes_map_by_model(monkeypatch):
     monkeypatch.setattr(tts_service, "_fetch_json", fake_fetch)
     monkeypatch.setattr(tts_service, "_voice_routes", {"map": {}, "at": 0.0, "base": ""})
     routes = tts_service.model_voice_routes({"base_url": "http://127.0.0.1:7799"})
-    assert routes["女声001"] == ("kokoro", "女声001")
-    assert routes["克隆·婷婷"] == ("indextts", "克隆·婷婷")
+    assert routes["女声001"] == ("kokoro", "女声001", "kokoro_tts")
+    assert routes["克隆·婷婷"] == ("indextts", "克隆·婷婷", "index_tts2")
     assert any("model=indextts" in u for u in calls), "每个模型都要单独问一次"
 
 
@@ -210,7 +212,7 @@ async def test_synthesize_routes_voice_to_its_own_model(tmp_path, monkeypatch):
     """选了别的模型的音色 → 把请求发给那个模型（前端只发一个字符串）。"""
     client = _stub(monkeypatch, _FakeResp(content=b"RIFF-x"))
     monkeypatch.setattr(tts_service, "model_voice_routes",
-                        lambda conf: {"克隆·婷婷": ("indextts", "克隆·婷婷")})
+                        lambda conf: {"克隆·婷婷": ("indextts", "克隆·婷婷", "index_tts2")})
     await tts_service.synthesize("你好", "克隆·婷婷", None,
                                  _cfg(tmp_path, {"model_id": "kokoro_v10"}))
     payload = client.posts[-1][1]
@@ -277,6 +279,8 @@ def test_status_reports_enabled_and_availability(tmp_path, monkeypatch):
     assert st == {"enabled": True, "available": True,
                   "base_url": tts_service.DEFAULT_TTS["base_url"],
                   "model_id": "melotts", "voice": "", "ref_audio": "", "speed": 1.0,
+                  # 音高也一并下发（前端滑杆拿它当初始值，避免"滑杆显示 1.00 实际 1.15"）
+                  "pitch": 1.0,
                   "timeout": tts_service.DEFAULT_TTS["timeout"]}
     monkeypatch.setattr(tts_service, "probe_service", lambda conf: False)
     st_off = tts_service.status(_cfg(tmp_path, {"enabled": False}))
@@ -331,3 +335,89 @@ async def test_synthesize_skips_pitch_when_not_configured(tmp_path, monkeypatch)
     monkeypatch.setattr(tts_service, "_pitch_shift", lambda a, f: called.append(f) or a)
     await tts_service.synthesize("你好", None, None, _cfg(tmp_path))
     assert called == []
+
+
+# ── 音色语言归类（前端据此只列当前语言的音色）────────────────────
+def test_voice_lang_from_label_prefix():
+    """服务给的是标签（女声001/英文女·heart），不是底层 id。"""
+    assert tts_service._voice_lang("kokoro", "女声001") == "zh"
+    assert tts_service._voice_lang("kokoro_v10", "女声-晓晓") == "zh"
+    assert tts_service._voice_lang("kokoro_v10", "男声-云希") == "zh"
+    assert tts_service._voice_lang("kokoro_v10", "英文女·heart") == "en"
+    assert tts_service._voice_lang("kokoro_v10", "英式男·george") == "en"
+    assert tts_service._voice_lang("kokoro_v10", "西语女·dora") == "es"
+    assert tts_service._voice_lang("kokoro_v10", "法语女·siwis") == "fr"
+    assert tts_service._voice_lang("kokoro_v10", "葡语男·alex") == "pt"
+
+
+def test_voice_lang_from_id_prefix():
+    assert tts_service._voice_lang("kokoro", "zf_001") == "zh"
+    assert tts_service._voice_lang("kokoro_v10", "zf_xiaoxiao") == "zh"
+    assert tts_service._voice_lang("kokoro_v10", "af_heart") == "en"
+    assert tts_service._voice_lang("kokoro_v10", "bf_emma") == "en"
+    assert tts_service._voice_lang("kokoro_v10", "ef_dora") == "es"
+    assert tts_service._voice_lang("kokoro_v10", "ff_siwis") == "fr"
+    assert tts_service._voice_lang("kokoro_v10", "hf_alpha") == "hi"
+
+
+def test_voice_lang_clone_family_is_chinese():
+    """克隆音色的参考音频是我们录的中文样本 → 算中文。"""
+    assert tts_service._voice_lang("indextts", "", "index_tts2") == "zh"
+
+
+def test_voice_lang_unknown_is_empty_not_guessed():
+    assert tts_service._voice_lang("kokoro", "weird-id") == ""
+    assert tts_service._voice_lang("kokoro", "") == ""
+
+
+@pytest.mark.asyncio
+async def test_list_voices_includes_language_details(tmp_path, monkeypatch):
+    monkeypatch.setattr(tts_service, "model_voice_routes",
+                        lambda conf: {"女声001": ("kokoro", "zf_001", "kokoro_tts"),
+                                      "英文女·heart": ("kokoro_v10", "af_heart", "kokoro_tts"),
+                                      "克隆·婷婷": ("indextts", "", "index_tts2")})
+    data = await tts_service.list_voices(_cfg(tmp_path))
+    langs = {d["name"]: d["lang"] for d in data["details"]}
+    assert langs == {"女声001": "zh", "英文女·heart": "en", "克隆·婷婷": "zh"}
+
+
+# ── 请求级 pitch / emotion ─────────────────────────────────────
+@pytest.mark.asyncio
+async def test_request_pitch_overrides_config(tmp_path, monkeypatch):
+    calls = []
+    _stub(monkeypatch, _FakeResp(content=b"RIFF-audio"))
+    monkeypatch.setattr(tts_service, "model_voice_routes", lambda conf: {})
+    monkeypatch.setattr(tts_service, "_pitch_shift", lambda a, f: calls.append(f) or a)
+    await tts_service.synthesize("你好", None, None, _cfg(tmp_path, {"pitch": 1.3}), pitch=1.15)
+    assert calls == [1.15], "请求里的滑杆值应压过 config"
+
+
+@pytest.mark.asyncio
+async def test_request_pitch_is_clamped(tmp_path, monkeypatch):
+    calls = []
+    _stub(monkeypatch, _FakeResp(content=b"RIFF-audio"))
+    monkeypatch.setattr(tts_service, "model_voice_routes", lambda conf: {})
+    monkeypatch.setattr(tts_service, "_pitch_shift", lambda a, f: calls.append(f) or a)
+    await tts_service.synthesize("你好", None, None, _cfg(tmp_path), pitch=9.9)
+    assert calls == [1.5]
+
+
+@pytest.mark.asyncio
+async def test_emotion_only_forwarded_to_clone_models(tmp_path, monkeypatch):
+    client = _stub(monkeypatch, _FakeResp(content=b"RIFF-audio"))
+    monkeypatch.setattr(tts_service, "model_voice_routes",
+                        lambda conf: {"克隆·婷婷": ("indextts", "", "index_tts2"),
+                                      "女声001": ("kokoro", "zf_001", "kokoro_tts")})
+    await tts_service.synthesize("你好", "克隆·婷婷", None, _cfg(tmp_path), emotion="happy")
+    assert client.posts[-1][1].get("emotion") == "happy"
+    await tts_service.synthesize("你好", "女声001", None, _cfg(tmp_path), emotion="happy")
+    assert "emotion" not in client.posts[-1][1], "Kokoro 收到 emotion 会拒/忽略，别发过去"
+
+
+@pytest.mark.asyncio
+async def test_emotion_rejects_unknown_values(tmp_path, monkeypatch):
+    client = _stub(monkeypatch, _FakeResp(content=b"RIFF-audio"))
+    monkeypatch.setattr(tts_service, "model_voice_routes",
+                        lambda conf: {"克隆·婷婷": ("indextts", "", "index_tts2")})
+    await tts_service.synthesize("你好", "克隆·婷婷", None, _cfg(tmp_path), emotion="rm -rf /")
+    assert "emotion" not in client.posts[-1][1]

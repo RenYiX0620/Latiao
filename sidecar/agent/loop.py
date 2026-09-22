@@ -1153,7 +1153,9 @@ class ThinAgentLoop:
                 elif self.last_user_text and not _notes_ok:
                     self._step_log("知识注入", "跳过（短消息/寒暄，避免劫持本轮）")
         except Exception:
-            logger.debug("learnings retrieval skipped", exc_info=True)
+            # 别降级成 DEBUG：正是因为这里"看不见"，09-21 那次漏 import 让知识注入
+            # 静默死了两天（日志里一条痕迹都没有）。失败就该留在 WARNING 上。
+            logger.warning("知识注入失败（本轮跳过，不影响回答）", exc_info=True)
         # 当日额度状态预注入：今天已知 mx_query 用尽（持久标记，跨 turn/跨
         # 会话、按日期比对）→ 第一轮就告知模型，绕开注定失败的调用
         # （09-08 17:11：首轮 2 次 mx_query 秒错后才见提示；17:03 同款）

@@ -41,6 +41,15 @@ interface SettingsViewProps {
   ttsLocalVoices: string[];
   ttsLocalVoice: string;
   setTtsLocalVoice: (v: string) => void;
+  /** 音高（变调后处理，1.0 原声；前端只发请求，sidecar 用 ffmpeg 做） */
+  ttsPitch: number;
+  setTtsPitch: (v: number) => void;
+  /** 情绪（只对 IndexTTS 克隆音色生效） */
+  ttsEmotion: string;
+  setTtsEmotion: (v: string) => void;
+  /** 自动朗读：每轮回复结束后自动念 */
+  ttsAutoRead: boolean;
+  setTtsAutoRead: (v: boolean) => void;
 }
 
 function toggleOnChange(setter: (v: boolean) => void, storageKey: string) {
@@ -144,6 +153,7 @@ export default function SettingsView({
   reflectionMode, setReflectionMode,
   ttsEnabled, setTtsEnabled, ttsRate, setTtsRate, ttsVoice, setTtsVoice, ttsVoices,
   ttsLocalVoices, ttsLocalVoice, setTtsLocalVoice,
+  ttsPitch, setTtsPitch, ttsEmotion, setTtsEmotion, ttsAutoRead, setTtsAutoRead,
 }: SettingsViewProps) {
   const { t, lang, setLanguage } = useTranslation();
 
@@ -234,6 +244,42 @@ export default function SettingsView({
                   </select>
                 </div>
               )}
+              <div className="settings-row">
+                <div>
+                  <div className="settings-row-label">{t("settings.tts_pitch")}</div>
+                  <div className="settings-row-desc">{t("settings.tts_pitch_desc", { value: ttsPitch.toFixed(2) })}</div>
+                </div>
+                <input type="range" min="0.75" max="1.30" step="0.05" value={ttsPitch}
+                  style={{ width: 130 }}
+                  onChange={e => { const v = Number(e.target.value) || 1; setTtsPitch(v); localStorage.setItem("latiao_tts_pitch", String(v)); }} />
+              </div>
+              <div className="settings-row">
+                <div>
+                  <div className="settings-row-label">{t("settings.tts_emotion")}</div>
+                  <div className="settings-row-desc">{t("settings.tts_emotion_desc")}</div>
+                </div>
+                <select className="form-input" style={{ width: "auto", margin: 0, padding: "5px 10px", fontSize: 11 }}
+                  value={ttsEmotion}
+                  onChange={e => { setTtsEmotion(e.target.value); localStorage.setItem("latiao_tts_emotion", e.target.value); }}>
+                  <option value="">{t("settings.tts_emotion_none")}</option>
+                  <option value="happy">{t("settings.tts_emotion_happy")}</option>
+                  <option value="calm">{t("settings.tts_emotion_calm")}</option>
+                  <option value="sad">{t("settings.tts_emotion_sad")}</option>
+                  <option value="angry">{t("settings.tts_emotion_angry")}</option>
+                  <option value="surprised">{t("settings.tts_emotion_surprised")}</option>
+                </select>
+              </div>
+              <div className="settings-row">
+                <div>
+                  <div className="settings-row-label">{t("settings.tts_autoread")}</div>
+                  <div className="settings-row-desc">{t("settings.tts_autoread_desc")}</div>
+                </div>
+                <label className="toggle">
+                  <input type="checkbox" checked={ttsAutoRead}
+                    onChange={e => { const v = e.target.checked; setTtsAutoRead(v); localStorage.setItem("latiao_tts_autoread", String(v)); }} />
+                  <span className="toggle-slider"></span>
+                </label>
+              </div>
               <div className="settings-row">
                 <div>
                   <div className="settings-row-label">{t("settings.tts_voice")}</div>
