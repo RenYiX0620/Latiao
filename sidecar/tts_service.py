@@ -18,6 +18,7 @@ import json
 import logging
 import time
 from pathlib import Path
+from urllib.parse import quote
 from typing import Optional, Tuple
 
 import httpx
@@ -29,9 +30,16 @@ DEFAULT_TTS = {
     "base_url": "http://127.0.0.1:7799",    # 本地语音服务（OpenAI 兼容）
     "model_id": "",                         # 服务端模型名；空＝用服务默认
     "voice": "",                            # 音色；空＝用服务默认
+    # 参考音频路径：**零样本克隆类模型（IndexTTS 等）没有内置音色**，不给参考音频
+    # 直接报错（mlx_audio: "Must provide one of ref_audio or ref_mel"）。这类模型靠
+    # 一段 5~15s 的干净人声决定音色，所以接缝必须留这个字段；有音色包的模型留空即可。
+    "ref_audio": "",
     "speed": 1.0,
     "max_chars": 3000,                       # 单次合成上限，超长由前端按句切
-    "timeout": 30.0,                         # 单次合成超时（秒）
+    # 单次合成超时（秒）。**必须与前端 speak() 的 8s AbortSignal 对齐**：
+    # 实测（假服务"在监听但不响应"）30s 会让用户白等到超时才听到系统语音 —— 朗读这种
+    # 动作的容错窗口只有几秒，本地合成一句本来 <2s，8s 已经是很宽的余量。
+    "timeout": 8.0,
 }
 
 _PROBE_TTL = 20.0            # 可达性缓存：朗读是高频动作，别每次都探
@@ -109,6 +117,16 @@ def unavailable_payload(conf: dict) -> dict:
     )
 
 
+def _looks_like_json(body: bytes) -> bool:
+    """音频响应体里混进了 JSON —— 说明服务端是「先提交 200 + audio/* 头，再在流里报错」。
+
+    mlx_audio.server 就是这种实现（StreamingResponse 的头在生成器运行前就发出去了），
+    所以模型在流中失败时前端会拿到 200 + `audio/wav` + 一段 JSON 错误文本；不挡住的话
+    这段文本会被当音频播放，用户听到的是一声爆音而不是回退系统语音。
+    """
+    return body.lstrip()[:1] == b"{"
+
+
 async def synthesize(text: str, voice: Optional[str], speed: Optional[float],
                      config_file: Path) -> Tuple[Optional[bytes], Optional[str], Optional[dict]]:
     """把文本转成音频字节。返回 (audio, content_type, error)，三选二。"""
@@ -129,10 +147,23 @@ async def synthesize(text: str, voice: Optional[str], speed: Optional[float],
     payload = {
         "model": str(conf.get("model_id") or "kokoro"),
         "input": clean,
-        "voice": str(voice or conf.get("voice") or ""),
         "speed": float(speed or conf.get("speed") or 1.0),
         "response_format": "wav",
     }
+    # 音色为空时**不要发这个键**：有的后端（audio.cpp）把空串当成一个真实音色名去查，
+    # 直接 500 "unknown voice id: "，用户就永远只能用系统语音且不知道为什么。
+    # 省略键＝让服务用它自己的默认音色，这才是"没选"的正确表达。
+    voice_id = str(voice or conf.get("voice") or "").strip()
+    if voice_id:
+        payload["voice"] = voice_id
+    ref_audio = str(conf.get("ref_audio") or "").strip()
+    if ref_audio:
+        # 两个名字都发：克隆类模型没有内置音色，但各家字段名不同 —— mlx_audio 用
+        # `ref_audio`，audio.cpp 用 `voice_ref`。实测两边都会忽略自己不认识的那个键
+        # （audio.cpp 200 照常出声，mlx_audio 的 pydantic 默认忽略多余字段），
+        # 所以不必按后端分支，接缝保持"一个字段配好就能换后端"。
+        payload["ref_audio"] = ref_audio
+        payload["voice_ref"] = ref_audio
     try:
         async with httpx.AsyncClient(timeout=_request_timeout(conf)) as client:
             resp = await client.post(f"{conf['base_url']}/v1/audio/speech", json=payload)
@@ -142,13 +173,15 @@ async def synthesize(text: str, voice: Optional[str], speed: Optional[float],
         return None, None, unavailable_payload(conf)
 
     ctype = (resp.headers.get("content-type") or "").split(";")[0].strip()
-    if resp.status_code >= 400 or ctype.startswith("application/json"):
+    audio = resp.content or b""
+    if resp.status_code >= 400 or ctype.startswith("application/json") or _looks_like_json(audio):
         detail = ""
         try:
             body = resp.json()
             detail = str(body.get("detail") or body.get("message") or body.get("error") or "")
         except Exception:
-            detail = resp.text[:200]
+            detail = audio.decode("utf-8", "replace")[:200] if _looks_like_json(audio) \
+                else resp.text[:200]
         logger.warning("语音服务返回 %s: %s", resp.status_code, detail)
         return None, None, _error(
             "tts_service_error",
@@ -156,7 +189,6 @@ async def synthesize(text: str, voice: Optional[str], speed: Optional[float],
             ["已自动改用系统语音。",
              "若反复出现：检查语音服务的模型是否加载成功（服务日志）。"],
         )
-    audio = resp.content or b""
     if not audio:
         return None, None, _error("tts_empty_audio", "语音服务返回了空音频", [])
     if len(audio) > _MAX_AUDIO_BYTES:
@@ -174,8 +206,14 @@ async def list_voices(config_file: Path) -> dict:
         return _error("tts_unavailable", unavailable_payload(conf)["message"],
                       unavailable_payload(conf)["next_steps"])
     try:
+        # 必须带 ?model=<id>：服务可能挂了多个模型（本机就同时有 kokoro 和 indextts），
+        # 不带参数时 audio.cpp 无法判断要列哪一个，会返回空表 —— 音色下拉就一直是空的。
+        voices_url = f"{conf['base_url']}/v1/audio/voices"
+        model_id = str(conf.get("model_id") or "").strip()
+        if model_id:
+            voices_url += f"?model={quote(model_id, safe='')}"
         async with httpx.AsyncClient(timeout=_request_timeout(conf, probe=True)) as client:
-            resp = await client.get(f"{conf['base_url']}/v1/audio/voices")
+            resp = await client.get(voices_url)
         if resp.status_code >= 400:
             return _error("tts_service_error", f"语音服务返回 {resp.status_code}", [])
         data = resp.json()
@@ -189,7 +227,12 @@ async def list_voices(config_file: Path) -> dict:
 
 
 def status(config_file: Path) -> dict:
-    """给设置页看的一行状态：是否启用、服务是否在跑、当前模型与音色。"""
+    """给设置页看的一行状态：是否启用、服务是否在跑、当前模型与音色。
+
+    这里也把 `timeout` 报给前端：**合成超时是跟着模型走的** —— 系统语音/小模型 <2s，
+    而本机 IndexTTS-2.5 这种要 6~20s。前端不猜，直接用服务端配置的这个值当 AbortSignal，
+    于是"换模型"只改 config.json 一处，前端一行都不用动。
+    """
     conf = read_tts_config(config_file)
     enabled = bool(conf.get("enabled", True))
     return {
@@ -198,5 +241,7 @@ def status(config_file: Path) -> dict:
         "base_url": conf.get("base_url") or "",
         "model_id": conf.get("model_id") or "",
         "voice": conf.get("voice") or "",
+        "ref_audio": conf.get("ref_audio") or "",
         "speed": conf.get("speed"),
+        "timeout": _request_timeout(conf),
     }

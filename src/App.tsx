@@ -153,6 +153,13 @@ const [timeFilter, setTimeFilter] = useState("all");
   const [ttsVoice, setTtsVoice] = useState<string>(() => localStorage.getItem("latiao_tts_voice") || "");
   useEffect(() => { localStorage.setItem("latiao_tts_voice", ttsVoice); }, [ttsVoice]);
   const [ttsVoices, setTtsVoices] = useState<SpeechSynthesisVoice[]>([]);
+  // 合成等待上限：默认 8s（系统语音/小模型够用），由 /v1/tts/status 按配置覆盖
+  const [ttsTimeoutMs, setTtsTimeoutMs] = useState(8000);
+  // 本地语音服务的音色 id（与系统语音列表是两套命名，不能混用）
+  const [ttsLocalVoices, setTtsLocalVoices] = useState<string[]>([]);
+  const [ttsLocalVoice, setTtsLocalVoice] = useState<string>(
+    () => localStorage.getItem("latiao_tts_local_voice") || ""
+  );
   const [speakingId, setSpeakingId] = useState<string | null>(null);
 
   // 权限模式五档（从保守到放手）：read_only / confirm / auto_edit / plan / full
@@ -1534,6 +1541,34 @@ const [timeFilter, setTimeFilter] = useState("all");
     };
   }, []);
 
+  // 合成超时跟着服务端配置走（默认仍是 8s）。本机大模型要 6~20s，靠它一处配置调开，
+  // 前端不用改代码；服务不可用由 sidecar 的探测先挡掉，所以放长不会白等。
+  // 顺带取本地语音服务的音色表：设置页那份是**系统语音**的名字，本地服务不认，
+  // 拿它去合成会 500（audio.cpp: unknown voice id）→ 对不上就不发，让服务用默认音色。
+  useEffect(() => {
+    if (!ttsEnabled) return;
+    let alive = true;
+    (async () => {
+      try {
+        const resp = await authFetch("/v1/tts/status", { signal: AbortSignal.timeout(4000) });
+        if (resp.ok) {
+          const data = await resp.json();
+          const secs = Number(data?.timeout);
+          if (alive && Number.isFinite(secs) && secs > 0) setTtsTimeoutMs(Math.round(secs * 1000));
+        }
+      } catch { /* 拿不到就用默认 8s */ }
+      try {
+        const resp = await authFetch("/v1/tts/voices", { signal: AbortSignal.timeout(4000) });
+        if (resp.ok) {
+          const data = await resp.json();
+          const list = Array.isArray(data?.voices) ? data.voices : [];
+          if (alive) setTtsLocalVoices(list.map((v: unknown) => String(v)));
+        }
+      } catch { /* 服务不在 → 空表，走系统语音 */ }
+    })();
+    return () => { alive = false; };
+  }, [ttsEnabled]);
+
   const stopSpeaking = useCallback(() => {
     try { window.speechSynthesis?.cancel(); } catch { /* ignore */ }
     const audio = ttsAudioRef.current;
@@ -1578,8 +1613,13 @@ const [timeFilter, setTimeFilter] = useState("all");
       const resp = await authFetch("/v1/synthesize_speech", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text, voice: ttsVoice || undefined, speed: ttsRate }),
-        signal: AbortSignal.timeout(8000),
+        body: JSON.stringify({
+          text,
+          // 本地音色优先；系统音色名服务不认，发过去只会 500（见 ttsLocalVoices 的说明）
+          voice: ttsLocalVoices.includes(ttsLocalVoice) ? ttsLocalVoice : undefined,
+          speed: ttsRate,
+        }),
+        signal: AbortSignal.timeout(ttsTimeoutMs),
       });
       const ctype = resp.headers.get("content-type") || "";
       if (resp.ok && !ctype.includes("application/json")) {
@@ -1602,7 +1642,7 @@ const [timeFilter, setTimeFilter] = useState("all");
       return;
     }
     systemSpeak(text);
-  }, [ttsEnabled, ttsVoice, ttsRate, stopSpeaking, systemSpeak, showToast, t]);
+  }, [ttsEnabled, ttsVoice, ttsRate, ttsTimeoutMs, ttsLocalVoices, ttsLocalVoice, stopSpeaking, systemSpeak, showToast, t]);
 
   // 切会话/新会话时停掉上一轮的朗读，别让它在后台继续念
   useEffect(() => { stopSpeaking(); }, [session.id, stopSpeaking]);
@@ -1847,6 +1887,7 @@ const [timeFilter, setTimeFilter] = useState("all");
           </div>
           <SettingsView
             theme={theme} setTheme={setTheme}
+            active={activeView === "settings"}
             sidecarStatus={sidecarStatus}
             restartingSidecar={restartingSidecar}
             onRestartSidecar={handleRestartSidecar}
@@ -1865,6 +1906,9 @@ const [timeFilter, setTimeFilter] = useState("all");
             ttsRate={ttsRate} setTtsRate={setTtsRate}
             ttsVoice={ttsVoice} setTtsVoice={setTtsVoice}
             ttsVoices={ttsVoices.map(v => ({ name: v.name, lang: v.lang }))}
+            ttsLocalVoices={ttsLocalVoices}
+            ttsLocalVoice={ttsLocalVoice}
+            setTtsLocalVoice={setTtsLocalVoice}
           />
         </div>
 
