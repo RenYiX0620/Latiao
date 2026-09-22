@@ -21,11 +21,12 @@ from pathlib import Path
 
 import httpx
 from fastapi import File, HTTPException, Query, Request, UploadFile
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 import cron
 import local_llm
 import main
+import tts_service
 from agent_loop import (
     _NATIVE_TOOL_RE,
     AGENT_PROFILES,
@@ -950,6 +951,41 @@ async def recognize_speech(request: Request):
                 os.unlink(wav_path)
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+
+# ── 语音合成（朗读）：代理给独立的本地语音服务，服务不在就返回结构化降级 ──
+# 第一轮「框架先行」：模型不在 Latiao 里，换模型只改 config.json 的 tts.model_id。
+
+
+@app.post("/v1/synthesize_speech")
+async def synthesize_speech(request: Request):
+    """文字 → 音频。成功回音频字节；服务未就绪回 {code: tts_unavailable} 让前端回退系统语音。"""
+    body = await _json_body(request)
+    text = str(body.get("text") or "").strip()
+    if not text:
+        return JSONResponse(status_code=400, content={"status": "error",
+                                                     "code": "tts_empty_text",
+                                                     "message": "没有需要朗读的文本"})
+    audio, ctype, err = await tts_service.synthesize(
+        text, body.get("voice"), body.get("speed"), CONFIG_FILE)
+    if audio:
+        return Response(content=audio, media_type=ctype or "audio/wav")
+    return JSONResponse(status_code=503, content=err or {"status": "error",
+                                                        "code": "tts_unavailable"})
+
+
+@app.get("/v1/tts/voices")
+async def tts_voices():
+    """音色列表：按当前模型动态取，前端不用因换模型而改。"""
+    data = await tts_service.list_voices(CONFIG_FILE)
+    code = 503 if data.get("status") == "error" else 200
+    return JSONResponse(status_code=code, content=data)
+
+
+@app.get("/v1/tts/status")
+async def tts_status():
+    """给设置页看的一行状态（是否启用 / 服务是否在跑 / 当前模型与音色）。"""
+    return tts_service.status(CONFIG_FILE)
 
 
 @app.post("/v1/test_connection")
