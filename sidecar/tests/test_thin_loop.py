@@ -43,9 +43,7 @@ def _run_loop(engine, messages, *, access_mode="full", session_suffix=""):
 
 
 def _finally_restore():
-    import agent_loop
-    import agent.context as agent_context
-    import local_llm
+    pass
     # 占位：真正的恢复在测试体内 try/finally 完成
 
 
@@ -85,7 +83,6 @@ async def test_thin_cloud_text_round_trip():
 @pytest.mark.asyncio
 async def test_thin_native_tool_round_trip():
     """原生 tools 下发 → delta.tool_calls 执行 → assistant 携 tool_calls → 完成。"""
-    import agent_loop
     import agent.context as agent_context
     import local_llm
     from tests.test_loop_scenarios import _StubEngine
@@ -123,7 +120,6 @@ async def test_thin_native_tool_round_trip():
 @pytest.mark.asyncio
 async def test_thin_error_as_result_model_self_corrects():
     """错误即结果：工具失败的结构化错误回填后模型自纠，无 nudge 介入。"""
-    import agent_loop
     import agent.context as agent_context
     import local_llm
     from tests.test_loop_scenarios import _StubEngine
@@ -201,7 +197,6 @@ async def test_thin_steer_claimed_at_step_boundary():
     """steer：队列中的新消息在 step 边界并入同轮续跑。"""
     from tests.test_loop_scenarios import _StubEngine
     from agent.loop import ThinAgentLoop, queue_steer
-    import agent.context as agent_context
     import local_llm
     sid = f"thin-t6-{time.time()}"
     with FakeEngine() as engine:
@@ -230,7 +225,6 @@ async def test_thin_think_only_assist():
     """思考-only → 终答提取辅助（弱模型辅助层，仅本地）。"""
     from tests.test_loop_scenarios import _StubEngine
     from agent.loop import ThinAgentLoop
-    import agent.context as agent_context
     import local_llm
     with FakeEngine() as engine:
         engine.push(engine.thinking_only_response("让我思考一下这个问题……"))
@@ -250,7 +244,6 @@ async def test_thin_think_only_assist():
 async def test_thin_cloud_body_model_is_cloud_name():
     """09-06 19:29 事故回归：本地引擎加载着 Qwen 时，云端请求的 model
     必须仍是云端模型名（此前返回本地路径 → deepseek 400）。"""
-    import agent_loop
     import local_llm
     from agent.loop import ThinAgentLoop
     from tests.test_loop_scenarios import _StubEngine

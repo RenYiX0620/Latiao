@@ -13,7 +13,6 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-import adapters
 from adapters import (
     parse_github_repo,
     parse_frontmatter,

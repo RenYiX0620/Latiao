@@ -3,12 +3,11 @@
 覆盖：seq 连续、surface 强制、坏数据拒绝（非有限数/函数/stem）、
 快照深拷贝（事后改不动）、source_seqs 唯一、SQLite 回放往返。
 """
-import json
 import sqlite3
 
 import pytest
 
-from session_log import EventLogError, SessionLog, SessionEvent, _persist_enabled
+from session_log import EventLogError, SessionLog, _persist_enabled
 
 
 @pytest.fixture()

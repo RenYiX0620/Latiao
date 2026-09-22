@@ -167,7 +167,6 @@ class TestConfirmFlowIntegration(unittest.TestCase):
     def test_confirm_control_tool_approve_executes(self):
         import asyncio
         import agent_loop
-        from plugins import control_launch
 
         async def run():
             msgs = []

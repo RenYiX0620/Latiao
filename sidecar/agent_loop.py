@@ -1128,8 +1128,14 @@ async def _start_plan_confirmation(plan_id: str, plan: str) -> dict:
 
 
 async def _wait_plan_confirmation(plan_id: str, event_obj: asyncio.Event,
-                                  timeout: float = 0) -> tuple[bool, list[dict]]:
-    """等待计划确认结果（默认不限时，用户点击后继续；09-21 用户反馈）。"""
+                                  timeout: float = 0, lang: str = "zh") -> tuple[bool, list[dict]]:
+    """等待计划确认结果（默认不限时，用户点击后继续；09-21 用户反馈）。
+
+    `timeout=0` 是**有意**不限时（用户反馈：急着超时会打断他确认）。但超时分支本身
+    必须能用：它原先引用 `_msg`/`lang_of`/`msgs` 三个名字，而这三个在该作用域都不存在
+    → 一旦真传了 timeout 就会 NameError 把友好提示变成报错。`lang` 由调用方传入
+    （原来是靠 `lang_of(msgs)` 猜，而 msgs 在这里根本没有）。
+    """
     events = []
     try:
         if timeout and timeout > 0:
@@ -1141,8 +1147,9 @@ async def _wait_plan_confirmation(plan_id: str, event_obj: asyncio.Event,
         logger.info("plan confirmation resolved: %s approved=%s", plan_id, approved)
     except asyncio.TimeoutError:
         approved = False
+        from agent.messages import msg as _msg
         events.append({
-            "content": "\n\n" + _msg("plan_timeout", lang_of(msgs)),
+            "content": "\n\n" + _msg("plan_timeout", lang or "zh"),
         })
     finally:
         async with _pending_lock:

@@ -47,7 +47,8 @@ export function stripForSpeech(markdown: string): string {
   t = t.replace(/~~([^~]+)~~/g, "$1");
 
   // emoji：多数引擎会念成"表情符号"或读出名字，朗读时去掉
-  t = t.replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}\u{2190}-\u{21FF}]/gu, "");
+  t = t.replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2190}-\u{21FF}]/gu, "")
+      .replace(/\uFE0F/g, "");   // 变体选择符单独删：组合字符放进字符类，linter 与引擎都会误解
 
   // 收尾：去掉只剩空白的行（代码块/分隔线被替换后留下的），再折叠空行
   return t
@@ -108,6 +109,25 @@ export function splitSentences(text: string, maxLen = 110): string[] {
 }
 
 /** 从系统音色里挑一个与界面语言匹配的；找不到返回 undefined（交给系统默认音色）。 */
+/** 只挑当前语言的系统语音，给设置页的下拉用。
+ *
+ * 为什么要筛：macOS 的 `getVoices()` 会给 180+ 个语音（英文 18、中文只有 10，还有韩语西语
+ * 葡语……），全塞进下拉既难找也让人以为"怎么全是英文"。筛不到任何匹配时**回落全量**，
+ * 免得用户在下拉里一个都选不到。语言码统一把 `zh_CN` 归一成 `zh-CN` 再比。
+ */
+export function voicesForLang<T extends { lang?: string }>(voices: T[] | undefined | null,
+                                                          lang: string): T[] {
+  const list = (voices || []).filter((v) => !!v);
+  const want = (lang || "zh").toLowerCase().replace("_", "-");
+  const short = want.split("-")[0];
+  const norm = (v: { lang?: string }) => (v.lang || "").toLowerCase().replace("_", "-");
+  const hit = list.filter((v) => {
+    const l = norm(v);
+    return l === want || l.startsWith(short + "-") || l === short;
+  });
+  return hit.length ? hit : list;
+}
+
 export function pickVoice(
   voices: SpeechSynthesisVoice[] | undefined | null,
   lang: string,

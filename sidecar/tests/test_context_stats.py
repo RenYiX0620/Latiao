@@ -4,6 +4,8 @@
 不依赖 tokenizer 的路径；精确计数（vocab_only / tokenizers）在实现时用真机
 实测校验过（GGUF 与 MLX 两路计数一致，误差 0）。
 """
+from unittest import mock
+import time
 import json
 import shutil
 import sys
@@ -327,7 +329,6 @@ class TestBoundedToolExecution(unittest.TestCase):
     """工具执行护栏（09-19 事故：search_files 递归扫家目录 → 整轮卡死 21 分钟无输出）。"""
 
     def setUp(self):
-        import tempfile
         from pathlib import Path
         self.tmp = Path(tempfile.mkdtemp(prefix="search-guard-"))
         (self.tmp / "keep").mkdir()
@@ -343,7 +344,6 @@ class TestBoundedToolExecution(unittest.TestCase):
             (self.tmp / "keep" / f"many{i}.md").write_text("x", encoding="utf-8")
 
     def tearDown(self):
-        import shutil
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_large_dirs_skipped(self):
@@ -355,7 +355,7 @@ class TestBoundedToolExecution(unittest.TestCase):
         self.assertIn("a.md", out2)
 
     def test_results_capped(self):
-        from tool_executor import search_files, _SEARCH_MAX_RESULTS
+        from tool_executor import search_files
         out = search_files(str(self.tmp), "many*.md")
         self.assertIn("上限", out)                          # 明确告知已截断
         self.assertLessEqual(out.count("📄"), 50)           # 展示条数上限
@@ -612,7 +612,7 @@ class TestCustomEngine(unittest.TestCase):
     """路线 A：custom_engine 配置（第三方 fork 引擎当辣条本地后端）。"""
 
     def setUp(self):
-        import tempfile, pathlib as _pl, os
+        import pathlib as _pl, os
         self.tmp = tempfile.TemporaryDirectory()
         self.bin = _pl.Path(self.tmp.name) / "their-llama-server"
         self.bin.write_text("#!/bin/sh\n")
@@ -739,7 +739,6 @@ class TestGgufPrecheck(unittest.TestCase):
         return str(path)
 
     def test_flags_private_quant_type(self):
-        import tempfile
         from local_llm import _gguf_scan, _gguf_precheck
         with tempfile.TemporaryDirectory() as tmp:
             path = self._gguf(tmp, 142, [5120, 248320], 4096)
@@ -752,7 +751,6 @@ class TestGgufPrecheck(unittest.TestCase):
             self.assertNotIn("架构", msg.split("这通常不是架构问题")[0])   # 不再甩给架构
 
     def test_flags_truncated_file(self):
-        import tempfile
         from local_llm import _gguf_precheck
         with tempfile.TemporaryDirectory() as tmp:
             # Q8_0(8)：256 元素/块、34 字节/块 → dims [256,256] 需 69632 字节，只给 4096
@@ -762,14 +760,13 @@ class TestGgufPrecheck(unittest.TestCase):
             self.assertIn("还缺", msg)
 
     def test_complete_standard_file_passes(self):
-        import tempfile
         from local_llm import _gguf_precheck
         with tempfile.TemporaryDirectory() as tmp:
             path = self._gguf(tmp, 8, [256, 256], 69632)
             self.assertEqual(_gguf_precheck(path), "")
 
     def test_garbage_file_fails_open(self):
-        import tempfile, pathlib as _pl
+        import pathlib as _pl
         from local_llm import _gguf_precheck, _gguf_scan
         with tempfile.TemporaryDirectory() as tmp:
             path = _pl.Path(tmp) / "x.gguf"
@@ -794,7 +791,7 @@ class TestCustomEngineTarget(unittest.TestCase):
     """自定义引擎的加载目标检查（09-20）：GGUF 文件 / MLX 目录都要能识别。"""
 
     def test_gguf_file_and_directory(self):
-        import tempfile, pathlib as _pl
+        import pathlib as _pl
         from local_llm import _custom_engine_target
         with tempfile.TemporaryDirectory() as tmp:
             d = _pl.Path(tmp)
@@ -807,7 +804,7 @@ class TestCustomEngineTarget(unittest.TestCase):
             self.assertEqual(_custom_engine_target(str(bad))[0], "err")
 
     def test_mlx_pack_directory(self):
-        import tempfile, pathlib as _pl, json
+        import pathlib as _pl, json
         from local_llm import _custom_engine_target
         with tempfile.TemporaryDirectory() as tmp:
             d = _pl.Path(tmp)
@@ -845,7 +842,6 @@ class TestShortMessageNoInjection(unittest.TestCase):
         return str(out[-1].get("content") or "")
 
     def test_short_or_chat_no_injection(self):
-        import agent_loop as A
         for t in ("骚货", "在吗", "你好", "谢谢", "嗯"):
             last = self._last(t)
             self.assertNotIn("【背景资料", last, f"短消息不应注入: {t}")
@@ -881,7 +877,7 @@ class TestMultiCustomEngines(unittest.TestCase):
     """同一模型家族多个包（GGUF→fork 引擎、MLX→自带运行时）各用各的 binary（09-20）。"""
 
     def setUp(self):
-        import tempfile, pathlib as _pl, os
+        import pathlib as _pl, os
         self.tmp = tempfile.TemporaryDirectory()
         self.a = _pl.Path(self.tmp.name) / "fork-llama-server"
         self.b = _pl.Path(self.tmp.name) / "mlx-shim.sh"
@@ -926,7 +922,7 @@ class TestMlxRejectReason(unittest.TestCase):
     把"需要自带运行时"的包（Prism Bonsai MLX，无视觉塔）说成"多模态 MLX-VLM"。"""
 
     def _mk(self, files: dict) -> str:
-        import json, tempfile, pathlib as _pl
+        import json, pathlib as _pl
         d = _pl.Path(tempfile.mkdtemp())
         for name, content in files.items():
             f = d / name.replace("__", "/")
@@ -974,7 +970,7 @@ class TestMaxTokensAndLengthRetry(unittest.TestCase):
         self.assertEqual(_resolve_max_tokens("x", local=True, override=32768), 32768)  # 配置优先
 
     def test_custom_engine_max_tokens_from_config(self):
-        import json, tempfile, pathlib as _pl
+        import json, pathlib as _pl
         import agent_loop as A
         from agent.context import _custom_engine_max_tokens
         old = A.CONFIG_FILE
@@ -1282,7 +1278,7 @@ class TestPromptCacheFriendly(unittest.TestCase):
     """
 
     def test_volatile_blocks_come_last(self):
-        import os, tempfile
+        import os
         os.environ["LATIAO_TEST_PROGRESS_DIR"] = tempfile.mkdtemp()
         from agent_loop import _build_chat_messages
         body = {"messages": [{"role": "user", "content": "读取这个文件并分析"}]}
@@ -1339,3 +1335,60 @@ def test_resolve_gguf_plain_file_and_non_gguf(tmp_path):
     assert _resolve_gguf_file(str(f)) == str(f)
     assert _resolve_gguf_file(str(tmp_path / "nope.txt")) is None
     assert _resolve_gguf_file("") is None
+
+
+class TestCounterFailureMemory(unittest.TestCase):
+    """加载不了的模型只试一次：否则每轮对每个文本块重试一次，日志被 traceback 灌爆。"""
+
+    def setUp(self):
+        import context_stats
+        self.cs = context_stats
+        self.cs._counters.clear(); self.cs._counter_order.clear()
+        self.cs._FAILED_COUNTERS.clear()
+
+    def test_failure_attempted_once_per_ttl(self):
+        calls = []
+
+        def boom(path):
+            calls.append(path)
+            raise ValueError("failed to load model")
+
+        orig = self.cs._gguf_counter
+        self.cs._gguf_counter = boom
+        try:
+            with mock.patch.object(self.cs, "_resolve_gguf_file", return_value="/tmp/x.gguf"):
+                for _ in range(5):
+                    n, src = self.cs.count_tokens("今天大盘", "/tmp/model.gguf")
+                    self.assertEqual(src, "estimated")
+        finally:
+            self.cs._gguf_counter = orig
+        self.assertEqual(len(calls), 1, "同一模型半小时内只应尝试加载一次")
+
+    def test_ttl_expiry_allows_retry(self):
+        calls = []
+
+        def boom(path):
+            calls.append(path)
+            raise ValueError("nope")
+
+        orig = self.cs._gguf_counter
+        self.cs._gguf_counter = boom
+        try:
+            with mock.patch.object(self.cs, "_resolve_gguf_file", return_value="/tmp/x.gguf"):
+                self.cs.count_tokens("x", "/tmp/m.gguf")
+                # 手动把失败时间往前拨，模拟 TTL 过期
+                self.cs._FAILED_COUNTERS["/tmp/m.gguf"] = time.monotonic() - 3600
+                self.cs.count_tokens("x", "/tmp/m.gguf")
+        finally:
+            self.cs._gguf_counter = orig
+        self.assertEqual(len(calls), 2, "过了 TTL 应重新尝试（模型可能被换掉）")
+
+    def test_only_one_warning_per_model(self):
+        with mock.patch.object(self.cs, "_resolve_gguf_file", return_value="/tmp/x.gguf"), \
+             mock.patch.object(self.cs, "_gguf_counter",
+                               side_effect=ValueError("load failed")), \
+             self.assertLogs("latiao-sidecar", level="WARNING") as logs:
+            for _ in range(4):
+                self.cs.count_tokens("今天", "/tmp/warn.gguf")
+        warnings = [r for r in logs.output if "精确计数不可用" in r]
+        self.assertEqual(len(warnings), 1, "同一模型的告警只打一次")

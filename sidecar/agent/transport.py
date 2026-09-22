@@ -6,7 +6,6 @@ import logging
 import weakref
 from contextlib import asynccontextmanager
 from pathlib import Path
-from urllib.parse import urlparse
 
 import httpx
 

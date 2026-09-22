@@ -1296,7 +1296,6 @@ class LocalLLMEngine:
         type(self)._engine_busy_until = _t.monotonic() + max(grace_sec, 180.0)
 
     def mark_engine_idle(self):
-        import time as _t
         type(self)._engine_busy_until = 0.0
 
     @classmethod

@@ -26,7 +26,6 @@ from agent.core import Scope
 from agent.transport import (
     _is_local_llm_url,
     _local_llm_stream,
-    mark_llm_suspect,
 )
 from agent.parsing import (
     _parse_delta_line,
@@ -36,15 +35,14 @@ from agent.text_quality import (
     _GenerationLoopError,
     _detect_text_loop,
     _strip_repeat_tail,
-    _strip_think_fences,
 )
-from agent.messages import lang_of, msg as _msg
+from agent.messages import msg as _msg
 from agent.context import (
-    _detect_user_language,
     detect_language_decision,
     _ensure_market_tools,
     _extract_last_user_text,
     _filter_tools_by_access,
+    _is_chat_query,
     _is_light_query,
     _local_native_tools_ok,
     _maybe_add_inline_file_note,
@@ -52,7 +50,6 @@ from agent.context import (
     _normalize_access,
     _resolve_max_tokens,
     _sanitize_tool_messages,
-    _slim_history_for_local,
     _strip_transient_reminders,
 
     _is_custom_engine,
@@ -1196,7 +1193,8 @@ class ThinAgentLoop:
                 if plan_wait and not self._plan_injected:
                     from agent_loop import _wait_plan_confirmation
                     approved, evts = await _wait_plan_confirmation(
-                        plan_wait["plan_id"], plan_wait["event_obj"])
+                        plan_wait["plan_id"], plan_wait["event_obj"],
+                        lang=self.user_lang)
                     for evt in evts:
                         yield evt
                     if not approved:

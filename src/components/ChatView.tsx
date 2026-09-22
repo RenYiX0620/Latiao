@@ -47,6 +47,7 @@ const TOOL_CATEGORY_FALLBACK = { verb: "Tool call", noun: "调用", icon: Wrench
 import ReactMarkdown from "react-markdown";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import remarkGfm from "remark-gfm";
+import type { SyntaxHighlighterProps } from "react-syntax-highlighter";
 
 const SyntaxHighlighter = lazy(async () => {
   const [{ Prism }, themes] = await Promise.all([
@@ -71,8 +72,11 @@ const SyntaxHighlighter = lazy(async () => {
   };
   const darkFlat = flatten(themes.oneDark);
   const lightFlat = flatten(themes.oneLight);
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  return { default: (props: any) => {
+
+  // 必须写成**具名组件**再赋给 default：原来是一个匿名箭头函数直接放在 default 属性里，
+  // React 认不出来这是组件（Fast Refresh 失效），eslint 也会报 rules-of-hooks —— hook 写在
+  // 无名函数里，一旦哪天被当成普通函数调用就会崩。
+  function DarkAwarePrism(props: SyntaxHighlighterProps) {
     const [theme, setTheme] = useState<string>(
       () => document.documentElement.getAttribute("data-theme") || "dark"
     );
@@ -84,7 +88,8 @@ const SyntaxHighlighter = lazy(async () => {
       return () => mo.disconnect();
     }, []);
     return <Prism style={theme === "light" ? lightFlat : darkFlat} {...props} />;
-  } };
+  }
+  return { default: DarkAwarePrism };
 });
 
 function CodeBlock({ language, children }: { language: string; children: string }) {

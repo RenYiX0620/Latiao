@@ -7,7 +7,6 @@
   白名单恒排除 delegate_task；registry 保留 depth 字段为将来递归预留）。
 - UI 契约不变：_SUBTASKS/_SUBTASK_EVENTS/前台返回文本，与旧实现逐字段兼容。
 """
-import json
 import logging
 import time as _time
 import uuid

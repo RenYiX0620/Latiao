@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { pickVoice, speechSupported, splitSentences, stripForSpeech } from "./speech";
+import { pickVoice, speechSupported, splitSentences, stripForSpeech, voicesForLang } from "./speech";
 
 describe("stripForSpeech", () => {
   it("整块丢掉围栏代码（含语言标记）", () => {
@@ -105,5 +105,42 @@ describe("pickVoice", () => {
 describe("speechSupported", () => {
   it("在 jsdom 里没有 speechSynthesis 时返回 false（不崩）", () => {
     expect(typeof speechSupported()).toBe("boolean");
+  });
+});
+
+describe("voicesForLang 只列当前语言的系统语音", () => {
+  const all = [
+    { name: "Tingting", lang: "zh-CN" },
+    { name: "Shelley", lang: "zh-CN" },
+    { name: "Samantha", lang: "en-US" },
+    { name: "Daniel", lang: "en-GB" },
+    { name: "Kyoko", lang: "ja-JP" },
+    { name: "Milena", lang: "ru-RU" },
+    { name: "Odd", lang: "" },
+  ];
+
+  it("中文只留中文语音（macOS 的 185 个里中文只有 10 个）", () => {
+    const got = voicesForLang(all, "zh").map((v: { name: string }) => v.name);
+    expect(got).toEqual(["Tingting", "Shelley"]);
+  });
+
+  it("换语言就换成那个语言的语音", () => {
+    expect(voicesForLang(all, "en").map((v: { name: string }) => v.name)).toEqual(["Samantha", "Daniel"]);
+    expect(voicesForLang(all, "ja").map((v: { name: string }) => v.name)).toEqual(["Kyoko"]);
+    expect(voicesForLang(all, "ru").map((v: { name: string }) => v.name)).toEqual(["Milena"]);
+  });
+
+  it("zh_CN 这种下划线写法也能匹配", () => {
+    expect(voicesForLang([{ name: "A", lang: "zh_CN" }], "zh").map((v: { name: string }) => v.name)).toEqual(["A"]);
+  });
+
+  it("一个都匹配不上时回落全量（下拉不能是空的）", () => {
+    const only = [{ name: "Samantha", lang: "en-US" }];
+    expect(voicesForLang(only, "zh")).toEqual(only);
+  });
+
+  it("空输入不炸", () => {
+    expect(voicesForLang(undefined, "zh")).toEqual([]);
+    expect(voicesForLang([], "zh")).toEqual([]);
   });
 });

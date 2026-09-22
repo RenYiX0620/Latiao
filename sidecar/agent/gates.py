@@ -1,15 +1,12 @@
 """弱模型辅助层与语言链：交付闸门、终答提取、翻译、规划识别、本地工具提示词。"""
 import asyncio
-import json
 import os
 import re
-import time
 import logging
 
-import httpx
 
 from agent.transport import _is_local_llm_url, _local_llm_serialized
-from agent.context import _detect_user_language, _get_localized_text
+from agent.context import _detect_user_language
 from agent.text_quality import _strip_think_fences
 
 logger = logging.getLogger("latiao-sidecar")

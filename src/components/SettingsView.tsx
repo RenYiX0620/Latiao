@@ -76,6 +76,8 @@ function PersonaCard({ active, sidecarReady }: { active: boolean; sidecarReady: 
   // checking → online 时再取一次 —— 启动瞬间那次请求几乎必然失败，否则卡片会一直空着。
   useEffect(() => {
     if (!active || !sidecarReady) return;
+    // load() 内部第一步就 await，状态是在异步返回之后才更新，不是同步 setState
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     load();
   }, [active, sidecarReady, load]);
 

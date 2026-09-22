@@ -35,7 +35,7 @@ class DualFakeEngine:
 
     def start(self) -> str:
         import uvicorn
-        from fastapi import FastAPI, Request
+        from fastapi import FastAPI
         from fastapi.responses import StreamingResponse, JSONResponse
 
         app = FastAPI()

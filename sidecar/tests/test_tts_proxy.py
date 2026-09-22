@@ -173,12 +173,57 @@ async def test_synthesize_truncates_to_max_chars(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_list_voices_proxies_and_shapes(tmp_path, monkeypatch):
-    _stub(monkeypatch, _FakeResp(content=b"{}", ctype="application/json",
-                                 body={"voices": ["af_heart", "zf_xiaobei"]}))
+async def test_list_voices_unions_all_models(tmp_path, monkeypatch):
+    """下拉里是各模型音色的并集（本机：Kokoro 100 + v1.0 49 + 克隆 1）。"""
+    monkeypatch.setattr(tts_service, "model_voice_routes",
+                        lambda conf: {"女声001": ("kokoro", "女声001"),
+                                      "女声-晓晓": ("kokoro_v10", "女声-晓晓"),
+                                      "克隆·婷婷": ("indextts", "克隆·婷婷")})
     data = await tts_service.list_voices(_cfg(tmp_path))
     assert data["status"] == "success"
-    assert data["voices"] == ["af_heart", "zf_xiaobei"]
+    assert data["voices"] == ["克隆·婷婷", "女声-晓晓", "女声001"]   # 按码点排序
+
+
+def test_voice_routes_map_by_model(monkeypatch):
+    calls = []
+
+    def fake_fetch(url, conf, timeout=5.0):
+        calls.append(url)
+        if url.endswith("/v1/models"):
+            return {"data": [{"id": "kokoro"}, {"id": "indextts"}]}
+        if "model=kokoro" in url:
+            return {"voices": ["女声001"]}
+        if "model=indextts" in url:
+            return {"voices": ["克隆·婷婷"]}
+        return {"voices": []}
+
+    monkeypatch.setattr(tts_service, "_fetch_json", fake_fetch)
+    monkeypatch.setattr(tts_service, "_voice_routes", {"map": {}, "at": 0.0, "base": ""})
+    routes = tts_service.model_voice_routes({"base_url": "http://127.0.0.1:7799"})
+    assert routes["女声001"] == ("kokoro", "女声001")
+    assert routes["克隆·婷婷"] == ("indextts", "克隆·婷婷")
+    assert any("model=indextts" in u for u in calls), "每个模型都要单独问一次"
+
+
+@pytest.mark.asyncio
+async def test_synthesize_routes_voice_to_its_own_model(tmp_path, monkeypatch):
+    """选了别的模型的音色 → 把请求发给那个模型（前端只发一个字符串）。"""
+    client = _stub(monkeypatch, _FakeResp(content=b"RIFF-x"))
+    monkeypatch.setattr(tts_service, "model_voice_routes",
+                        lambda conf: {"克隆·婷婷": ("indextts", "克隆·婷婷")})
+    await tts_service.synthesize("你好", "克隆·婷婷", None,
+                                 _cfg(tmp_path, {"model_id": "kokoro_v10"}))
+    payload = client.posts[-1][1]
+    assert payload["model"] == "indextts"
+    assert payload["voice"] == "克隆·婷婷"
+
+
+@pytest.mark.asyncio
+async def test_synthesize_keeps_config_model_for_unknown_voice(tmp_path, monkeypatch):
+    client = _stub(monkeypatch, _FakeResp(content=b"RIFF-x"))
+    monkeypatch.setattr(tts_service, "model_voice_routes", lambda conf: {})
+    await tts_service.synthesize("你好", "zzz", None, _cfg(tmp_path, {"model_id": "kokoro_v10"}))
+    assert client.posts[-1][1]["model"] == "kokoro_v10"
 
 
 @pytest.mark.asyncio
@@ -186,25 +231,6 @@ async def test_list_voices_when_service_down(tmp_path, monkeypatch):
     monkeypatch.setattr(tts_service, "probe_service", lambda conf: False)
     data = await tts_service.list_voices(_cfg(tmp_path))
     assert data["status"] == "error" and data["code"] == "tts_unavailable"
-
-
-@pytest.mark.asyncio
-async def test_list_voices_passes_model_query(tmp_path, monkeypatch):
-    """必须带 ?model=<id>：服务挂了多个模型时不带参数会返回空表（下拉全空）。"""
-    client = _stub(monkeypatch, _FakeResp(content=b"{}", ctype="application/json",
-                                         body={"voices": ["zf_001"]}))
-    await tts_service.list_voices(_cfg(tmp_path, {"model_id": "kokoro"}))
-    url, _ = client.posts[-1]
-    assert "?model=kokoro" in url
-    assert url.endswith("/v1/audio/voices?model=kokoro")
-
-
-@pytest.mark.asyncio
-async def test_list_voices_without_model_id_has_no_query(tmp_path, monkeypatch):
-    client = _stub(monkeypatch, _FakeResp(content=b"{}", ctype="application/json",
-                                         body={"voices": []}))
-    await tts_service.list_voices(_cfg(tmp_path))
-    assert client.posts[-1][0].endswith("/v1/audio/voices")
 
 
 # ── 零样本克隆模型：参考音频必须能传下去 ──────────────────────────
@@ -255,3 +281,53 @@ def test_status_reports_enabled_and_availability(tmp_path, monkeypatch):
     monkeypatch.setattr(tts_service, "probe_service", lambda conf: False)
     st_off = tts_service.status(_cfg(tmp_path, {"enabled": False}))
     assert st_off["enabled"] is False and st_off["available"] is False
+
+
+# ── 音高（变调后处理）────────────────────────────────────────────
+def _sine_wav(path, freq=440.0, secs=1.0, sr=24000):
+    import math, wave, struct
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(sr)
+        w.writeframes(b"".join(struct.pack("<h", int(12000 * math.sin(2 * math.pi * freq * i / sr)))
+                               for i in range(int(sr * secs))))
+
+
+def test_wav_sample_rate_reads_header(tmp_path):
+    p = tmp_path / "t.wav"; _sine_wav(p, sr=24000)
+    assert tts_service._wav_sample_rate(p.read_bytes()) == 24000
+    assert tts_service._wav_sample_rate(b"not a wav") == 0
+
+
+def test_pitch_shift_is_noop_at_unity(tmp_path):
+    p = tmp_path / "t.wav"; _sine_wav(p)
+    body = p.read_bytes()
+    assert tts_service._pitch_shift(body, 1.0) == body
+    assert tts_service._pitch_shift(body, 1.004) == body      # 1% 以内不动
+
+
+def test_pitch_shift_is_noop_without_ffmpeg(tmp_path, monkeypatch):
+    """没装 ffmpeg 的机器上静默跳过 —— 朗读绝不能因为变调失败而变哑。"""
+    p = tmp_path / "t.wav"; _sine_wav(p)
+    body = p.read_bytes()
+    monkeypatch.setattr(tts_service.shutil, "which", lambda name: None)
+    assert tts_service._pitch_shift(body, 1.15) == body
+
+
+@pytest.mark.asyncio
+async def test_synthesize_applies_configured_pitch(tmp_path, monkeypatch):
+    calls = []
+    _stub(monkeypatch, _FakeResp(content=b"RIFF-audio"))
+    monkeypatch.setattr(tts_service, "_pitch_shift",
+                        lambda audio, f: (calls.append(f), audio + b"!")[1])
+    audio, _, err = await tts_service.synthesize(
+        "你好", None, None, _cfg(tmp_path, {"pitch": 1.15}))
+    assert err is None and calls == [1.15] and audio.endswith(b"!")
+
+
+@pytest.mark.asyncio
+async def test_synthesize_skips_pitch_when_not_configured(tmp_path, monkeypatch):
+    called = []
+    _stub(monkeypatch, _FakeResp(content=b"RIFF-audio"))
+    monkeypatch.setattr(tts_service, "_pitch_shift", lambda a, f: called.append(f) or a)
+    await tts_service.synthesize("你好", None, None, _cfg(tmp_path))
+    assert called == []

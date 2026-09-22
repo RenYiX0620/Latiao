@@ -2,7 +2,6 @@
 
 网络隔离：mock urllib（清单拉取与下载），不真实下载。
 """
-import json
 import sys
 import tempfile
 import unittest

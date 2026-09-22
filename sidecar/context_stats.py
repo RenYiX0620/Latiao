@@ -94,6 +94,13 @@ def _resolve_gguf_file(model_path: str) -> str | None:
     return p if p.lower().endswith(".gguf") else None
 
 
+# 加载失败的模型要**记住**：llama_cpp 对某些 GGUF（例如它不认识的量化/架构）永远加载不了，
+# 而 count_tokens 是按"每条消息 + 每个系统段 + 每个工具定义"逐个调的 —— 不记失败就会
+# 每轮重试几十次、每次写一整条 traceback（实测把日志灌到 4.7MB、单小时 1894 条）。
+_FAILED_COUNTERS: dict[str, float] = {}   # model_path -> 首次失败时间
+_FAIL_COUNTER_TTL = 1800.0                # 半小时后允许重试：模型可能被换掉/修好
+
+
 def _get_counter(model_path: str):
     """按模型路径取精确计数器；不可用返回 None（调用方退回估算）。"""
     if not model_path:
@@ -104,6 +111,9 @@ def _get_counter(model_path: str):
                 _counter_order.remove(model_path)
             _counter_order.append(model_path)
             return _counters[model_path]
+        failed_at = _FAILED_COUNTERS.get(model_path)
+        if failed_at is not None and (time.monotonic() - failed_at) < _FAIL_COUNTER_TTL:
+            return None                      # 已知加载不了，直接退回估算（不再重试、不再刷日志）
     counter = None
     try:
         _gguf = _resolve_gguf_file(model_path)
@@ -111,8 +121,15 @@ def _get_counter(model_path: str):
             counter = _gguf_counter(_gguf)
         elif os.path.isfile(f"{model_path.rstrip('/')}/tokenizer.json"):
             counter = _hf_counter(model_path)
-    except Exception:
-        logger.info("精确计数不可用，退回估算: %s", model_path, exc_info=True)
+    except Exception as e:
+        with _lock:
+            first = model_path not in _FAILED_COUNTERS
+            _FAILED_COUNTERS[model_path] = time.monotonic()
+        if first:
+            # 只说一次，且不打印整条 traceback（细节留给 DEBUG）
+            logger.warning("精确计数不可用（该模型加载不出词表），本会话改用估算: %s —— %s",
+                           model_path, str(e)[:120])
+            logger.debug("精确计数失败细节", exc_info=True)
         counter = None
     if counter is not None:
         with _lock:
@@ -121,6 +138,7 @@ def _get_counter(model_path: str):
             while len(_counter_order) > _COUNTER_CACHE_MAX:
                 evicted = _counter_order.pop(0)
                 _counters.pop(evicted, None)
+                _FAILED_COUNTERS.pop(evicted, None)
     return counter
 
 

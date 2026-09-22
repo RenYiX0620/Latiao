@@ -6,7 +6,7 @@ from tempfile import TemporaryDirectory
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from local_llm import _resolve_mlx_path, list_local_models  # noqa: E402
+from local_llm import _resolve_mlx_path  # noqa: E402
 
 
 class TestMlxResolvePath(unittest.TestCase):
