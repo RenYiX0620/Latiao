@@ -73,7 +73,6 @@ from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-import httpx
 from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -136,7 +135,10 @@ from agent_loop import (  # noqa: F401 — 门面 re-export：保持 main.xxx �
     _strip_native_tool_calls,
     execute_tool,
 )
-from config import PROGRESS_DIR, SUBAGENT_MODEL
+from config import PROGRESS_DIR
+# SUBAGENT_MODEL 在本文件里没用到，但**是对外 re-export**（测试与 cron 走 `from main import`）。
+# 别被 ruff 的"未用导入"删掉：删了它们会在别处 ImportError。
+from config import SUBAGENT_MODEL  # noqa: F401
 from cron import _cron_loop, _seed_default_cron
 from db import _init_db
 from identity import _create_default_identity

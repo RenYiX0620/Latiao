@@ -10,7 +10,6 @@
 
 现在：次数只是"可疑"信号，**必须同时信息增量低**（真的在原地换措辞重搜）才收口。
 """
-import asyncio
 import json
 import sys
 import time
@@ -50,7 +49,6 @@ async def _collect(agen):
 @pytest.mark.asyncio
 async def test_three_distinct_queries_are_coverage_not_saturation():
     """同一轮 3 次不同 mx_query = 覆盖查询，不得被当成饱和而强制收口。"""
-    import agent_loop
     import agent.context as agent_context
     import local_llm
     from tests.test_loop_scenarios import _StubEngine
@@ -85,7 +83,6 @@ async def test_three_distinct_queries_are_coverage_not_saturation():
 @pytest.mark.asyncio
 async def test_second_call_cap_no_longer_forces_finalize_alone():
     """同轮 3 次检索（计数达上限）+ 增量高 → 仍不得收口；这是原 bug 的最小复现。"""
-    import agent_loop
     import agent.context as agent_context
     import local_llm
     from tests.test_loop_scenarios import _StubEngine

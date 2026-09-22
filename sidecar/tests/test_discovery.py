@@ -282,7 +282,6 @@ class TestMarketDedup(unittest.TestCase):
             "kind": "openclaw", "builtin": False}]
         mock_fetch.return_value = {"status": "ok", "plugins": []}
         # 手动源走 discover_auto 也返回同样技能
-        import adapters
         with mock.patch("adapters.discover_auto", return_value={"status": "ok", "plugins": [
             {"repo": "owner/repo", "skill_path": "/skills/x/SKILL.md",
              "name": "x", "display_name": "X", "version": "1", "source_kind": "openclaw-skill"}]}):
@@ -365,3 +364,56 @@ class TestClaudePluginAndDeps(unittest.TestCase):
         self.assertTrue(discovery._has_external_deps({"primaryEnv": "API_KEY"}))
         self.assertTrue(discovery._has_external_deps({"envVars": {"X": {"required": True}}}))
         self.assertFalse(discovery._has_external_deps({"name": "x", "description": "y"}))
+
+
+class TestSearchRateLimit(unittest.TestCase):
+    """限流必须和"确实没结果"区分开：以前 403 直接 return []，界面上看不出区别。"""
+
+    def test_search_repositories_raises_on_rate_limit(self):
+        import httpx
+        import discovery
+
+        class _Resp:
+            status_code = 403
+            text = '{"message":"API rate limit exceeded"}'
+            def raise_for_status(self): pass
+
+        with mock.patch.object(httpx, "get", return_value=_Resp()):
+            with self.assertRaises(discovery.RateLimited):
+                discovery.search_repositories("llm")
+
+    def test_collect_candidates_counts_limit_and_stops_early(self):
+        """撞限流后不再继续打剩下的查询（继续打只会把额度烧更久），但已拿到的候选保留。
+
+        只统计**本线程**的调用：别的测试可能留下仍在跑的后台 discovery 线程
+        （main.py 启动钩子 / discover-refresh 端点都会起线程），它的调用会混进同一个 mock。
+        """
+        import discovery
+        import threading
+
+        calls = []
+        me = threading.get_ident()
+
+        def fake_search(q, per_page=10, page=1):
+            if threading.get_ident() != me:
+                raise discovery.RateLimited("别的线程的抓取，忽略")
+            calls.append((q, page))
+            if len(calls) == 1:
+                return [{"full_name": "owner/repo", "stargazers_count": 5}]
+            raise discovery.RateLimited("配额耗尽")
+
+        with mock.patch.object(discovery, "search_repositories", fake_search), \
+             mock.patch.object(discovery.time, "sleep", lambda s: None):
+            out = discovery._collect_candidates()
+
+        self.assertIn("owner/repo", out)                 # 限流前拿到的仍在
+        self.assertEqual(discovery._search_limited_count(), 1,
+                         f"本线程应只记一次限流（实际 calls={calls}）")
+        self.assertLessEqual(len(calls), 2,
+                             f"撞限流后应立刻收工（实际 calls={calls}）")
+
+    def test_discover_status_surfaces_limit(self):
+        import discovery
+        with mock.patch.object(discovery, "_load_index",
+                               return_value={"search_limited": 3}):
+            self.assertEqual(discovery.discover_status()["search_limited"], 3)

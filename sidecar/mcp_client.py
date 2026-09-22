@@ -13,8 +13,6 @@ import asyncio
 import json
 import logging
 import re
-import sys
-import uuid
 
 import httpx
 

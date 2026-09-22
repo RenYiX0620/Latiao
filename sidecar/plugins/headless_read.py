@@ -9,7 +9,6 @@ import os
 import re
 import json
 import urllib.parse
-from pathlib import Path
 
 # 浏览器二进制固定装在应用数据目录——不依赖会被系统定期清理的
 # ~/Library/Caches/ms-playwright（09-08 17:13 事故：缓存被清后工具失效）。

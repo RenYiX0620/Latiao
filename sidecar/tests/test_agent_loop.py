@@ -269,8 +269,6 @@ class TestSubagentWhitelistReachable(unittest.TestCase):
     否则只读白名单（执行时兜底）永远不可达——'死配置'复发。"""
 
     def test_run_cmd_visible_for_explore(self):
-        import asyncio
-        from tool_executor import _delegate_task_bg, _SUBTASKS
         # 不真正跑 LLM：构造到 sub_tools 过滤后的可见性检查即可
         # （直接调 _delegate_task 会发起 HTTP；这里验证过滤逻辑链路存在）
         # 模拟 _delegate_task 内部的可见性过滤（TOOLS 由 agent_loop 门面持有）
@@ -282,7 +280,6 @@ class TestSubagentWhitelistReachable(unittest.TestCase):
         self.assertIn("run_cmd", names)
 
     def test_prune_subtasks_caps_registry(self):
-        import time as _t
         from tool_executor import _SUBTASKS, _prune_subtasks
         for i in range(120):
             _SUBTASKS[f"old_{i}"] = {"agent": "x", "task": "t", "status": "done",
@@ -388,6 +385,25 @@ class TestPlanConfirmationGate(unittest.TestCase):
         approved, events = asyncio.run(run())
         self.assertFalse(approved)
         self.assertTrue(any(e.get("event") == "plan_confirm" for e in events))
+
+
+    def test_plan_confirmation_timeout_returns_message_not_nameerror(self):
+        """超时分支原先引用 _msg/lang_of/msgs 三个不存在的名字 → 真超时会 NameError。
+
+        现在改成局部 import + 调用方传 lang；这里用 timeout=0.05 真跑一次超时路径。
+        """
+        import asyncio
+        import agent_loop
+
+        async def run():
+            started = await agent_loop._start_plan_confirmation("plan-to1", "1. A\n2. B")
+            return await agent_loop._wait_plan_confirmation(
+                "plan-to1", started["event_obj"], timeout=0.05, lang="zh")
+
+        approved, events = asyncio.run(run())
+        self.assertFalse(approved)
+        self.assertEqual(len(events), 1)
+        self.assertIn("超时", events[0]["content"])
 
     def test_plan_confirm_approve(self):
         import asyncio

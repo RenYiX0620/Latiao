@@ -5,7 +5,7 @@ import logoUrl from "./assets/logo.png";
 import type { Message, PendingFile, SessionInfo, ViewId, CloudModel, DownloadState, HFModelResult, LLMStatus } from "./types";
 import { parseSSEDataLine } from "./utils/sse";
 import { saveSessionsWithFallback } from "./utils/storage";
-import { pickVoice, speechSupported, splitSentences, stripForSpeech } from "./utils/speech";
+import { pickVoice, speechSupported, splitSentences, stripForSpeech, voicesForLang } from "./utils/speech";
 // API keys stored in OS keychain via Rust commands (store_secret/get_secret/delete_secret)
 import { useSessions } from "./hooks/useSessions";
 import { sidecarFetch, waitForSidecar, authFetch, uploadSidecarFile, uploadLocalPath } from "./utils/api";
@@ -480,7 +480,11 @@ const [timeFilter, setTimeFilter] = useState("all");
               // 自动新建专属聊天会话，完整结果写入其中（不混入当前对话）
               const content = `**${header}**\n\n${(ev.full || ev.summary || "").trim() || "(无输出)"}`;
               const s = newSession();
-              const name = `⏰ ${ev.task.replace(/[🔍📋📊⚡📈]|\s*\(记录到记忆库\)/g, "").trim().slice(0, 20)} ${ev.ts.slice(5, 16).replace("T", " ")}`;
+              const name = `⏰ ${ev.task
+                  // emoji 要带 u 标志并用码点写：不加 u 时字符类匹配的是**代理半区**，
+                  // 会把别的 emoji（与这五个共享半区的，如 🔎🚀）削掉一半变成非法字符
+                  .replace(/[\u{1F50D}\u{1F4CB}\u{1F4CA}\u{26A1}\u{1F4C8}]|\s*\(记录到记忆库\)/gu, "")
+                  .trim().slice(0, 20)} ${ev.ts.slice(5, 16).replace("T", " ")}`;
               const sess = { ...s, name, messages: [{ id: msgId(), role: "assistant" as const, content, ts: Date.now() }], lastActive: Date.now() };
               // 新会话插到列表顶部并切换到聊天页，确保用户立刻看得到
               setSessionsRef.current((prev) => [sess, ...prev]);
@@ -1905,7 +1909,8 @@ const [timeFilter, setTimeFilter] = useState("all");
             ttsEnabled={ttsEnabled} setTtsEnabled={setTtsEnabled}
             ttsRate={ttsRate} setTtsRate={setTtsRate}
             ttsVoice={ttsVoice} setTtsVoice={setTtsVoice}
-            ttsVoices={ttsVoices.map(v => ({ name: v.name, lang: v.lang }))}
+            ttsVoices={voicesForLang(
+              ttsVoices.map(v => ({ name: v.name, lang: v.lang })), lang)}
             ttsLocalVoices={ttsLocalVoices}
             ttsLocalVoice={ttsLocalVoice}
             setTtsLocalVoice={setTtsLocalVoice}

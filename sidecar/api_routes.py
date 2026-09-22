@@ -80,7 +80,6 @@ from main import (
 from loop_state import turn_state_for
 from memory import (
     _extract_learnings_heuristic,
-    _get_recent_learnings,
     get_recent_learnings_for_ui,
     _refine_learnings,
     _retrieve_preferences,
@@ -2003,7 +2002,6 @@ async def local_llm_benchmark(request: Request):
     """一键基准测试：生成速度/首字延迟/预填充/内存 + 建议（对当前已加载引擎实测）。"""
     body = await _json_body(request)
     large = bool(body.get("large", True))
-    from starlette.concurrency import run_in_threadpool
     protocol, api_url, headers, is_local = await _resolve_api_target(None)
     if not api_url:
         return {"status": "error", "message": "模型未加载或引擎不可用"}

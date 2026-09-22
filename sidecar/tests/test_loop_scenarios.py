@@ -43,7 +43,6 @@ class _StubEngine:
 async def test_stream_registration_balance_with_suspect():
     """09-05 23:31 引擎被误杀回归：suspect 验证路径 enter/exit 只配对一次——
     请求进行中引擎保持"忙"注册，退出后计数归零。"""
-    import agent_loop
     import agent.transport as transport
     import local_llm
     counters = {"busy": 0, "idle": 0, "streams": 0}

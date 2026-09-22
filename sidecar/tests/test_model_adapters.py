@@ -5,7 +5,7 @@ usage-only 块/finish_reason/[DONE]/坏 JSON/非 data 行；适配器 prepare �
 """
 import pytest
 
-from model_adapters import Chunk, OpenAICompatAdapter, ParsedLine, ToolCallDelta
+from model_adapters import OpenAICompatAdapter, ToolCallDelta
 
 
 class TestParseLine:

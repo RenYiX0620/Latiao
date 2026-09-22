@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """control_wait - 等待指定秒数（流程编排用）。"""
 import asyncio
-import time
 
 NAME = "control_wait"
 PERMISSION = "safe"

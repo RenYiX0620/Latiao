@@ -65,8 +65,8 @@ MESSAGES: dict[str, dict[str, str]] = {
         "ru": "⏹️ План отклонён, ничего не выполнено. Измените запрос и повторите.",
     },
     "plan_timeout": {
-        "zh": "⚠️ 计划等待确认超时（5 分钟无人操作），任务已暂停未执行。可重新发起任务。",
-        "en": "⚠️ Timed out waiting for plan approval (5 minutes). The task was paused and not executed; start it again when ready.",
+        "zh": "⚠️ 计划等待确认超时，任务已暂停未执行。可重新发起任务。",
+        "en": "⚠️ Timed out waiting for plan approval. The task was paused and not executed; start it again when ready.",
         "ja": "⚠️ 計画の確認待ちがタイムアウトしました（5 分間操作なし）。タスクは実行せず保留です。再実行してください。",
         "ru": "⚠️ Истекло время ожидания подтверждения плана (5 минут). Задача приостановлена и не выполнялась.",
     },

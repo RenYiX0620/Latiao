@@ -131,10 +131,11 @@ def search_repositories(query: str, per_page: int = 10, page: int = 1) -> list[d
             params={"q": query, "per_page": per_page, "page": page, "sort": "stars", "order": "desc"},
         )
         if resp.status_code == 403 and "rate" in resp.text.lower():
-            logger.warning("repo search 配额耗尽（匿名 10/分）")
-            return []
+            raise RateLimited("repo search 配额耗尽（匿名 10/分）")
         resp.raise_for_status()
         return resp.json().get("items", [])
+    except RateLimited:
+        raise                      # 限流要抛给上层记账，不能被下面这层兜底又吞成空列表
     except Exception as e:
         logger.warning("repo search failed %s: %s", query, e)
         return []
@@ -364,13 +365,42 @@ def _save_cache(cache: dict):
 
 _CANDIDATES: dict[str, dict] = {}  # repo -> {stars, updated_at, reason}
 
+# 搜索被限流时**不能再假装"什么都没搜到"**：匿名配额只有 10 次/分，而一次发现要打
+# 12 次搜索 → 撞限流是常态。限流时抛异常、由 _collect_candidates 记账并提前收工，
+# 计数写进索引，discover_status / 市场页就能如实展示"这次结果不全"。
+#
+# 用 thread-local 而不是模块级变量：main.py 的启动钩子和
+# POST /v1/marketplace/discover-refresh 都可能各起一个后台线程跑 run_discovery，
+# 共享一个变量时两边会互相把计数清零/覆盖（实测就在测试里表现为"计数莫名变成 2"）。
+_THREAD_STATE = threading.local()
+
+
+def _search_limited_count() -> int:
+    """本线程最近一轮被抓取时撞限流的次数。"""
+    return getattr(_THREAD_STATE, "limited", 0)
+
+
+class RateLimited(RuntimeError):
+    """GitHub 搜索配额耗尽（匿名 10 次/分）。与"确实没有结果"必须区分开。"""
+
 
 def _collect_candidates() -> dict[str, dict]:
     """仓库发现：repo search（6 查询 × 翻 2 页 × 50）+ 组织 + awesome 列表链接。"""
+    _THREAD_STATE.limited = 0
     out: dict[str, dict] = {}
+    limited = False
     for q in SEARCH_QUERIES:
+        if limited:
+            break
         for page in (1, 2):  # 翻 2 页扩候选（每页 50，配额允许）
-            repos = search_repositories(q, per_page=50, page=page)
+            try:
+                repos = search_repositories(q, per_page=50, page=page)
+            except RateLimited as e:
+                # 已经被限流就别接着打剩下的查询：既拿不到数据，还会把额度烧得更久
+                limited = True
+                _THREAD_STATE.limited = _search_limited_count() + 1
+                logger.warning("repo search 被限流，提前结束本轮抓取（已拿到的候选仍会入库）：%s", e)
+                break
             for r in repos:
                 full = r.get("full_name", "")
                 if not full:
@@ -587,6 +617,13 @@ def run_discovery(force: bool = False, max_repos: int = 60) -> dict:
     index["entries"] = [e for e in entries_map.values() if e.get("repo") in all_repos]
     index["repos"] = seen
     index["last_scan_ts"] = _t.time()
+    # 如实记下"这轮有没有被限流、少打了多少次搜索" —— 结果不全时不能再无声无息
+    index["search_limited"] = _search_limited_count()
+    if _search_limited_count():
+        logger.warning(
+            "本轮发现被 GitHub 限流 %d 次搜索，候选/条目会偏少。"
+            "解决办法：在设置里配置 GitHub Token（配额从 10 次/分提到 30 次/分），或过几分钟再刷新。",
+            _search_limited_count())
     index["scan_stats"] = {"scanned": scanned, "entries": len(index["entries"]), "candidates": len(candidates)}
     _save_index(index)
     logger.info("Discovery 扫描完成: %d 仓库 / %d 条目（候选 %d）", scanned, len(index["entries"]), len(candidates))
@@ -595,6 +632,7 @@ def run_discovery(force: bool = False, max_repos: int = 60) -> dict:
 
 def _run_incremental(index: dict, max_repos: int) -> dict:
     """24h 内的增量扫描：只扫新面孔（index 未登记的候选），不动已扫仓库。"""
+    # _collect_candidates 会把本轮限流次数写在模块级 _LAST_SEARCH_LIMITED 上
     import time as _t
     candidates = _collect_candidates()
     seen: dict[str, dict] = index.get("repos", {})
@@ -643,6 +681,8 @@ def discover_status() -> dict:
         "repos": len(index.get("repos", {})),
         "entries": len(index.get("entries", [])),
         "stats": index.get("scan_stats", {}),
+        # 上一轮被搜索限流了几次：>0 说明候选偏少，界面应如实提示而不是装作"就这些"
+        "search_limited": index.get("search_limited", 0),
         "thread_lock": True,  # 标记可并发调用（不阻塞市场加载）
     }
 

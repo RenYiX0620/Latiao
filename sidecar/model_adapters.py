@@ -21,7 +21,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Literal, Optional
+from typing import Any, Literal
 
 logger = logging.getLogger("latiao-sidecar")
 

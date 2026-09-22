@@ -98,7 +98,6 @@ class TestEngineStatePersistence(unittest.TestCase):
         eng.current_model_id = "m"
         LocalLLMEngine._save_engine_state(eng)
         LocalLLMEngine._clear_engine_state(eng)
-        import os
         from local_llm import LocalLLMEngine as L
         self.assertFalse(L._engine_state_file.exists())
 

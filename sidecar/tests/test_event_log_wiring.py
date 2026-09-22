@@ -83,7 +83,7 @@ async def test_clear_before_begin_order_contract(logged_turn, conn):
     后续取消 request_stop 无活动可停 → turn/end 谎报 completed。
     本测试模拟正确顺序（clear 先于 begin），验证停止语义完整。
     """
-    from agent_loop import _clear_session_cancel, _request_session_cancel, _session_cancel_requested
+    from agent_loop import _clear_session_cancel, _request_session_cancel
     from loop_state import turn_state_for
     from loop_state import Phase
 

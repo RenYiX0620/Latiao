@@ -1,5 +1,4 @@
 """Security regression tests (audit H2/H3: fail-open auth, implicit privilege, run_cmd bypass)."""
-import json
 import re
 import sys
 import unittest

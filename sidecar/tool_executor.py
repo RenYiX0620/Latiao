@@ -333,7 +333,6 @@ def search_files(directory: str, pattern: str) -> str:
 
 async def tavily_search(args: dict) -> str:
     """Search the web using Tavily API."""
-    import json
 
     # 常量由 main.py 门面持有 → 函数内 lazy import 避免循环依赖
     from main import TAVILY_API_URL
@@ -478,7 +477,6 @@ def _is_readonly_cmd(cmd: str) -> bool:
 
 
 # ── 后台子任务注册表（ZCode 式：fire-and-forget + 进度事件 + 结果查询） ──
-import time as _time
 
 # delegate 机制已迁至 agent/subagent.py（Stage 5 子代理一等公民）；
 # 这里保留兼容导入（api_routes/tests 的既有引用不变）。

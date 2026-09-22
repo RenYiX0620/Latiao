@@ -25,9 +25,8 @@ import os
 import sqlite3
 import threading
 import time
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Callable
+from dataclasses import dataclass
+from typing import Any
 
 logger = logging.getLogger(__name__)
 

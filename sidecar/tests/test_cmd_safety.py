@@ -91,7 +91,6 @@ class TestAccessDefaultsConfirm(unittest.TestCase):
     def test_loop_defaults_confirm(self):
         from agent_loop import _handle_tool_execution
         from agent.loop import ThinAgentLoop
-        import inspect
         self.assertEqual(
             inspect.signature(ThinAgentLoop.__init__).parameters["access_mode"].default,
             "confirm")

@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """control_list_processes - 列出运行中的进程（只读）。"""
-from pathlib import Path
 
 NAME = "control_list_processes"
 PERMISSION = "safe"
