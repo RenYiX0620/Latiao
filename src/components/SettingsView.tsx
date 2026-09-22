@@ -6,6 +6,8 @@ interface SettingsViewProps {
   theme: "light" | "dark";
   setTheme: (t: "light" | "dark") => void;
   sidecarStatus: string;
+  /** 当前是否停在设置页（常驻挂载，靠这个信号决定何时刷新） */
+  active: boolean;
   restartingSidecar: boolean;
   onRestartSidecar: () => void;
   gatewayLogsOpen: boolean;
@@ -35,6 +37,10 @@ interface SettingsViewProps {
   ttsVoice: string;
   setTtsVoice: (v: string) => void;
   ttsVoices: { name: string; lang: string }[];
+  /** 本地语音服务的音色（来自 /v1/tts/voices，与系统语音是两套命名，别混用） */
+  ttsLocalVoices: string[];
+  ttsLocalVoice: string;
+  setTtsLocalVoice: (v: string) => void;
 }
 
 function toggleOnChange(setter: (v: boolean) => void, storageKey: string) {
@@ -46,7 +52,7 @@ function toggleOnChange(setter: (v: boolean) => void, storageKey: string) {
 }
 
 /** 人格与称呼：显示当前的 称呼/名字/语气，并可重新运行首启引导。 */
-function PersonaCard() {
+function PersonaCard({ active, sidecarReady }: { active: boolean; sidecarReady: boolean }) {
   const { t } = useTranslation();
   const [info, setInfo] = useState<{ done: boolean; user_name: string; agent_name: string; tone: string } | null>(null);
   const [note, setNote] = useState("");
@@ -65,7 +71,13 @@ function PersonaCard() {
     } catch { /* 侧车未就绪时卡片留空 */ }
   }, []);
 
-  useEffect(() => { load(); }, [load]);
+  // 页面是常驻挂载的（view-panel 只切 CSS 显隐，不是条件渲染），所以不能"挂载时取一次"
+  // 就算完：① 打开设置页时刷新一次 —— 称呼/语气常常是在对话里刚改的；② 侧车
+  // checking → online 时再取一次 —— 启动瞬间那次请求几乎必然失败，否则卡片会一直空着。
+  useEffect(() => {
+    if (!active || !sidecarReady) return;
+    load();
+  }, [active, sidecarReady, load]);
 
   const post = async (path: string, okKey: string) => {
     setBusy(true);
@@ -121,7 +133,7 @@ function PersonaCard() {
 
 export default function SettingsView({
   theme, setTheme,
-  sidecarStatus, restartingSidecar, onRestartSidecar,
+  sidecarStatus, restartingSidecar, onRestartSidecar, active,
   gatewayLogsOpen, setGatewayLogsOpen, gatewayLogs,
   selectedModel, cloudModels, setActiveView,
   autoLaunch, setAutoLaunch, autoStartGateway, setAutoStartGateway,
@@ -129,6 +141,7 @@ export default function SettingsView({
   appVersion, checkingUpdate, onCheckUpdate,
   reflectionMode, setReflectionMode,
   ttsEnabled, setTtsEnabled, ttsRate, setTtsRate, ttsVoice, setTtsVoice, ttsVoices,
+  ttsLocalVoices, ttsLocalVoice, setTtsLocalVoice,
 }: SettingsViewProps) {
   const { t, lang, setLanguage } = useTranslation();
 
@@ -203,6 +216,22 @@ export default function SettingsView({
                   <option value="1.5">1.5×</option>
                 </select>
               </div>
+              {ttsLocalVoices.length > 0 && (
+                <div className="settings-row">
+                  <div>
+                    <div className="settings-row-label">{t("settings.tts_local_voice")}</div>
+                    <div className="settings-row-desc">
+                      {t("settings.tts_local_voice_desc", { count: ttsLocalVoices.length })}
+                    </div>
+                  </div>
+                  <select className="form-input" style={{ width: "auto", margin: 0, padding: "5px 10px", fontSize: 11, maxWidth: 200 }}
+                    value={ttsLocalVoice}
+                    onChange={e => { setTtsLocalVoice(e.target.value); localStorage.setItem("latiao_tts_local_voice", e.target.value); }}>
+                    <option value="">{t("settings.tts_local_voice_default")}</option>
+                    {ttsLocalVoices.map(v => <option key={v} value={v}>{v}</option>)}
+                  </select>
+                </div>
+              )}
               <div className="settings-row">
                 <div>
                   <div className="settings-row-label">{t("settings.tts_voice")}</div>
@@ -332,7 +361,7 @@ export default function SettingsView({
           )}
         </div>
 
-        <PersonaCard />
+        <PersonaCard active={active} sidecarReady={sidecarStatus === "online"} />
 
       </div>
     </div>

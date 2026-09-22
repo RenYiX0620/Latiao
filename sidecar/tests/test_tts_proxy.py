@@ -154,6 +154,18 @@ async def test_synthesize_service_error_is_reported(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_synthesize_omits_voice_when_unset(tmp_path, monkeypatch):
+    """没选音色＝不发声这个键（让服务用自己的默认音色）。
+
+    audio.cpp 把空串当真音色名查，直接 500：「unknown Kokoro voice id: 」。发空串等于
+    让所有人都静默退回系统语音。
+    """
+    client = _stub(monkeypatch, _FakeResp(content=b"RIFF-x"))
+    await tts_service.synthesize("你好", None, None, _cfg(tmp_path))
+    assert "voice" not in client.posts[-1][1]
+
+
+@pytest.mark.asyncio
 async def test_synthesize_truncates_to_max_chars(tmp_path, monkeypatch):
     client = _stub(monkeypatch, _FakeResp())
     await tts_service.synthesize("啊" * 50, None, None, _cfg(tmp_path, {"max_chars": 10}))
@@ -176,12 +188,70 @@ async def test_list_voices_when_service_down(tmp_path, monkeypatch):
     assert data["status"] == "error" and data["code"] == "tts_unavailable"
 
 
+@pytest.mark.asyncio
+async def test_list_voices_passes_model_query(tmp_path, monkeypatch):
+    """必须带 ?model=<id>：服务挂了多个模型时不带参数会返回空表（下拉全空）。"""
+    client = _stub(monkeypatch, _FakeResp(content=b"{}", ctype="application/json",
+                                         body={"voices": ["zf_001"]}))
+    await tts_service.list_voices(_cfg(tmp_path, {"model_id": "kokoro"}))
+    url, _ = client.posts[-1]
+    assert "?model=kokoro" in url
+    assert url.endswith("/v1/audio/voices?model=kokoro")
+
+
+@pytest.mark.asyncio
+async def test_list_voices_without_model_id_has_no_query(tmp_path, monkeypatch):
+    client = _stub(monkeypatch, _FakeResp(content=b"{}", ctype="application/json",
+                                         body={"voices": []}))
+    await tts_service.list_voices(_cfg(tmp_path))
+    assert client.posts[-1][0].endswith("/v1/audio/voices")
+
+
+# ── 零样本克隆模型：参考音频必须能传下去 ──────────────────────────
+@pytest.mark.asyncio
+async def test_synthesize_passes_ref_audio_when_configured(tmp_path, monkeypatch):
+    client = _stub(monkeypatch, _FakeResp(content=b"RIFF-x"))
+    await tts_service.synthesize(
+        "你好", None, None,
+        _cfg(tmp_path, {"model_id": "IndexTTS-2", "ref_audio": "/tmp/ref.wav"}))
+    sent = client.posts[-1][1]
+    assert sent["ref_audio"] == "/tmp/ref.wav"
+    assert sent["voice_ref"] == "/tmp/ref.wav"   # audio.cpp 的字段名，两边都发
+
+
+@pytest.mark.asyncio
+async def test_synthesize_omits_ref_audio_when_empty(tmp_path, monkeypatch):
+    """有音色包的模型（Kokoro 等）不带这个键，别给服务塞空路径。"""
+    client = _stub(monkeypatch, _FakeResp(content=b"RIFF-x"))
+    await tts_service.synthesize("你好", None, None, _cfg(tmp_path))
+    assert "ref_audio" not in client.posts[-1][1]
+    assert "voice_ref" not in client.posts[-1][1]
+
+
+# ── 200 + audio/* 里混 JSON 错误：不能当音频播出去 ────────────────
+@pytest.mark.asyncio
+async def test_synthesize_json_error_masked_as_audio_is_rejected(tmp_path, monkeypatch):
+    _stub(monkeypatch, _FakeResp(
+        content=b'{"error": {"message": "Must provide one of ref_audio", "type": "ValueError"}}',
+        ctype="audio/wav"))
+    audio, ctype, err = await tts_service.synthesize("你好", None, None, _cfg(tmp_path))
+    assert audio is None and ctype is None
+    assert err["code"] == "tts_service_error"
+    assert "ref_audio" in err["message"]
+
+
+def test_looks_like_json_only_for_object_bodies():
+    assert tts_service._looks_like_json(b'  {"error": 1}')
+    assert not tts_service._looks_like_json(b"RIFF\x00\x00\x00\x00WAVE")
+
+
 def test_status_reports_enabled_and_availability(tmp_path, monkeypatch):
     monkeypatch.setattr(tts_service, "probe_service", lambda conf: True)
     st = tts_service.status(_cfg(tmp_path, {"model_id": "melotts"}))
     assert st == {"enabled": True, "available": True,
                   "base_url": tts_service.DEFAULT_TTS["base_url"],
-                  "model_id": "melotts", "voice": "", "speed": 1.0}
+                  "model_id": "melotts", "voice": "", "ref_audio": "", "speed": 1.0,
+                  "timeout": tts_service.DEFAULT_TTS["timeout"]}
     monkeypatch.setattr(tts_service, "probe_service", lambda conf: False)
     st_off = tts_service.status(_cfg(tmp_path, {"enabled": False}))
     assert st_off["enabled"] is False and st_off["available"] is False
