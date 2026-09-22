@@ -93,7 +93,9 @@ _running_turns: set[str] = set()
 
 # 已处理确认的 LRU（双击去重：第二次点击不再误报"确认已过期"）
 import collections as _collections
-_recently_confirmed: "collections.deque[str]" = _collections.deque(maxlen=200)
+# 注解是字符串、运行时不会求值，但名字得能解析：这里导入的是 _collections，
+# 写成 "collections.deque" 会让任何求值注解的工具（get_type_hints 等）炸掉。
+_recently_confirmed: "_collections.deque[str]" = _collections.deque(maxlen=200)
 
 
 async def _logged_agent_turn(session_id: str, messages: list, inner):
@@ -966,7 +968,8 @@ async def synthesize_speech(request: Request):
                                                      "code": "tts_empty_text",
                                                      "message": "没有需要朗读的文本"})
     audio, ctype, err = await tts_service.synthesize(
-        text, body.get("voice"), body.get("speed"), CONFIG_FILE)
+        text, body.get("voice"), body.get("speed"), CONFIG_FILE,
+        pitch=body.get("pitch"), emotion=body.get("emotion"))
     if audio:
         return Response(content=audio, media_type=ctype or "audio/wav")
     return JSONResponse(status_code=503, content=err or {"status": "error",

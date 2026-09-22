@@ -200,8 +200,48 @@ def _fetch_json(url: str, conf: dict, timeout: float = 5.0):
         return None
 
 
+# 音色 id 的语言前缀（Kokoro 的命名约定：z=中文 a=美英 b=英式 e=西 f=法 h=印地 i=意 p=葡）
+_VOICE_LANG_PREFIX = {
+    "zf": "zh", "zm": "zh",
+    "af": "en", "am": "en", "bf": "en", "bm": "en",
+    "ef": "es", "em": "es", "ff": "fr",
+    "hf": "hi", "hm": "hi", "if": "it", "im": "it", "pf": "pt", "pm": "pt",
+}
+
+
+# 标签前缀 → 语言。**服务返回的是标签，不是底层 id**（`/v1/audio/voices` 只给名字），
+# 所以主要靠标签判定；标签是我们自己定的（见 audiocpp/server.json 的 voice_presets）。
+_LABEL_LANG = (
+    ("英文女", "en"), ("英文男", "en"), ("英式女", "en"), ("英式男", "en"),
+    ("西语", "es"), ("法语", "fr"), ("印地", "hi"), ("意语", "it"), ("葡语", "pt"),
+    ("女声", "zh"), ("男声", "zh"), ("克隆", "zh"),
+)
+
+
+def _voice_lang(model_id: str, voice_id: str, family: str = "") -> str:
+    """这个音色说哪种语言。前端据此只列当前界面语言的音色。
+
+    克隆类模型（index_tts2）没有命名约定 —— 参考音频是我们录的中文样本，按 zh 算。
+    判不出来返回 ""（前端遇到空语言会照常显示，不至于把音色藏没）。
+    """
+    if family == "index_tts2":
+        return "zh"
+    name = voice_id or ""
+    for prefix, lang in _LABEL_LANG:
+        if name.startswith(prefix):
+            return lang
+    vid = name.lower()                      # 兜底：万一标签就是原始 id（zf_001 / af_heart）
+    if len(vid) >= 2 and vid[:2] in _VOICE_LANG_PREFIX:
+        return _VOICE_LANG_PREFIX[vid[:2]]
+    if "_" in vid:
+        head = vid.split("_", 1)[0]
+        if head in _VOICE_LANG_PREFIX:
+            return _VOICE_LANG_PREFIX[head]
+    return ""
+
+
 def model_voice_routes(conf: dict) -> dict:
-    """{音色名: (model_id, voice)}，带 TTL 缓存；服务只有一个模型时也照常工作。"""
+    """{音色名: (model_id, voice_id, family)}，带 TTL 缓存；服务只有一个模型时也照常工作。"""
     base = str(conf.get("base_url") or "").strip()
     if not base:
         return {}
@@ -216,19 +256,24 @@ def model_voice_routes(conf: dict) -> dict:
             continue
         # /v1/audio/voices 必须带 ?model=（服务有多个模型时不带参数返回空表）
         data = _fetch_json(f"{base}/v1/audio/voices?model={quote(str(mid), safe='')}", conf)
+        family = str((m or {}).get("family") or "") if isinstance(m, dict) else ""
         voices = (data or {}).get("voices") if isinstance(data, dict) else data
         for v in (voices or []):
             if isinstance(v, str) and v and v not in routes:
-                routes[v] = (str(mid), v)
+                routes[v] = (str(mid), v, family)
     _voice_routes.update({"map": routes, "at": now, "base": base})
     if routes:
         logger.info("本地语音服务音色路由: %d 个音色 / %d 个模型",
-                    len(routes), len({mid for mid, _ in routes.values()}))
+                    len(routes), len({mid for mid, *_ in routes.values()}))
     return routes
 
 
+_EMOTIONS = {"happy", "sad", "angry", "afraid", "disgusted", "melancholic", "surprised", "calm"}
+
+
 async def synthesize(text: str, voice: Optional[str], speed: Optional[float],
-                     config_file: Path) -> Tuple[Optional[bytes], Optional[str], Optional[dict]]:
+                     config_file: Path, pitch: Optional[float] = None,
+                     emotion: Optional[str] = None) -> Tuple[Optional[bytes], Optional[str], Optional[dict]]:
     """把文本转成音频字节。返回 (audio, content_type, error)，三选二。"""
     conf = read_tts_config(config_file)
     clean = (text or "").strip()
@@ -262,6 +307,10 @@ async def synthesize(text: str, voice: Optional[str], speed: Optional[float],
     voice_id = chosen or str(conf.get("voice") or "").strip()
     if voice_id:
         payload["voice"] = voice_id
+    # 情绪只对克隆模型（index_tts2）有意义：Kokoro 收到会拒或忽略，索性按模型族过滤
+    emo = str(emotion or "").strip().lower()
+    if emo in _EMOTIONS and routed and routed[2] == "index_tts2":
+        payload["emotion"] = emo
     ref_audio = str(conf.get("ref_audio") or "").strip()
     if ref_audio:
         # 两个名字都发：克隆类模型没有内置音色，但各家字段名不同 —— mlx_audio 用
@@ -300,8 +349,10 @@ async def synthesize(text: str, voice: Optional[str], speed: Optional[float],
     if len(audio) > _MAX_AUDIO_BYTES:
         return None, None, _error("tts_audio_too_large",
                                   f"音频过大（{len(audio) // 1048576}MB），请分段朗读", [])
+    # 音高：请求（设置页滑杆）优先于 config.json；夹到 0.5~1.5 免得离谱
+    raw_pitch = pitch if pitch is not None else conf.get("pitch")
     try:
-        factor = float(conf.get("pitch") or 1.0)
+        factor = min(1.5, max(0.5, float(raw_pitch or 1.0)))
     except Exception:
         factor = 1.0
     if abs(factor - 1.0) >= 0.01:
@@ -326,6 +377,8 @@ async def list_voices(config_file: Path) -> dict:
         return _error("tts_unavailable", f"读取音色列表失败：{e}", [])
     routes = model_voice_routes(conf)
     voices = list(routes.keys()) if routes else []
+    details = [{"name": name, "lang": _voice_lang(mid, vid, fam)}
+               for name, (mid, vid, fam) in routes.items()]
     if not voices:
         # 服务只挂一个模型且没有显式 voice_presets 时，退回直接问它
         model_id = str(conf.get("model_id") or "").strip()
@@ -336,7 +389,9 @@ async def list_voices(config_file: Path) -> dict:
         raw = (data or {}).get("voices") if isinstance(data, dict) else data
         voices = [v for v in (raw or []) if isinstance(v, str)]
     voices.sort()
-    return {"status": "success", "voices": voices, "default": conf.get("voice") or ""}
+    details.sort(key=lambda d: d["name"])
+    return {"status": "success", "voices": voices, "details": details,
+            "default": conf.get("voice") or ""}
 
 
 def status(config_file: Path) -> dict:
@@ -356,5 +411,7 @@ def status(config_file: Path) -> dict:
         "voice": conf.get("voice") or "",
         "ref_audio": conf.get("ref_audio") or "",
         "speed": conf.get("speed"),
+        # 配置里的音高：前端滑杆拿它当初始值，避免"滑杆显示 1.00、实际按 1.15 变调"
+        "pitch": conf.get("pitch") or 1.0,
         "timeout": _request_timeout(conf),
     }

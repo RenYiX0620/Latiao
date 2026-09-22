@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { pickVoice, speechSupported, splitSentences, stripForSpeech, voicesForLang } from "./speech";
+import { localVoicesForLang, pickVoice, speechSupported, splitSentences, stripForSpeech, voicesForLang } from "./speech";
 
 describe("stripForSpeech", () => {
   it("整块丢掉围栏代码（含语言标记）", () => {
@@ -142,5 +142,45 @@ describe("voicesForLang 只列当前语言的系统语音", () => {
   it("空输入不炸", () => {
     expect(voicesForLang(undefined, "zh")).toEqual([]);
     expect(voicesForLang([], "zh")).toEqual([]);
+  });
+});
+
+describe("localVoicesForLang 本地音色按界面语言筛", () => {
+  const voices = ["女声001", "男声100", "克隆·婷婷", "英文女·heart", "西语女·dora", "怪名字"];
+  const langs = { "女声001": "zh", "男声100": "zh", "克隆·婷婷": "zh",
+                  "英文女·heart": "en", "西语女·dora": "es", "怪名字": "" };
+
+  it("中文界面只留中文音色，加语言未知的", () => {
+    expect(localVoicesForLang(voices, langs, "zh")).toEqual(["女声001", "男声100", "克隆·婷婷", "怪名字"]);
+  });
+
+  it("英文界面只留英文音色 + 语言未判定的（英文音色念中文会念歪，所以要筛）", () => {
+    expect(localVoicesForLang(voices, langs, "en")).toEqual(["英文女·heart", "怪名字"]);
+  });
+
+  it("该语言一个音色都没有时回落全表（俄语界面不该只剩一个怪名字）", () => {
+    expect(localVoicesForLang(voices, langs, "ru")).toEqual(voices);
+  });
+
+  it("空输入不炸", () => {
+    expect(localVoicesForLang([], {}, "zh")).toEqual([]);
+  });
+});
+
+describe("localVoicesForLang 的 keep：已选音色必须始终在列表里", () => {
+  const voices = ["女声001", "英文女·heart"];
+  const langs = { "女声001": "zh", "英文女·heart": "en" };
+
+  it("切到中文后，之前选的英文音色仍留在列表（否则显示与实际不一致）", () => {
+    expect(localVoicesForLang(voices, langs, "zh", "英文女·heart"))
+      .toEqual(["英文女·heart", "女声001"]);
+  });
+
+  it("已选项本来就在列表里时不重复添加", () => {
+    expect(localVoicesForLang(voices, langs, "zh", "女声001")).toEqual(["女声001"]);
+  });
+
+  it("keep 传了不存在的音色时忽略", () => {
+    expect(localVoicesForLang(voices, langs, "zh", "不存在")).toEqual(["女声001"]);
   });
 });

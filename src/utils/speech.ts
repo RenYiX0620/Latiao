@@ -115,6 +115,29 @@ export function splitSentences(text: string, maxLen = 110): string[] {
  * 葡语……），全塞进下拉既难找也让人以为"怎么全是英文"。筛不到任何匹配时**回落全量**，
  * 免得用户在下拉里一个都选不到。语言码统一把 `zh_CN` 归一成 `zh-CN` 再比。
  */
+/** 「本地音色」下拉：只列当前界面语言的音色。
+ *
+ * 本地服务有 157 个音色（中文 113 + 英文 31 + 西/法/印地/意/葡 13），混在一个下拉里
+ * 没法挑；而拿英文音色去念中文不会报错、只会念歪（实测 HTTP 200 但发音是错的），
+ * 所以按语言筛是防错而不只是好看。语言判不出来（""）的照常显示，
+ * 筛完一个不剩就回落全表 —— 不能把音色藏没。
+ */
+export function localVoicesForLang(voices: string[], langs: Record<string, string>,
+                                   lang: string, keep?: string): string[] {
+  const list = voices || [];
+  const want = (lang || "zh").toLowerCase();
+  const norm = (v: string) => (langs?.[v] || "").toLowerCase();
+  const matched = list.filter((v) => !!norm(v) && norm(v).startsWith(want));
+  // 该语言一个音色都没有时不返回只有怪名字的子集，而是回落全表：
+  // 界面切到俄语而本地只有中/英/西/法/印地/意/葡时，给全表比只给一个更合理。
+  // 有该语言的音色时，语言未判定的也一起显示（宁可多给，不可藏没）。
+  let shown = !matched.length ? list : list.filter((v) => !norm(v) || norm(v).startsWith(want));
+  // keep：当前已选音色**必须留在列表里**。否则切界面语言后选中项从下拉里消失，
+  // 下拉显示 A、实际发出去的是 B（状态与显示不一致）。
+  if (keep && list.includes(keep) && !shown.includes(keep)) shown = [keep, ...shown];
+  return shown;
+}
+
 export function voicesForLang<T extends { lang?: string }>(voices: T[] | undefined | null,
                                                           lang: string): T[] {
   const list = (voices || []).filter((v) => !!v);
