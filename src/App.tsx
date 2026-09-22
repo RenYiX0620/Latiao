@@ -5,6 +5,7 @@ import logoUrl from "./assets/logo.png";
 import type { Message, PendingFile, SessionInfo, ViewId, CloudModel, DownloadState, HFModelResult, LLMStatus } from "./types";
 import { parseSSEDataLine } from "./utils/sse";
 import { saveSessionsWithFallback } from "./utils/storage";
+import { pickVoice, speechSupported, splitSentences, stripForSpeech } from "./utils/speech";
 // API keys stored in OS keychain via Rust commands (store_secret/get_secret/delete_secret)
 import { useSessions } from "./hooks/useSessions";
 import { sidecarFetch, waitForSidecar, authFetch, uploadSidecarFile, uploadLocalPath } from "./utils/api";
@@ -138,6 +139,22 @@ const [timeFilter, setTimeFilter] = useState("all");
   );
   useEffect(() => { localStorage.setItem("latiao_reflection", reflectionMode); }, [reflectionMode]);
 
+  // 朗读（TTS）：开关 / 语速 / 音色 / 当前正在朗读的消息
+  // 第一轮「框架先行」：先问本地语音服务（/v1/synthesize_speech），服务没装或没起来
+  // 就直接回退系统语音 —— 所以现在听到的是系统音，装上服务后自动升级，前端一行不用改。
+  const [ttsEnabled, setTtsEnabled] = useState<boolean>(
+    () => (localStorage.getItem("latiao_tts") ?? "true") !== "false"
+  );
+  useEffect(() => { localStorage.setItem("latiao_tts", String(ttsEnabled)); }, [ttsEnabled]);
+  const [ttsRate, setTtsRate] = useState<number>(
+    () => Number(localStorage.getItem("latiao_tts_rate")) || 1
+  );
+  useEffect(() => { localStorage.setItem("latiao_tts_rate", String(ttsRate)); }, [ttsRate]);
+  const [ttsVoice, setTtsVoice] = useState<string>(() => localStorage.getItem("latiao_tts_voice") || "");
+  useEffect(() => { localStorage.setItem("latiao_tts_voice", ttsVoice); }, [ttsVoice]);
+  const [ttsVoices, setTtsVoices] = useState<SpeechSynthesisVoice[]>([]);
+  const [speakingId, setSpeakingId] = useState<string | null>(null);
+
   // 权限模式五档（从保守到放手）：read_only / confirm / auto_edit / plan / full
   // 思考强度三档（🧠 选择器）：off / high(默认) / max
   const [thinkingLevel, setThinkingLevel] = useState<"off" | "low" | "high" | "max">(
@@ -256,6 +273,9 @@ const [timeFilter, setTimeFilter] = useState("all");
   // 边录边转写: 录音中是否仍在进行 + 上一块是否还在识别(串行,避免堆积)
   const isRecordingRef = useRef(false);
   const transcribingRef = useRef(false);
+  // 朗读：正在朗读的消息 id（再点一次＝停）+ 本地语音服务返回的音频元素
+  const speakingIdRef = useRef<string | null>(null);
+  const ttsAudioRef = useRef<HTMLAudioElement | null>(null);
   /* ── Persistence: debounce during SSE streaming, immediate otherwise ── */
   const isProcessingRef = useRef(isProcessing);
   isProcessingRef.current = isProcessing;
@@ -1501,6 +1521,92 @@ const [timeFilter, setTimeFilter] = useState("all");
     }
   };
 
+  /* ── 朗读（TTS）：本地语音服务优先，系统语音兜底 ── */
+  useEffect(() => {
+    if (!speechSupported()) return;
+    const load = () => {
+      try { setTtsVoices(window.speechSynthesis.getVoices() || []); } catch { /* ignore */ }
+    };
+    load();  // 有的 WebView 首次为空，靠 voiceschanged 再补一次
+    try { window.speechSynthesis.addEventListener("voiceschanged", load); } catch { /* ignore */ }
+    return () => {
+      try { window.speechSynthesis.removeEventListener("voiceschanged", load); } catch { /* ignore */ }
+    };
+  }, []);
+
+  const stopSpeaking = useCallback(() => {
+    try { window.speechSynthesis?.cancel(); } catch { /* ignore */ }
+    const audio = ttsAudioRef.current;
+    if (audio) {
+      try { audio.pause(); } catch { /* ignore */ }
+      ttsAudioRef.current = null;
+    }
+    speakingIdRef.current = null;
+    setSpeakingId(null);
+  }, []);
+
+  const systemSpeak = useCallback((text: string) => {
+    const chunks = splitSentences(text);
+    if (!chunks.length) { speakingIdRef.current = null; setSpeakingId(null); return; }
+    const voice = pickVoice(ttsVoices, lang);
+    chunks.forEach((chunk, idx) => {
+      const utter = new SpeechSynthesisUtterance(chunk);
+      if (voice) utter.voice = voice;
+      utter.rate = ttsRate;
+      utter.lang = voice?.lang || lang;
+      if (idx === chunks.length - 1) {
+        utter.onend = () => {
+          if (speakingIdRef.current) { speakingIdRef.current = null; setSpeakingId(null); }
+        };
+      }
+      window.speechSynthesis.speak(utter);
+    });
+  }, [ttsVoices, lang, ttsRate]);
+
+  /** 朗读一条回复。同一个消息再点一次＝停止。 */
+  const speak = useCallback(async (raw: string, id?: string) => {
+    if (!ttsEnabled) return;
+    const key = id ?? "";
+    if (speakingIdRef.current !== null && speakingIdRef.current === key) { stopSpeaking(); return; }
+    stopSpeaking();
+    const text = stripForSpeech(raw);
+    if (!text) return;
+    speakingIdRef.current = key;
+    setSpeakingId(key);
+    // ① 本地语音服务（装好之前这里会失败 → 直接落 ②，用户无感）
+    try {
+      const resp = await authFetch("/v1/synthesize_speech", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text, voice: ttsVoice || undefined, speed: ttsRate }),
+        signal: AbortSignal.timeout(8000),
+      });
+      const ctype = resp.headers.get("content-type") || "";
+      if (resp.ok && !ctype.includes("application/json")) {
+        const url = URL.createObjectURL(await resp.blob());
+        const audio = new Audio(url);
+        ttsAudioRef.current = audio;
+        audio.onended = () => {
+          URL.revokeObjectURL(url);
+          if (speakingIdRef.current === key) { speakingIdRef.current = null; setSpeakingId(null); }
+        };
+        await audio.play();
+        return;
+      }
+    } catch { /* 服务不可用 → 系统语音 */ }
+    // ② 系统语音兜底
+    if (!speechSupported()) {
+      showToast(t("toast.tts_unsupported"));
+      speakingIdRef.current = null;
+      setSpeakingId(null);
+      return;
+    }
+    systemSpeak(text);
+  }, [ttsEnabled, ttsVoice, ttsRate, stopSpeaking, systemSpeak, showToast, t]);
+
+  // 切会话/新会话时停掉上一轮的朗读，别让它在后台继续念
+  useEffect(() => { stopSpeaking(); }, [session.id, stopSpeaking]);
+
   /* ── API Test ── */
   const testConnection = async (modelName: string, key: string, endpoint: string, protocol: string) => {
     setTestingModel(modelName);
@@ -1637,6 +1743,7 @@ const [timeFilter, setTimeFilter] = useState("all");
             isRecording={isRecording}
             sendMessage={sendMessage} onStop={stopGeneration} handleFileSelect={handleFileSelect}
             startRecording={startRecording} confirmTool={confirmTool}
+            onSpeak={speak} speakingId={speakingId}
             chatEndRef={chatEndRef} handleDrop={handleDrop}
             onPasteImage={(file) => processImageFile(file, `截图 ${new Date().toLocaleTimeString()}`)}
             cloudModels={cloudModels}
@@ -1754,6 +1861,10 @@ const [timeFilter, setTimeFilter] = useState("all");
             autoCheckUpdate={autoCheckUpdate} setAutoCheckUpdate={setAutoCheckUpdate}
             appVersion={appVersion} checkingUpdate={checkingUpdate} onCheckUpdate={() => runUpdateCheck(false)}
             reflectionMode={reflectionMode} setReflectionMode={setReflectionMode}
+            ttsEnabled={ttsEnabled} setTtsEnabled={setTtsEnabled}
+            ttsRate={ttsRate} setTtsRate={setTtsRate}
+            ttsVoice={ttsVoice} setTtsVoice={setTtsVoice}
+            ttsVoices={ttsVoices.map(v => ({ name: v.name, lang: v.lang }))}
           />
         </div>
 

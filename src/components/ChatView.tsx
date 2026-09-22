@@ -112,6 +112,9 @@ interface ChatViewProps {
   handleFileSelect: (e: React.ChangeEvent<HTMLInputElement>) => void;
   startRecording: () => void;
   confirmTool: (callId: string, approved: boolean) => void;
+  /** 朗读一条回复（同一个 id 再点＝停止）。文本的 Markdown 剥离在 App 里统一做。 */
+  onSpeak?: (text: string, id?: string) => void;
+  speakingId?: string | null;
   chatEndRef: React.RefObject<HTMLDivElement | null>;
   handleDrop?: (e: React.DragEvent) => void;
   onPasteImage?: (file: File) => void;
@@ -139,6 +142,7 @@ export default memo(function ChatView({
   prompt, setPrompt,
   fileInputRef, mediaRecorderRef, isRecording,
   sendMessage, onStop, handleFileSelect, startRecording, confirmTool,
+  onSpeak, speakingId,
   chatEndRef, handleDrop, onPasteImage,
   cloudModels, selectedModel, onSelectModel, sessionId,
   accessMode, setAccessMode, thinkingLevel, setThinkingLevel,
@@ -380,6 +384,13 @@ export default memo(function ChatView({
                     <button className="btn-icon" title={t("chat.copy")} onClick={() => {
                       navigator.clipboard?.writeText(msg.content).then(() => showToast(t("chat.copied"))).catch(() => showToast(t("chat.copy_fail"), "warn"));
                     }}>⧉</button>
+                    {onSpeak && (
+                      <button
+                        className={`btn-icon${speakingId && speakingId === msg.id ? " active" : ""}`}
+                        title={speakingId === msg.id ? t("chat.speaking") : t("chat.speak")}
+                        onClick={() => onSpeak(msg.content, msg.id)}
+                      >{speakingId === msg.id ? "⏹" : "🔊"}</button>
+                    )}
                     <button className={`btn-icon${msgFeedback[msg.id || ""] === "up" ? " active" : ""}`} title={t("chat.like")}
                       onClick={() => msg.id && toggleFeedback(msg.id, "up", msg.content)}>👍</button>
                     <button className={`btn-icon${msgFeedback[msg.id || ""] === "down" ? " active" : ""}`} title={t("chat.dislike")}

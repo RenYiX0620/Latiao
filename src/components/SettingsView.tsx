@@ -27,6 +27,14 @@ interface SettingsViewProps {
   onCheckUpdate: () => void;
   reflectionMode: "off" | "light" | "deep";
   setReflectionMode: (v: "off" | "light" | "deep") => void;
+  /** 朗读：开关 / 语速 / 音色（音色列表来自系统语音，随设备变化） */
+  ttsEnabled: boolean;
+  setTtsEnabled: (v: boolean) => void;
+  ttsRate: number;
+  setTtsRate: (v: number) => void;
+  ttsVoice: string;
+  setTtsVoice: (v: string) => void;
+  ttsVoices: { name: string; lang: string }[];
 }
 
 function toggleOnChange(setter: (v: boolean) => void, storageKey: string) {
@@ -120,6 +128,7 @@ export default function SettingsView({
   anonymousData, setAnonymousData, autoCheckUpdate, setAutoCheckUpdate,
   appVersion, checkingUpdate, onCheckUpdate,
   reflectionMode, setReflectionMode,
+  ttsEnabled, setTtsEnabled, ttsRate, setTtsRate, ttsVoice, setTtsVoice, ttsVoices,
 }: SettingsViewProps) {
   const { t, lang, setLanguage } = useTranslation();
 
@@ -174,6 +183,44 @@ export default function SettingsView({
               <span className="toggle-slider"></span>
             </label>
           </div>
+          <div className="settings-row">
+            <div><div className="settings-row-label">{t("settings.tts")}</div><div className="settings-row-desc">{t("settings.tts_desc")}</div></div>
+            <label className="toggle">
+              <input type="checkbox" checked={ttsEnabled} onChange={toggleOnChange(setTtsEnabled, "latiao_tts")} />
+              <span className="toggle-slider"></span>
+            </label>
+          </div>
+          {ttsEnabled && (
+            <>
+              <div className="settings-row">
+                <div><div className="settings-row-label">{t("settings.tts_rate")}</div></div>
+                <select className="form-input" style={{ width: "auto", margin: 0, padding: "5px 10px", fontSize: 11 }}
+                  value={String(ttsRate)}
+                  onChange={e => { const v = Number(e.target.value) || 1; setTtsRate(v); localStorage.setItem("latiao_tts_rate", String(v)); }}>
+                  <option value="0.75">0.75×</option>
+                  <option value="1">1×</option>
+                  <option value="1.25">1.25×</option>
+                  <option value="1.5">1.5×</option>
+                </select>
+              </div>
+              <div className="settings-row">
+                <div>
+                  <div className="settings-row-label">{t("settings.tts_voice")}</div>
+                  <div className="settings-row-desc">
+                    {ttsVoices.length ? t("settings.tts_voice_desc", { count: ttsVoices.length }) : t("settings.tts_voice_none")}
+                  </div>
+                </div>
+                <select className="form-input" style={{ width: "auto", margin: 0, padding: "5px 10px", fontSize: 11, maxWidth: 200 }}
+                  value={ttsVoice}
+                  onChange={e => { setTtsVoice(e.target.value); localStorage.setItem("latiao_tts_voice", e.target.value); }}>
+                  <option value="">{t("settings.tts_voice_default")}</option>
+                  {ttsVoices.map(v => (
+                    <option key={v.name + v.lang} value={v.name}>{`${v.name} · ${v.lang}`}</option>
+                  ))}
+                </select>
+              </div>
+            </>
+          )}
         </div>
 
         <div className="settings-group">
