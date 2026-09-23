@@ -491,6 +491,46 @@ def _store_learning(session_id: str, topic: str, content: str, confidence: float
         logger.warning("Failed to store learning in memory DB", exc_info=True)
 
 
+# ── 偏好键的稳定化（2026-09-23，审查①）────────────────────────────
+# 旧键 = 命中文本前 30 字的归一化。同一偏好换个说法就变成新键 → 永不加成 →
+# 到不了 0.7 的无条件注入档（真库实测：preferences 只有 1 行、置信度 0.6；
+# 用户"说过的话记不住"）。改成按**意图**归一：同一意图的重复表达累加到同一行
+# （0.6 → 0.78），值取最新措辞。
+# 档位（0.6 写入 / 0.7 注入）与两道守卫都不动——依然要求"重复表达过"才进无条件
+# 注入档，不重开 09-21 修过的单次发言劫持；且同一条消息里同一意图只记一次
+# （否则"我希望以后回复用中文"同时命中两条偏好模式 → 一次发言就到 0.78）。
+_PREF_INTENT_PATTERNS = (
+    ("lang", re.compile(r"中文|国语|英文|英语|日文|日语|language|汉字")),
+    ("tone", re.compile(r"语气|口吻|腔调|风格|正式|随意|温柔|简洁|直接|暧昧|露骨|幽默|严肃")),
+    ("address", re.compile(r"叫我|别叫|称呼")),
+    ("length", re.compile(r"简短|详细|长一点|短一点|多少字|字数|精简|啰嗦|太长")),
+    ("format", re.compile(r"表格|分点|列点|代码块|结论先行|markdown|格式|排版")),
+)
+_PREF_OTHER_MERGE_OVERLAP = 0.85   # 其它类偏好：只并"几乎逐字重复"的（防噪声累积）
+
+
+def _resolve_preference_key(matched_text: str) -> str:
+    """给一条命中算稳定键：能识别意图就按意图；否则与已有偏好做近重复合并。"""
+    low = (matched_text or "").lower()
+    for intent, pat in _PREF_INTENT_PATTERNS:
+        if pat.search(low):
+            return f"intent:{intent}"
+    base = re.sub(r'[^a-z0-9\u4e00-\u9fff]', '', matched_text[:30].lower())
+    try:
+        conn = _get_db()
+        cand = set(_tokenize_zh(matched_text))
+        if cand:
+            for k, v in conn.execute("SELECT key, value FROM preferences"):
+                if str(k).startswith("intent:"):
+                    continue          # 意图键由模式表决定，不做模糊合并
+                tv = set(_tokenize_zh(v or ""))
+                if tv and len(cand & tv) / len(cand | tv) >= _PREF_OTHER_MERGE_OVERLAP:
+                    return k
+    except Exception:
+        pass
+    return base
+
+
 def _store_preference(key: str, value: str, confidence: float = 0.5):
     """Store a learned user preference. Boosts confidence if already exists."""
     try:
@@ -900,6 +940,7 @@ def _extract_learnings_heuristic(user_text: str, session_id: str) -> int:
     if not user_text:
         return 0
     count = 0
+    _seen_pref_keys: set[str] = set()      # 同一条消息里同一意图只记一次（见 _resolve_preference_key 注释）
     for pattern, source_type, confidence in _KNOWLEDGE_PATTERNS:
         for match in re.finditer(pattern, user_text):
             matched_text = match.group(0).strip()
@@ -918,7 +959,11 @@ def _extract_learnings_heuristic(user_text: str, session_id: str) -> int:
                     logger.info("偏好守卫：跳过疑似整句发言/噪声的偏好记录（%d 字）",
                                 len(matched_text))
                     continue
-                pref_key = re.sub(r'[^a-z0-9\u4e00-\u9fff]', '', matched_text[:30].lower())
+                pref_key = _resolve_preference_key(matched_text)
+                if pref_key in _seen_pref_keys:
+                    logger.debug("偏好：同一消息内重复命中同一键 %s，跳过", pref_key)
+                    continue
+                _seen_pref_keys.add(pref_key)
                 _store_preference(pref_key, matched_text, min(confidence, 0.6))
             count += 1
     return count
