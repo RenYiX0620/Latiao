@@ -144,5 +144,74 @@ def _init_db():
     except Exception:
         logger.error("Failed to initialize memory DB", exc_info=True)
 
+# ── 工具调用历史的保留策略（2026-09-23，用户定的 30 天）──────────────
+# 为什么需要：tool_calls 每次工具调用写一行（含参数/结果），只增不减——
+# 本机 9 月已长到 6283 行 / 35.6MB，其中 57% 是 30 天前的。检索
+# （/v1/memory/search）用 FTS5 external-content 表，删主表会由 AFTER DELETE
+# 触发器自动同步，不需要额外清 FTS。
+DEFAULT_TOOL_CALLS_RETENTION_DAYS = 30
 
 
+def tool_calls_retention_days() -> int:
+    """保留天数：环境变量 LATIAO_TOOL_CALLS_RETENTION_DAYS > config.json
+    memory.tool_calls_retention_days > 30。<=0 表示不清理。"""
+    import json
+    import os
+    raw = os.environ.get("LATIAO_TOOL_CALLS_RETENTION_DAYS", "")
+    if not raw:
+        try:
+            cfg = json.loads((PROGRESS_DIR / "config.json").read_text(encoding="utf-8")) or {}
+            section = cfg.get("memory") if isinstance(cfg, dict) else None
+            if isinstance(section, dict) and section.get("tool_calls_retention_days") is not None:
+                raw = str(section.get("tool_calls_retention_days"))
+        except Exception:
+            raw = ""
+    try:
+        days = int(raw)
+    except (TypeError, ValueError):
+        days = DEFAULT_TOOL_CALLS_RETENTION_DAYS
+    return days
+
+
+def prune_tool_calls(retention_days: int | None = None, vacuum: bool = True) -> dict:
+    """删除超过保留期的工具调用历史。返回 {days, deleted, kept}。
+
+    - 清理在写锁内做（与 _record_tool_call_db 互斥）
+    - 删完做一次 wal_checkpoint(TRUNCATE)，并在确实删了行时 VACUUM 回收空间
+      （35MB 级库上是毫秒级；VACUUM 失败不影响删除结果，只记日志）
+    """
+    days = tool_calls_retention_days() if retention_days is None else int(retention_days)
+    if days <= 0:
+        return {"days": days, "deleted": 0, "kept": 0, "skipped": "retention disabled"}
+    conn = _get_db()
+    with _db_write_lock:
+        try:
+            cur = conn.execute(
+                "DELETE FROM tool_calls WHERE created_at != '' AND created_at < datetime('now', ?)",
+                (f"-{days} days",),
+            )
+            deleted = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+            conn.commit()
+        except Exception:
+            logger.warning("工具历史清理失败", exc_info=True)
+            return {"days": days, "deleted": 0, "kept": -1, "skipped": "error"}
+        try:
+            kept = conn.execute("SELECT count(*) FROM tool_calls").fetchone()[0]
+        except Exception:
+            kept = -1
+    if deleted and vacuum:
+        try:
+            with _db_write_lock:
+                conn.execute("VACUUM")
+        except Exception:
+            logger.debug("VACUUM 失败（空间回收留到下次）", exc_info=True)
+    # checkpoint 放在 VACUUM **之后**：VACUUM 自己会写一大截 WAL（实测 19.8MB），
+    # 不回收的话目录看起来没瘦（首次实现就踩了这个顺序）
+    try:
+        with _db_write_lock:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except Exception:
+        logger.debug("wal_checkpoint 失败（不影响清理结果）", exc_info=True)
+    if deleted:
+        logger.info("工具历史清理：保留 %d 天，删除 %d 行，剩余 %d 行", days, deleted, kept)
+    return {"days": days, "deleted": deleted, "kept": kept}

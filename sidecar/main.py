@@ -341,9 +341,25 @@ async def lifespan(app: FastAPI):
     cron_task = asyncio.create_task(_cron_loop())
     catchup_task = asyncio.create_task(run_cron_catchup())  # 补跑关闭期间错过的任务
     logger.info("Sidecar 启动 — cron loop started")
+
+    # 工具调用历史保留策略（2026-09-23，用户定 30 天）：启动跑一次 + 之后每天一次。
+    # 放线程池/后台任务里做，VACUUM 是同步阻塞操作，不能在事件循环里跑。
+    async def _prune_loop():
+        while True:
+            try:
+                from starlette.concurrency import run_in_threadpool
+                import db
+                await run_in_threadpool(db.prune_tool_calls)
+            except Exception:
+                logger.warning("工具历史清理任务失败", exc_info=True)
+            await asyncio.sleep(24 * 3600)
+
+    prune_task = asyncio.create_task(_prune_loop())
     yield
     # 正常退出（应用关窗/托盘退出，Rust 端发 SIGTERM）：停掉本地模型引擎，
     # 释放显存/内存。sidecar 单独重启走 detach+SIGKILL，不会经过这里。
+    for _t in (cron_task, catchup_task, prune_task):
+        _t.cancel()
     try:
         from local_llm import shutdown_engine
         shutdown_engine()
