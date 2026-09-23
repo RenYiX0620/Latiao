@@ -54,13 +54,19 @@ npx tauri dev
 ```
 
 ## Architecture
-- `src/` — React frontend (App.tsx is the main component, ~1700 lines; ChatView.tsx ~800)
+- `src/` — React frontend (App.tsx is the main component, ~2100 lines; ChatView.tsx ~800)
 - `src-tauri/` — Rust backend (Tauri commands proxy to sidecar)
-- `sidecar/` — Python FastAPI sidecar: agent loops in `agent_loop.py`（云/本地双循环）+ `agent_loop_v2.py`（灰度统一循环）, routing/API in `api_routes.py`, tools in `tool_executor.py`/`tool_system.py`, engine in `local_llm.py`; main.py is the FastAPI app + facade
+- `sidecar/` — Python FastAPI sidecar. **真实布局（2026-09-23 校正，此前文档描述的 `agent_loop_v2.py` 已不存在）**：
+  - `agent/loop.py` — `ThinAgentLoop`，**唯一的 agent 循环**（云/本地共用一个，注释自称"薄循环"）
+  - `agent_loop.py` — **枢纽**（不是循环）：工具注册表与执行、工具确认、PROGRESS 记录、`_build_chat_messages` 上下文组装、MCP 加载、计划/反思、自动验证、`_resolve_api_target`
+  - `agent/` 其余模块 — `transport.py`（本地引擎闸门/流）、`parsing.py`（工具调用方言解析与清洗）、`context.py`（权限档/工具过滤）、`gates.py`、`subagent.py`
+  - `api_routes.py`（HTTP）、`tool_executor.py`/`tool_system.py`（工具与插件）、`local_llm.py`（引擎启动/配置）
+  - 注意循环依赖靠惰性 import 硬扛（`agent/loop.py` 内 `from agent_loop import …`、`main.py` 末尾 `import api_routes` 反向注册路由）——改这两处之前先读注释
+  - 跑测试：`pytest sidecar/tests`（仓库根）或 `cd sidecar && pytest tests` 结果一致（`sidecar/pytest.ini` 固定 rootdir/pythonpath）
 - Frontend manages all session state (localStorage); sidecar is stateless
 - Agent loop: SSE streaming with `tool_confirm`/`tool_start`/`tool_end` events
 - Tool permissions: `safe` = auto-execute, `confirm` = user must approve
-- Progress persisted to `~/.local-ai-os/PROGRESS.md`
+- Progress persisted to `~/.local-ai-os/PROGRESS.<session>.md`（按会话，注入回提示词的只有本会话） + 共享 `PROGRESS.md`（read_file 启动协议用）
 
 ## When editing the sidecar agent layer
 - The agent loop uses `asyncio.Event` for tool confirmation — don't break the async flow.

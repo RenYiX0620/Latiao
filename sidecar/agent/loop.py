@@ -8,7 +8,9 @@
   deliver）与工具目录；快车道/弱模型辅助/规划门/压缩全部是插件
   （agent/plugins/builtin.py）。
 - steer：新消息入队，step 边界/交付后认领（不再取消）。
-- 门控：LATIAO_AGENT_LOOP_V3=1 启用；默认仍走 v1（Stage 4 切换删除）。
+- 门控（2026-09-23 校正）：曾有过 `LATIAO_AGENT_LOOP_V3=1` 门控与 v1 旧循环，
+  迁移已完成——`api_routes.py` 直接调本类，v1 函数（`_agent_loop_stream` 等）已全部删除，
+  环境变量不再有任何读取点（审计据此判定"未切换"是误读：那是这行注释没删干净）。
 """
 import asyncio
 import datetime
@@ -780,7 +782,7 @@ class ThinAgentLoop:
         return body
 
     # ── 流读取（本地走传输封装，云端直连；停滞/心跳共用）──────
-    async def _stream(self, client: httpx.AsyncClient, body: dict):
+    async def _stream(self, client: httpx.AsyncClient, body: dict, wait_info: dict | None = None):
         if not self.is_local:
             async with client.stream("POST", self.api_url, json=body,
                                      headers=self.headers) as r:
@@ -788,7 +790,8 @@ class ThinAgentLoop:
                 async for line in r.aiter_lines():
                     yield line
             return
-        async with _local_llm_stream(client, self.api_url, body, self.headers) as r:
+        async with _local_llm_stream(client, self.api_url, body, self.headers,
+                                     wait_info=wait_info) as r:
             aiter = r.aiter_lines()
             silent = 0
             any_out = False
@@ -817,9 +820,16 @@ class ThinAgentLoop:
         raw = 0
         finish_reason = None
         deadline = time.monotonic() + 900
-        async for line in self._stream(client, body):
+        # 等引擎放行的时长：多会话并行时这一轮可能排在别的会话后面（见 transport 闸门）
+        _wait: dict = {}
+        _wait_reported = False
+        async for line in self._stream(client, body, wait_info=_wait):
             if time.monotonic() > deadline:
                 raise _GenerationLoopError("单步生成超时(900s)，已截断")
+            if not _wait_reported and _wait.get("waited", 0) >= 1.5:
+                # 只报一次：这是"排在别的会话后面"，不是卡住；前端显示"等待引擎…"
+                _wait_reported = True
+                yield {"event": "engine_wait", "waited": round(float(_wait["waited"]), 1)}
             if not line.startswith("data: "):
                 continue
             if '"usage"' in line or '"timings"' in line:
@@ -1235,6 +1245,9 @@ class ThinAgentLoop:
                         if "__result__" in evt:
                             result = evt["__result__"]
                             continue
+                        if evt.get("event"):
+                            yield evt          # engine_wait 等状态事件原样下发
+                            continue
                         _c = evt.get("content")
                         if _c:
                             if t_first_token is None:
@@ -1648,7 +1661,12 @@ class ThinAgentLoop:
                     except Exception:
                         targs = {}
                     pre = None
-                    if _resolve_permission(tname, targs) == "confirm" \
+                    # 子代理受限档**从不启动确认**：闸门（agent.context.subagent_tool_gate）
+                    # 在执行层全权判定——放行即免确认、拒绝即返回拒绝文案。子代理没有确认
+                    # 通道（子流事件不转发给前端），启动确认就是等一个没人能点的弹窗直到
+                    # 超时，并给 _pending_confirmations 留无人认领的条目。
+                    if self.access_mode != "subagent" \
+                            and _resolve_permission(tname, targs) == "confirm" \
                             and not _confirm_bypassed(tname, self.access_mode):
                         pre = await _start_tool_confirmation(tc["id"], tname, targs)
                         yield pre["event"]

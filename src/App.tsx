@@ -122,7 +122,7 @@ function App() {
   /* ── Session State ── */
   const {
     sessions, setSessions, currentIdx, setCurrentIdx,
-    session, messages, setSelectedModel, setMessages, newSession,
+    session, messages, setSelectedModel, setMessages, setMessagesFor, newSession,
   } = useSessions();
   // 停止按钮服务端取消用（P0 修复）：会话 id 经 ref 取最新值，避免闭包过期
   const sessionIdRef = useRef<string>("");
@@ -194,7 +194,13 @@ const [timeFilter, setTimeFilter] = useState("all");
 
 
   const [prompt, setPrompt] = useState("");
-  const [isProcessing, setIsProcessing] = useState(false);
+  // 处理中状态**按会话**记录（09-23）：此前是一个全局布尔——A 会话在等回复时
+  // B 会话的发送键被判定为"处理中"，于是否决发送/被当成"打断"，表现为
+  // "一个会话在跑，另一个会话发不出去"。现在是 Record<sessionId, true>，
+  // 每个会话只看自己那一位；两个会话可以各自跑各自的一轮。
+  const [processing, setProcessing] = useState<Record<string, boolean>>({});
+  // 当前**查看的**会话是否在跑（渲染/发送/停止都只看这一位）
+  const isProcessing = !!processing[session.id];
   // 当前执行中任务摘要（tool_start/tool_end 驱动，顶部状态条展示）
   const [activeTask, setActiveTask] = useState<string | null>(null);
   // 后台子智能体任务（ZCode 式活动栏：delegate_task background=true 产生）
@@ -202,8 +208,15 @@ const [timeFilter, setTimeFilter] = useState("all");
   const [taskStartAt, setTaskStartAt] = useState<number | null>(null);
   // 流式中的思考缓冲（运行中 Think 行实时摘要；800ms 节流，见 flushStream）
   const [streamingThink, setStreamingThink] = useState<string>("");
-  const activeTaskStackRef = useRef<string[]>([]);
-  const abortControllerRef = useRef<AbortController | null>(null);
+  // 任务栈与中止控制器**按会话**存：A 在跑时切到 B，B 的工具栈/停止键不能
+  // 受 A 影响，A 的流也不能被 B 的停止键打断（此前都是全局单值）
+  const taskStacksRef = useRef<Record<string, string[]>>({});
+  const taskStartsRef = useRef<Record<string, number>>({});
+  const abortControllersRef = useRef<Record<string, AbortController | null>>({});
+  // 回合令牌（每个会话一个自增值）：旧流收尾时校验自己是否仍是该会话的当前回合，
+  // 不是就不动状态（打断后立刻重发/两会话并发的状态互相踩）
+  const turnSeqRef = useRef(0);
+  const turnIdsRef = useRef<Record<string, number>>({});
   // 已提示过的 cron 完成事件（ts+task 键），防止 5s 心跳对同一事件反复弹 toast
   const lastCronEventRef = useRef<string>("");
   // useSessions 的 setter 每次渲染重建，心跳 effect（空依赖）需要最新引用
@@ -293,8 +306,11 @@ const [timeFilter, setTimeFilter] = useState("all");
   const speakingIdRef = useRef<string | null>(null);
   const ttsAudioRef = useRef<HTMLAudioElement | null>(null);
   /* ── Persistence: debounce during SSE streaming, immediate otherwise ── */
-  const isProcessingRef = useRef(isProcessing);
-  isProcessingRef.current = isProcessing;
+  // 同步镜像（state 更新滞后于渲染，同 tick 的双击/回车必须靠 ref 判断）
+  const processingRef = useRef<Record<string, boolean>>({});
+  processingRef.current = processing;
+  // 任一会话在跑 → 落盘节流（别的会话在流式时也没必要每 120ms 全量写 localStorage）
+  const anyProcessing = Object.keys(processing).length > 0;
   // 最新 pendingFile 镜像 + 后台英化完成等待者（sendMessage 组装消息前
   // 若英化未完成，等待英化结果拿英文内容——用户偏好"上传文字以英文上传"）
   const pendingFileRef = useRef<PendingFile | null>(null);
@@ -325,7 +341,7 @@ const [timeFilter, setTimeFilter] = useState("all");
   useEffect(() => {
     const stripped = stripForStorage(sessions);
     const data = JSON.stringify(stripped);
-    if (isProcessing) {
+    if (anyProcessing) {
       // Streaming: debounce to 1s to avoid thrashing
       const timer = setTimeout(() => saveSessions(data), 1000);
       return () => clearTimeout(timer);
@@ -333,7 +349,7 @@ const [timeFilter, setTimeFilter] = useState("all");
       // Not streaming: save immediately
       saveSessions(data);
     }
-  }, [sessions, isProcessing, stripForStorage, saveSessions]);
+  }, [sessions, anyProcessing, stripForStorage, saveSessions]);
 
   // Auto-scroll chat to bottom（instant，内容高度未定时 smooth 会滚错位）
   useEffect(() => {
@@ -461,7 +477,9 @@ const [timeFilter, setTimeFilter] = useState("all");
     const tick = async () => {
       // Unified sidecar heartbeat
       try {
-        const resp = await authFetch("/v1/heartbeat", { signal: AbortSignal.timeout(5000) });
+        // session_id：活动栏只显示本会话的子代理（此前混着所有会话的任务）
+        const resp = await authFetch(`/v1/heartbeat?session_id=${encodeURIComponent(sessionIdRef.current)}`,
+                                     { signal: AbortSignal.timeout(5000) });
         const data = await resp.json();
         if (data.status === "ok") {
           offlineStreakRef.current = 0;
@@ -703,6 +721,11 @@ const [timeFilter, setTimeFilter] = useState("all");
         body: JSON.stringify({ model_id: mid }),
       });
       const data = await resp.json();
+      // 引擎忙（别的会话正在用本地模型）：不动状态卡，只提示——切换会让那些会话断流
+      if (data.code === "engine_busy") {
+        showToast(String(data.message || t("toast.start_fail", { msg: "" })), "warn");
+        return;
+      }
       setLocalLLMStatus(data);
       if (data.status === "running") {
         showToast(t("toast.started", { model: data.model_name }));
@@ -715,6 +738,11 @@ const [timeFilter, setTimeFilter] = useState("all");
     try {
       const resp = await authFetch("/v1/local-llm/stop", { method: "POST" });
       const data = await resp.json();
+      // 引擎忙：后端拒绝停止（有回合正在用），照实提示，别谎报"已停止"
+      if (data.code === "engine_busy") {
+        showToast(String(data.message || ""), "warn");
+        return;
+      }
       setLocalLLMStatus(data);
       // Restore the default UI after unloading: clear the model-id input and
       // drop the local model selection in chat so the next message routes
@@ -730,14 +758,33 @@ const [timeFilter, setTimeFilter] = useState("all");
 
 
   /* ── Session Management ── */
-  const switchSession = (idx: number) => { setCurrentIdx(idx); setPendingFile(null); setActiveView("chat"); };
+  const switchSession = (idx: number) => {
+    setCurrentIdx(idx);
+    setPendingFile(null);
+    setActiveView("chat");
+    // 活动栏/任务条先清空：下一个心跳会填回**该会话**自己的子任务
+    setSubagents([]);
+    // 切回会话时恢复**它自己**的阶段/任务显示（09-23 按会话隔离）：
+    // A 在后台跑、切到 B 再切回 A，顶部状态条要还是 A 的进度而不是 B 的残留
+    const target = sessions[idx];
+    if (target) {
+      const stack = taskStacksRef.current[target.id] || [];
+      setActiveTask(stack[stack.length - 1] || null);
+      setTaskStartAt(taskStartsRef.current[target.id] || null);
+      setStreamingThink("");
+      setAgentPhase(processingRef.current[target.id] ? t("agent.phase_analyze") : "");
+    }
+  };
   const deleteSession = (idx: number) => {
-    const makeNew = () => ({ id: `session_${Math.random().toString(36).substring(7)}`, name: "session.default", messages: [] as Message[], selectedModel: "", lastActive: Date.now() });
+    // 复用 hook 的 newSession()（crypto.randomUUID）：此前这里另起一套
+    // Math.random().substring(7) 低熵 id（约 20-30 bit）——会话 id 是消息写入、
+    // 取消请求、进度文件的定位键，碰撞即跨会话串话（审计 A2）
     setSessions((prev) => {
       const next = prev.filter((_, i) => i !== idx);
-      if (next.length === 0) return [makeNew()];
+      if (next.length === 0) return [newSession()];
       return next;
     });
+    // 删掉的是正在查看的会话时，把查看位置挪到存在的会话上
     if (currentIdx >= idx) setCurrentIdx((c) => Math.max(0, c - 1));
   };
   /* ── Toast ── */
@@ -782,6 +829,23 @@ const [timeFilter, setTimeFilter] = useState("all");
     opts?: { model?: string; agent?: string; cloudConfig?: Record<string, unknown>; skipTools?: boolean; sessionId?: string },
     signal?: AbortSignal,
   ): Promise<string> => {
+    // 本轮流的目标会话在**发起时**固化（09-23 并发隔离）：用户中途切到别的
+    // 会话时，消息写入仍落到本会话；显示类状态（思考/阶段/任务条）只在
+    // "正在看的就是本会话"时更新，避免 A 的流在 B 的界面上闪现（混会话）。
+    const targetId = opts?.sessionId || session.id;
+    const viewed = () => sessionIdRef.current === targetId;
+    const writeMessages = (fn: (prev: Message[]) => Message[]) =>
+      (opts?.sessionId ? setMessagesFor(targetId, fn) : setMessages(fn));
+    const showThink = (v: string) => { if (viewed()) setStreamingThink(v); };
+    const showPhase = (v: string) => { if (viewed()) setAgentPhase(v); };
+    const myStack = () => {
+      if (!taskStacksRef.current[targetId]) taskStacksRef.current[targetId] = [];
+      return taskStacksRef.current[targetId];
+    };
+    const showStackTop = () => {
+      if (viewed()) setActiveTask(taskStacksRef.current[targetId]?.slice(-1)[0] || null);
+    };
+
     const body: Record<string, unknown> = { messages, stream: true, reflection_mode: reflectionMode, access_mode: accessMode, thinking_level: thinkingLevel };
     // 传 session_id：后端记忆/停滞检测按会话归档（P0-2）
     if (opts?.sessionId) body.session_id = opts.sessionId;
@@ -835,16 +899,16 @@ const [timeFilter, setTimeFilter] = useState("all");
       if (!streamFinalized && pendingThinking) {
         if (Date.now() - lastThinkPropFlush >= 800) {
           lastThinkPropFlush = Date.now();
-          setStreamingThink(pendingThinking);
+          showThink(pendingThinking);
         }
       } else if (streamFinalized) {
-        setStreamingThink("");
+        showThink("");
       }
       // 非定稿 + 有思考 + 未到节流窗口：跳过空写（避免每 120ms 重渲染）
       const livePreview = !streamFinalized && pendingThinking !== ""
         && Date.now() - lastThinkingFlush >= 10_000;
       if (!text && !th && !livePreview) return;
-      setMessages((prev) => {
+      writeMessages((prev) => {
         const msgs = [...prev];
         const last = msgs[msgs.length - 1];
         if (last?.role === "assistant") {
@@ -937,7 +1001,7 @@ const [timeFilter, setTimeFilter] = useState("all");
                 const cloudCfgPre = opts?.model
                   ? cloudModels.find((m) => m.name === opts.model)
                   : undefined;
-                setAgentPhase(t("agent.phase_analyze"));
+                showPhase(t("agent.phase_analyze"));
                 if (isLocalEngine && declared && !cloudCfgPre) {
                   // 本地模型选择是常态，不再弹窗打扰（09-04 用户反馈）——
                   // 路由信息保留在日志/routeInfo 中以便排查
@@ -954,6 +1018,12 @@ const [timeFilter, setTimeFilter] = useState("all");
                 showToast(String(parsed.message || t("app.model_switched")) + (fbModel ? ` (${fbModel})` : ""), "warn");
                 continue;
               }
+              if (parsed.event === "engine_wait") {
+                // 多会话并行：本轮排在别的会话后面（后端闸门等待）。只在"正看这个
+                // 会话"时改状态，避免 A 的等待提示画到 B 的界面上。
+                showPhase(t("agent.phase_engine_wait"));
+                continue;
+              }
               if (parsed.event === "round_start") {
                 // 轮次透明化（09-05 23:52：本地慢生成多轮拉锯时前端黑盒）
                 currentRound = Number(parsed.iteration) || currentRound;
@@ -962,12 +1032,12 @@ const [timeFilter, setTimeFilter] = useState("all");
               }
               if (parsed.event === "tool_confirm") {
                 flushStream();
-                setAgentPhase(t("agent.phase_confirm", { tool: parsed.tool || "" }));
+                showPhase(t("agent.phase_confirm", { tool: parsed.tool || "" }));
                 showToast(t("tool.confirm_toast", { tool: parsed.tool || "" }), "warn");
                 // 等待用户确认可能超过看门狗时限——确认期间暂停看门狗，
                 // 用户点允许/拒绝后 tool_start/tool_end 数据到达即自动恢复
                 disarmWatchdog();
-                setMessages((prev) => {
+                writeMessages((prev) => {
                   const msgs = [...prev];
                   // 工具消息插到用户问题之后、思考/回答之前（保持 [user, tool, assistant] 顺序）
                   const last = msgs[msgs.length - 1];
@@ -983,7 +1053,7 @@ const [timeFilter, setTimeFilter] = useState("all");
                 // 规划模式：执行计划显示为一条消息
                 const plan = String(parsed.content ?? "");
                 if (plan.trim()) {
-                  setMessages((prev) => [...prev, {
+                  writeMessages((prev) => [...prev, {
                     id: msgId(), role: "assistant",
                     content: `${t("app.plan_title")}\n\n${plan}`,
                   }]);
@@ -993,8 +1063,8 @@ const [timeFilter, setTimeFilter] = useState("all");
                 flushStream();
                 disarmWatchdog();
                 showToast(t("tool.confirm_toast", { tool: t("app.plan_tool") }), "warn");
-                setAgentPhase(t("agent.phase_confirm", { tool: t("app.plan_tool") }));
-                setMessages((prev) => [...prev, {
+                showPhase(t("agent.phase_confirm", { tool: t("app.plan_tool") }));
+                writeMessages((prev) => [...prev, {
                   id: msgId(), role: "tool", type: "tool_call", content: "",
                   callId: parsed.call_id, toolName: t("app.plan_tool"),
                   toolArgs: parsed.args, toolStatus: "confirming",
@@ -1010,7 +1080,7 @@ const [timeFilter, setTimeFilter] = useState("all");
                   streamFinalized = true;
                   thinkingAttached = true;
                   thinkingAttached = true; // 后续 flush 不再跑（否则 revised 被重复 push）
-                  setMessages((prev) => {
+                  writeMessages((prev) => {
                     const msgs = [...prev];
                     for (let i = msgs.length - 1; i >= 0; i--) {
                       if (msgs[i].role === "assistant" && msgs[i].content && msgs[i].content.trim()) {
@@ -1030,7 +1100,7 @@ const [timeFilter, setTimeFilter] = useState("all");
                   full = revised;
                   streamFinalized = true;
                   // 注意：不置 thinkingAttached——定稿时最后一次 flush 仍需附着思考
-                  setMessages((prev) => {
+                  writeMessages((prev) => {
                     const msgs = [...prev];
                     for (let i = msgs.length - 1; i >= 0; i--) {
                       if (msgs[i].role === "assistant" && msgs[i].content && msgs[i].content.trim()) {
@@ -1045,10 +1115,10 @@ const [timeFilter, setTimeFilter] = useState("all");
                 flushStream();
                 // 工具执行期静默可超 180s（长命令/重载）：暂停看门狗，tool_end 再续（P0-4）
                 disarmWatchdog();
-                activeTaskStackRef.current.push(`${parsed.tool || ""} ${JSON.stringify(parsed.args || {}).slice(0, 60)}`);
-                setActiveTask(activeTaskStackRef.current[activeTaskStackRef.current.length - 1] || null);
+                myStack().push(`${parsed.tool || ""} ${JSON.stringify(parsed.args || {}).slice(0, 60)}`);
+                showStackTop();
                 const startTs = Number(parsed.ts) || Date.now();
-                setMessages((prev) => {
+                writeMessages((prev) => {
                   const msgs = [...prev];
                   const idx = msgs.findIndex((m) => m.callId === parsed.call_id && m.toolStatus === "confirming");
                   if (idx !== -1) { msgs[idx] = { ...msgs[idx], toolStatus: "running", ts: startTs }; }
@@ -1066,15 +1136,15 @@ const [timeFilter, setTimeFilter] = useState("all");
               } else if (parsed.event === "tool_end") {
                 flushStream();
                 armWatchdog();  // 工具执行结束，恢复看门狗（P0-4）
-                activeTaskStackRef.current.pop();
-                setActiveTask(activeTaskStackRef.current[activeTaskStackRef.current.length - 1] || null);
+                myStack().pop();
+                showStackTop();
                 const rawResult = String(parsed.result ?? "");
                 const toolResult = rawResult.length > 10000
                   ? rawResult.slice(0, 10000) + "\n\n" + t("app.truncated")
                   : rawResult;
                 const isError = rawResult.startsWith("Error") || rawResult.startsWith("⛔");
                 const endTs = Number(parsed.ts) || Date.now();
-                setMessages((prev) => {
+                writeMessages((prev) => {
                   const msgs = [...prev];
                   const idx = msgs.findIndex((m) => m.callId === parsed.call_id && (m.toolStatus === "running" || m.toolStatus === "confirming"));
                   if (idx !== -1) {
@@ -1129,13 +1199,13 @@ const [timeFilter, setTimeFilter] = useState("all");
       const data = await resp.json();
       if (data.status === "already") {
         // 服务端幂等：已处理（本卡已批准/拒绝）——收尾卡片状态，避免永远 confirming
-        setMessages(prev => prev.map(m => m.callId === callId && m.toolStatus === "confirming"
+        setMessagesFor(session.id, prev => prev.map(m => m.callId === callId && m.toolStatus === "confirming"
           ? { ...m, toolStatus: "done" as const } : m));
         return;
       }
       if (data.status === "not_found") {
         showToast(t("toast.timeout"));
-        setMessages(prev => prev.map(m => m.callId === callId && m.toolStatus === "confirming" ? { ...m, toolStatus: "error" as const, toolResult: t("toast.timeout_detail") } : m));
+        setMessagesFor(session.id, prev => prev.map(m => m.callId === callId && m.toolStatus === "confirming" ? { ...m, toolStatus: "error" as const, toolResult: t("toast.timeout_detail") } : m));
       }
     } catch (e) {
       console.error(e);
@@ -1147,7 +1217,7 @@ const [timeFilter, setTimeFilter] = useState("all");
         });
         const d2 = await resp2.json();
         if (d2.status === "ok" || d2.status === "already") {
-          setMessages(prev => prev.map(m => m.callId === callId && m.toolStatus === "confirming"
+          setMessagesFor(session.id, prev => prev.map(m => m.callId === callId && m.toolStatus === "confirming"
             ? { ...m, toolStatus: "done" as const } : m));
           return;
         }
@@ -1157,24 +1227,31 @@ const [timeFilter, setTimeFilter] = useState("all");
     finally { confirmInFlightRef.current.delete(callId); }
   }, [showToast, setMessages, t]);
 
-  const stopGeneration = useCallback(() => {
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
-      abortControllerRef.current = null;
-    }
+  // 停止**指定会话**（默认=当前查看的会话）的回合：控制器/取消请求/显示状态
+  // 全部按会话定位（09-23）。此前用跟随视图的 sessionIdRef + 单一控制器，
+  // 切走再点停止会停错会话。
+  const stopGeneration = useCallback((targetSession?: string) => {
+    const sid = targetSession || sessionIdRef.current;
+    const ctl = abortControllersRef.current[sid];
+    if (ctl) ctl.abort();
+    abortControllersRef.current[sid] = null;
     // 服务端取消：仅断前端流时 agent 循环会继续烧 GPU/执行工具/扣云端
     // 费用（P0）。置位 sidecar 会话级取消标记，循环在每轮迭代/工具执行前
     // 检查并中止。
     authFetch("/v1/chat/cancel", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ session_id: sessionIdRef.current }),
+      body: JSON.stringify({ session_id: sid }),
     }).catch(() => { /* sidecar 不可达时仅靠 abort 兜底 */ });
-    activeTaskStackRef.current = [];
-    setActiveTask(null);
-    setTaskStartAt(null);
-    setIsProcessing(false);
-    setAgentPhase("");
+    taskStacksRef.current[sid] = [];
+    delete taskStartsRef.current[sid];
+    delete processingRef.current[sid];          // 同步镜像（state 更新滞后一拍）
+    setProcessing((p) => { const n = { ...p }; delete n[sid]; return n; });
+    if (sessionIdRef.current === sid) {
+      setActiveTask(null);
+      setTaskStartAt(null);
+      setAgentPhase("");
+    }
   }, []);
 
   /* ── Send Message ── */
@@ -1188,12 +1265,18 @@ const [timeFilter, setTimeFilter] = useState("all");
     // and the sidecar eventually crashes -> "Unhandled Promise Rejection".
     // ⚠️ 必须用 ref 同步判断：isProcessing state 更新滞后于渲染，同 tick
     // 内两次 Enter/双击都在 state 更新前通过 → 双循环（审计 P1）
-    if (isProcessingRef.current) {
-      // 任务执行中发送新消息 = 中止当前任务再发（用户可随时插话/纠正方向；
+    // 09-23：只看**本会话**是否在跑——别的会话在跑与我无关（此前全局布尔导致
+    // "另一个会话在等回复时，这个会话发不出去"）
+    if (processingRef.current[session.id]) {
+      // 本会话任务执行中发送新消息 = 中止当前任务再发（用户可随时插话/纠正方向；
       // 后端取消由 stopGeneration 同步触发 /v1/chat/cancel，循环不残留）
-      stopGeneration();
+      stopGeneration(session.id);
     }
-    isProcessingRef.current = true;
+    // 本轮的令牌：本轮 finally 只有在"令牌仍是自己的"时才清处理中标记，
+    // 避免"打断后立刻重发"时旧流的收尾把新流的标记清掉（红停止键永不恢复）
+    const myTurn = ++turnSeqRef.current;
+    turnIdsRef.current[session.id] = myTurn;
+    processingRef.current[session.id] = true;
 
     // Guard: block sending images to a local model that lacks vision support.
     // Otherwise the local server (mlx_lm/llama.cpp) hangs or errors on the
@@ -1210,11 +1293,12 @@ const [timeFilter, setTimeFilter] = useState("all");
     }
 
     setPrompt("");
-    setIsProcessing(true);
+    setProcessing((p) => ({ ...p, [session.id]: true }));
     setAgentPhase(t("agent.phase_analyze"));
-    activeTaskStackRef.current = []; // 清残留工具栈（上次中断/未正常结束）
+    taskStacksRef.current[session.id] = []; // 清残留工具栈（上次中断/未正常结束）
+    taskStartsRef.current[session.id] = Date.now(); // 任务头部"已工作"计时起点
     setActiveTask(null);
-    setTaskStartAt(Date.now()); // 任务头部"已工作"计时起点
+    setTaskStartAt(taskStartsRef.current[session.id]);
 
     // 等待后台英化完成再组装消息（用户偏好：上传文字以英文上传）。
     // 12 秒上限：超时/失败用当前内容兜底，不阻塞发送。
@@ -1256,10 +1340,10 @@ const [timeFilter, setTimeFilter] = useState("all");
     // 发送即清预览框（此前只在 finally 清：请求期间预览残留；且任务执行中
     // 发送会先经 stopGeneration 把 pendingFile 提前清掉导致文件丢失）
     setPendingFile(null);
-    setMessages((prev) => [...prev, userMsg]);
+    setMessagesFor(session.id, (prev) => [...prev, userMsg]);
 
     const assistantPlaceholder: Message = { id: msgId(), role: "assistant", content: "", ts: Date.now() };
-    setMessages((prev) => [...prev, assistantPlaceholder]);
+    setMessagesFor(session.id, (prev) => [...prev, assistantPlaceholder]);
 
     try {
       const apiMessages = buildApiMessages(session, userMsg, accessMode === "plan", lang);
@@ -1268,7 +1352,7 @@ const [timeFilter, setTimeFilter] = useState("all");
       if (cloudCfgPre) opts.cloudConfig = { key: cloudCfgPre.key, endpoint: cloudCfgPre.endpoint, protocol: cloudCfgPre.protocol || "openai" };
 
       const controller = new AbortController();
-      abortControllerRef.current = controller;
+      abortControllersRef.current[session.id] = controller;
       const finalText = await streamChat(apiMessages, opts, controller.signal);
       // 自动朗读：只在整轮成功结束时念一次正文。报错（❌ 开头）和用户中止的都不念。
       if (ttsAutoRead && finalText && finalText.trim() && !finalText.trimStart().startsWith("❌")) {
@@ -1280,7 +1364,7 @@ const [timeFilter, setTimeFilter] = useState("all");
       const errText = String((e as { message?: string })?.message ?? e ?? "");
       const aborted = (e as { name?: string })?.name === "AbortError"
         || /resource id .* is invalid/i.test(errText);
-      setMessages((prev) => {
+      setMessagesFor(session.id, (prev) => {
         const msgs = [...prev];
         const last = msgs[msgs.length - 1];
         if (last?.role === "assistant") {
@@ -1296,11 +1380,21 @@ const [timeFilter, setTimeFilter] = useState("all");
         return msgs;
       });
     } finally {
-      abortControllerRef.current = null;
-      setIsProcessing(false);
+      abortControllersRef.current[session.id] = null;
+      // 只有"令牌还是自己"才清处理中标记（见上面 myTurn）：打断后立刻重发时，
+      // 旧流的收尾不能把新回合的标记清掉（红停止键永不恢复的旧根因）
+      if (turnIdsRef.current[session.id] === myTurn) {
+        delete turnIdsRef.current[session.id];
+        delete processingRef.current[session.id];
+        setProcessing((p) => { const n = { ...p }; delete n[session.id]; return n; });
+        if (sessionIdRef.current === session.id) {
+          setStreamingThink("");
+          setAgentPhase("");
+          setActiveTask(null);
+          setTaskStartAt(null);
+        }
+      }
       setPendingFile(null);
-      setStreamingThink("");
-      setAgentPhase("");
     }
   };
 

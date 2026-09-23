@@ -1,0 +1,44 @@
+# 单元测试依赖（CI 用；**不含** mlx / llama_cpp_python / akshare / av / faster-whisper 等重包）。
+#
+# 为什么单独一份：完整 sidecar/requirements.txt 有 58 条（含仅 macOS 的 mlx、CUDA/编译型
+# 包），CI 每次装要 5-8 分钟；而 tests/ 这套单元测试实测只需下面这些（本地 2026-09-23 用
+# Python 3.11 全新 venv 跑通 828 通过 / 1 跳过）。
+#
+# 版本按"本地验证通过"的实际版本固定（与 requirements.txt 的新旧不要求一致——
+# 那份是随应用下发的运行时依赖，这份只服务 CI 的测试与静态检查）。
+annotated-doc==0.0.5
+annotated-types==0.8.0
+anyio==4.15.1
+certifi==2026.7.22
+charset-normalizer==3.5.1
+click==8.5.0
+diskcache==5.6.3
+et_xmlfile==2.0.0
+fastapi==0.141.1
+h11==0.16.0
+httpcore==1.0.9
+httpx==0.28.1
+idna==3.19
+iniconfig==2.3.0
+openpyxl==3.1.5
+packaging==26.3
+pluggy==1.6.0
+pydantic-settings==2.15.0
+pydantic==2.13.5
+pydantic_core==2.46.5
+Pygments==2.21.0
+pytest-asyncio==1.4.0
+pytest==9.1.1
+python-dotenv==1.2.3
+python-multipart==0.0.32
+PyYAML==6.0.3
+requests==2.34.2
+sse-starlette==3.4.11
+starlette==1.6.0
+tree-sitter-bash==0.25.1
+tree-sitter==0.26.0
+typing-inspection==0.4.4
+typing_extensions==4.16.0
+urllib3==2.7.0
+uvicorn==0.52.4
+ruff==0.16.6

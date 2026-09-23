@@ -150,8 +150,18 @@ class TestFlowTools(unittest.TestCase):
 
 
 def importlib_util(path):
+    """按 **sidecar/** 为基准解析相对路径加载插件。
+
+    此前直接传相对路径 → 取决于 CWD：从仓库根跑 pytest 会去找
+    `<repo>/plugins/control_wait.py`（不存在），4 个用例失败；从 sidecar/ 跑才过。
+    审计实测（824 通过/4 失败 vs 828 全过），现固定为 __file__ 基准。
+    """
     import importlib.util
-    spec = importlib.util.spec_from_file_location(f"t_{abs(hash(path))}", path)
+    from pathlib import Path as _P
+    p = _P(path)
+    if not p.is_absolute():
+        p = _P(__file__).resolve().parent.parent / p     # tests/ → sidecar/
+    spec = importlib.util.spec_from_file_location(f"t_{abs(hash(str(p)))}", p)
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
     return m

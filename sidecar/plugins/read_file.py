@@ -3,8 +3,13 @@
 import os
 import re
 
-_BLOCKED_SUBSTRINGS = ("/.ssh", "/.aws", "/.gnupg", "/Library/Keychains", "/.kube", "/.docker")
-_BLOCKED_FILE_NAMES = (".env", "id_rsa", "id_ed25519", "id_ecdsa", "known_hosts")
+# 敏感路径判定**与 run_cmd 共享一份**（cmd_safety.sensitive_read_block）：
+# 此前两条路不一致——`cat ~/.local-ai-os/config.json` 被拦，read_file 同一路径
+# 免确认读通，明文 API key 因此进了模型上下文/日志/报告（09-23 真机复现，审计 P1）
+# 兼容导出：旧代码/测试可能引用这两个常量名（实际判定统一走 sensitive_read_block）
+from cmd_safety import _BLOCKED_DIR_SUBSTRINGS as _BLOCKED_SUBSTRINGS  # noqa: F401
+from cmd_safety import _BLOCKED_FILE_NAMES as _BLOCKED_FILE_NAMES  # noqa: F401
+from cmd_safety import sensitive_read_block
 
 MAX_READ_SIZE = 10000  # chars before truncation
 
@@ -74,12 +79,10 @@ def execute(args: dict) -> str:
     p = _safe_path(args["path"])
     if p is None:
         return "⛔ Blocked: 路径无效（空路径或包含 .. 穿越片段）"
-    # 敏感目录（密钥/凭证）一律拒绝
-    if any(s in p for s in _BLOCKED_SUBSTRINGS):
-        return f"⛔ Blocked: 不允许访问敏感目录 - {p}"
-    # 敏感文件名一律拒绝
-    if os.path.basename(p) in _BLOCKED_FILE_NAMES:
-        return f"⛔ Blocked: 不允许读取敏感文件 - {p}"
+    # 敏感路径（密钥目录/凭据文件/.env 家族/辣条自身 config.json）一律拒绝
+    _blocked = sensitive_read_block(p)
+    if _blocked:
+        return _blocked
     try:
         # 先检测是否为二进制文件(xlsx/zip/png 等),避免 utf-8 codec 报错
         # 让模型困惑。读前 1KB 探测 NUL 字节或已知二进制魔数。

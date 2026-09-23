@@ -8,6 +8,7 @@
 - 敏感路径读取拦截（cat .ssh/id_rsa 等，与 read_file 插件黑名单对齐）
 """
 import logging
+import os
 import platform
 import re
 
@@ -92,6 +93,114 @@ def reject_sensitive_read(cmd: str) -> str | None:
     if first in _SENSITIVE_READERS and SENSITIVE_READ_RE.search(low):
         return f"⛔ 敏感路径读取被拒绝（密钥/凭据/配置）: {cmd[:80]}"
     return None
+
+
+# ── 敏感路径读取：**工具路径**版（09-23，审计 P1）────────────────────
+# 命令路径（run_cmd 白名单）一直有 SENSITIVE_READ_RE 守着，工具路径（read_file
+# 插件、tool_executor 的 fallback）却没有：同一份 config.json，`cat` 被拦、
+# `read_file` 免确认读通。真机复现（09-23 11:16）：模型读 config.json → 明文
+# Tavily key 进模型上下文 → 进日志、进报告、进 cron 事件与会话。
+# 这里给"路径"形态一份判定，与命令版**同源同心**（密钥/凭据/配置一律不可读），
+# 但**不**直接套用 SENSITIVE_READ_RE：它按子串匹配 `config.json`，会把项目的
+# `tsconfig.json` 一起拦掉（子串命中），那是能力回归。
+_BLOCKED_DIR_SUBSTRINGS = ("/.ssh", "/.aws", "/.gnupg", "/Library/Keychains",
+                           "/.kube", "/.docker")
+_BLOCKED_FILE_NAMES = (".env", "id_rsa", "id_ed25519", "id_ecdsa", "known_hosts",
+                       ".netrc", ".git-credentials", "credentials", "_netrc")
+# .env 家族（.env.local / .env.production…）全拦；模板类放行（无密钥、开发要看）
+_ENV_FAMILY_RE = re.compile(r"^\.env(\.[\w.-]+)?$", re.IGNORECASE)
+_ENV_TEMPLATE_SUFFIXES = (".example", ".sample", ".template", ".dist", ".defaults", ".md")
+
+
+def _app_data_dir() -> str:
+    """辣条自身的数据目录（config.json 所在处）。取不到时退回默认位置。"""
+    try:
+        from config import PROGRESS_DIR
+        return os.path.realpath(str(PROGRESS_DIR))
+    except Exception:
+        return os.path.realpath(os.path.expanduser("~/.local-ai-os"))
+
+
+def _app_data_dirs() -> tuple[str, ...]:
+    """辣条自身数据目录（config.json 所在处）的候选集合。
+
+    同时认**运行时 PROGRESS_DIR** 和**默认位置** `~/.local-ai-os`：只认前者时，
+    数据目录一旦被重定向（测试环境/自定义位置），真实 config.json 就从判定里漏过
+    ——写测试时实测到的漏洞（`_blk('~/.local-ai-os/config.json')` 返回 False）。
+    """
+    dirs: list[str] = []
+    try:
+        from config import PROGRESS_DIR
+        dirs.append(os.path.realpath(str(PROGRESS_DIR)))
+    except Exception:
+        pass
+    dirs.append(os.path.realpath(os.path.expanduser("~/.local-ai-os")))
+    out: list[str] = []
+    for d in dirs:
+        if d and d not in out:
+            out.append(d)
+    return tuple(out)
+
+
+def sensitive_read_block(path: str) -> str | None:
+    """工具路径读文件前的敏感判定：返回拒绝文案或 None（放行）。
+
+    拦截范围：密钥/凭据目录、密钥文件名、`.env` 家族（模板除外）、
+    辣条自身目录下的 `config.json`（含 .bak 备份，里面有云端与 Tavily key）。
+    """
+    if not path:
+        return None
+    _rp = os.path.realpath(str(path))
+    if any(s in _rp for s in _BLOCKED_DIR_SUBSTRINGS):
+        return f"⛔ 不允许访问敏感目录 - {_rp}"
+    base = os.path.basename(_rp)
+    low = base.lower()
+    if low in _BLOCKED_FILE_NAMES:
+        return f"⛔ 不允许读取敏感文件（密钥/凭据）- {_rp}"
+    if _ENV_FAMILY_RE.match(low) and not low.endswith(_ENV_TEMPLATE_SUFFIXES):
+        return f"⛔ 不允许读取 .env 家族文件（可能含密钥）- {_rp}"
+    if low.startswith("config.json"):
+        # 只在辣条自己的数据目录里拦，不误伤用户项目的 config.json / tsconfig.json
+        _under = any(_rp.startswith(d + os.sep) for d in _app_data_dirs())
+        if _under or "/.local-ai-os/config.json" in _rp.replace(os.sep, "/"):
+            return (f"⛔ 不允许读取辣条自身配置（含 API 密钥）- {_rp}。"
+                    "需要改配置请到设置界面操作")
+    return None
+
+
+# ── 日志/落盘脱敏（09-23，审计 P1 附带）──────────────────────────
+# 真机复现：工具结果原样进日志（`Tool result: read_file → { "tavily_api_key":
+# "tvly-dev-…"`），而日志是 0644 且常被贴进工单。这里统一打码，供日志预览、
+# 进度文件、记忆库写入三处共用。
+_SECRET_PATTERNS = re.compile(
+    r"(?:tvly|sk|gsk|xai|hf|ghp|gho|glpat|github_pat)[-_][A-Za-z0-9_\-]{12,}"
+    r"|AIza[A-Za-z0-9_\-]{20,}"
+    r"|eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}"      # JWT
+    r"|(?:Bearer|token|api[_-]?key)\s*[\"']?\s*[:=]?\s*[\"']?[A-Za-z0-9_\-\.]{16,}",
+    re.IGNORECASE,
+)
+# 整份文件/目录内容类工具：日志里只记长度，不记内容（内容是本类泄露的主要载体）
+_RAW_CONTENT_TOOLS = frozenset({"read_file", "headless_read", "list_dir"})
+
+
+def redact_secrets(text: str) -> str:
+    """把文本里像密钥的片段打码（日志、进度文件、记忆库写入前都要用）。"""
+    try:
+        return _SECRET_PATTERNS.sub("***", text or "")
+    except Exception:
+        return text or ""
+
+
+def tool_log_preview(tool_name: str, result: str, limit: int = 80) -> str:
+    """工具结果的日志预览：密钥一律打码；整份文件内容这一类只记长度。
+
+    read_file 的内容几乎没诊断价值（路径已经单独打过），而它正是密钥泄露的载体；
+    mx_query/搜索类保留脱敏后的预览——09-01 排查工具参数问题就靠这几行。
+    """
+    txt = result or ""
+    if tool_name in _RAW_CONTENT_TOOLS:
+        return f"[{len(txt)} 字内容已省略]"
+    return redact_secrets(txt)[:limit].replace("\n", " ")
 
 
 def check_cmd(cmd: str) -> str | None:

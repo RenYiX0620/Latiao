@@ -11,31 +11,84 @@ import inspect
 import json
 import logging
 import os
-import platform
 import re
-import threading
 import time
 import uuid
 from datetime import datetime
 from pathlib import Path
 
-import httpx
 
-import local_llm
 from config import PROGRESS_DIR
+
+# ── 进度读写已拆到 agent/progress.py（2026-09-23 第一块接缝）──
+# 保留同名 re-export：api_routes（_progress_file）、main（_record_progress）与既有
+# 测试（test_language 的 _progress_tail、test_context_stats 的 monkeypatch）都按
+# agent_loop 的旧路径导入；monkeypatch agent_loop._progress_tail 依然生效，因为
+# _build_chat_messages 在本模块内按全局名查表。
+from agent.prompt_build import (  # noqa: F401  —— re-export（api_routes/main/6 个测试按旧路径导入）
+    _build_chat_messages,
+)
+from agent.session_events import (  # noqa: F401  —— re-export（旧导入路径继续可用）
+    _clear_session_cancel,
+    _EVENT_LOGS,
+    _EVENT_LOGS_LOCK,
+    _EVENT_LOGS_MAX,
+    _event_log_for,
+    _request_session_cancel,
+    _session_cancel_requested,
+)
+from agent.mcp_tools import (  # noqa: F401  —— re-export（旧导入路径继续可用）
+    _load_mcp_tools,
+    _mcp_invoke,
+    _mcp_tool_name,
+    ensure_mcp_loaded,
+)
+from agent.verify import (  # noqa: F401  —— re-export（旧导入路径继续可用）
+    _auto_verify,
+    _enhance_auto_verify,
+    _semgrep_scan,
+)
+from agent.reflection import (  # noqa: F401  —— re-export（旧导入路径继续可用）
+    _REFLECT_CHECKLISTS,
+    _find_unverified_numbers,
+    _generate_plan,
+    _reflect_output,
+)
+from agent.routing import (  # noqa: F401  —— re-export（旧导入路径继续可用）
+    _get_best_cloud_config,
+    _resolve_api_target,
+)
+from agent.confirm import (  # noqa: F401  —— re-export（旧导入路径继续可用）
+    _await_tool_confirmation,
+    _check_pre_hooks,
+    _confirm_bypassed,
+    _count_successful_duplicates,
+    _pending_confirmations,
+    _pending_lock,
+    _start_plan_confirmation,
+    _start_tool_confirmation,
+    _wait_plan_confirmation,
+    _wait_tool_confirmation,
+)
+from agent.progress import (  # noqa: F401  —— re-export（兼容旧导入路径）
+    PROGRESS_FILE,        # 规范所有者在 agent.progress：进度路径只留一份定义
+    _clean_progress_tail,
+    _progress_file,
+    _progress_tail,
+    _record_progress,
+    _rotate_progress_file,
+)
+AGENTS_FILE = PROGRESS_DIR / "agents.json"
+CONFIG_FILE = PROGRESS_DIR / "config.json"
+
 from cron import _create_cron
 from db import _db_write_lock, _get_db
-from identity import _load_agent_identity, _process_identity_intents, _read_identity
-from onboarding import process_message as _process_onboarding
-from session_log import SessionLog
-from loop_state import turn_state_for
+from identity import _load_agent_identity
 from memory import (
-    _get_high_confidence_preferences,
     _maybe_generate_skill,
     _quick_reflect,
     _record_reflection,
     _refine_learnings,
-    _retrieve_relevant_learnings,
 )
 from tool_executor import (
     _FALLBACK_DISPATCH,
@@ -46,6 +99,7 @@ from tool_executor import (
 from tool_system import load_plugins
 
 # ── Stage 1 拆分：实现移至 agent/ 包（兼容导入，既有引用继续可用）──
+from cmd_safety import redact_secrets, tool_log_preview   # 日志/落盘脱敏（09-23）
 from agent.transport import (  # noqa: F401
     _is_local_llm_url, _local_llm_serialized, _local_llm_stream,
     _safe_cwd, _verify_llm_health, clear_llm_suspect, mark_llm_suspect,
@@ -74,6 +128,7 @@ from agent.context import (  # noqa: F401
     _get_localized_text, _inject_image, _inject_thinking_disabled,
     _is_chat_query, _is_light_query, _local_native_tools_ok,
     _maybe_add_inline_file_note, _merge_system_messages, _normalize_access,
+    subagent_tool_gate,
     _recover_tool_name, _resolve_max_tokens, _sanitize_tool_messages,
     _slim_history_for_local, _strip_transient_reminders,
 )
@@ -232,87 +287,7 @@ TOOLS: list[dict] = []
 TOOL_DISPATCH: dict[str, callable] = {}
 TOOL_HOOKS: dict[str, dict] = {}
 
-# Pending confirmations: call_id → asyncio.Event (approve) or None (deny)
-_pending_confirmations: dict[str, dict] = {}
-_pending_lock = asyncio.Lock()
 
-# 会话级取消注册表：POST /v1/chat/cancel 置位。两个循环在每轮迭代开头与
-# 每次工具执行前检查——停止按钮此前只断前端流，服务端循环继续烧 GPU/
-# 执行工具/扣云端费用（P0）。set 的 add/discard/contains 原子，无需锁。
-_session_cancelled: set[str] = set()
-
-# 事件日志（阶段 1，灰度）：LATIAO_EVENT_LOG=1 时取消/回合边界事件写入
-# session_events 表（sidecar/session_log.py，移植 dsh append 契约）。
-# 有会话级取消事件时，重放/审计能还原"用户何时按过停止"——0.3.14 审计发现
-# 停止按钮此前只断前端流，这类时序信息在旧日志里是彻底丢失的。
-# 日志实例按会话缓存：seq 连续性契约要求同一会话共用同一实例（否则每个
-# 新实例 seq 都从 0 开始，回放时"连续序号"语义失效）。缓存有界（LRU 32），
-# 会话结束不清理——事件是审计事实，实例只是写入口。
-_EVENT_LOGS: dict[str, SessionLog] = {}
-_EVENT_LOGS_LOCK = threading.Lock()
-_EVENT_LOGS_MAX = 32
-
-
-def _event_log_for(session_id: str) -> SessionLog | None:
-    try:
-        with _EVENT_LOGS_LOCK:
-            log = _EVENT_LOGS.get(session_id)
-            if log is None:
-                log = SessionLog(session_id)
-                if len(_EVENT_LOGS) >= _EVENT_LOGS_MAX:
-                    _EVENT_LOGS.pop(next(iter(_EVENT_LOGS)))
-                _EVENT_LOGS[session_id] = log
-            return log
-    except Exception:
-        logger.warning("event log unavailable for %s", session_id, exc_info=True)
-        return None
-
-
-def _request_session_cancel(session_id: str) -> None:
-    """置位会话取消标记（/v1/chat/cancel 调用）。"""
-    if session_id:
-        _session_cancelled.add(session_id)
-        # 相位状态机镜像（阶段 2a，与事件日志同源）：stopping 相位 + 先行原因
-        try:
-            turn_state_for(session_id).request_stop("user", "button")
-        except Exception:
-            logger.warning("failed to mirror cancel to turn state", exc_info=True)
-        log = _event_log_for(session_id)
-        if log is not None:
-            try:
-                log.append("cancel/request", {"cause": "user"})
-            except Exception:
-                logger.warning("failed to log cancel/request", exc_info=True)
-
-
-def _clear_session_cancel(session_id: str) -> None:
-    """新请求开始时清除标记（重发消息不应被上一次停止影响）。"""
-    _session_cancelled.discard(session_id)
-    # 上一次停止若因断连/异常未结算，新请求强制放弃旧 turn（产品语义：重发必须可用）
-    try:
-        turn_state_for(session_id).abandon()
-    except Exception:
-        logger.warning("failed to abandon turn state", exc_info=True)
-
-
-def _session_cancel_requested(session_id: str) -> bool:
-    """会话是否已被请求取消。
-
-    子代理会话形如 "<父会话>:sub_xxx"——父被取消（用户点停止 / 客户端断流）时
-    子代理必须同步骤内停，否则断连后仍会继续烧算力（09-13 事故）。
-    """
-    if not session_id:
-        return False
-    if session_id in _session_cancelled:
-        return True
-    root = session_id.split(":", 1)[0]
-    return root != session_id and root in _session_cancelled
-
-# PROGRESS_DIR is imported from config
-PROGRESS_FILE = PROGRESS_DIR / "PROGRESS.md"
-AGENTS_FILE = PROGRESS_DIR / "agents.json"
-CONFIG_FILE = PROGRESS_DIR / "config.json"
-_merge_agents()
 
 # ═══════════════════════════════════════════════════════
 #  Self-Verification: programmatic post-tool quality checks
@@ -323,135 +298,6 @@ _merge_agents()
 # ║  _auto_verify, execute_tool, _handle_tool_execution  ║
 # ╚══════════════════════════════════════════════════════╝
 
-async def _auto_verify(tool_name: str, args: dict, result: str) -> str:
-    """Run programmatic verification after a tool executes.
-    Returns a verification report to inject into the LLM context, or '' if nothing to verify."""
-    checks = []
-    path = ''
-
-    if tool_name == "write_file":
-        path = args.get("path") or args.get("file") or ""
-        content_written = args.get("content") or ""
-
-        # ── Read-back verification ──
-        if path:
-            try:
-                loop = asyncio.get_running_loop()
-                actual = await loop.run_in_executor(None, lambda: Path(path).read_text(encoding="utf-8"))
-                if actual == content_written:
-                    checks.append(("OK", "回读比对", f"内容一致 ({len(content_written)} 字符)"))
-                else:
-                    diff = len(actual) - len(content_written)
-                    checks.append(("FAIL", "回读比对", f"内容不一致！期望 {len(content_written)} 字符，实际 {len(actual)} (差 {diff})"))
-                lines = actual.split("\n")
-                checks.append(("OK", "完整性", f"{len(lines)} 行, 首行: {lines[0][:60] if lines else '(空)'}"))
-            except FileNotFoundError:
-                checks.append(("FAIL", "文件存在", f"写入后文件不存在: {path}"))
-
-        # ── TypeScript type-check (find nearest tsconfig.json) ──
-        if path.endswith((".ts", ".tsx")):
-            p = Path(path)
-            for parent in [p.parent, p.parent.parent, p.parent.parent.parent]:
-                if (parent / "tsconfig.json").exists():
-                    try:
-                        proc = await asyncio.create_subprocess_exec(
-                            "npx", "tsc", "--noEmit", cwd=str(parent),
-                            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-                        )
-                        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-                        if proc.returncode == 0:
-                            checks.append(("OK", "TS 类型检查", "tsc --noEmit 通过"))
-                        else:
-                            output = (stderr or stdout or b"").decode("utf-8", errors="replace")
-                            errs = [line for line in output.strip().split("\n") if line.strip()]
-                            checks.append(("FAIL", "TS 类型检查", f"发现 {len(errs)} 个错误"))
-                            for el in errs[:3]:
-                                checks.append(("  ", "  ↳", el[:120]))
-                    except FileNotFoundError:
-                        pass
-                    except asyncio.TimeoutError:
-                        checks.append(("FAIL", "TS 类型检查", "超时"))
-                    except Exception:
-                        logger.warning("TypeScript check failed in auto-verify", exc_info=True)
-                    break
-
-    if tool_name == "run_cmd":
-        exit_match = re.search(r'退出码:\s*(\d+)', result)
-        if exit_match:
-            code = int(exit_match.group(1))
-            checks.append(("OK" if code == 0 else "FAIL", "退出码", f"exit {code}"))
-        elif "超时" in result:
-            checks.append(("FAIL", "超时", "命令执行超时 (30s)"))
-
-    if tool_name in ("write_file", "run_cmd"):
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "git", "diff", "--stat",
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
-            if proc.returncode == 0 and stdout.strip():
-                checks.append(("INFO", "Git 变更", "\n" + stdout.decode("utf-8", errors="replace").strip()))
-        except Exception:
-            logger.warning("Git diff check failed in auto-verify", exc_info=True)
-
-        # ── ESLint check for JS/TS files ──
-        if path.endswith((".ts", ".tsx", ".js", ".jsx")):
-            p = Path(path)
-            for parent in [p.parent, p.parent.parent, p.parent.parent.parent]:
-                if (parent / "eslint.config.js").exists() or (parent / ".eslintrc").exists():
-                    try:
-                        proc = await asyncio.create_subprocess_exec(
-                            "npx", "eslint", str(p),
-                            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-                        )
-                        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-                        output = (stdout or stderr or b"").decode("utf-8", errors="replace").strip()
-                        if proc.returncode == 0 and not output:
-                            checks.append(("OK", "ESLint", "无警告"))
-                        elif output:
-                            errs = [line for line in output.split("\n") if line.strip()][:5]
-                            checks.append(("FAIL", "ESLint", f"发现 {len(errs)} 个问题"))
-                            for el in errs[:3]:
-                                checks.append(("  ", "  ↳", el[:120]))
-                    except FileNotFoundError:
-                        pass
-                    except asyncio.TimeoutError:
-                        checks.append(("FAIL", "ESLint", "超时"))
-                    except Exception:
-                        logger.debug("ESLint check failed", exc_info=True)
-                    break
-
-        # ── Python syntax check ──
-        if path.endswith(".py"):
-            try:
-                try:
-                    with open(path, encoding="utf-8") as _f:
-                        source = _f.read()
-                    compile(source, path, "exec")
-                    checks.append(("OK", "Python 语法", "编译通过"))
-                except SyntaxError as _e:
-                    checks.append(("FAIL", "Python 语法", str(_e)[:150]))
-            except FileNotFoundError:
-                pass
-            except asyncio.TimeoutError:
-                checks.append(("FAIL", "Python 语法", "超时"))
-            except Exception:
-                logger.debug("Python syntax check failed", exc_info=True)
-
-    # ── Semgrep security scan ──
-    await _enhance_auto_verify(tool_name, args, result, checks)
-
-    if not checks:
-        return ""
-
-    report = ["\n## 🔍 自动验证"]
-    all_ok = all(s in ("OK", "INFO", "  ") for s, _, _ in checks)
-    report.append(f"**{'✅ 全部通过' if all_ok else '⚠️ 发现问题'}**\n")
-    for status, name, detail in checks:
-        icon = {"OK": "✅", "FAIL": "❌", "INFO": "📋", "  ": "  "}.get(status, status)
-        report.append(f"- {icon} **{name}**: {detail}")
-    return "\n".join(report)
 
 
 # Initialize plugin system at module load (seeded inside _load_plugins)
@@ -592,89 +438,15 @@ except Exception:
     logger.warning("capability sync at import failed", exc_info=True)
 
 
-# ── MCP 扩展：启用扩展声明 mcpServers → 动态注册远程工具 ──
-# 工具命名 mcp_<server>_<tool>；dispatch 异步转发，连接失败返回错误文本（不崩整轮）。
-def _mcp_tool_name(server: str, tool: str) -> str:
-    from mcp_client import sanitize_tool_name
-    return sanitize_tool_name(f"mcp_{server}_{tool}")
 
 
-async def _load_mcp_tools() -> None:
-    """扫描启用扩展的 mcpServers 声明，把远程工具并入 TOOLS/DISPATCH。"""
-    try:
-        from extension_manager import active_extension_dirs, _read_manifest
-        from mcp_client import get_mcp_client
-        for ext_dir in active_extension_dirs():
-            manifest = _read_manifest(ext_dir) or {}
-            servers = manifest.get("mcpServers") or {}
-            for srv_name, cfg in servers.items():
-                if not isinstance(cfg, dict):
-                    continue
-                entry = f"{ext_dir.parent.name}/{srv_name}"
-                try:
-                    client = get_mcp_client(entry, cfg)
-                    tools = await client.list_tools()
-                except Exception as e:
-                    logger.warning("MCP 连接失败 %s: %s", entry, e)
-                    continue
-                for t in tools:
-                    tname = t.get("name", "")
-                    if not tname:
-                        continue
-                    fname = _mcp_tool_name(srv_name, tname)
-                    schema = (t.get("inputSchema") or {}).copy()
-                    desc = t.get("description") or f"MCP 工具 {srv_name}:{tname}"
-                    # 已有同名工具时跳过（内置优先）
-                    if any(td.get("function", {}).get("name") == fname for td in TOOLS):
-                        continue
-                    TOOLS.append({
-                        "type": "function",
-                        "function": {"name": fname, "description": desc, "parameters": schema},
-                    })
-                    # 审计 P2-18：MCP 工具此前一律注册 safe（免确认）。MCP 服务
-                    # 可暴露任意能力（网络/文件/系统命令），且扩展本身无签名
-                    # 校验——默认降为 confirm，由用户把关（与未知工具 fail-close 一致）
-                    TOOL_PERMISSIONS[fname] = "confirm"
-                    TOOL_DISPATCH[fname] = (
-                        lambda args, _srv=srv_name, _tool=tname, _entry=entry:
-                        _mcp_invoke(_entry, _tool, args)
-                    )
-                    logger.info("MCP 工具注册: %s (%s)", fname, entry)
-    except Exception:
-        logger.warning("MCP 扩展扫描失败", exc_info=True)
 
 
-async def _mcp_invoke(entry: str, tool: str, args: dict) -> str:
-    try:
-        from mcp_client import _MCP_CLIENTS
-        client = _MCP_CLIENTS.get(entry)
-        if client is None:
-            return "⛔ MCP 连接已失效，请重启应用或重新安装扩展"
-        return await client.call_tool(tool, args)
-    except Exception as e:
-        return f"⛔ MCP 工具调用失败: {e}"
 
 
 _MCP_LOADED = False
 
 
-def ensure_mcp_loaded() -> None:
-    """进程内一次性 MCP 注册（幂等）。api_routes 每个请求入口调用。"""
-    global _MCP_LOADED
-    if _MCP_LOADED:
-        return
-    _MCP_LOADED = True
-    try:
-        import asyncio as _asyncio
-        try:
-            _asyncio.get_running_loop()
-        except RuntimeError:
-            _asyncio.run(_load_mcp_tools())
-        else:
-            # 已在事件循环内（理论上 api 层 async 调用前不至此）
-            _asyncio.create_task(_load_mcp_tools())
-    except Exception:
-        logger.warning("MCP 工具注册失败", exc_info=True)
 
 
 async def execute_tool(tool_name: str, arguments: dict) -> str:
@@ -729,68 +501,12 @@ async def execute_tool(tool_name: str, arguments: dict) -> str:
     return result
 
 
-def _record_progress(entry: str):
-    """Append a progress entry to PROGRESS.md for cross-session continuity."""
-    try:
-        PROGRESS_DIR.mkdir(parents=True, exist_ok=True)
-        now = datetime.now().isoformat()
-        with open(PROGRESS_FILE, "a", encoding="utf-8") as f:
-            f.write(f"### {now}\n{entry}\n\n")
-        # 体积轮转（审计 B10）：append-only 已长到 1.1MB 且无上限。
-        # 超 1MB 时保留尾部 500KB——read_file 从头截断读最旧 5 万字符，
-        # 轮转同时保证最近进度仍在文件里（尾部注入读的也是最新段）
-        if PROGRESS_FILE.stat().st_size > 1024 * 1024:
-            _rotate_progress_file()
-    except Exception:
-        logger.warning("Failed to record progress", exc_info=True)
 
 
-def _rotate_progress_file():
-    """把 PROGRESS.md 截到最近 500KB（保留尾部，即最新进度）。
-
-    切点必须对齐 UTF-8 字符边界：按字节直切会在多字节汉字中间断开，
-    文件从此不再是合法 UTF-8 → read_file 整个拒绝读取 → 断点续作失效
-    （22:46 事故根因："文件编码不是 UTF-8"）。
-    """
-    try:
-        keep = 500 * 1024
-        size = PROGRESS_FILE.stat().st_size
-        if size <= keep:
-            return
-        with open(PROGRESS_FILE, "rb") as f:
-            f.seek(size - keep)
-            tail = f.read()
-        # 对齐字符边界：跳过开头的残缺多字节字符（找下一个 UTF-8 合法起始字节）
-        offset = 0
-        while offset < len(tail):
-            b = tail[offset]
-            # 合法起始：ASCII(<0x80) 或 2/3/4 字节前缀(0xC0-0xF7)
-            if b < 0x80 or (0xC0 <= b <= 0xF7):
-                break
-            offset += 1
-        tail = tail[offset:]
-        with open(PROGRESS_FILE, "wb") as f:
-            f.write("(早期进度已轮转)\n\n".encode("utf-8") + tail)
-    except Exception:
-        logger.warning("PROGRESS 轮转失败", exc_info=True)
 
 
-def _progress_tail(max_chars: int = 600) -> str:
-    """读取 PROGRESS.md 尾部（最新进度），用于注入 system prompt。
 
-    600 而非 2000：PROGRESS.md 是 2/3 英文的工具日志，2000 字符的英文注入
-    是新会话被带偏成英文回复的最大英文源（09-03 事故）。"""
-    try:
-        if not PROGRESS_FILE.exists():
-            return ""
-        size = PROGRESS_FILE.stat().st_size
-        read = min(size, max_chars * 4)  # 多读些字节再截字符，中文占 3 字节
-        with open(PROGRESS_FILE, "rb") as f:
-            f.seek(max(0, size - read))
-            tail = f.read().decode("utf-8", errors="replace")
-        return tail[-max_chars:]
-    except Exception:
-        return ""
+
 
 
 
@@ -819,30 +535,6 @@ def _record_tool_call_db(session_id: str, tool_name: str, args: dict, result: st
 #  Progressive Delivery + State Tracking + Stagnation Detection
 # ═══════════════════════════════════════════════════════
 
-PROGRESSIVE_DELIVERY_PROMPT = """
-## 渐进式交付协议（必须遵守）
-
-将每个任务拆为 3 个最小可验证单元，逐步交付：
-
-**阶段 1 — 骨架**：仅生成接口定义、类型声明、空函数体。不实现逻辑。
-**阶段 2 — 核心**：填充核心逻辑，跳过边界处理和异常分支。
-**阶段 3 — 完善**：补充异常处理、边界检查、注释、测试用例。
-
-每阶段 token 预算 ≤ 上下文窗口 30%。完成一阶段后明确报告进度，再进入下一阶段。
-禁止单次输出完整功能——会被截断且质量下降。
-"""
-
-GOAL_MODE_PROMPT = """
-## 目标导向模式
-
-你收到的是一个**目标**而非指令。你需要：
-1. 分析目标 → 拆解为可执行步骤
-2. 按渐进式交付协议逐步执行
-3. 遇到阻塞主动报告，不强行推进
-4. 每完成一步报告进度
-
-用户只关心目标是否达成，不关心你用什么工具。
-"""
 
 _PLAN_KEYWORDS = (
     "分析", "报告", "调研", "研究", "构建", "搭建", "部署", "修复", "排查",
@@ -861,36 +553,6 @@ def _should_plan(user_text: str, is_local: bool) -> bool:
     return len(user_text.strip()) >= 30 and any(k in user_text.lower() for k in _PLAN_KEYWORDS)
 
 
-async def _generate_plan(user_text: str, model: str, api_url: str, headers: dict,
-                         client: httpx.AsyncClient) -> str:
-    """生成执行计划（3-8 步编号列表）。失败返回空串（降级为普通执行）。"""
-    sys_prompt = (
-        "你是任务规划器。用户给了一个复杂任务，请输出一份简洁、可执行的计划。\n"
-        "要求：\n"
-        "1. 用编号列表列出 3-8 个步骤\n"
-        "2. 每步说明具体要做什么（可提及将使用的工具，如查询行情、读取文件、运行命令、生成报告）\n"
-        "3. 步骤具体可执行，不要空话，不要重复用户原文\n"
-        "4. 只输出计划本身，不要任何前后缀说明"
-    )
-    body = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": sys_prompt},
-            {"role": "user", "content": user_text},
-        ],
-        "max_tokens": 1024,
-        "stream": False,
-        "temperature": 0.3,
-    }
-    try:
-        resp = await client.post(api_url, json=body, headers=headers)
-        resp.raise_for_status()
-        data = resp.json()
-        plan = (data.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
-        return plan.strip()
-    except Exception as e:
-        logger.warning("Plan generation failed (fallback to direct execution): %s", e)
-        return ""
 
 
 def _should_reflect(mode: str, text: str, is_local: bool) -> bool:
@@ -904,21 +566,6 @@ def _should_reflect(mode: str, text: str, is_local: bool) -> bool:
     return False
 
 
-_REFLECT_CHECKLISTS = {
-    "light": (
-        "1. 事实/数据与提供的上下文一致，没有编造数字\n"
-        "2. 结构完整，有明确的结论\n"
-        "3. 没有明显截断、乱码或格式损坏"
-    ),
-    "deep": (
-        "1. 事实/数据与提供的上下文一致，没有编造数字\n"
-        "2. 逻辑自洽，前后不矛盾\n"
-        "3. 结论完整，回应了用户的所有诉求\n"
-        "4. 建议/步骤可执行、无歧义\n"
-        "5. 语言通顺，格式规范\n"
-        "6. 篇幅合适，不啰嗦也不过于简略"
-    ),
-}
 
 
 _NUM_RE = re.compile(r"-?\d+(?:\.\d+)?%")
@@ -937,224 +584,29 @@ def _extract_numbers(text: str) -> list[str]:
     return out
 
 
-def _find_unverified_numbers(text: str, tool_outputs: list[str]) -> list[str]:
-    """报告中出现的、但未能在本次工具查询结果中找到来源的数字。
-    用于反思环节逐项核实——机制化防编造，不依赖模型自觉。"""
-    haystack = "\n".join(tool_outputs)
-    return [n for n in _extract_numbers(text) if n not in haystack]
 
 
-async def _reflect_output(text: str, model: str, api_url: str, headers: dict,
-                          mode: str, client: httpx.AsyncClient,
-                          tool_outputs: list[str] | None = None) -> tuple[str, bool]:
-    """对最终文本做一轮（light）或两轮（deep）自查反思。
-    返回 (最终文本, 是否有修正)。有修正时前端替换最后一条消息。"""
-    checklist = _REFLECT_CHECKLISTS.get(mode, _REFLECT_CHECKLISTS["light"])
-    rounds = 2 if mode == "deep" else 1
-    current = text
-    changed = False
-    # 机制化溯源核查：报告里的数字若在本会话工具查询结果中找不到来源，
-    # 列出供反思模型逐项核实（不硬删，交给模型判断口径）
-    unverified = _find_unverified_numbers(current, tool_outputs or [])
-    unverified_note = ""
-    if unverified:
-        unverified_note = (
-            "\n\n⚠️ 数字溯源核查：以下数字在本会话的**工具查询结果中未找到来源**，"
-            "请逐项处理：\n"
-            + "\n".join(f"- {n}" for n in unverified[:15])
-            + "\n处理规则：属于查询数据（可能因口径/表述不同而未匹配）→ 保留；"
-              "属于宏观/外部数据且本次**没有查询过** → 删除该数字或改为不带具体数字的定性描述。"
-        )
-    for _ in range(rounds):
-        sys_prompt = (
-            "你是输出质检员。检查下面这份回答，严格按清单逐项核对。\n"
-            f"检查清单：\n{checklist}{unverified_note}\n\n"
-            "规则：\n"
-            "- 如果发现实质问题（数据错误、遗漏关键结论、自相矛盾、格式损坏、明显不完整），"
-            "输出修正后的完整版本。\n"
-            "- 如果没有问题，**原样输出原文**，不要添加任何说明。\n"
-            "- 只输出最终版本本身，不要输出检查过程、不要加任何前缀。"
-        )
-        body = {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": sys_prompt},
-                {"role": "user", "content": current},
-            ],
-            "max_tokens": max(2048, len(current) + 2000),
-            "stream": False,
-            "temperature": 0.2,
-        }
-        try:
-            resp = await client.post(api_url, json=body, headers=headers)
-            resp.raise_for_status()
-            data = resp.json()
-            revised = (data.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
-            revised = revised.strip()
-            if revised and revised != current:
-                current = revised
-                changed = True
-        except Exception as e:
-            logger.warning("Reflection failed (keep original): %s", e)
-            break
-    return current, changed
 
 
 REASONING_MODEL_HINTS = ("reasoner", "r1", "reasoning", "thinking", "o1", "o3", "o4", "gpt-5")
 _session_states: dict[str, dict] = {}
 
 
-async def _semgrep_scan(filepath: str) -> str | None:
-    """Run semgrep on a file if available. Returns scan report or None."""
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "semgrep", "--config", "auto", "--quiet", filepath,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-        output = (stdout or b"").decode("utf-8", errors="replace").strip()
-        output += (stderr or b"").decode("utf-8", errors="replace").strip()
-        if output:
-            return output
-        return None
-    except FileNotFoundError:
-        return None  # semgrep not installed
-    except asyncio.TimeoutError:
-        return "semgrep 扫描超时"
-    except Exception:
-        logger.debug("Semgrep scan failed", exc_info=True)
-        return None
-
-
-async def _enhance_auto_verify(tool_name: str, args: dict, result: str, checks: list):
-    """Add semgrep scanning to the verification checks list."""
-    if tool_name != "write_file":
-        return
-    path = args.get("path") or args.get("file") or ""
-    if not path.endswith((".ts", ".tsx", ".js", ".jsx", ".py")):
-        return
-    scan_result = await _semgrep_scan(path)
-    if scan_result:
-        issue_count = scan_result.count("\n") + 1
-        checks.append(("FAIL" if "error" in scan_result.lower() else "OK",
-                       "Semgrep 安全扫描",
-                       f"发现 {issue_count} 行输出" if issue_count > 1 else "通过"))
-        if issue_count > 1:
-            for line in scan_result.split("\n")[:3]:
-                if line.strip():
-                    checks.append(("  ", "  ↳", line[:120]))
-    else:
-        checks.append(("OK", "Semgrep", "跳过 (未安装或无可扫描内容)"))
 
 
 
-async def _start_tool_confirmation(call_id: str, tool_name: str, args: dict) -> dict:
-    """启动工具确认：注册 pending，返回 {"event": 待发事件, "event_obj": 等待用}。
-
-    ⚠️ SSE 生成器必须**先 yield 该事件、再等待结果**——事件若攒到确认完成后
-    才发出，前端在等待期间收不到 tool_confirm，弹窗永不出现（死锁到超时）。
-    此前 _await_tool_confirmation 正是这个结构，导致确认功能从未真正工作。"""
-    event = asyncio.Event()
-    async with _pending_lock:
-        _pending_confirmations[call_id] = {"event": event, "approved": False}
-    return {"event": {"event": "tool_confirm", "call_id": call_id, "tool": tool_name, "args": args},
-            "event_obj": event}
 
 
-async def _wait_tool_confirmation(call_id: str, tool_name: str,
-                                  event_obj: asyncio.Event, timeout: float = 0) -> tuple[bool, list[dict]]:
-    """等待已启动（_start_tool_confirmation）的确认结果。
-    返回 (approved, events)——events 只含超时提示等补充事件（初始
-    tool_confirm 已由调用方发出）。
-
-    默认不限时（timeout=0）：确认由用户点击决定下一步，任务在等待期间
-    保持暂停；停止/取消可中断（生成器取消 → finally 清理 pending）。
-    09-21 用户反馈："确认超时 30 秒，改成不限时间，我点了再操作下一步"。
-    """
-    events = []
-    try:
-        if timeout and timeout > 0:
-            await asyncio.wait_for(event_obj.wait(), timeout=timeout)
-        else:
-            await event_obj.wait()
-        async with _pending_lock:
-            approved = _pending_confirmations.get(call_id, {}).get("approved", False)
-        logger.info("tool confirmation resolved: %s approved=%s", call_id, approved)
-    except asyncio.TimeoutError:
-        approved = False
-        events.append({
-            "content": (
-                f"\n\n⚠️ 工具 `{tool_name}` 等待确认超时（2 分钟无人操作），"
-                "任务已暂停，未执行该操作。可在界面中重新批准后继续。"
-            ),
-        })
-    finally:
-        async with _pending_lock:
-            _pending_confirmations.pop(call_id, None)
-    return approved, events
 
 
-async def _await_tool_confirmation(call_id: str, tool_name: str, args: dict) -> tuple[bool, list[dict]]:
-    """兼容入口：启动 + 等待一次性完成（仅限不经过 SSE 的内部调用）。"""
-    started = await _start_tool_confirmation(call_id, tool_name, args)
-    approved, events = await _wait_tool_confirmation(call_id, tool_name, started["event_obj"])
-    return approved, [started["event"]] + events
 
 
-def _confirm_bypassed(tool_name: str, access_mode: str) -> bool:
-    """confirm 级工具是否免确认（full 档全免；auto_edit 档文件类免确认）。
-    供 _handle_tool_execution 与 SSE 调用方（提前发确认事件）共用，避免判定漂移。"""
-    _access = _normalize_access(access_mode)
-    if _access == "full":
-        return True
-    if _access == "auto_edit" and tool_name in AUTO_EDIT_TOOLS:
-        try:
-            from main import _custom_permissions
-            _has_rule = any(r.get("tool") == tool_name for r in _custom_permissions)
-        except Exception:
-            _has_rule = False
-        return not _has_rule
-    return False
 
 
-async def _start_plan_confirmation(plan_id: str, plan: str) -> dict:
-    """启动计划确认（同工具确认：先发事件再等待）。"""
-    event = asyncio.Event()
-    async with _pending_lock:
-        _pending_confirmations[plan_id] = {"event": event, "approved": False}
-    return {"event": {"event": "plan_confirm", "call_id": plan_id, "tool": "执行计划",
-                      "args": {"plan": plan[:2000]}},
-            "event_obj": event}
 
 
-async def _wait_plan_confirmation(plan_id: str, event_obj: asyncio.Event,
-                                  timeout: float = 0, lang: str = "zh") -> tuple[bool, list[dict]]:
-    """等待计划确认结果（默认不限时，用户点击后继续；09-21 用户反馈）。
 
-    `timeout=0` 是**有意**不限时（用户反馈：急着超时会打断他确认）。但超时分支本身
-    必须能用：它原先引用 `_msg`/`lang_of`/`msgs` 三个名字，而这三个在该作用域都不存在
-    → 一旦真传了 timeout 就会 NameError 把友好提示变成报错。`lang` 由调用方传入
-    （原来是靠 `lang_of(msgs)` 猜，而 msgs 在这里根本没有）。
-    """
-    events = []
-    try:
-        if timeout and timeout > 0:
-            await asyncio.wait_for(event_obj.wait(), timeout=timeout)
-        else:
-            await event_obj.wait()
-        async with _pending_lock:
-            approved = _pending_confirmations.get(plan_id, {}).get("approved", False)
-        logger.info("plan confirmation resolved: %s approved=%s", plan_id, approved)
-    except asyncio.TimeoutError:
-        approved = False
-        from agent.messages import msg as _msg
-        events.append({
-            "content": "\n\n" + _msg("plan_timeout", lang or "zh"),
-        })
-    finally:
-        async with _pending_lock:
-            _pending_confirmations.pop(plan_id, None)
-    return approved, events
+
 
 
 # Regex to parse prompt-based tool calls from local model output.
@@ -1167,62 +619,11 @@ async def _wait_plan_confirmation(plan_id: str, event_obj: asyncio.Event,
 _REPEAT_ALLOWED_TOOLS = frozenset({"screen_capture", "control_wait"})
 
 
-def _count_successful_duplicates(current_msgs: list, tool_name: str, args: dict) -> int:
-    """统计同会话内相同 (tool_name, args) 的已成功执行次数（失败结果不计数，
-    保留"失败→重试一次"的合法模式；14:26 事故：模型被 nudge 后反复重读
-    PROGRESS.md 每轮重跑启动协议陷入循环）。"""
-    try:
-        _norm_args = dict(args)
-        # 路径归一化：read_file 的 "~" 与绝对路径指向同一文件，
-        # 不归一化时模型交替两种写法就能绕过护栏（17:10 重放实测）
-        if tool_name == "read_file" and _norm_args.get("path"):
-            from pathlib import Path as _P
-            _norm_args["path"] = str(_P(_norm_args["path"]).expanduser())
-        args_sig = json.dumps(_norm_args, ensure_ascii=False, sort_keys=True)
-    except Exception:
-        return 0
-    call_ids: set[str] = set()
-    for m in current_msgs:
-        if m.get("role") != "assistant":
-            continue
-        for tc in (m.get("tool_calls") or []):
-            f = tc.get("function", {})
-            if f.get("name") != tool_name:
-                continue
-            try:
-                _a = json.loads(f.get("arguments", "{}"))
-                if tool_name == "read_file" and isinstance(_a, dict) and _a.get("path"):
-                    from pathlib import Path as _P
-                    _a["path"] = str(_P(_a["path"]).expanduser())
-                same = (json.dumps(_a, ensure_ascii=False, sort_keys=True) == args_sig)
-            except Exception:
-                same = False
-            if same and tc.get("id"):
-                call_ids.add(tc["id"])
-    ok = 0
-    for m in current_msgs:
-        if m.get("role") == "tool" and m.get("tool_call_id") in call_ids:
-            if not str(m.get("content", "")).startswith(("Error", "⛔", "⚠️")):
-                ok += 1
-    return ok
 
 
 
 
 
-def _check_pre_hooks(tool_name: str, args: dict) -> tuple[bool, list[dict], str]:
-    """Run pre-tool hooks. Returns (vetoed, events, result_if_vetoed)."""
-    hooks = TOOL_HOOKS.get(tool_name, {})
-    pre_hook = hooks.get("pre_tool_call")
-    if not pre_hook:
-        return False, [], ""
-    try:
-        veto = pre_hook(tool_name, args)
-        if veto is False:
-            return True, [], f"⛔ Hook vetoed: {tool_name}"
-    except Exception:
-        logger.warning(f"Pre-tool hook failed for {tool_name}", exc_info=True)  # don't block execution
-    return False, [], ""
 
 
 # 时间敏感工具：结果自带日期数据，模型易把"昨晚/今天"等相对时间换算错后
@@ -1411,6 +812,28 @@ async def _handle_tool_execution_inner(tc: dict, current_msgs: list, session_id:
         current_msgs.append({"role": "tool", "tool_call_id": call_id, "content": result})
         return False, [{"event": "tool_end", "call_id": call_id, "tool": tool_name, "result": result, "ts": int(time.time() * 1000)}]
 
+    # ── 子代理执行层闸门（09-23 审计 A3，必须在权限规则之前）──
+    # 子代理（access_mode="subagent"）没有确认通道：run_cmd 只放行只读 ∪ 构建/测试
+    # 白名单，其余 confirm 级工具一律拒绝。位置必须在 _resolve_permission 之前——
+    # 用户在 permissions.json 里把 run_cmd/write_file 降成 safe 的规则不能重新打开
+    # 这条路径（否则子代理又变成免确认任意执行）。
+    # 判定为放行的命令在下面**跳过确认**（_sub_gate_checked）：闸门已按白名单全权
+    # 判定，再进确认流程就是等一个没人能点的确认（子流事件不转发给前端）直到超时
+    # ——首版没跳过，实测"只读命令"直接挂死。
+    _sub_gate_checked = False
+    if _normalize_access(access_mode) == "subagent":
+        try:
+            _sub_deny = subagent_tool_gate(tool_name, args)
+        except Exception:
+            logger.warning("子代理闸门判定异常，按拒绝处理", exc_info=True)
+            _sub_deny = "⛔ 子代理权限判定异常，已拒绝执行（fail-closed）"
+        if _sub_deny:
+            result = _sub_deny
+            current_msgs.append({"role": "tool", "tool_call_id": call_id, "content": result})
+            return False, [{"event": "tool_end", "call_id": call_id, "tool": tool_name,
+                            "result": result, "ts": int(time.time() * 1000)}]
+        _sub_gate_checked = True
+
     # ── 权限规则拒绝（deny/danger）──
     # 自定义权限规则返回 danger/deny 时必须拦截，此前落空直接执行——
     # 权限语义严重不一致（实测 list_dir 设 danger 仍读到目录）
@@ -1437,7 +860,7 @@ async def _handle_tool_execution_inner(tc: dict, current_msgs: list, session_id:
     # full（完全访问）档：confirm 级工具免确认直接执行——此前 5 档中
     # confirm/plan/full 三档无门控、与默认档完全等价（审计 A2）。
     # danger/deny 规则拦截仍在上方生效，不受此豁免影响。
-    _full_bypass = (_access == "full")
+    _full_bypass = (_access == "full") or _sub_gate_checked
     # 事件列表必须先初始化：confirm 分支的 pre_started 路径（当前两个 SSE
     # 循环的唯一调用方式）此前从未绑定 events 就 extend → UnboundLocalError
     # 整个任务崩溃（审计 P0：每次确认弹窗路径必炸）
@@ -1467,9 +890,12 @@ async def _handle_tool_execution_inner(tc: dict, current_msgs: list, session_id:
 
     # ── Execute + Post-hooks ──
     events.append({"event": "tool_start", "call_id": call_id, "tool": tool_name, "args": args, "ts": int(time.time() * 1000)})
-    logger.info("Tool executing: %s %s", tool_name, json.dumps(args, ensure_ascii=False)[:120])
+    # 参数预览也要脱敏：run_cmd 的 token、api key 常出现在参数里（09-23）
+    logger.info("Tool executing: %s %s", tool_name,
+                redact_secrets(json.dumps(args, ensure_ascii=False))[:120])
     result = await execute_tool(tool_name, args)
-    logger.info("Tool result: %s → %s", tool_name, result[:80].replace("\n", " "))
+    # 结果预览脱敏：read_file 这类内容工具只记长度（真机实测原样落盘过 API key）
+    logger.info("Tool result: %s → %s", tool_name, tool_log_preview(tool_name, result))
 
     post_hook = TOOL_HOOKS.get(tool_name, {}).get("post_tool_call")
     if post_hook:
@@ -1481,8 +907,11 @@ async def _handle_tool_execution_inner(tc: dict, current_msgs: list, session_id:
     events.append({"event": "tool_end", "call_id": call_id, "tool": tool_name, "result": result, "ts": int(time.time() * 1000)})
 
     # ── State tracking + Verification + Reflection ──
-    _record_progress(f"**{tool_name}**\nArgs: `{json.dumps(args)}`\nResult: {result[:200]}")
-    _record_tool_call_db(session_id, tool_name, args, result)
+    # 进度文件同样脱敏（它会按会话注入回提示词，密钥不该进去）
+    _record_progress(f"**{tool_name}**\nArgs: `{redact_secrets(json.dumps(args, ensure_ascii=False))}`"
+                     f"\nResult: {redact_secrets(result)[:200]}",
+                     session_id=session_id)
+    _record_tool_call_db(session_id, tool_name, args, redact_secrets(result))
 
     # Self-evolution: background-refine learning + auto-skill generation
     _spawn(_refine_learnings(tool_name, args, result, session_id))
@@ -1551,498 +980,9 @@ async def _handle_tool_execution_inner(tc: dict, current_msgs: list, session_id:
     return verify_failed, events
 
 
-# ── Native tool call format parser (for models like Gemma that use
-#    <|tool_call|>call:name{args}<tool_call|> instead of OpenAI JSON) ──
-
-def _clean_progress_tail(text: str, max_lines: int = 12) -> str:
-    """过滤"进展尾巴"里的**工具调用日志**，只留人类可读的进展。
-
-    09-20 事故：PROGRESS.md 尾部记着上一会话的 `**mx_query** / Args: {...} /
-    Result: 半导体板块…` 工具日志，被贴到用户每条消息尾部（权重最高）→ 用户问
-    任何事，弱模型都以为本轮要查行情（"我说什么他都去找股市"）。
-    """
-    keep = []
-    for ln in str(text or "").splitlines():
-        t = ln.strip()
-        if not t:
-            continue
-        if (t.startswith(("Args:", "Result:", "```", "### ", "**"))
-                or "Args: `" in t or "Result: `" in t or "Tool result" in t):
-            continue
-        keep.append(t)
-    return "\n".join(keep[-max_lines:])
 
 
-def _build_chat_messages(body: dict, messages: list) -> list:
-    """Assemble the full message array with identity, env, skills, agent, and image injections.
-    All system prompts are merged into ONE message to work around a llama-cpp bug
-    where multiple system messages cause empty responses."""
-    # 技能目录由 capability_registry 提供（统一能力模型）→ lazy import 避免循环依赖
-    import capability_registry
-    last_user_text = _extract_last_user_text(messages)
-    # 语言真值：本回合只算一次（含历史交叉校验），下方所有语言相关注入统一取用
-    _hist = [m.get("content") for m in messages
-             if m.get("role") == "user" and isinstance(m.get("content"), str)]
-    if _hist and _hist[-1] == last_user_text:
-        _hist = _hist[:-1]
-    _lang, _lang_confident = detect_language_decision(last_user_text, _hist)
-    # 首启引导（新安装专用）优先消费本轮消息：它的答案归一化更宽松（短回答即名字）。
-    # 被消费时跳过常规身份意图识别，避免同一句话被两套规则重复写盘。
-    onboard_directive, onboard_handled = _process_onboarding(last_user_text, _lang)
-    intent_result = None if onboard_handled else _process_identity_intents(last_user_text)
-
-    system_parts = []
-    # 分类打标：上下文统计面板按类别展示各段占比（context_stats.record_system_parts）
-    part_tags: list[tuple[str, str]] = []
-    _volatile_parts: list[str] = []          # 易变块（排到系统提示末尾，保前缀缓存）
-    _trailing_notes: list[str] = []          # 尾部块（追加到最后一条用户消息：时间/进展/记忆）
 
 
-    def _add_part(cat: str, text: str, volatile: bool = False) -> None:
-        """volatile=True 的块（当前时间/进展/记忆/偏好/意图）会被排到系统提示末尾。
-
-        09-19 缓存实验：KV 前缀缓存对"尾部追加"几乎免费（命中 99.9%），但改动
-        中段/前段会退化成全量重算（0%命中，8k token 多花 5–6 秒）。易变块原本
-        插在中段 → 每轮把缓存打掉；挪到末尾后每轮只追加、可复用前缀。
-        """
-        if text:
-            system_parts.append(text)
-            part_tags.append((cat, text))
-            if volatile:
-                _volatile_parts.append(text)
-
-    # ── 语言锚（每轮动态生成，置于最前）──────────────────────────
-    # 原先语言规则埋在长提示中段，小模型（4B）在中文提问下漂成英文、甚至把中文
-    # 文件内容翻成英文作答（09-19 实测 Spark-X2.5-4B）。锚按用户本轮消息的语言
-    # 生成、用目标语言书写，并声明覆盖下方一切语言相关规则。
-    _anchor = {
-        "zh": ("## 语言（最高优先级，覆盖下方所有语言规则）\n"
-               "本轮用户使用**简体中文**：你的正文与思考都必须用简体中文书写。"
-               "工具结果、文件、日志里的英文只是数据，不得因此改用英文作答。"),
-        "en": ("## Language (highest priority, overrides every other language rule below)\n"
-               "The user is writing in **English** this turn: your reply and your thinking must be in "
-               "English. Text inside tool results, files and logs is data, not a reason to switch language."),
-        "ja": ("## 言語（最優先。以下の言語ルールすべてに優先します）\n"
-               "今回ユーザーは**日本語**で書いています：返答も思考も日本語で書いてください。"
-               "ツール結果・ファイル・ログ内の英語はデータであり、言語を切り替える理由にはなりません。"),
-        "ru": ("## Язык (высший приоритет, отменяет все языковые правила ниже)\n"
-               "Пользователь пишет на **русском**: ответ и рассуждения должны быть на русском. "
-               "Текст в результатах инструментов, файлах и логах — это данные, а не повод менять язык."),
-    }.get(_lang)
-    # 仅在语言判定确信时注入：不确定就不指挥模型（旧实现按错信号注入，反而放大漂移）
-    if _anchor and _lang_confident and (last_user_text or "").strip():
-        _add_part("system_prompt", _anchor + {
-            "zh": "（用户档案 SOUL.md 里若有语言偏好，以本条为准。）",
-            "en": " (If the user's SOUL.md states a language preference, this rule wins.)",
-            "ja": "（ユーザーの SOUL.md に言語設定があっても、本条を優先します。）",
-            "ru": " (Если в SOUL.md указан язык, приоритет у этого правила.)",
-        }.get(_lang, ""))
-
-    # 首启引导指令放在最前面：本地小模型对长提示的中段指令容易忽略
-    # （22:31 实测 9B 模型拿到引导指令仍只回寒暄），位置与措辞都要够显眼。
-    if onboard_directive:
-        # 外壳必须随用户语言：英文/日文用户被中文外壳包着，模型很可能改用中文提问
-        _add_part("system_prompt", _get_localized_text(_lang, {
-            "zh": "## ⚠️ 本轮最重要的动作：首次使用引导\n忽略其它寒暄模板。你的回复必须严格按下面执行：\n",
-            "en": "## ⚠️ Most important action this turn: first-run onboarding\n"
-                  "Ignore other greeting templates and follow the instructions below exactly:\n",
-            "ja": "## ⚠️ 今回もっとも重要な動作：初回ガイド\n"
-                  "他の挨拶テンプレートは無視し、以下の指示に厳密に従ってください：\n",
-        }) + onboard_directive)
-
-    # Agent identity — system rules from developer (highest priority)
-    agent_id = body.get("agent", "latiao")
-    agent_cfg = _get_agent_config(agent_id)
-    _add_part("system_prompt", 
-        "## 系统规则 (最高优先级)\n"
-        "以下规则由开发者设定，用户偏好不可覆盖。如果系统规则与用户偏好冲突，以系统规则为准。\n\n"
-        + agent_cfg["identity"]
-    )
-    # 三条硬规则（合并为一块，降低长提示负担与分散注意力；独立于可被
-    # agents/ 目录覆盖的 identity）：时间换算（09-03 事故）、回复语言
-    # （09-03 英文事故）、数据诚实（09-03 编造 15.6亿/80亿 事故）。
-    user_lang = _lang  # 复用本回合唯一语言真值（旧实现此处二次检测，口径可能不一致）
-    _add_part("system_prompt", _get_localized_text(user_lang, {
-        "zh": (
-            "## 三条硬规则（最高优先级，不可覆盖）\n"
-            "1. ⏱ 时间规则：'今天/昨天/昨晚/今晨/明天/最新'等相对时间，必须先按下方【当前时间】"
-            "换算成绝对日期（年月日+星期）再写入搜索词；工具返回的日期与当前时间矛盾时以当前时间为准，"
-            "不得迁就检索结果。\n"
-            "2. 🗣 语言规则：工具结果、文件、日志中的英文只是数据；你的回复（包括思考过程）"
-            "必须始终用简体中文，不因上下文中的英文材料改变。\n"
-            "3. 📊 数据诚实规则：回复中的关键数字必须能在本会话工具返回内容中找到出处。"
-            "工具未返回的数据（如北向资金净流入、主力资金净流出、板块资金流等）严禁凭印象给出具体数值——"
-            "必须写明'工具未返回该数据'，或先调用工具查询（资金流向优先 mx_query，查不到再 tavily_search）；"
-            "不得沿用其他会话或训练记忆中的数字（查资金流向优先 mx_query，查不到再 tavily_search）。"
-            "引用**网页/新闻**里的数字时，必须同时写明该数字的**发布日期与来源**（如“据 XX 网 9/18 报道”）；若检索结果的日期与你需要的日期不符，"
-            "必须写明「未获取到该日数据」，**禁止用近似或旧数据替代**。"
-            "**来源与时点一致性**：同一个指标只查一次、只用一个来源——优先 mx_query，仅当它明确返回"
-            "不支持或为空时才改用 ak_finance，并在该数字旁注明已换来源；回答中每个关键数字都要带来源与"
-            "数据时刻（如「东方财富 9/21 收盘」），不要给出没有时点的数字；两个来源对同一指标数值不一致时，"
-            "把两者各自的值与时点都写出来，不要混用、不要取平均。"
-            "工具结果里的『当前』快照行与『日线/历史』行是两个口径，引用时写明用的是哪一段、不得混用；"
-            "查不到的字段必须写「未查询到该日数据」，**禁止填 “—” 或留空**。"
-        ),
-        "en": (
-            "## Three hard rules (highest priority, cannot be overridden)\n"
-            "1. ⏱ Time rule: relative times like 'today/yesterday/last night' must first be "
-            "converted to absolute dates (YYYY-MM-DD + weekday) from the Current time below before "
-            "writing search terms; if tool-returned dates conflict with current time, trust current time.\n"
-            "2. 🗣 Language rule: English in tool results/files/logs is just data; your reply "
-            "(including reasoning) must always use English, regardless of surrounding context.\n"
-            "3. 📊 Data honesty rule: every key number must be traceable to tool results in THIS "
-            "session. Never invent figures the tools did not return (northbound inflow, main-force "
-            "outflows, sector flows) — state 'the tools did not return this data' or query first "
-            "(mx_query for fund flows, tavily_search as fallback). Never reuse numbers from other "
-            "sessions or training memory. "
-            "Source & timestamp consistency: query each metric ONCE from ONE source — prefer mx_query, "
-            "switch to ak_finance only when mx_query clearly reports unsupported/empty, and say so beside "
-            "that number; every key number carries its source and data timestamp (e.g. \"Eastmoney, 9/21 "
-            "close\") — never a timeless number; when two sources disagree on one metric, state both values "
-            "with their timestamps instead of mixing or averaging them. "
-            "A tool result's \"current\" snapshot row and its daily/history rows are different measures — "
-            "never mix them, and say which one you quote. Any field you could not fetch must be written as "
-            "\"no data retrieved for that day\" — never as \"—\" or blank."
-        ),
-        "ja": (
-            "## 三つのハードルール（最優先、上書き不可）\n"
-            "1. ⏱ 時間ルール：'今日/昨日/昨夜/明日/最新'などの相対時間は、下の【現在時刻】から"
-            "絶対日付（年月日+曜日）に変換してから検索語にしてください。ツール結果の日付が現在時刻と"
-            "矛盾する場合は、現在時刻を優先します。\n"
-            "2. 🗣 言語ルール：ツール結果・ファイル・ログ内の外国語はデータに過ぎません。"
-            "返信（思考プロセス含む）は常に日本語で行ってください。\n"
-            "3. 📊 データ誠実ルール：回答中の主要な数字はこのセッションのツール結果に出典が必要です。"
-            "ツールが返さなかったデータ（北向資金流入、主力資金流出、セクター資金フロー等）に"
-            "具体的な数値をでっち上げてはいけません——「ツールはこのデータを返していない」と明記するか、"
-            "先にツールで照会してください。他セッションや学習メモリの数字を使用しないこと。"
-            "【出典と時点の一貫性】同じ指標は一度・一つの出典だけで照会してください——優先は mx_query、"
-            "それが明確に「非対応／空」を返したときだけ ak_finance に切り替え、その数字の横に切替を明記します。"
-            "回答中の主要な数字には出典とデータ時点（例「東方財富 9/21 終値」）を必ず添え、時点のない数字を"
-            "出してはいけません。二つの出典が食い違う場合は、混ぜたり平均したりせず、両方の値と時点を併記してください。"
-            "ツール結果の「現在」スナップショット行と「日足/履歴」行は別の口径です——混ぜず、どちらを引用したか明記してください。"
-            "取得できなかった項目は「その日のデータは未取得」と明記し、**「—」や空欄で済ませないこと**。"
-        ),
-        "ru": (
-            "## Три жёстких правила (высший приоритет, не переопределяются)\n"
-            "1. ⏱ Время: относительные даты («сегодня/вчера/завтра/последние») сначала переводи в "
-            "абсолютные (ГГГГ-ММ-ДД + день недели) по указанному ниже текущему времени, и только потом "
-            "пиши поисковые запросы. Если даты из инструментов противоречат текущему времени — верь текущему.\n"
-            "2. 🗣 Язык: английский в результатах инструментов, файлах и логах — это данные. Ответ "
-            "(включая рассуждения) всегда на языке, заданном языковым блоком в начале системного промпта.\n"
-            "3. 📊 Честность данных: каждое ключевое число должно опираться на результат инструмента из ЭТОЙ "
-            "сессии. Не придумывай цифры, которых инструменты не вернули — напиши, что данных нет, или сначала "
-            "вызови инструмент. Не переноси числа из других сессий или из памяти модели. "
-            "Согласованность источника и времени: каждый показатель запрашивай один раз и из ОДНОГО "
-            "источника — приоритет mx_query; переходи на ak_finance только если mx_query явно вернул "
-            "«не поддерживается»/пусто, и укажи это рядом с числом. Каждое ключевое число сопровождай "
-            "источником и временем данных (например, «Eastmoney, закрытие 09-21»); чисел без времени не давай. "
-            "Если два источника расходятся, приведи оба значения с их временем, не смешивай и не усредняй. "
-            "Строка «текущий снимок» и строки «дневная история» в результате инструмента — это разные меры: "
-            "не смешивай их и указывай, какую цитируешь. Поле, которое не удалось получить, пиши как "
-            "«данные за этот день не получены», а не «—» и не пустым."
-        ),
-    }))
-
-    # 身份与语气（09-21 改写）：原写法是「## 用户偏好 / 优先级低于系统规则」，把
-    # SOUL.md 的人格与语气降级成"可选偏好"——模型（尤其本地小模型）会当作可忽略项，
-    # 这正是"设了语气却不生效"的一个来源。对齐 OpenClaw/Hermes 的做法：这是**你是谁**，
-    # 逐文件标用途 + 一句"除非与上方系统规则冲突否则照做"，再加 persona_latch
-    # （跨轮不漂移、且语气永不压过硬规则——防止"暧昧"把数据诚实规则一起软化）。
-    # 位置仍在稳定头部且不带 volatile → 不影响前缀缓存。
-    user_identity = _read_identity()
-    # 当前语气（09-21）：从 SOUL.md 的 `- 对话语气：X` 取出，供 ①块标题里"露面"
-    # ②每轮尾注提醒。实测动因：语气行位于系统提示 64% 深处、其后还压着技能目录与
-    # 交付纪律，而最后一条用户消息不含任何语气信息 → 模型"忘记语气、平铺直叙，
-    # 你提醒一句才照做"。本地模型对最近的文字权重最高，所以要在尾部也说一次。
-    _tone = ""
-    for _m in user_identity:
-        if (_m.get("file") or "") == "SOUL.md":
-            _tm = re.search(r"^-\s*对话语气：\s*(.+?)\s*$", _m.get("content") or "", re.M)
-            if _tm:
-                _tone = _tm.group(1).strip()
-            break
-    if user_identity:
-        _hdr_suffix = f"｜当前语气：{_tone}" if _tone else ""
-        _add_part("system_prompt", _get_localized_text(user_lang, {
-            "zh": (
-                f"## 身份与语气（你的身份文件）{_hdr_suffix}\n"
-                "以下是**你自己的**身份设定，不是可选偏好——SOUL.md 是人格与语气，"
-                "IDENTITY.md 是你的名字与自我认知，AGENTS.md 是你的工作规则，USER.md 是用户档案。\n"
-                "跨轮保持这个语气与人格，不要因为对话变长而漂移；但语气永不压过正确性、"
-                "数据诚实、安全与权限规则。\n"
-                "除与上方【系统规则】【三条硬规则】冲突外，一律照做（冲突时以上方为准）。"
-            ),
-            "en": (
-                f"## Identity & tone (your identity files){(' | current tone: ' + _tone) if _tone else ''}\n"
-                "These are **your own** settings, not optional preferences — SOUL.md is persona & tone, "
-                "IDENTITY.md is your name and self-concept, AGENTS.md is your working rules, "
-                "USER.md is the user profile.\n"
-                "Keep that tone and persona across turns; do not let it drift as the conversation grows. "
-                "Style never overrides correctness, data honesty, safety, or permission rules.\n"
-                "Follow them unless they conflict with the System rules / Three hard rules above."
-            ),
-        }))
-        _file_labels = _get_localized_text(user_lang, {
-            "zh": {"IDENTITY.md": "身份", "SOUL.md": "人格与语气",
-                   "AGENTS.md": "工作规则", "USER.md": "用户档案"},
-            "en": {"IDENTITY.md": "identity", "SOUL.md": "persona & tone",
-                   "AGENTS.md": "working rules", "USER.md": "user profile"},
-        })
-        for msg in user_identity:
-            _fname = msg.get("file") or ""
-            _label = _file_labels.get(_fname) if isinstance(_file_labels, dict) else None
-            if _label:
-                _add_part("system_prompt", f"### {_fname}（{_label}）\n{msg['content']}")
-            else:
-                _add_part("system_prompt", msg["content"])
-
-    if intent_result:
-        # volatile：这一块只在"真的发生了身份/偏好变更"的那一轮出现，内容逐轮不同；
-        # 放系统提示中段会让该轮头部变化（缓存全丢），故归入易变块（排到末尾）。
-        _add_part("system_prompt",
-            f"⚠️ 你的身份刚刚被用户更新了：{intent_result}。"
-            f"从现在开始，你必须以更新后的身份回复用户。",
-            volatile=True,
-        )
-
-    # Environment info
-    home = str(Path.home())
-    cwd = _safe_cwd()
-    now = datetime.now().strftime("%Y-%m-%d (%A) %H:%M:%S")
-
-    env_labels = _get_localized_text(user_lang, {
-        "zh": {"rt": "运行环境", "time": "当前时间", "home": "用户目录", "cwd": "工作目录", "os": "操作系统", "sh": "终端"},
-        "en": {"rt": "Runtime Environment", "time": "Current time", "home": "Home", "cwd": "Working dir", "os": "OS", "sh": "Shell"},
-        "ja": {"rt": "実行環境", "time": "現在時刻", "home": "ホーム", "cwd": "作業ディレクトリ", "os": "OS", "sh": "シェル"},
-    })
-    # 09-19 缓存实验：环境块里的"分钟级时间"每轮都变，而它在对话历史之前 →
-    # 一变就把后面整段历史的位置错开、缓存全废（实测命中率被压到个位数）。
-    # 现在：常驻部分只放稳定的（日期/目录/系统），**分钟级时间仅在用户提到
-    # 相对时间时才注入**（"今天/昨天/最新"这类需要换算的场景）。
-    # 精确到分钟的时间**不进系统提示**：它每轮都变，而系统提示在历史之前，
-    # 一变就把后面全部位置错开（实测该轮命中 0%）。系统提示里只保留"日期"
-    # （逐轮字节一致）；需要精确时间时，追加到最后一条用户消息里（尾部追加最便宜）。
-    _rel_time_re = re.compile(r"今天|昨天|昨晚|今晨|明天|前天|本周|上周|这周|最新|现在|几点|today|yesterday|tomorrow|latest|now", re.I)
-    _show_time = bool(_rel_time_re.search(last_user_text or ""))
-    _time_line = f"- {env_labels['time']}: {now[:10]}\n"
-    _add_part("system_prompt", 
-        f"{env_labels['rt']}:\n"
-        + _time_line
-        + f"- {env_labels['home']}: {home}\n"
-        f"- {env_labels['cwd']}: {cwd}\n"
-        f"- {env_labels['os']}: {platform.system()} ({platform.release()})\n"
-        f"- {env_labels['sh']}: {os.environ.get('SHELL', os.environ.get('COMSPEC', 'unknown'))}",
-        volatile=True)
-
-    # Skill catalog（统一能力模型）：只注入目录，模型按需调用 use_skill 取全文
-    _catalog = capability_registry.skill_catalog()
-    if _catalog:
-        catalog_label = _get_localized_text(user_lang, {
-            "zh": "## 可用技能（按需调用）",
-            "en": "## Available skills (load on demand)",
-            "ja": "## 利用可能なスキル（オンデマンド）",
-        })
-        lines = [catalog_label, "执行以下领域的任务时，先调用 use_skill 工具获取对应技能的完整说明，再按其执行："]
-        for s in _catalog:
-            desc = (s.get("description") or "").strip()
-            lines.append(f"- **{s['name']}**: {desc[:120]}" if desc else f"- **{s['name']}**")
-        _add_part("skills", "\n".join(lines))
-
-    # 09-20：短消息/寒暄**不注入**进展与记忆。注入块贴在最后一条用户消息尾部
-    # （缓存优化的结果），对弱模型权重最高 → 用户只发两三个字时，模型会把注入的
-    # "上次在查 XX" 当成本轮任务（实测：只发两个字，它去查了半导体板块、答非所问）。
-    _lmsg = (last_user_text or "").strip()
-    _no_notes = len(_lmsg) < 6 or _is_chat_query(_lmsg)
-
-    # 上次会话进展（审计 B10）：PROGRESS.md 尾部注入，跨会话断点续作生效
-    #     09-20：只在**会话首轮**注入，且过滤掉工具调用日志行。这段记的是上个会话的
-    #     `**mx_query** / Args: … / Result: 半导体板块…` 工具日志，贴在每条消息尾部
-    #     （权重最高）会让弱模型"无论问什么都去找股市"（用户实测反馈）。
-    _is_first_turn = sum(1 for m in messages if m.get("role") == "user") <= 1
-    _tail = _clean_progress_tail(_progress_tail()) if _is_first_turn else ""
-    if _tail.strip() and not _no_notes:
-        _pt_label = _get_localized_text(user_lang, {
-            "zh": "## 上次会话进展（最近记录）",
-            "en": "## Recent progress from previous sessions",
-            "ja": "## 前回セッションの進捗（最近の記録）",
-        })
-        _trailing_notes.append(f"{_pt_label}:\n{_tail}\n（以上为历史记录，仅供参考；继续当前任务时请注意衔接。）")
-
-    # Goal mode / progressive delivery
-    goal_mode = body.get("goal_mode", False)
-    progressive = body.get("progressive_delivery", True)
-    extra_prompts = []
-    if goal_mode:
-        extra_prompts.append(GOAL_MODE_PROMPT)
-    if progressive:
-        # P0 语境分流：渐进式交付协议（"阶段1骨架/阶段2核心/阶段3完善/每阶段≤30% token"）
-        # 是纯写代码的分步规范，对"查行情/分析/聊天"类任务只会诱导模型先写一堆"我将分几步做"
-        # 的声明话术，正是"意图声明未行动/8 分钟空转"的帮凶（09-03 事故）。只有任务含明显
-        # 代码/文件构建语义时才注入，其余任务改为提示"直接产出完整结果，不要分步声明"。
-        _detect_code_task = any(
-            k in (last_user_text or "").lower() for k in
-            ("代码", "编程", "写函数", "实现", "重构", "类 ", "模块", "接口",
-             "compile", "refactor", "implement", "typescript", "python", "function",
-             "class ", "module", "api ", "bugfix", "lint", "改代码", "修 bug")
-        )
-        extra_prompts.append(PROGRESSIVE_DELIVERY_PROMPT if _detect_code_task else
-            "## 交付纪律\n"
-            "用户等待的是完整结果。不要声明\"你将分几步/我接下来要做什么/让我先查一下\"之类的话术——"
-            "要么立即调用工具，要么直接写出包含关键数据与结论的完整回答。"
-            "若已有足够工具数据，直接把分析结论写入正文，不要再描述计划。")
-    if extra_prompts:
-        _add_part("other", "\n".join(extra_prompts))
-
-    # Cross-session memory: inject learnings semantically relevant to current query
-    # 记忆检索是**按本条消息**召回的 → 每轮都不同；而它在历史之前 → 每轮都把
-    # 历史位置错开（同时间块的病）。改为只在会话首轮注入（跨会话背景知识）。
-    # 记忆按消息召回、每轮都不同——但**放在尾部**就不伤前缀缓存（09-19 实测）
-    recent_data = (_retrieve_relevant_learnings(last_user_text, limit=5)
-                   if (last_user_text and not _no_notes) else [])
-    if recent_data:
-        recent_data = [r for r in recent_data if r.get("confidence", 0) >= 0.3]
-    if recent_data:
-        memory_label = _get_localized_text(user_lang, {
-            "zh": "以下是 AI 从过去交互学到的相关知识：",
-            "en": "Relevant learnings from past interactions:",
-            "ja": "過去の対話からの関連知識：",
-        })
-        _trailing_notes.append(memory_label + "\n" + "\n".join(
-            f"- {item['topic']}: {item['content'][:200]}" for item in recent_data))
-
-    # Always-inject high-confidence preferences (independent of query matching)
-    high_prefs = _get_high_confidence_preferences()
-    if high_prefs:
-        pref_lines = []
-        for p in high_prefs:
-            pref_lines.append(f"- {p['key']}: {p['value']}")
-        pref_label = _get_localized_text(user_lang, {
-            "zh": "以下是用户的高置信度偏好（每次对话都必须遵守）：",
-            "en": "User's high-confidence preferences (must follow every conversation):",
-            "ja": "ユーザーの高信頼度設定（毎回の対話で遵守すること）：",
-        })
-        _add_part("other", pref_label + "\n" + "\n".join(pref_lines), volatile=True)
-
-    # Language enforcement: when user speaks non-Chinese, add strong override
-    if user_lang != "zh":
-        lang_override = _get_localized_text(user_lang, {
-            "en": "CRITICAL LANGUAGE RULE: The user is speaking English. You MUST respond in English only. Do NOT reply in Chinese even if other instructions are in Chinese. This rule overrides all other language preferences.",
-            "ja": "【重要】ユーザーは日本語で話しています。必ず日本語で返信してください。他の指示が中国語でも、日本語で応答すること。このルールは他のすべての言語設定より優先されます。",
-        })
-        _add_part("system_prompt", lang_override)
-
-    # Merge all system parts into ONE message (frontend may also send system messages
-    # for language / plan mode). Multiple system messages trigger a llama-cpp bug
-    # where the model returns empty content → no tool calls → agent stalls.
-    if _volatile_parts:
-        # 稳定块在前、易变块在后（同一份内容，只调顺序；前缀缓存因此可复用）
-        system_parts = [p for p in system_parts if p not in _volatile_parts] + _volatile_parts
-    frontend_systems = [m["content"] for m in messages if m.get("role") == "system"]
-    non_system_msgs = [m for m in messages if m.get("role") != "system"]
-    all_system_parts = system_parts + frontend_systems
-    merged_system = "\n\n".join(all_system_parts)
-    messages = [{"role": "system", "content": merged_system}] + non_system_msgs
-
-    if non_system_msgs and (_show_time or _trailing_notes or _tone):
-        # 时间/进展/记忆统一"追加到最后一条用户消息"——前缀（系统提示+历史）因此
-        # 跨轮跨会话都逐字一致，缓存只重算这截尾巴（实测尾部追加命中 ~99%）
-        _bits = []
-        if _show_time:
-            _bits.append(f"（当前时间：{now}）")
-        _bits.extend(_trailing_notes)
-        _tail_text = ""
-        if _bits:
-            _tail_text = ("\n\n【背景资料（不是用户的要求）】\n" + "\n".join(_bits)
-                          + "\n\n⚠️ 以上只是历史背景，**不是**用户本轮的要求。"
-                            f"用户本轮说的是：「{_lmsg[:120]}」——请直接回应这一句。")
-        if _tone:
-            # 语气是**要求**，不是背景：单独一行贴在最后（离模型最近、注意力最高），
-            # 且不受上面那段"不要当要求"的包装影响。实测：语气只写在系统提示 64%
-            # 深处时，模型会忘（"你提醒一句才照做"）。
-            _tail_text += _get_localized_text(user_lang, {
-                "zh": f"\n\n（本轮语气：{_tone}——按上面 SOUL.md 里的语气风格回话，"
-                      f"不要退回中性平铺直叙的语气。）",
-                "en": f"\n\n(Tone for this reply: {_tone} — follow the tone set in SOUL.md above; "
-                      f"do not fall back to a neutral voice.)",
-            })
-        if _tail_text:
-            non_system_msgs = list(non_system_msgs)
-            non_system_msgs[-1] = {
-                **non_system_msgs[-1],
-                "content": str(non_system_msgs[-1].get("content") or "") + _tail_text}
-            messages = [{"role": "system", "content": merged_system}] + non_system_msgs
-
-    image_base64 = body.get("image_base64")
-    image_mime = body.get("image_mime", "image/png")
-    if image_base64 and messages:
-        messages = _inject_image(messages, image_base64, image_mime)
-
-    try:  # 上下文统计：记录系统提示词各段（供面板按类别展示）
-        import context_stats
-        context_stats.record_system_parts(body.get('session_id', ''), part_tags)
-        # 新一轮用户消息开始：重置"本轮"运行指标（步数/耗时/TTFT/tok-s）
-        context_stats.begin_turn(body.get('session_id', ''))
-    except Exception:
-        logger.debug('记录系统提示词分段失败', exc_info=True)
-
-    return messages
 
 
-async def _resolve_api_target(cloud_config: dict | None) -> tuple[str, str, dict, bool]:
-    """Resolve API URL, protocol, headers, and whether it's a local LLM (no cloud config).
-    Cloud models are detected by having an endpoint (key is optional for local proxies).
-
-    async：get_api_url 内含同步健康探测（最长 20s + 空闲复验 3s sleep），
-    必须放线程池执行，否则阻塞事件循环（P2-13）。"""
-    if cloud_config and cloud_config.get("endpoint"):
-        protocol = cloud_config.get("protocol", "openai")
-        api_url = cloud_config["endpoint"].rstrip("/") + "/chat/completions"
-        headers = {"Content-Type": "application/json"}
-        key = cloud_config.get("key", "")
-        if key and protocol != "local":
-            headers["Authorization"] = f"Bearer {key}"
-        # If the endpoint points to a local server, treat as cloud (native function calling)
-        return protocol, api_url, headers, False
-    else:
-        from starlette.concurrency import run_in_threadpool
-        protocol = "openai"
-        local_api = await run_in_threadpool(local_llm.get_api_url)
-        if local_api:
-            api_url = local_api + "/chat/completions"
-        else:
-            api_url = ""  # No local LLM running — will be caught as connection error
-        headers = {"Content-Type": "application/json"}
-        return protocol, api_url, headers, True
-
-
-# 闲聊识别（17:11 事故根治）：任务词表里的"做"字会把"你能做什么"判成任务型
-# ——model 因此进入工具结果追问链。闲聊标记优先于任务词：命中即按非任务处理。
-def _get_best_cloud_config() -> dict | None:
-    """Get the best available cloud model config for code tasks."""
-    try:
-        # First try: config.json cloud_models
-        config_file = CONFIG_FILE
-        if config_file.exists():
-            cfg = json.loads(config_file.read_text(encoding="utf-8"))
-            models = cfg.get("cloud_models", [])
-            # Prefer models with "mini" or "gpt" in name for code tasks
-            for m in models:
-                if m.get("endpoint"):
-                    return {
-                        "endpoint": m["endpoint"],
-                        "key": m.get("key", ""),
-                        "model": m.get("name", ""),
-                        "protocol": m.get("protocol", "openai"),
-                    }
-            # Fallback: first model with endpoint
-            for m in models:
-                if m.get("endpoint"):
-                    return {
-                        "endpoint": m["endpoint"],
-                        "key": m.get("key", ""),
-                        "model": m.get("name", ""),
-                        "protocol": m.get("protocol", "openai"),
-                    }
-    except Exception:
-        logger.warning("Failed to read best cloud config", exc_info=True)
-    return None
