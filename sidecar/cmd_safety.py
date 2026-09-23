@@ -238,7 +238,7 @@ def check_cmd(cmd: str) -> str | None:
     for pattern in OBFUSCATION_PATTERNS:
         if re.search(pattern, low):
             return f"⛔ Blocked potentially unsafe command: {cmd}"
-    return reject_sensitive_read(cmd)
+    return reject_sensitive_read(cmd) or reject_sensitive_write(cmd)
 
 # ── ⑧ 自动加载目录的写入封印（2026-09-23 审计 P1）────────────────────
 # ~/.local-ai-os/extensions/<name>/<ver>/plugin.py 会被 tool_system 用
@@ -264,6 +264,58 @@ def sensitive_write_block(path: str) -> str | None:
                 return f"⛔ 不允许改写辣条自身配置（含 API 密钥）: {_rp}"
     if "/.local-ai-os/config.json" in _norm:
         return f"⛔ 不允许改写辣条自身配置（含 API 密钥）: {_rp}"
+    return None
+
+
+# ── 命令路径的写入封印（2026-09-23 审查补）─────────────────────────
+# 上面那层只挡住了 write_file 工具。审查实测：同一份 config.json，
+# `cp /tmp/x <config>`、`tee <config>`、`sed -i s/a/b/ <config>`、
+# `cp /tmp/evil.py ~/.local-ai-os/extensions/x/1.0/plugin.py` **全部放行**
+# ——封印被绕过的路子和读的那半一模一样（工具被封、命令放行）。
+# 判定按"路径"而不是"动词"：命令里出现受保护的写入目标就拒，只读动词放行
+# （ls/stat/grep 看扩展目录是正常操作，不能误伤）。
+_READ_ONLY_VERBS = frozenset({
+    "ls", "stat", "file", "head", "tail", "wc", "du", "tree", "find", "grep", "rg",
+    "diff", "md5", "md5sum", "shasum", "sha256sum", "cat", "less", "more", "bat",
+    "xxd", "strings", "echo", "pwd", "which", "type", "basename", "dirname",
+})
+
+
+def _protected_write_target(tok: str) -> str | None:
+    """单个 argv token 是否是受保护的写入目标（自动加载目录 / config.json）。"""
+    if not tok or tok.startswith("-"):
+        return None
+    if "=" in tok:                      # dd of=/path、--output=/path、-o=/path
+        tok = tok.split("=", 1)[1]
+    if not tok or tok.startswith("-"):
+        return None
+    rp = os.path.realpath(os.path.abspath(os.path.expanduser(tok)))
+    for d in _app_data_dirs():
+        for sub in ("extensions", "skills"):
+            if rp == f"{d}{os.sep}{sub}" or rp.startswith(f"{d}{os.sep}{sub}{os.sep}"):
+                return rp
+        if os.path.basename(rp).lower().startswith("config.json") and rp.startswith(d + os.sep):
+            return rp
+    return None
+
+
+def reject_sensitive_write(cmd: str) -> str | None:
+    """命令写入自动加载目录/配置时返回拒绝文案，否则 None。"""
+    import shlex
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        tokens = cmd.split()
+    if not tokens:
+        return None
+    verb = os.path.basename(tokens[0]).lower()
+    if verb in _READ_ONLY_VERBS:
+        return None
+    for tok in tokens[1:]:
+        hit = _protected_write_target(tok)
+        if hit:
+            return (f"⛔ 不允许用命令写入自动加载目录/配置（写进去的代码会被执行、"
+                    f"配置含 API 密钥）: {hit}")
     return None
 
 

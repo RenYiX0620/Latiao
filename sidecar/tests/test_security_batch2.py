@@ -119,6 +119,55 @@ def test_write_seal_allows_normal_paths(monkeypatch, tmp_path):
     importlib.reload(config)
 
 
+# ── ⑧ 补：命令路径的写入封印（2026-09-23 审查发现）──────────────────
+# write_file 被封住之后，同一份 config.json / 扩展目录用 shell 仍能写：
+# `sed -i`、`cp`、`tee`、`dd of=` 全部放行（实测 13 例，见下）。
+@pytest.mark.parametrize("tpl", [
+    "sed -i '' s/a/b/ {cfg}",
+    "cp /tmp/x {cfg}",
+    "tee {cfg}",
+    "mv /tmp/x {cfg}",
+    "dd if=/tmp/x of={cfg}",
+    "cp /tmp/evil.py {ext}",
+    "tee {ext}",
+    "cat {cfg}",              # 读那半由 reject_sensitive_read 守，必须仍然拦
+])
+def test_cmd_write_seal_blocks_protected_targets(tpl, monkeypatch, tmp_path):
+    monkeypatch.setenv("LATIAO_TEST_PROGRESS_DIR", str(tmp_path / ".local-ai-os"))
+    import importlib
+    import config
+    importlib.reload(config)
+    import cmd_safety
+    importlib.reload(cmd_safety)
+    root = pathlib.Path.home() / ".local-ai-os"
+    cmd = tpl.format(cfg=str(root / "config.json"),
+                     ext=str(root / "extensions/evil/1.0/plugin.py"))
+    assert cmd_safety.check_cmd(cmd), f"应被拦下: {cmd}"
+    importlib.reload(cmd_safety)
+    importlib.reload(config)
+
+
+@pytest.mark.parametrize("tpl", [
+    "ls {ext_dir}",                                  # 看扩展目录是正常操作
+    "cp /tmp/a.txt /tmp/b.txt",
+    "sed -i '' s/a/b/ /tmp/notes.md",
+    "tee /tmp/out.txt",
+    "cp /tmp/a.py ./config.json",                    # 相对路径落在 cwd，不误伤
+])
+def test_cmd_write_seal_allows_normal_targets(tpl, monkeypatch, tmp_path):
+    monkeypatch.setenv("LATIAO_TEST_PROGRESS_DIR", str(tmp_path / ".local-ai-os"))
+    import importlib
+    import config
+    importlib.reload(config)
+    import cmd_safety
+    importlib.reload(cmd_safety)
+    root = pathlib.Path.home() / ".local-ai-os"
+    cmd = tpl.format(ext_dir=str(root / "extensions"))
+    assert cmd_safety.check_cmd(cmd) is None, f"不该被拦: {cmd}"
+    importlib.reload(cmd_safety)
+    importlib.reload(config)
+
+
 def test_write_file_plugin_refuses_extensions(monkeypatch, tmp_path):
     """插件层的端到端：写扩展目录会拿到拒绝文案。"""
     import importlib

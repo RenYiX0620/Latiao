@@ -2818,7 +2818,10 @@ def run_fix(fix_type: str, fix_pkg: str = "") -> dict:
         try:
             proc_result = subprocess.run(
                 [sys.executable, "-m", "pip", "install", fix_pkg],
-                capture_output=True, text=True, timeout=120
+                capture_output=True, text=True, timeout=120,
+                # ④ pip 同样不该拿到 sidecar token / 云模型密钥；PIP_/UV_ 前缀
+                # 保留镜像与索引配置（用户可能靠 PIP_INDEX_URL 走内网源）
+                env=child_env(allow_prefixes=("PIP_", "UV_")),
             )
             if proc_result.returncode == 0:
                 if fix_pkg == "mlx-lm":
