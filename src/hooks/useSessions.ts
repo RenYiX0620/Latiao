@@ -1,6 +1,11 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { SessionInfo, Message } from "../types";
 import { sanitizeSessions } from "../utils/storage";
+import {
+  deleteSessionRemote, fetchSessionList, fetchSessionMessages, importSessions, putSession,
+  reportSessionIssue,
+} from "../utils/sessionApi";
+import { planSync, sessionFingerprint } from "../utils/sessionSync";
 
 const newSession = (): SessionInfo => ({
   // crypto.randomUUID()：熵充足。此前 Math.random().toString(36).substring(7)
@@ -12,17 +17,25 @@ const newSession = (): SessionInfo => ({
   lastActive: Date.now(),
 });
 
+/** 读本地会话快照（初始渲染与首次迁移共用）。返回 null 表示没有可用数据。 */
+function readLocalSessions(): SessionInfo[] | null {
+  try {
+    const saved = localStorage.getItem("local_ai_os_sessions");
+    if (!saved) return null;
+    const parsed = sanitizeSessions(saved, () => `msg_${crypto.randomUUID()}`);
+    return parsed ? (parsed as unknown as SessionInfo[]) : null;
+  } catch {
+    return null;
+  }
+}
+
+
+/** 启动时最多预载多少个会话的消息（其余懒加载）。见下方"影子副本不能被写空"注释。 */
+const EAGER_LOAD_LIMIT = 200;
+
 export function useSessions() {
-  const [sessions, setSessions] = useState<SessionInfo[]>(() => {
-    try {
-      const saved = localStorage.getItem("local_ai_os_sessions");
-      if (saved) {
-        const parsed = sanitizeSessions(saved, () => `msg_${crypto.randomUUID()}`);
-        if (parsed) return parsed as unknown as SessionInfo[];
-      }
-    } catch { /* ignore */ }
-    return [newSession()];
-  });
+  const [sessions, setSessions] = useState<SessionInfo[]>(
+    () => readLocalSessions() || [newSession()]);
   
   const [currentIdx, setCurrentIdx] = useState(0);
 
@@ -39,7 +52,6 @@ export function useSessions() {
       return prev.map((s, i) => (i === idx ? { ...s, ...patch } : s));
     });
   const setSelectedModel = (m: string) => updateSession({ selectedModel: m });
-  const switchSession = (idx: number) => { setCurrentIdx(idx); };
   const deleteSession = (idx: number) => {
     setSessions((prev) => {
       const next = prev.filter((_, i) => i !== idx);
@@ -79,12 +91,156 @@ export function useSessions() {
   const setMessagesFor = (sessionId: string, fn: (prev: Message[]) => Message[]) =>
     _applyMessages(sessionId, fn);
 
+  // ── 后端持久化（2026-09-23，审查⑩）────────────────────────────────
+  // 三层责任：①启动时从后端取列表（拿不到就留在 localStorage，绝不丢会话）；
+  // ②后端为空且本地有内容 → 一次性导入（幂等）；③变更按会话快照同步回后端。
+  // localStorage 仍照常写（App 里那条 effect）——它是降级路径，不是主存储。
+  const _syncedRef = useRef<Record<string, string>>({});   // id → 上次同步的内容指纹
+  const _backendIdsRef = useRef<Set<string>>(new Set());   // 后端已有的会话 id（删除判定用）
+  const _pendingRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  const [backendReady, setBackendReady] = useState(false);
+
+  // 变更同步：按会话 diff（内容指纹变了才 PUT），删除的会话 DELETE。
+  const syncRemote = (list: SessionInfo[]) => {
+    if (!backendReady) return;
+    const plan = planSync(_syncedRef.current, list, _backendIdsRef.current);
+    _syncedRef.current = plan.nextFingerprints;
+    for (const id of plan.puts) {
+      const s0 = list.find((x) => x.id === id);
+      if (!s0) continue;
+      const payload = {
+        id: s0.id, name: s0.name, selectedModel: s0.selectedModel || "",
+        lastActive: s0.lastActive || 0, messages: s0.messages,
+      };
+      const timer = _pendingRef.current[id];
+      if (timer) clearTimeout(timer);
+      // 每会话独立防抖：流式期间内容一直变，避免每个 token 都发一次
+      _pendingRef.current[id] = setTimeout(() => {
+        delete _pendingRef.current[id];
+        void putSession(payload);
+      }, 1200);
+    }
+    for (const id of plan.deletes) {
+      _backendIdsRef.current.delete(id);
+      void deleteSessionRemote(id);
+    }
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+      let list = await fetchSessionList();
+      if (cancelled) return;
+      if (list === null) {
+        console.warn("[sessions] 后端不可用，继续使用 localStorage（降级）");
+        void reportSessionIssue("读取后端会话列表失败 → 降级用 localStorage");
+        return;
+      }
+      // 迁移：不是"后端空才导"，而是**按会话补**（后端缺哪个就导哪个）。
+      // 首版用 list.length===0 当开关，于是后端只要有一条别的记录（哪怕是个空
+      // 会话），本地既有会话就永远进不去——真机上正是这么卡住的。
+      const backendIds = new Set(list.map((m) => m.id));
+      const local = (readLocalSessions() || []).filter((s) => s.messages.length > 0);
+      const toImport = local.filter((s) => !backendIds.has(s.id));
+      let _rawLen = -1;
+      let _parsed = 0;
+      try {
+        const raw = localStorage.getItem("local_ai_os_sessions");
+        _rawLen = raw ? raw.length : 0;
+        _parsed = raw ? (JSON.parse(raw) as unknown[]).length : 0;
+      } catch { /* ignore */ }
+      if (toImport.length) {
+        const r = await importSessions(toImport);
+        void reportSessionIssue(
+          r ? `迁移本地会话：新增 ${r.imported} / 跳过 ${r.skipped} / 共 ${r.total}` +
+              `（本地 raw=${_rawLen} 字符 / 解析 ${_parsed} 个 / 待迁 ${toImport.length}）`
+            : `迁移失败（后端不可用；本地 raw=${_rawLen} / 解析 ${_parsed} / 待迁 ${toImport.length}）`,
+          r ? "info" : "warn");
+        if (r && r.imported > 0) {
+          const refreshed = await fetchSessionList();
+          if (refreshed) list = refreshed;      // 导入后重取，列表里就能看到本地会话
+        }
+      } else if (_parsed > 0) {
+        void reportSessionIssue(`本地会话均已存在后端（本地 ${_parsed} 个）`, "info");
+      }
+      if (list.length === 0) {
+        // 后端与本地都没有 → 保持新会话即可
+        local.forEach((s0) => {
+          _syncedRef.current[s0.id] = sessionFingerprint({ ...s0, loaded: true });
+          _backendIdsRef.current.add(s0.id);
+        });
+        setBackendReady(true);
+        return;
+      }
+      // 后端有数据 → 用后端列表（元数据 + 预览），消息懒加载
+      const metas: SessionInfo[] = list.map((m) => ({
+        id: m.id,
+        name: m.name || "session.default",
+        selectedModel: m.selectedModel || "",
+        lastActive: m.lastActive || 0,
+        messages: [],
+        preview: m.preview || "",
+        message_count: m.message_count || 0,
+        loaded: false,
+      }));
+      if (cancelled) return;
+      metas.forEach((m) => _backendIdsRef.current.add(m.id));
+      // 未载入的会话不参与同步（否则空消息会覆盖后端）——由 planSync 保证；
+      // 标记 backendReady 之前先把 id 登记好
+      setSessions(metas);
+      setCurrentIdx(0);
+      // 启动时把消息**全部**载入（上限 EAGER_LOAD_LIMIT）：
+      // 为什么不用懒加载——localStorage 影子副本是按内存状态写的，未载入的会话
+      // 消息为空 → 影子会被"写空"（实测：187 条变成 6 条）。影子是后端不可用时的
+      // 唯一退路，不能被自己的写入掏空。超出上限的老会话仍走懒加载（切换时取）。
+      const eager = metas.slice(0, EAGER_LOAD_LIMIT);
+      const rest = metas.slice(EAGER_LOAD_LIMIT);
+      const loadedMetas = await Promise.all(eager.map(async (m) => {
+        const msgs = await fetchSessionMessages(m.id);
+        return { id: m.id, msgs };
+      }));
+      if (!cancelled) {
+        const byId = new Map(loadedMetas.map((x) => [x.id, x.msgs]));
+        setSessions((prev) => prev.map((s) => {
+          const msgs = byId.get(s.id);
+          if (msgs) {
+            _syncedRef.current[s.id] = sessionFingerprint(
+              { ...s, messages: msgs, loaded: true });
+            return { ...s, messages: msgs as unknown as Message[], loaded: true };
+          }
+          if (rest.some((r) => r.id === s.id)) return s;      // 超出上限：保持未载入
+          return s;
+        }));
+      }
+      setBackendReady(true);
+      } catch (e) {
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  const switchSessionWithLoad = (idx: number) => {
+    setCurrentIdx(idx);
+    const target = sessions[Math.min(Math.max(idx, 0), sessions.length - 1)];
+    if (!target || target.loaded || !backendReady) return;
+    void (async () => {
+      const msgs = await fetchSessionMessages(target.id);
+      if (!msgs) return;
+      setSessions((prev) => prev.map((s) => (s.id === target.id
+        ? { ...s, messages: msgs as unknown as Message[], loaded: true } : s)));
+      _syncedRef.current[target.id] = sessionFingerprint(
+        { ...target, messages: msgs, loaded: true });
+    })();
+  };
+
   return {
     sessions, setSessions,
+    backendReady, syncRemote,
     currentIdx, setCurrentIdx,
     session, messages,
     updateSession, setSelectedModel,
-    switchSession, deleteSession, setMessages, setMessagesFor,
+    switchSession: switchSessionWithLoad, deleteSession, setMessages, setMessagesFor,
     newSession,
   };
 }

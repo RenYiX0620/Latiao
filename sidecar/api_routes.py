@@ -23,6 +23,7 @@ from cmd_safety import redact_secrets   # 工具日志脱敏（09-23）
 import httpx
 from fastapi import File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from starlette.concurrency import run_in_threadpool
 
 import cron
 import local_llm
@@ -2167,6 +2168,76 @@ async def api_extensions_list():
         return {"status": "ok", "extensions": list_extensions()}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+
+# ═══════════════════════════════════════════════════════
+#  会话持久化（2026-09-23，审查⑩）：前端 localStorage → 后端权威存储
+#  列表只回元数据+预览；消息按需取；写入是"整会话快照"（前端防抖后 PUT）。
+# ═══════════════════════════════════════════════════════
+
+@app.post("/v1/sessions/report")
+async def api_sessions_report(request: Request):
+    """前端会话同步的诊断上报（2026-09-23）。
+
+    为什么需要：⑩ 上线时前端把"后端不可用"降级成 console.warn —— 日志里什么都
+    看不到，迁移静默不发生，只能靠读 webview 的 localStorage 才查出根因。会话
+    持久化是用户数据，它出问题必须在服务端日志里留痕。
+    """
+    body = await _json_body(request)
+    msg = str(body.get("message", ""))[:500]
+    level = str(body.get("level", "info")).lower()
+    if level in ("error", "warn", "warning"):
+        logger.warning("会话同步(前端): %s", msg)
+    else:
+        logger.info("会话同步(前端): %s", msg)
+    return {"status": "ok"}
+
+
+@app.get("/v1/sessions")
+async def api_sessions_list(limit: int = Query(default=500, ge=1, le=2000),
+                            offset: int = Query(default=0, ge=0)):
+    logger.info("会话列表请求")
+    import sessions as _sessions
+    return await run_in_threadpool(_sessions.list_sessions, limit, offset)
+
+
+@app.get("/v1/sessions/{session_id}")
+async def api_sessions_get(session_id: str):
+    logger.info("会话内容请求: %s", session_id[:18])
+    import sessions as _sessions
+    return await run_in_threadpool(_sessions.get_session, session_id)
+
+
+@app.post("/v1/sessions/{session_id}")
+async def api_sessions_save(session_id: str, request: Request):
+    """整会话快照 upsert：{name, selectedModel, lastActive, messages:[…]}。
+
+    用 POST 而非 PUT：前端走 Rust IPC 代理（sidecar_proxy），它只转发
+    GET/POST/DELETE；而 Tauri HTTP 插件那条路实测**挂住不返回**（⑩ 首版调试：
+    请求既不到服务端、也不报错、还没有超时，前端静默停住）。
+    """
+    body = await _json_body(request)
+    import sessions as _sessions
+    return await run_in_threadpool(
+        _sessions.save_session, session_id,
+        str(body.get("name", "")), str(body.get("selectedModel", "")),
+        int(body.get("lastActive", 0) or 0), body.get("messages") or [])
+
+
+@app.delete("/v1/sessions/{session_id}")
+async def api_sessions_delete(session_id: str):
+    import sessions as _sessions
+    return await run_in_threadpool(_sessions.delete_session, session_id)
+
+
+@app.post("/v1/sessions/import")
+async def api_sessions_import(request: Request):
+    """一次性迁移：把前端 localStorage 的会话整体搬进后端（幂等，默认只补不覆盖）。"""
+    body = await _json_body(request)
+    import sessions as _sessions
+    return await run_in_threadpool(_sessions.import_sessions,
+                                   body.get("sessions") or [],
+                                   bool(body.get("replace", False)))
 
 
 @app.post("/v1/extensions/install")

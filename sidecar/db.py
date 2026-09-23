@@ -129,6 +129,28 @@ def _init_db():
         except Exception:
             pass
 
+        # ── 会话持久化（2026-09-23，审查⑩）──────────────────────────
+        # 此前会话只在前端 localStorage（5MB 配额 + 四级降级链，跨设备/备份/服务端
+        # 摘要都无从谈起）。这里落库：
+        #   sessions          会话元数据（列表页只需读它 + preview）
+        #   session_messages  消息（整条消息的 JSON 存在 data 里——前端 Message 类型
+        #                     有十几个可选字段，逐列建表会随字段增删漂移）
+        try:
+            conn.execute("CREATE TABLE IF NOT EXISTS sessions ("
+                "id TEXT PRIMARY KEY, name TEXT NOT NULL DEFAULT '', "
+                "selected_model TEXT DEFAULT '', last_active INTEGER DEFAULT 0, "
+                "created_at TEXT NOT NULL, updated_at TEXT NOT NULL, "
+                "message_count INTEGER DEFAULT 0, preview TEXT DEFAULT '')")
+            conn.execute("CREATE TABLE IF NOT EXISTS session_messages ("
+                "id TEXT PRIMARY KEY, session_id TEXT NOT NULL, seq INTEGER NOT NULL, "
+                "role TEXT NOT NULL, data TEXT NOT NULL, created_at TEXT NOT NULL)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_session_messages_sid "
+                "ON session_messages(session_id, seq)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_active "
+                "ON sessions(last_active DESC)")
+        except Exception:
+            logger.error("Failed to create sessions tables", exc_info=True)
+
         try:
             conn.execute("CREATE TABLE IF NOT EXISTS reflections ("
                 "id TEXT PRIMARY KEY, session_id TEXT NOT NULL, tool_name TEXT NOT NULL, "

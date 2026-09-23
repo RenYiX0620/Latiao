@@ -37,6 +37,12 @@ export interface SessionInfo {
   messages: Message[];
   selectedModel: string;
   lastActive?: number;
+  /** 服务端算好的预览（最后一条有内容的消息前 60 字）——列表不再需要消息体 */
+  preview?: string;
+  /** 服务端记账：消息条数（本地只加载了部分会话时用于显示） */
+  message_count?: number;
+  /** 消息是否已从后端载入（懒加载标记；localStorage 路径下一律为 true） */
+  loaded?: boolean;
 }
 
 export interface IdentityFile {
