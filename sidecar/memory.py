@@ -9,7 +9,7 @@ from datetime import datetime
 
 import httpx
 
-from config import LM_STUDIO_URL, SUBAGENT_MODEL
+from config import SUBAGENT_MODEL
 from capability_registry import USER_SKILLS_DIR
 from db import _db_write_lock
 
@@ -906,14 +906,27 @@ async def _maybe_generate_skill(tool_name: str, args: dict, result: str):
                 f"原始学习记录:\n{learnings_text}\n\n"
                 f"技能文档 (SKILL.md):"
             )
+            # 端点走统一解析器（与 _refine_learnings 同一套）：此前这里写死
+            # config.LM_STUDIO_URL（默认 http://localhost:1234，LM Studio 的端口），
+            # 而原生引擎在 1235 —— 于是这段**从未生效**，每次静默回退到"原始拼接"
+            # （日志里那句 "LLM synthesis unavailable, using raw concatenation"）。
+            from agent.routing import _resolve_api_target
+            _protocol, _api_url, _headers, _is_local = await _resolve_api_target(
+                main._last_cloud_config.get())
+            if not _api_url:
+                raise RuntimeError("没有可用的模型端点")
             async with httpx.AsyncClient(timeout=httpx.Timeout(30)) as client:
                 # 本地 llama.cpp 并发请求会崩溃 -> 走 main 的串行锁
-                async with main._local_llm_serialized(LM_STUDIO_URL):
+                async with main._local_llm_serialized(_api_url):
                     r = await client.post(
-                    LM_STUDIO_URL,
+                    _api_url,
+                    headers=_headers,
                     json={
                         "model": SUBAGENT_MODEL,
                         "messages": [{"role": "user", "content": prompt}],
+                        # 关思考：技能文档要的是正文，思考会把 max_tokens 吃光
+                        # （与 LLM 裁判同一个坑，实测过）
+                        "chat_template_kwargs": {"enable_thinking": False},
                         "max_tokens": 500,
                         "temperature": 0.4,
                         "stream": False,
@@ -953,27 +966,10 @@ async def _maybe_generate_skill(tool_name: str, args: dict, result: str):
         logger.warning("Auto-skill generation failed for %s", tool_name, exc_info=True)
 
 
-def _get_recent_learnings(limit: int = 5) -> list[str]:
-    """Get the most recent learning summaries for cross-session context injection."""
-    learnings = []
-    try:
-        db = _get_db()
-        rows = db.execute(
-            "SELECT topic, content FROM learnings_fts ORDER BY rowid DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
-        for topic, content in rows:
-            if topic and content and len(content) > 10:
-                learnings.append(f"- {topic}: {content[:200]}")
-    except Exception:
-        pass
-    return learnings
-
-
 def get_recent_learnings_for_ui(limit: int = 8) -> list[dict]:
     """知识库面板专用：返回对象格式的最近知识（topic/content/confidence）。
 
-    09-07 NaN 事故：心跳把 _get_recent_learnings 的【字符串数组】直接给了
+    09-07 NaN 事故：心跳把"最近知识"的【字符串数组】直接给了
     前端，UI 取 l.topic/l.confidence 全是 undefined → "📝 : NaN%"。"""
     out: list[dict] = []
     try:

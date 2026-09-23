@@ -136,3 +136,57 @@ def test_learnings_max_from_config(mem, monkeypatch):
     assert db.learnings_max() == 123
     monkeypatch.setenv("LATIAO_LEARNINGS_MAX", "50")
     assert db.learnings_max() == 50
+
+
+# ── 自动技能合成：端点走统一解析器（2026-09-23 清理死配置）────────────
+
+@pytest.mark.asyncio
+async def test_skill_synthesis_uses_resolved_endpoint(mem, monkeypatch):
+    """此前写死 config.LM_STUDIO_URL（localhost:1234）→ 从未生效；
+    现在必须用 agent.routing._resolve_api_target 解析出的端点。
+
+    断言"请求发到了解析出的 URL"而不只是"函数没报错"——写死端点的 bug 恰恰是
+    "函数照常返回、只是请求发错地方"，只测返回值是抓不到的。
+    """
+    db, memory = mem
+    conn = db._get_db()
+    for i in range(3):
+        conn.execute("INSERT INTO learnings(id, session_id, topic, content, confidence, "
+                     "source_type, hit_count, created_at, updated_at) VALUES(?,?,?,?,?,?,0,?,?)",
+                     (f"r{i}", "s", f"read_file 用法{i}", f"read_file 的经验 {i}", 0.9,
+                      "refined", "2026-09-23", "2026-09-23"))
+    conn.commit()
+
+    seen_urls: list[str] = []
+
+    class _Resp:
+        status_code = 200
+        def json(self):
+            return {"choices": [{"message": {"content": "技能文档正文" * 8}}]}
+
+    class _Client:
+        def __init__(self, *a, **k): ...
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def post(self, url, headers=None, json=None, **k):
+            seen_urls.append(url)
+            return _Resp()
+
+    import httpx
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    import agent.routing as routing
+    async def _fake_resolve(cfg):
+        return ("openai", "http://127.0.0.1:1235/v1/chat/completions", {}, True)
+    monkeypatch.setattr(routing, "_resolve_api_target", _fake_resolve, raising=False)
+
+    import main
+    if not hasattr(main, "_last_cloud_config"):
+        pytest.skip("main 无 _last_cloud_config（此环境不适用）")
+    memory._skill_gen_tracker["read_file"] = memory._SKILL_GENERATION_THRESHOLD - 1
+    await memory._maybe_generate_skill("read_file", {"path": "x"}, "读到了内容")
+
+    if seen_urls:
+        assert seen_urls[0] == "http://127.0.0.1:1235/v1/chat/completions", \
+            f"请求发到了 {seen_urls[0]}（写死端点的老毛病）"
+    else:
+        pytest.fail("没有发出请求——合成路径没跑到（阈值/前缀条件要跟实现保持一致）")

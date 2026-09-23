@@ -2,8 +2,9 @@
 import os
 from pathlib import Path
 
-# LLM endpoints
-LM_STUDIO_URL = os.environ.get("LATIAO_LM_STUDIO_URL", "http://localhost:1234/v1/chat/completions")
+# LLM 端点：统一由 agent.routing._resolve_api_target 解析（云端配置优先，否则本地引擎），
+# 不再有写死的端点常量（LM_STUDIO_URL 是 LM Studio 时代的遗留，指向 1234、
+# 原生引擎在 1235，任何写死它的地方都会静默失效——2026-09-23 清理）。
 # 未显式选模型时的兜底名：诚实标识本地引擎（不再冒充 gpt-4o-mini——
 # 09-04 用户反馈"我就没用过这个模型名"，假名导致排查误判模型来源）
 SUBAGENT_MODEL = os.environ.get("LATIAO_SUBAGENT_MODEL", "latiao-local-default")
