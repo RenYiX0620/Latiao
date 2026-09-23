@@ -1,6 +1,7 @@
 import { memo, lazy, Suspense, useCallback, useState, useMemo, useRef, useEffect } from "react";
 import type { Message, PendingFile } from "../types";
 import { useTranslation } from "../i18n";
+import { loadedMismatch } from "../utils/modelSelection";
 import RunMetrics from "./RunMetrics";
 import ToolCallBubble from "./ToolCallBubble";
 import ToolbarSelect from "./ToolbarSelect";
@@ -125,7 +126,10 @@ interface ChatViewProps {
   onPasteImage?: (file: File) => void;
   cloudModels: { name: string }[];
   selectedModel: string;
-  onSelectModel: (m: string) => void;
+  /** 选择模型（本地模型会顺带触发加载）——见 utils/modelSelection 的说明 */
+  onSelectModelAndLoad: (m: string) => void;
+  /** 引擎真实加载的模型（下拉要显示真相：会话选择与实际回答者可能不一致） */
+  engineStatus?: { status?: string; model_id?: string; model_name?: string } | null;
   accessMode: "read_only" | "confirm" | "auto_edit" | "plan" | "full";
   setAccessMode: (m: "read_only" | "confirm" | "auto_edit" | "plan" | "full") => void;
   thinkingLevel: "off" | "low" | "high" | "max";
@@ -149,7 +153,7 @@ export default memo(function ChatView({
   sendMessage, onStop, handleFileSelect, startRecording, confirmTool,
   onSpeak, speakingId,
   chatEndRef, handleDrop, onPasteImage,
-  cloudModels, selectedModel, onSelectModel, sessionId,
+  cloudModels, selectedModel, onSelectModelAndLoad, engineStatus, sessionId,
   accessMode, setAccessMode, thinkingLevel, setThinkingLevel,
   contextEstimate, showToast, activeTask, taskStartAt, streamingThink, subagents,
   routeInfo, localModelId, localModelName,
@@ -777,16 +781,32 @@ export default memo(function ChatView({
                 background: "transparent", border: "0", color: "var(--text-secondary)",
                 cursor: "pointer", outline: "none",
               }}
-                value={selectedModel} onChange={(e) => onSelectModel(e.target.value)}
+                value={selectedModel} onChange={(e) => onSelectModelAndLoad(e.target.value)}
                 title={t("chat.model_select")}>
                 <option value="">{t("sidebar.auto_detect")}</option>
+                {/* 会话选的本地模型不在"已加载"里时也要列出来，否则浏览器没有对应选项可显示、
+                    下拉会显示成别的（用户 2026-09-23 遇到的就是这个错位） */}
+                {selectedModel && selectedModel !== localModelId && !cloudModels.some((m) => m.name === selectedModel) && (
+                  <option key="session-pick" value={selectedModel}>🎯 {selectedModel.split("/").filter(Boolean).pop()}（{t("chat.model_session_pick")}）</option>
+                )}
                 {localModelId && (
-                  <option key="local-loaded" value={localModelId}>💻 {localModelName || localModelId.split("/").filter(Boolean).pop()}</option>
+                  <option key="local-loaded" value={localModelId}>💻 {localModelName || localModelId.split("/").filter(Boolean).pop()}（{t("chat.model_loaded_mark")}）</option>
                 )}
                 {cloudModels.map((m) => (
                   <option key={m.name} value={m.name}>☁️ {m.name}</option>
                 ))}
               </select>
+              {/* 实际回答者与会话选择不一致时必须说出来——事件上"谁加载谁回答"，
+                  下拉框只是个标签，不说清楚就是"点了没反应"的又一种 */}
+              {(() => {
+                const actual = loadedMismatch(selectedModel, engineStatus);
+                return actual ? (
+                  <span style={{ fontSize: 11, color: "var(--warning, #f59e0b)", marginLeft: 6 }}
+                        title={t("chat.model_mismatch_hint", { model: actual })}>
+                    ⚠️ {t("chat.model_answering", { model: actual })}
+                  </span>
+                ) : null;
+              })()}
               {isProcessing ? (
                 <button className="btn-send btn-circle" onClick={onStop} title={t("chat.stop")}>⏹</button>
               ) : (
