@@ -492,6 +492,69 @@ def _record_engine_usage(session_id: str, line: str) -> None:
         logger.debug("上下文统计记录用量失败", exc_info=True)
 
 
+# ── 语言漂移早退（2026-09-23 真机事故）──────────────────────────────
+# 用户两次反馈"我说中文它回英文、还要等翻译"。事后翻译能兜住（现在也不失败了），
+# 但用户要等一两分钟。这里治的是**生成时就不让它漂**：首段 30 字一旦是清一色
+# 拉丁字母、且一个目标语言文字都没有 → 判定漂移，丢弃这次生成、带更强的语言要求
+# 重试一次（只一次，再漂就交给交付闸门翻译）。
+#
+# 判据刻意保守（宁可放过不可错杀）：要求"拉丁 ≥20 且目标文字 ==0"这种极端情形才判；
+# 以工具标记/JSON/代码块开头的正文直接豁免（那些本来就该是英文 token）。
+_LANG_DRIFT_MIN_CHARS = 30
+_LANG_DRIFT_MIN_LATIN = 20
+
+
+def _looks_structured(text: str) -> bool:
+    t = (text or "").lstrip()
+    return t.startswith(("<tool_call", "<function", "<|", "```", "{", "["))
+
+
+def _looks_like_lang_drift(text: str, lang: str) -> bool:
+    """首段是否明显不是目标语言（只有目标语言被**压倒性**压过时才判，结构化开头豁免）。
+
+    判据用比例而不是"零目标文字"：真机那条漂移回复是 `**"嗯～主人要我看 it? Okay then~"**
+    I crawl back…` —— 开头一两个汉字、其余整段英文。早先"零汉字才判"的写法会漏掉它
+    （矩阵实测抓到的），所以改成「拉丁 ≥20 且拉丁 ≥ 4×(目标文字+1)」这种压倒性判据：
+    正常中文回复里夹术语（`SOUL.md`、代码/路径）达不到这个比例，不会误杀。
+    """
+    import re as _re
+    if not text or lang not in ("zh", "en", "ja", "ru"):
+        return False
+    if _looks_structured(text):
+        return False
+    latin = len(_re.findall(r"[A-Za-z]", text))
+    cjk = len(_re.findall(r"[\u4e00-\u9fff]", text))
+    kana = len(_re.findall(r"[\u3040-\u30ff]", text))
+    cyr = len(_re.findall(r"[\u0400-\u04ff]", text))
+    if lang in ("zh", "ja"):
+        target = cjk + kana
+        return latin >= _LANG_DRIFT_MIN_LATIN and latin >= 4 * (target + 1)
+    if lang == "ru":
+        return cjk >= _LANG_DRIFT_MIN_LATIN and cjk >= 4 * (cyr + 1)
+    # 英文用户：正文被中文压倒
+    return cjk >= 12 and cjk >= 4 * (latin + 1)
+
+
+def _append_lang_retry_note(body: dict, lang: str) -> None:
+    """重试时在最后一条用户消息尾部追加更强的语言要求（**复制**消息，不改会话状态）。"""
+    msgs = body.get("messages") or []
+    if not msgs:
+        return
+    last = msgs[-1]
+    if last.get("role") != "user" or not isinstance(last.get("content"), str):
+        return
+    note = {
+        "zh": "\n\n（⚠️ 上一个回答因为用了英文已被丢弃——本轮必须用**简体中文**书写正文与思考，"
+              "包括角色扮演的台词与描述。）",
+        "en": "\n\n(⚠️ The previous reply was discarded for not being in English — write this "
+              "one in **English**, thinking included.)",
+        "ja": "\n\n（⚠️ 前の回答は日本語でなかったため破棄されました——今回は必ず**日本語**で。）",
+        "ru": "\n\n(⚠️ Предыдущий ответ отброшен из-за языка — пишите по-**русски**.)",
+    }.get(lang)
+    if note:
+        msgs[-1] = {**last, "content": last["content"] + note}
+
+
 class ThinAgentLoop:
     """单一 agent 循环：cloud/local 共用，差异只体现在请求组装与辅助层开关。"""
 
@@ -519,6 +582,7 @@ class ThinAgentLoop:
             _hist = _hist[:-1]
         self.lang_decision = detect_language_decision(self.last_user_text, _hist)
         self.user_lang, self.user_lang_confident = self.lang_decision
+        self._lang_retried = False   # 语言漂移早退：每轮只允许重试一次（2026-09-23）
         self.steps = 0
         self.native_tools = False
         self.native_fallback_used = False
@@ -823,6 +887,12 @@ class ThinAgentLoop:
         # 等引擎放行的时长：多会话并行时这一轮可能排在别的会话后面（见 transport 闸门）
         _wait: dict = {}
         _wait_reported = False
+        # ── 语言漂移早退（2026-09-23）：首段攒着不下发，判完再放行 ──
+        # 为什么攒：命中漂移时这次生成要被丢掉重来，若已下发，屏幕上会留下
+        # "半截英文 + 中文"的拼接。攒 30 字只让首字延迟约 1 秒，换来丢弃时零残留。
+        _gate_open = False          # 是否已通过漂移检查（通过后正常实时下发）
+        _pending: list[dict] = []   # 检查通过前攒下的事件
+        _drift_hit = False
         async for line in self._stream(client, body, wait_info=_wait):
             if time.monotonic() > deadline:
                 raise _GenerationLoopError("单步生成超时(900s)，已截断")
@@ -866,12 +936,54 @@ class ThinAgentLoop:
             if think:
                 reasoning += think
                 streamed += think
-                yield {"reasoning": think, "ts": int(time.time() * 1000)}
+                if _gate_open:
+                    yield {"reasoning": think, "ts": int(time.time() * 1000)}
+                else:
+                    _pending.append({"reasoning": think, "ts": int(time.time() * 1000)})
             if content:
                 streamed += content
                 body_text += content
-                # 真流式：正文 delta 即刻下发（09-06 用户反馈"直接蹦出答案"）
-                yield {"content": content, "ts": int(time.time() * 1000)}
+                if _gate_open:
+                    # 真流式：正文 delta 即刻下发（09-06 用户反馈"直接蹦出答案"）
+                    yield {"content": content, "ts": int(time.time() * 1000)}
+                else:
+                    _pending.append({"content": content, "ts": int(time.time() * 1000)})
+                    if len(body_text) >= _LANG_DRIFT_MIN_CHARS:
+                        if (getattr(self, "user_lang_confident", False)
+                                and _looks_like_lang_drift(body_text, self.user_lang)):
+                            _drift_hit = True
+                            break
+                        _gate_open = True
+                        for _ev in _pending:
+                            yield _ev
+                        _pending.clear()
+        if _drift_hit:
+            # 丢弃这次生成：重试一次（在最后一条用户消息尾部追加更强的语言要求）。
+            # 只重试一次——再漂就照常交付，交给交付闸门去翻译（那条兜底仍在）。
+            if not getattr(self, "_lang_retried", False):
+                self._lang_retried = True
+                self._step_log("语言漂移重试", "首段非目标语言，丢弃后重试一次")
+                logger.info("thin loop: 首段语言漂移，丢弃这次生成并重试一次")
+                _append_lang_retry_note(body, self.user_lang)
+                async for _evt in self._sample(client, body):
+                    yield _evt
+                return
+            logger.info("thin loop: 重试后仍漂移，照常交付（交付闸门会翻译）")
+            _gate_open = True
+        if _pending and not _gate_open:
+            # 短回复（没攒够检查长度就结束）：检查一次，再决定放行还是重试
+            if (getattr(self, "user_lang_confident", False)
+                    and _looks_like_lang_drift(body_text, self.user_lang)
+                    and not getattr(self, "_lang_retried", False)):
+                self._lang_retried = True
+                self._step_log("语言漂移重试", "短回复非目标语言，丢弃后重试一次")
+                _append_lang_retry_note(body, self.user_lang)
+                async for _evt in self._sample(client, body):
+                    yield _evt
+                return
+            for _ev in _pending:
+                yield _ev
+            _pending.clear()
         yield {"__result__": (streamed, body_text, reasoning, native, finish_reason)}
 
     # ── 主循环 ────────────────────────────────────────────

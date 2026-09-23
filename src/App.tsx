@@ -6,6 +6,7 @@ import type { Message, PendingFile, SessionInfo, ViewId, CloudModel, DownloadSta
 import { parseSSEDataLine } from "./utils/sse";
 import { resolveStopTarget } from "./utils/sessionTarget";
 import { saveSessionsWithFallback } from "./utils/storage";
+import { needsEngineLoad } from "./utils/modelSelection";
 import { localVoicesForLang, pickVoice, speechSupported, splitSentences, stripForSpeech, voicesForLang } from "./utils/speech";
 // API keys stored in OS keychain via Rust commands (store_secret/get_secret/delete_secret)
 import { useSessions } from "./hooks/useSessions";
@@ -713,6 +714,7 @@ const [timeFilter, setTimeFilter] = useState("all");
     } catch { showToast(t("app.backend_no_reply"), "warn"); }
   };
 
+  // 注意：selectModelAndLoad 依赖它，声明顺序保持在前面
   const startLocalLLM = async (modelId?: string) => {
     const mid = (modelId || localModelId).trim();
     if (!mid) { showToast(t("toast.need_model_id")); return; }
@@ -799,6 +801,18 @@ const [timeFilter, setTimeFilter] = useState("all");
     if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
     toastTimerRef.current = setTimeout(() => setToast(null), 2200);
   }, []);
+
+  // 选模型 = 顺带加载（2026-09-23 用户要求）：下拉选中的与会话标签是两回事，
+  // 只改标签不切换引擎 → 实际还是旧模型在回答（"对话框显示的模型和引擎里装的不一样"）。
+  // 本地模型且与已加载不同才真加载；云端/空值不动引擎；引擎忙由 startLocalLLM 拒绝并提示。
+  const selectModelAndLoad = useCallback(async (m: string) => {
+    setSelectedModel(m);
+    if (!needsEngineLoad(m, cloudModels, localLLMStatus)) return;
+    const _short = String(m).split("/").filter(Boolean).pop() || m;
+    showToast(t("toast.model_switching", { model: _short }));
+    await startLocalLLM(m);
+  }, [cloudModels, localLLMStatus, setSelectedModel, showToast, t, startLocalLLM]);
+
 
   /* ── 自动更新（此前零接线：死开关 + 硬编码版本号，审计修复）── */
   const [appVersion, setAppVersion] = useState("…");
@@ -1917,7 +1931,7 @@ const [timeFilter, setTimeFilter] = useState("all");
         </nav>
 
         <div className="sidebar-footer">
-          <select className="sidebar-model-select" value={session.selectedModel} onChange={(e) => { setSelectedModel(e.target.value); showToast(t("toast.model_switched", { model: e.target.value || t("sidebar.auto_detect") })); }}>
+          <select className="sidebar-model-select" value={session.selectedModel} onChange={(e) => { void selectModelAndLoad(e.target.value); }}>
             <option value="">{t("sidebar.auto_detect")}</option>
             {localLLMStatus.model_id && (
               <option key="local-loaded" value={localLLMStatus.model_id}>💻 {localLLMStatus.model_name || localLLMStatus.model_id.split("/").filter(Boolean).pop()}</option>
@@ -1961,13 +1975,13 @@ const [timeFilter, setTimeFilter] = useState("all");
             fileInputRef={fileInputRef} mediaRecorderRef={mediaRecorderRef}
             isRecording={isRecording}
             sendMessage={sendMessage} onStop={() => stopGeneration()} handleFileSelect={handleFileSelect}
+            onSelectModelAndLoad={selectModelAndLoad} engineStatus={localLLMStatus}
             startRecording={startRecording} confirmTool={confirmTool}
             onSpeak={speak} speakingId={speakingId}
             chatEndRef={chatEndRef} handleDrop={handleDrop}
             onPasteImage={(file) => processImageFile(file, t("app.screenshot", { ts: new Date().toLocaleTimeString() }))}
             cloudModels={cloudModels}
             selectedModel={session.selectedModel}
-            onSelectModel={setSelectedModel}
             accessMode={accessMode} setAccessMode={setAccessMode}
             thinkingLevel={thinkingLevel} setThinkingLevel={setThinkingLevel}
             contextEstimate={contextEstimate}

@@ -193,3 +193,41 @@ def test_translation_request_disables_thinking():
     body = src[idx:idx + 700]
     assert "enable_thinking" in body and "False" in body, \
         "翻译请求里少了 enable_thinking: False（实测会因思考而撞 60s 超时）"
+
+
+# ── 语言要求贴在最后一行（2026-09-23 真机事故）────────────────────────
+
+def _tail_of(out: list) -> str:
+    """取发给模型的最后一条消息的尾注部分（语言行就在其中）。"""
+    return str(out[-1].get("content") or "")
+
+
+def test_language_requirement_is_the_last_line(monkeypatch, tmp_path):
+    """中文用户：尾注里必须有简体中文的要求，且它在**最后**（离生成最近）。
+
+    真机事故：语言规则只在系统提示开头 → 模型在角色扮演类长回复里漂成英文，
+    兜底翻译要 2 分钟才换上中文，用户实感"还是没中文"。
+    """
+    monkeypatch.setenv("LATIAO_TEST_PROGRESS_DIR", str(tmp_path / ".local-ai-os"))
+    import importlib
+    import config
+    importlib.reload(config)
+    import agent.prompt_build as PB
+    body = {"messages": [{"role": "user", "content": "来嘛来嘛。屁股撅起来"}]}
+    out = PB._build_chat_messages(body, list(body["messages"]))
+    tail = _tail_of(out)
+    assert "简体中文" in tail, f"尾注里没有中文要求：{tail[-160:]!r}"
+    assert tail.rstrip().endswith("）") or "英文只是数据" in tail[-200:], \
+        "语言要求应该在最后一段（离生成最近）"
+
+
+def test_language_requirement_follows_user_language(monkeypatch, tmp_path):
+    monkeypatch.setenv("LATIAO_TEST_PROGRESS_DIR", str(tmp_path / ".local-ai-os"))
+    import importlib
+    import config
+    importlib.reload(config)
+    import agent.prompt_build as PB
+    body = {"messages": [{"role": "user", "content": "hello, what is the weather today?"}]}
+    out = PB._build_chat_messages(body, list(body["messages"]))
+    tail = _tail_of(out)
+    assert "English" in tail and "简体中文" not in tail, f"英文用户不该被要求中文：{tail[-160:]!r}"

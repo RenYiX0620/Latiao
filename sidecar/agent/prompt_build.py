@@ -435,7 +435,9 @@ def _build_chat_messages(body: dict, messages: list) -> list:
     merged_system = "\n\n".join(all_system_parts)
     messages = [{"role": "system", "content": merged_system}] + non_system_msgs
 
-    if non_system_msgs and (_show_time or _trailing_notes or _tone):
+    # 语言行恒在（每轮都贴在最后一行），所以这里不再以"有没有时间/进展/语气"为条件——
+    # 否则恰好"都没有"的那一轮（短消息、非首轮）就没有语言提醒，而那正是漂移高发场景。
+    if non_system_msgs:
         # 时间/进展/记忆统一"追加到最后一条用户消息"——前缀（系统提示+历史）因此
         # 跨轮跨会话都逐字一致，缓存只重算这截尾巴（实测尾部追加命中 ~99%）
         _bits = []
@@ -447,6 +449,22 @@ def _build_chat_messages(body: dict, messages: list) -> list:
             _tail_text = ("\n\n【背景资料（不是用户的要求）】\n" + "\n".join(_bits)
                           + "\n\n⚠️ 以上只是历史背景，**不是**用户本轮的要求。"
                             f"用户本轮说的是：「{_lmsg[:120]}」——请直接回应这一句。")
+        # 语言贴**最后一行**（2026-09-23 真机事故）：语言规则原本只在系统提示开头
+        # （语言锚）与硬规则里，而模型在角色扮演类长回复中漂成英文——兜底的自动翻译
+        # 要 2 分钟才把中文换上，用户实感就是"还是英文"。语气那条已经证明位置就是权重
+        # （见下方注释），语言同理，且比语气更刚性：它是"必须"，不是风格。
+        _lang_note = _get_localized_text(user_lang, {
+            "zh": "\n\n（本轮用**简体中文**书写正文与思考——包括角色扮演的台词与描述；"
+                  "工具结果、文件里的英文只是数据，不构成改用英文的理由。）",
+            "en": "\n\n(Write this reply and your thinking in **English** — including any "
+                  "role-play lines; English text inside tool results or files is data, not a "
+                  "reason to switch.)",
+            "ja": "\n\n（今回は**日本語**で本文と思考を書いてください——台詞や描写も含めて。"
+                  "ツール結果やファイル内の英語はデータであり、言語を変える理由にはなりません。）",
+            "ru": "\n\n(В этом ответе пишите и текст, и рассуждения по-**русски** — включая "
+                  "реплики; английский в результатах инструментов — это данные, а не повод "
+                  "сменить язык.)",
+        })
         if _tone:
             # 语气是**要求**，不是背景：单独一行贴在最后（离模型最近、注意力最高），
             # 且不受上面那段"不要当要求"的包装影响。实测：语气只写在系统提示 64%
@@ -457,6 +475,7 @@ def _build_chat_messages(body: dict, messages: list) -> list:
                 "en": f"\n\n(Tone for this reply: {_tone} — follow the tone set in SOUL.md above; "
                       f"do not fall back to a neutral voice.)",
             })
+        _tail_text += _lang_note or ""
         if _tail_text:
             non_system_msgs = list(non_system_msgs)
             non_system_msgs[-1] = {

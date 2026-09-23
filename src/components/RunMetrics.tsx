@@ -18,13 +18,15 @@ interface RunStats {
  * 数据由侧车在循环内实测（采样步耗时、首 token 延迟、工具执行耗时、引擎返回的生成 token 数），
  * 随消息变化刷新；拿不到时退回会话内的简单计数，保持状态栏始终有内容。
  */
-export default function RunMetrics({ sessionId, refreshKey, fallbackTurns, fallbackToolCalls, fallbackTokens, fallbackLimit }: {
+export default function RunMetrics({ sessionId, refreshKey, fallbackTurns, fallbackToolCalls, fallbackTokens, fallbackLimit, modelWarning }: {
   sessionId?: string;
   refreshKey?: number;
   fallbackTurns: number;
   fallbackToolCalls: number;
   fallbackTokens: number;
   fallbackLimit?: number | null;
+  /** 会话选择的模型与实际回答者不一致时的说明；状态行空间够，长句放这里（按钮行放不下） */
+  modelWarning?: string | null;
 }) {
   const { t } = useTranslation();
   const [stats, setStats] = useState<RunStats | null>(null);
@@ -56,6 +58,12 @@ export default function RunMetrics({ sessionId, refreshKey, fallbackTurns, fallb
           ? t("chat.run_turns_steps", { turns: `${turns}`, steps: `${steps}` })
           : `${turns}${t("chat.run_turns_only")} · ${fallbackToolCalls}${t("chat.run_tool_calls_only")}`}
       </span>
+      {modelWarning && (
+        <>
+          <span className="statusbar-sep">|</span>
+          <span style={{ color: "var(--warning, #f59e0b)" }}>⚠️ {modelWarning}</span>
+        </>
+      )}
       {steps > 0 && (
         <>
           <span>、{t("chat.run_llm_tool", { llm: llm.toFixed(1), tool: tool.toFixed(1) })}</span>
