@@ -402,6 +402,9 @@ async def lifespan(app: FastAPI):
                 from starlette.concurrency import run_in_threadpool
                 import db
                 await run_in_threadpool(db.prune_tool_calls)
+                # ⑦（09-23）：反思保留 + learnings 超限淘汰（与工具历史同一轮里做）
+                await run_in_threadpool(db.prune_reflections)
+                await run_in_threadpool(db.prune_learnings)
             except Exception:
                 logger.warning("工具历史清理任务失败", exc_info=True)
             await asyncio.sleep(24 * 3600)

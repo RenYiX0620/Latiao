@@ -1,7 +1,10 @@
 """Database connection and schema management for Latiao sidecar."""
 import logging
+import os
 import re
 import sqlite3
+import time
+from datetime import datetime
 import threading
 
 from config import PROGRESS_DIR
@@ -198,6 +201,137 @@ def tool_calls_retention_days() -> int:
     except (TypeError, ValueError):
         days = DEFAULT_TOOL_CALLS_RETENTION_DAYS
     return days
+
+
+# ── 记忆的遗忘机制（2026-09-23，审查⑦）────────────────────────────────
+# 审查原文：「全库无 TTL、无行数上限、无定期清理；置信度只涨不降……垃圾记忆进来
+# 的唯一出路是被写入门槛拦住，一旦进去就是永久 1.0 满分」。
+# 这里做两件**不依赖打分**的事（按质量淘汰要等 ⑥ 的检索信号，见 db.prune_learnings）：
+#   1. reflections 定期清理：它是"每次工具调用的过程记录"，本来就不该永久保存
+#      （tool_calls 已有 30 天策略，反思同源同理）；
+#   2. learnings 容量上限：超限时淘汰"价值最低"的（置信度 × 命中次数 × 新近度），
+#      给垃圾记忆一条出路——但只在超限时才动手，日常不减少任何知识。
+DEFAULT_REFLECTIONS_RETENTION_DAYS = 180
+DEFAULT_LEARNINGS_MAX = 3000
+
+
+def reflections_retention_days() -> int:
+    """反思保留天数：环境变量 > config.json memory.reflections_retention_days > 180。<=0 关闭。"""
+    raw = os.environ.get("LATIAO_REFLECTIONS_RETENTION_DAYS")
+    if raw is None:
+        try:
+            import json as _json
+            from config import CONFIG_FILE
+            if CONFIG_FILE.exists():
+                cfg = _json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+                section = cfg.get("memory") if isinstance(cfg, dict) else None
+                if isinstance(section, dict) and section.get("reflections_retention_days") is not None:
+                    raw = str(section.get("reflections_retention_days"))
+        except Exception:
+            raw = None
+    try:
+        return int(raw) if raw is not None else DEFAULT_REFLECTIONS_RETENTION_DAYS
+    except (TypeError, ValueError):
+        return DEFAULT_REFLECTIONS_RETENTION_DAYS
+
+
+def learnings_max() -> int:
+    """learnings 行数上限：环境变量 > config.json memory.learnings_max > 3000。<=0 关闭淘汰。"""
+    raw = os.environ.get("LATIAO_LEARNINGS_MAX")
+    if raw is None:
+        try:
+            import json as _json
+            from config import CONFIG_FILE
+            if CONFIG_FILE.exists():
+                cfg = _json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+                section = cfg.get("memory") if isinstance(cfg, dict) else None
+                if isinstance(section, dict) and section.get("learnings_max") is not None:
+                    raw = str(section.get("learnings_max"))
+        except Exception:
+            raw = None
+    try:
+        return int(raw) if raw is not None else DEFAULT_LEARNINGS_MAX
+    except (TypeError, ValueError):
+        return DEFAULT_LEARNINGS_MAX
+
+
+def prune_learnings(max_rows: int | None = None) -> dict:
+    """超出上限时淘汰价值最低的 learnings。返回 {deleted, kept, max}。
+
+    价值 = confidence × (1 + hit_count) × 新近度（180 天半衰期）。
+    为什么是这三项：置信度是写入侧给的（重复出现会累加），hit_count 是"被检索到过"
+    （唯一的需求侧信号，目前只在 TF-IDF 主路径与 FTS 回退里加），新近度防"一次满分
+    永久占位"。**只在超限时淘汰**——未超限时不动任何一行。
+    """
+    cap = learnings_max() if max_rows is None else int(max_rows)
+    if cap <= 0:
+        return {"deleted": 0, "kept": -1, "max": cap, "skipped": "cap disabled"}
+    conn = _get_db()
+    with _db_write_lock:
+        try:
+            total = conn.execute("SELECT COUNT(*) FROM learnings").fetchone()[0]
+        except Exception:
+            logger.warning("统计 learnings 失败", exc_info=True)
+            return {"deleted": 0, "kept": -1, "max": cap, "skipped": "error"}
+        if total <= cap:
+            return {"deleted": 0, "kept": total, "max": cap}
+        try:
+            rows = conn.execute(
+                "SELECT id, confidence, hit_count, MAX(created_at, updated_at) AS ts "
+                "FROM learnings").fetchall()
+        except Exception:
+            logger.warning("读取 learnings 失败", exc_info=True)
+            return {"deleted": 0, "kept": total, "max": cap, "skipped": "error"}
+        now = time.time()
+        scored = []
+        for rid, conf, hits, ts in rows:
+            try:
+                t = datetime.fromisoformat(ts).timestamp()
+            except (TypeError, ValueError):
+                t = now
+            age_days = max(0.0, (now - t) / 86400)
+            recency = 0.5 ** (age_days / 180.0)          # 180 天半衰期
+            scored.append(((conf or 0.0) * (1.0 + (hits or 0)) * recency, rid))
+        scored.sort()                                     # 最低价值在前
+        victims = [rid for _score, rid in scored[: total - cap]]
+        try:
+            conn.executemany("DELETE FROM learnings WHERE id = ?", [(v,) for v in victims])
+            conn.commit()
+        except Exception:
+            logger.warning("淘汰 learnings 失败", exc_info=True)
+            return {"deleted": 0, "kept": total, "max": cap, "skipped": "error"}
+        deleted = len(victims)
+        kept = total - deleted
+    try:
+        from memory import _mark_tfidf_dirty
+        _mark_tfidf_dirty()                               # 淘汰后必须让检索索引失效
+    except Exception:
+        pass
+    logger.info("learnings 超限淘汰: %d 条（上限 %d，保留 %d）", deleted, cap, kept)
+    return {"deleted": deleted, "kept": kept, "max": cap}
+
+
+def prune_reflections(retention_days: int | None = None) -> dict:
+    """删除超过保留期的反思（与 tool_calls 同源的"过程记录"）。"""
+    days = reflections_retention_days() if retention_days is None else int(retention_days)
+    if days <= 0:
+        return {"days": days, "deleted": 0, "kept": -1, "skipped": "retention disabled"}
+    conn = _get_db()
+    with _db_write_lock:
+        try:
+            cur = conn.execute(
+                "DELETE FROM reflections WHERE created_at != '' AND created_at < datetime('now', ?)",
+                (f"-{days} days",))
+            deleted = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+            conn.commit()
+        except Exception:
+            logger.warning("反思清理失败", exc_info=True)
+            return {"days": days, "deleted": 0, "kept": -1, "skipped": "error"}
+        try:
+            kept = conn.execute("SELECT COUNT(*) FROM reflections").fetchone()[0]
+        except Exception:
+            kept = -1
+    return {"days": days, "deleted": deleted, "kept": kept}
 
 
 def prune_tool_calls(retention_days: int | None = None, vacuum: bool = True) -> dict:
