@@ -259,7 +259,10 @@ def _build_chat_messages(body: dict, messages: list) -> list:
                 "IDENTITY.md 是你的名字与自我认知，AGENTS.md 是你的工作规则，USER.md 是用户档案。\n"
                 "跨轮保持这个语气与人格，不要因为对话变长而漂移；但语气永不压过正确性、"
                 "数据诚实、安全与权限规则。\n"
-                "除与上方【系统规则】【三条硬规则】冲突外，一律照做（冲突时以上方为准）。"
+                "除与上方【系统规则】【三条硬规则】冲突外，一律照做（冲突时以上方为准）。\n"
+                "要改名字就改 IDENTITY.md 里那一行、要改语气就改 SOUL.md 里那一行——"
+                "**不要在别的身份文件里另写一份**（界面读的是各自那个文件，另写会出现"
+                "两个版本、行为与设置页对不上）。"
             ),
             "en": (
                 f"## Identity & tone (your identity files){(' | current tone: ' + _tone) if _tone else ''}\n"
@@ -268,7 +271,11 @@ def _build_chat_messages(body: dict, messages: list) -> list:
                 "USER.md is the user profile.\n"
                 "Keep that tone and persona across turns; do not let it drift as the conversation grows. "
                 "Style never overrides correctness, data honesty, safety, or permission rules.\n"
-                "Follow them unless they conflict with the System rules / Three hard rules above."
+                "Follow them unless they conflict with the System rules / Three hard rules above.\n"
+                "To rename yourself edit the name line in IDENTITY.md; to change tone edit the tone "
+                "line in SOUL.md — **do not write a second copy into another identity file** (the UI "
+                "reads each file separately, so a second copy makes the behaviour and the settings "
+                "page disagree)."
             ),
         }))
         _file_labels = _get_localized_text(user_lang, {

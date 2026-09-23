@@ -66,6 +66,37 @@ def _read_identity() -> list[dict]:
                 msgs.append({"role": "system", "content": content, "file": filename})
         except Exception:
             logger.warning("Failed to read identity file %s", filename, exc_info=True)
+    _warn_on_name_conflict(msgs)
+    return msgs
+
+
+def _warn_on_name_conflict(msgs: list[dict]) -> None:
+    """名字在多个身份文件里说法不一致时告警（2026-09-23）。
+
+    真机事故：用户让助手改叫"欧娜"，识别没命中 → IDENTITY.md 没更新，模型自己用
+    write_file 把名字写进了 USER.md → **两个事实源**：行为叫欧娜（USER.md 进了提示），
+    设置页"辣条的名字"仍是辣条（读 IDENTITY.md）。这种不一致必须留痕，别靠肉眼发现。
+    """
+    canonical = ""
+    for m in msgs:
+        if m.get("file") == "IDENTITY.md":
+            _mm = re.search(r"你的名字是「([^」]+)」", m.get("content") or "")
+            if _mm:
+                canonical = _mm.group(1).strip()
+    if not canonical:
+        return
+    for m in msgs:
+        if m.get("file") == "IDENTITY.md":
+            continue
+        _mm = re.search(r"(?:^|\n)\s*[-*]*\s*\**名字\**\s*[：:]\s*([^\s（(，,。\n]{1,20})",
+                        m.get("content") or "")
+        if _mm:
+            other = _mm.group(1).strip()
+            if other and other != canonical:
+                logger.warning(
+                    "身份文件名字冲突：IDENTITY.md=%r，%s 里写的是 %r —— 界面与行为会对不上；"
+                    "请只保留 IDENTITY.md 里的那一行（2026-09-23 实测过这个坑）",
+                    canonical, m.get("file"), other)
     return msgs
 
 
@@ -132,6 +163,15 @@ _IDENTITY_INTENTS = [
     (re.compile(r"(?:以后)?(?:叫|称呼)你(?:为|是)?[「『\s]*([^\s，。,.]{1,20})[」』]*", re.IGNORECASE), "IDENTITY.md", "name"),
     (re.compile(r"(?:改|换)(?:个)?(?:名字|名称|名(?:为|叫|是))(?:叫|为|是)?[：:]*\s*[「『]*([^\s，。,.]{1,20})[」』]*", re.IGNORECASE), "IDENTITY.md", "name"),
     (re.compile(r"(?:rename|call)\s+(?:yourself|you)\s+(?:to\s+)?['\"]?(\w{1,20})['\"]?", re.IGNORECASE), "IDENTITY.md", "name"),
+    # 09-23 扩充：用户"你已经叫欧娜了"这类自然说法没被上面几条接住 → IDENTITY.md 没更新，
+    # 而模型自己（用 write_file）把名字写进了 USER.md，于是**出现两个事实源**：
+    # 行为里叫欧娜（USER.md 进了提示），设置卡片的"辣条的名字"却还是辣条（读 IDENTITY.md）。
+    (re.compile(r"你(?:的)?(?:新)?名字(?:是|叫|为|改成?|换成?|叫做)?[：:]*\s*[「『]*([^\s，。,.]{1,20})[」』]*", re.IGNORECASE), "IDENTITY.md", "name"),
+    (re.compile(r"你(?:以后|从现在起|从今以后)?(?:就)?(?:自称)?叫([^\s，。,.]{1,20})", re.IGNORECASE), "IDENTITY.md", "name"),
+    # "名字在前"的说法（09-23 矩阵实测漏掉的）：名字改成/换成/改为/叫作 X
+    (re.compile(r"名字(?:改成|改为|换成|换为|叫做|叫|改|换)[：:]*\s*[「『]*([^\s，。,.]{1,20})[」』]*", re.IGNORECASE), "IDENTITY.md", "name"),  # 长优先：写成"换成?"会让裸"换"先匹配、"为X"留进名字（矩阵实测）
+    # 用户自己："我的名字是X" / "我叫X"（后者排除"我叫你X"那类代理人改名）
+    (re.compile(r"(?:我的?名字(?:是|叫|为)|我叫(?!你))[：:]*\s*[「『]*([^\s，。,.]{1,20})[」』]*", re.IGNORECASE), "USER.md", "user_name"),
     # User's own name: "叫我XX" / "称呼我为XX" / "call me XX" → USER.md (not an agent rename)
     (re.compile(r"(?:以后)?(?:叫|称呼)我(?:为|是)?[「『\s]*([^\s，。,.]{1,20})[」』]*", re.IGNORECASE), "USER.md", "user_name"),
     (re.compile(r"(?:call|name)\s+me\s+['\"]?(\w{1,20})['\"]?", re.IGNORECASE), "USER.md", "user_name"),
@@ -173,7 +213,10 @@ def _detect_identity_intent(text: str) -> list[dict]:
             r"帮我|请问|请帮|能不能|可不可以|如何|怎么|为什么|你有没有|我想知道", _t):
         return []
     results = []
-    _BAD_TONE = ("什么", "如何", "怎么", "吗", "呢", "？", "?", "多少", "区别", "意思")
+    # 疑问词守卫（name 与 style 共用）："你叫啥"/"你叫谁" 这类不能当名字
+    # （矩阵实测："你叫啥" 曾把"啥"当名字写进 IDENTITY.md）
+    _BAD_TONE = ("什么", "如何", "怎么", "吗", "呢", "？", "?", "多少", "区别", "意思",
+                 "啥", "谁", "哪", "what", "who", "which")
     for pattern, filename, action in _IDENTITY_INTENTS:
         m = pattern.search(text)
         if m:
@@ -182,6 +225,11 @@ def _detect_identity_intent(text: str) -> list[dict]:
                 value = re.sub(r"^(?:要|再|更|得|请|像|用|把|我的|我|的)+", "", value).strip()
                 if not value or any(b in value for b in _BAD_TONE) or len(value) < 2:
                     continue   # 问句/垃圾值不当语气（"你的语气是什么"）
+            if action in ("name", "user_name"):
+                # 名字同样要挡问句残留（"你叫什么名字" → 捕获"什么名字"）与句末语气词
+                value = re.sub(r"(?:吧|啊|呀|哦|呢|了|的)+$", "", value).strip()
+                if not value or any(b in value for b in _BAD_TONE):
+                    continue
             if value and len(value) >= 1:
                 results.append({"file": filename, "action": action, "value": value, "match": m.group(0)})
     return results
