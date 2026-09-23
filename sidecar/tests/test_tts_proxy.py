@@ -125,6 +125,10 @@ def _stub(monkeypatch, resp):
     client = _FakeClient(resp)
     monkeypatch.setattr(tts_service, "probe_service", lambda conf: True)
     monkeypatch.setattr(tts_service.httpx, "AsyncClient", lambda **kw: client)
+    # 同步取数（_fetch_json，列出音色用）也必须桩：它走 httpx.Client，
+    # 上面只桩了 AsyncClient → 会真连本地语音服务。CI 里没有服务，首跑就
+    # 栽在这（Connection refused，2026-09-23）。
+    monkeypatch.setattr(tts_service, "_fetch_json", lambda url, conf, timeout=5.0: {})
     return client
 
 
@@ -174,6 +178,7 @@ async def test_synthesize_truncates_to_max_chars(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_list_voices_unions_all_models(tmp_path, monkeypatch):
+    monkeypatch.setattr(tts_service, "probe_service", lambda conf: True)   # 不依赖本地服务
     """下拉里是各模型音色的并集（本机：Kokoro 100 + v1.0 49 + 克隆 1）。"""
     monkeypatch.setattr(tts_service, "model_voice_routes",
                         lambda conf: {"女声001": ("kokoro", "zf_001", "kokoro_tts"),
@@ -372,6 +377,7 @@ def test_voice_lang_unknown_is_empty_not_guessed():
 
 @pytest.mark.asyncio
 async def test_list_voices_includes_language_details(tmp_path, monkeypatch):
+    monkeypatch.setattr(tts_service, "probe_service", lambda conf: True)   # 不依赖本地服务
     monkeypatch.setattr(tts_service, "model_voice_routes",
                         lambda conf: {"女声001": ("kokoro", "zf_001", "kokoro_tts"),
                                       "英文女·heart": ("kokoro_v10", "af_heart", "kokoro_tts"),
