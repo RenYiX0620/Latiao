@@ -123,7 +123,7 @@ async def _prefill(client: httpx.AsyncClient, url: str, headers: dict, model: st
 
 async def run_benchmark(api_url: str, headers: dict, model: str,
                         context_limit: int, port: int = 1235,
-                        large: bool = True) -> dict:
+                        large: bool = True, lang: str = "zh") -> dict:
     """跑一轮基准测试（生成 + 预填充 + 内存），返回结果与建议。"""
     import local_llm
     name = getattr(local_llm._engine, "current_model_name", "") or model
@@ -154,42 +154,107 @@ async def run_benchmark(api_url: str, headers: dict, model: str,
         res["prefill"] = pf
     res["rss_gb"] = engine_rss_gb(port)
     res["total_ram_gb"] = total_ram_gb()
-    res["advice"] = _advice(res)
+    res["advice"] = _advice(res, lang)
     _append(res)
     return res
 
 
-def _advice(r: dict) -> list[str]:
+# 建议文案：后端按调用方传来的界面语言出（以前写死中文，英文界面里会突兀地插一段中文）
+_ADVICE_TEXT = {
+    "fast": {
+        "zh": "生成 {tps} tok/s：响应很快，适合日常问答与子代理任务。",
+        "en": "Generation {tps} tok/s: very responsive — good for everyday Q&A and sub-agent work.",
+        "ja": "生成 {tps} tok/s：非常に速く、日常の質疑応答やサブエージェント向き。",
+        "ru": "Генерация {tps} tok/s: очень быстро — подходит для обычных вопросов и суб-агентов.",
+    },
+    "ok": {
+        "zh": "生成 {tps} tok/s：可接受，适合常规分析；长回答需等待。",
+        "en": "Generation {tps} tok/s: acceptable for routine analysis; long answers will take a while.",
+        "ja": "生成 {tps} tok/s：許容範囲。通常の分析向きで、長い回答は待ち時間が発生。",
+        "ru": "Генерация {tps} tok/s: приемлемо для обычного анализа; длинные ответы придётся подождать.",
+    },
+    "slow": {
+        "zh": "生成仅 {tps} tok/s：偏慢——日常问答建议换更小模型或云端，本地留给需要质量的深度任务。",
+        "en": "Generation only {tps} tok/s: slow — use a smaller or cloud model for everyday chat and keep the local one for tasks that need quality.",
+        "ja": "生成は {tps} tok/s のみ：遅め。日常の会話は小型モデルかクラウドへ、ローカルは品質が要る作業に。",
+        "ru": "Генерация всего {tps} tok/s: медленно — для повседневных вопросов возьмите меньшую или облачную модель, локальную оставьте для задач, где важно качество.",
+    },
+    "ttft": {
+        "zh": "首字延迟 {ttft}s 偏高：通常是长上下文或输入过长导致，注意提示体积。",
+        "en": "First-token latency {ttft}s is high: usually a long context or oversized input — watch the prompt size.",
+        "ja": "初回トークン遅延 {ttft}s は高め：長いコンテキストか入力過多が原因。プロンプト量に注意。",
+        "ru": "Задержка первого токена {ttft}s велика: обычно из-за длинного контекста или слишком большого ввода.",
+    },
+    "prefill_slow": {
+        "zh": "读入约 {ktok}K token 需 {sec}s：长文档任务建议先经「长文档筛选」压缩输入，或改用云端模型。",
+        "en": "Reading ~{ktok}K tokens takes {sec}s: for long documents, compress the input with the document filter first or use a cloud model.",
+        "ja": "約 {ktok}K トークンの読み込みに {sec}s：長文は「長文フィルタ」で圧縮するか、クラウドモデルを。",
+        "ru": "Чтение ~{ktok}K токенов занимает {sec}s: для длинных документов сожмите ввод фильтром документов или возьмите облачную модель.",
+    },
+    "prefill_mid": {
+        "zh": "读入约 {ktok}K token 需 {sec}s：中等耗时，可接受。",
+        "en": "Reading ~{ktok}K tokens takes {sec}s: moderate, acceptable.",
+        "ja": "約 {ktok}K トークンの読み込みに {sec}s：中程度で許容範囲。",
+        "ru": "Чтение ~{ktok}K токенов занимает {sec}s: умеренно, приемлемо.",
+    },
+    "ram_tight": {
+        "zh": "内存余量仅 {head:.1f}GB（已用 {rss}GB / 共 {ram}GB）：再调大上下文或加载更大模型有爆内存风险。",
+        "en": "Only {head:.1f}GB RAM headroom ({rss}GB used of {ram}GB): raising the context or loading a bigger model risks running out.",
+        "ja": "メモリ余裕は {head:.1f}GB のみ（使用 {rss}GB / 全 {ram}GB）：コンテキスト拡大や大型モデルは危険。",
+        "ru": "Запас ОЗУ всего {head:.1f}GB (использовано {rss}GB из {ram}GB): увеличение контекста или большая модель рискуют исчерпать память.",
+    },
+    "ram_ok": {
+        "zh": "内存余量 {head:.1f}GB（已用 {rss}GB / 共 {ram}GB）：尚有余地。",
+        "en": "RAM headroom {head:.1f}GB ({rss}GB used of {ram}GB): comfortable.",
+        "ja": "メモリ余裕 {head:.1f}GB（使用 {rss}GB / 全 {ram}GB）：まだ余裕あり。",
+        "ru": "Запас ОЗУ {head:.1f}GB (использовано {rss}GB из {ram}GB): с запасом.",
+    },
+    "none": {
+        "zh": "未采集到有效指标，请确认模型已加载后重试。",
+        "en": "No usable metrics collected — make sure a model is loaded and try again.",
+        "ja": "有効な指標が取れませんでした。モデルを読み込んでから再試行してください。",
+        "ru": "Метрики не собраны — убедитесь, что модель загружена, и повторите.",
+    },
+}
+
+
+def _t(key: str, lang: str, **kw) -> str:
+    table = _ADVICE_TEXT.get(key) or {}
+    text = table.get((lang or "zh").lower()) or table.get("en") or table.get("zh", "")
+    try:
+        return text.format(**kw) if kw else text
+    except (KeyError, ValueError):
+        return text
+
+
+def _advice(r: dict, lang: str = "zh") -> list[str]:
     """规则化建议：只给可执行结论，不做玄学评分。"""
     out: list[str] = []
     tps = r.get("gen_tps") or 0
     ttft = r.get("ttft_s") or 0
     if tps >= 25:
-        out.append(f"生成 {tps} tok/s：响应很快，适合日常问答与子代理任务。")
+        out.append(_t("fast", lang, tps=tps))
     elif tps >= 8:
-        out.append(f"生成 {tps} tok/s：可接受，适合常规分析；长回答需等待。")
+        out.append(_t("ok", lang, tps=tps))
     else:
-        out.append(f"生成仅 {tps} tok/s：偏慢——日常问答建议换更小模型或云端，"
-                   "本地留给需要质量的深度任务。")
+        out.append(_t("slow", lang, tps=tps))
     if ttft >= 5:
-        out.append(f"首字延迟 {ttft}s 偏高：通常是长上下文或输入过长导致，注意提示体积。")
+        out.append(_t("ttft", lang, ttft=ttft))
     for p in r.get("prefill") or []:
         ktok = int(p["chars"] / 1.5 / 1000)
         if p["seconds"] >= 60:
-            out.append(f"读入约 {ktok}K token 需 {p['seconds']}s：长文档任务建议先经"
-                       "「长文档筛选」压缩输入，或改用云端模型。")
+            out.append(_t("prefill_slow", lang, ktok=ktok, sec=p["seconds"]))
         elif p["seconds"] >= 15:
-            out.append(f"读入约 {ktok}K token 需 {p['seconds']}s：中等耗时，可接受。")
+            out.append(_t("prefill_mid", lang, ktok=ktok, sec=p["seconds"]))
     rss, ram = r.get("rss_gb"), r.get("total_ram_gb")
     if rss and ram:
         head = ram - rss
         if head < 4:
-            out.append(f"内存余量仅 {head:.1f}GB（已用 {rss}GB / 共 {ram}GB）："
-                       "再调大上下文或加载更大模型有爆内存风险。")
+            out.append(_t("ram_tight", lang, head=head, rss=rss, ram=ram))
         else:
-            out.append(f"内存余量 {head:.1f}GB（已用 {rss}GB / 共 {ram}GB）：尚有余地。")
+            out.append(_t("ram_ok", lang, head=head, rss=rss, ram=ram))
     if not out:
-        out.append("未采集到有效指标，请确认模型已加载后重试。")
+        out.append(_t("none", lang))
     return out
 
 

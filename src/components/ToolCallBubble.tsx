@@ -44,10 +44,10 @@ function formatToolArgs(args?: Record<string, unknown>): string {
   return `${key}: ${valStr.length > 50 ? valStr.slice(0, 50) + "..." : valStr}`;
 }
 
-function fmtDur(ms: number): string {
+function fmtDur(ms: number, t: (k: string, p?: Record<string, string | number>) => string): string {
   const s = Math.max(0, Math.round(ms / 1000));
-  if (s < 60) return `${s} 秒`;
-  return `${Math.floor(s / 60)} 分 ${s % 60} 秒`;
+  if (s < 60) return t("time.seconds", { n: s });
+  return t("time.minutes", { m: Math.floor(s / 60), s: s % 60 });
 }
 
 const ToolCallBubble = memo(function ToolCallBubble({ msg, onConfirm }: {
@@ -138,7 +138,7 @@ const ToolCallBubble = memo(function ToolCallBubble({ msg, onConfirm }: {
         <span className="tool-call-name">{msg.toolName}</span>
         <span className="tool-call-args">{formatToolArgs(msg.toolArgs)}</span>
         {msg.duration !== undefined && msg.toolStatus === "done" && (
-          <span className="tool-call-duration">· {fmtDur(msg.duration)}</span>
+          <span className="tool-call-duration">· {fmtDur(msg.duration, t)}</span>
         )}
         {msg.toolStatus === "running" && <Loader2 size={13} className="tool-call-spinner" />}
         <span className="tool-call-chevron">{expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}</span>

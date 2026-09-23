@@ -16,34 +16,34 @@ import { COMPOSE_GRACE_MS, COMPOSING_BACKSTOP_MS, shouldSendOnEnter } from "../u
 // 活动类别：工具名 → (类别标签, 数量名词, 图标)。标签英文对齐 DSH/Codex
 // 活动行样式（Think/Bash/Search/Read/Write/Data…），noun 保留中文计数
 const TOOL_CATEGORIES: Record<string, { verb: string; noun: string; icon: LucideIcon }> = {
-  bing_search: { verb: "Search", noun: "搜索", icon: Search },
-  web_search: { verb: "Search", noun: "搜索", icon: Search },
-  tavily_search: { verb: "Search", noun: "搜索", icon: Search },
-  search_files: { verb: "Search", noun: "搜索", icon: Search },
-  mx_query: { verb: "Data", noun: "查询", icon: Database },
-  ak_finance: { verb: "Data", noun: "查询", icon: Database },
-  read_file: { verb: "Read", noun: "文件", icon: FileText },
-  list_dir: { verb: "Read", noun: "目录", icon: FolderOpen },
-  write_file: { verb: "Write", noun: "文件", icon: FilePen },
-  run_cmd: { verb: "Bash", noun: "命令", icon: Terminal },
-  open_folder: { verb: "Open", noun: "目录", icon: FolderOpen },
-  open_app: { verb: "Open", noun: "应用", icon: AppWindow },
-  delegate_task: { verb: "Task", noun: "任务", icon: Users },
-  create_cron: { verb: "Task", noun: "任务", icon: Clock },
+  bing_search: { verb: "Search", noun: "tool.noun_search", icon: Search },
+  web_search: { verb: "Search", noun: "tool.noun_search", icon: Search },
+  tavily_search: { verb: "Search", noun: "tool.noun_search", icon: Search },
+  search_files: { verb: "Search", noun: "tool.noun_search", icon: Search },
+  mx_query: { verb: "Data", noun: "tool.noun_query", icon: Database },
+  ak_finance: { verb: "Data", noun: "tool.noun_query", icon: Database },
+  read_file: { verb: "Read", noun: "tool.noun_file", icon: FileText },
+  list_dir: { verb: "Read", noun: "tool.noun_dir", icon: FolderOpen },
+  write_file: { verb: "Write", noun: "tool.noun_file", icon: FilePen },
+  run_cmd: { verb: "Bash", noun: "tool.noun_cmd", icon: Terminal },
+  open_folder: { verb: "Open", noun: "tool.noun_dir", icon: FolderOpen },
+  open_app: { verb: "Open", noun: "tool.noun_app", icon: AppWindow },
+  delegate_task: { verb: "Task", noun: "tool.noun_task", icon: Users },
+  create_cron: { verb: "Task", noun: "tool.noun_task", icon: Clock },
   // 五控工具
-  screen_capture: { verb: "Capture", noun: "屏幕", icon: Camera },
-  control_list_processes: { verb: "List", noun: "进程", icon: ListTree },
-  control_kill_process: { verb: "Kill", noun: "进程", icon: ScanLine },
-  control_launch: { verb: "Launch", noun: "进程", icon: Play },
-  control_process_log: { verb: "Read", noun: "日志", icon: FileText },
-  control_mouse_move: { verb: "Control", noun: "鼠标", icon: MousePointer2 },
-  control_mouse_click: { verb: "Control", noun: "鼠标", icon: MousePointer2 },
-  control_keyboard_type: { verb: "Control", noun: "键盘", icon: Keyboard },
-  control_keyboard_press: { verb: "Control", noun: "键盘", icon: Keyboard },
-  control_wait: { verb: "Wait", noun: "进程", icon: Clock },
-  control_audit: { verb: "Data", noun: "记录", icon: History },
+  screen_capture: { verb: "Capture", noun: "tool.noun_screen", icon: Camera },
+  control_list_processes: { verb: "List", noun: "tool.noun_process", icon: ListTree },
+  control_kill_process: { verb: "Kill", noun: "tool.noun_process", icon: ScanLine },
+  control_launch: { verb: "Launch", noun: "tool.noun_process", icon: Play },
+  control_process_log: { verb: "Read", noun: "tool.noun_log", icon: FileText },
+  control_mouse_move: { verb: "Control", noun: "tool.noun_mouse", icon: MousePointer2 },
+  control_mouse_click: { verb: "Control", noun: "tool.noun_mouse", icon: MousePointer2 },
+  control_keyboard_type: { verb: "Control", noun: "tool.noun_keyboard", icon: Keyboard },
+  control_keyboard_press: { verb: "Control", noun: "tool.noun_keyboard", icon: Keyboard },
+  control_wait: { verb: "Wait", noun: "tool.noun_process", icon: Clock },
+  control_audit: { verb: "Data", noun: "tool.noun_record", icon: History },
 };
-const TOOL_CATEGORY_FALLBACK = { verb: "Tool call", noun: "调用", icon: Wrench };
+const TOOL_CATEGORY_FALLBACK = { verb: "Tool call", noun: "tool.noun_call", icon: Wrench };
 import ReactMarkdown from "react-markdown";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import remarkGfm from "remark-gfm";
@@ -268,8 +268,8 @@ export default memo(function ChatView({
   // 时长格式化：<3s 显示"几秒"，长于 60s 显示"X 分 X 秒"
   const fmtDur = (ms: number) => {
     const s = Math.max(0, Math.round(ms / 1000));
-    if (s < 60) return `${s} 秒`;
-    return `${Math.floor(s / 60)} 分 ${s % 60} 秒`;
+    if (s < 60) return t("time.seconds", { n: s });
+    return t("time.minutes", { m: Math.floor(s / 60), s: s % 60 });
   };
 
   // 活动行摘要（DSH/Codex 同款：一行可见 = 摘要截断）
@@ -410,7 +410,7 @@ export default memo(function ChatView({
             // 拆分"用户输入文本 + 📎 文件…内容如下：```…```"结构：
             // 文本正常显示，文件内容默认折叠（点击展开）——模型仍收到完整内容，
             // 气泡不再整段刷屏。
-            const fm = msg.content.match(/^([\s\S]*?)\n*📎 文件「(.+?)」内容如下：\s*```\n([\s\S]*?)\n```\s*$/);
+            const fm = msg.content.match(/^([\s\S]*?)\n*📎 [^\n]{1,80}\n\s*```\n([\s\S]*?)\n```\s*$/);
             const textPart = fm ? fm[1].trim() : "";
             const fname = fm ? fm[2] : msg.filename || "";
             const fbody = fm ? fm[3] : msg.content;
@@ -428,7 +428,7 @@ export default memo(function ChatView({
                         onClick={() => setExpandedFiles((prev) => ({ ...prev, [msg.id || ""]: !prev[msg.id || ""] }))}>
                         📄 {fname}
                         <span className="file-attach-meta" style={{ opacity: 0.65, fontSize: "0.85em" }}>
-                          {isExpanded ? " · 收起" : ` · ${(fbody.length / 1024).toFixed(1)} KB · 点击展开`}
+                          {isExpanded ? ` · ${t("chat.collapse")}` : ` · ${(fbody.length / 1024).toFixed(1)} KB · ${t("chat.click_expand")}`}
                         </span>
                       </span>
                     )}
@@ -476,20 +476,21 @@ export default memo(function ChatView({
             const isExplore = sa.agent === "explore";
             const Icon = isExplore ? Search : Bot;
             // ZCode 式活动摘要："终端 · 1 个命令""文件 · 3 次读取"
-            const actLabel: Record<string, [string, string]> = {
-              终端: ["个命令", "个命令"], 文件: ["次读写", "次读写"],
-              搜索: ["次搜索", "次搜索"], 委派: ["个子任务", "个子任务"],
+            // 后端的 activity 分类名是中文（数据），这里映射到 i18n 键再翻译
+            const actLabel: Record<string, string> = {
+              终端: "chat.act_cmd", 文件: "chat.act_file",
+              搜索: "chat.act_search", 委派: "chat.act_delegate",
             };
             const parts = Object.entries(sa.activity || {})
               .filter(([, n]) => n > 0)
-              .map(([cat, n]) => `${cat} · ${n} ${actLabel[cat]?.[0] ?? "次"}`);
+              .map(([cat, n]) => `${cat} · ${n}${actLabel[cat] ? t(actLabel[cat]) : t("chat.act_times")}`);
             return (
               <div key={sa.id} className={`subagent-row${sa.status === "running" ? " running" : sa.status === "error" ? " error" : ""}`} title={sa.last_activity || sa.summary || ""} style={{ cursor: "pointer" }} onClick={() => setSubagentDetail(sa as typeof subagentDetail)}>
                 <span className={`subagent-icon${isExplore ? " explore" : ""}`}><Icon size={13} /></span>
                 <span className="subagent-name">{sa.agent}</span>
                 <span className="subagent-task">· {sa.task.slice(0, 40)}</span>
                 {(parts.length > 0 || (sa.steps ?? 0) > 0) && (
-                  <span className="subagent-activity">{parts.join("　") || `· ${sa.steps} 步`}</span>
+                  <span className="subagent-activity">{parts.join("　") || `· ${t("chat.steps", { n: sa.steps ?? 0 })}`}</span>
                 )}
                 <span className={`subagent-status${sa.status === "running" ? " running" : ""}`}>
                   {sa.status === "running" ? "●" : sa.status === "done" ? "✓" : sa.status === "stale" ? "⚠" : "✗"}
@@ -503,9 +504,9 @@ export default memo(function ChatView({
         <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.35)", backdropFilter: "blur(2px)", WebkitBackdropFilter: "blur(2px)", zIndex: 300, display: "flex", alignItems: "center", justifyContent: "center" }} onClick={() => setSubagentDetail(null)}>
           <div style={{ width: 520, maxWidth: "92%", maxHeight: "70vh", overflowY: "auto", background: "var(--bg-card)", borderRadius: 14, boxShadow: "0 20px 60px rgba(0,0,0,0.3)", padding: "16px 18px" }} onClick={(e) => e.stopPropagation()}>
             <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
-              <span style={{ fontWeight: 700, fontSize: 14 }}>{subagentDetail.agent === "explore" ? "🔍" : "🤖"} 子任务详情</span>
+              <span style={{ fontWeight: 700, fontSize: 14 }}>{subagentDetail.agent === "explore" ? "🔍" : "🤖"} {t("chat.subagent_detail")}</span>
               <span style={{ fontSize: 11, color: subagentDetail.status === "error" ? "var(--danger)" : subagentDetail.status === "done" ? "var(--success)" : "var(--warning)", marginLeft: "auto" }}>
-                {subagentDetail.status === "running" ? "● 执行中" : subagentDetail.status === "done" ? "✓ 已完成" : "✗ 失败"}
+                {subagentDetail.status === "running" ? t("chat.status_running") : subagentDetail.status === "done" ? t("chat.status_done") : t("chat.status_failed")}
               </span>
               {subagentDetail.status !== "running" && (
                 <button className="btn btn-sm btn-ghost" style={{ color: "var(--danger)", padding: "2px 8px" }}
@@ -515,20 +516,20 @@ export default memo(function ChatView({
                       const { authFetch } = await import("../utils/api");
                       const resp = await authFetch(`/v1/subagents/${subagentDetail.id}`, { method: "DELETE" });
                       const d = await resp.json();
-                      if (d.status === "ok") { showToast("已清除该记录"); setSubagentDetail(null); }
-                      else showToast(d.message || "清除失败", "warn");
-                    } catch { showToast("清除失败", "warn"); }
-                  }} title="从列表中清除这条记录">🗑 清除</button>
+                      if (d.status === "ok") { showToast(t("chat.clear_done")); setSubagentDetail(null); }
+                      else showToast(d.message || t("chat.clear_fail"), "warn");
+                    } catch { showToast(t("chat.clear_fail"), "warn"); }
+                  }} title={t("chat.clear_title")}>🗑 {t("chat.clear")}</button>
               )}
               <button className="btn btn-sm btn-ghost" style={{ padding: "2px 8px" }} onClick={() => setSubagentDetail(null)}>✕</button>
             </div>
-            <div style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 6 }}>任务内容：</div>
+            <div style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 6 }}>{t("chat.task_content")}</div>
             <div style={{ fontSize: 12, whiteSpace: "pre-wrap", wordBreak: "break-word", background: "var(--bg-input)", borderRadius: 8, padding: "10px 12px", marginBottom: 10 }}>{subagentDetail.task}</div>
             {(subagentDetail.summary || "").trim() && <>
-              <div style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 6 }}>执行结果：</div>
+              <div style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 6 }}>{t("chat.task_result")}</div>
               <div style={{ fontSize: 12, whiteSpace: "pre-wrap", wordBreak: "break-word", background: "var(--bg-input)", borderRadius: 8, padding: "10px 12px" }}>{subagentDetail.summary}</div>
             </>}
-            {subagentDetail.updated_at && <div style={{ fontSize: 10, color: "var(--text-muted)", marginTop: 10 }}>更新时间：{subagentDetail.updated_at}</div>}
+            {subagentDetail.updated_at && <div style={{ fontSize: 10, color: "var(--text-muted)", marginTop: 10 }}>{t("chat.updated_at", { ts: subagentDetail.updated_at })}</div>}
           </div>
         </div>
       )}
@@ -551,7 +552,7 @@ export default memo(function ChatView({
         turns.forEach((t, i) => { if (t.top !== undefined && t.top <= center) activeIdx = i; });
         const hovered = hoverTurn ? turns[hoverTurn.idx] : null;
         const stripText = (s: string | undefined, n: number) =>
-          (s || "").replace(/```[\s\S]*?```/g, " [代码] ").replace(/[#*|`>-]/g, "").replace(/\s+/g, " ").trim().slice(0, n);
+          (s || "").replace(/```[\s\S]*?```/g, t("chat.code_placeholder")).replace(/[#*|`>-]/g, "").replace(/\s+/g, " ").trim().slice(0, n);
         return (
           <>
           <div className="chat-minimap" onMouseLeave={() => setHoverTurn(null)}>
@@ -572,7 +573,7 @@ export default memo(function ChatView({
           </div>
           {hovered && hovered.q && (
             <div className="mini-preview" style={{ top: Math.max(34, Math.min(34 + (scrollInfo.viewH - 220), 20 + (hoverTurn!.topPx))) }}>
-              <p className="mini-preview-q">{stripText(hovered.q.content, 140) || "（无文字）"}</p>
+              <p className="mini-preview-q">{stripText(hovered.q.content, 140) || t("chat.no_text")}</p>
               {hovered.a && <p className="mini-preview-a">{stripText(hovered.a.content, 180)}</p>}
             </div>
           )}
@@ -590,14 +591,14 @@ export default memo(function ChatView({
           const live = si === segments.length - 1 && taskStartAt !== null && (isProcessing || activeTask !== null);
           const label = live
             ? (elapsed >= 15000 ? `Deep diving… ${fmtDur(elapsed)}` : "Deep diving…")
-            : segDur > 0 ? `已工作 ${fmtDur(segDur)}` : qText || "对话";
+            : segDur > 0 ? t("chat.worked", { d: fmtDur(segDur) }) : qText || t("chat.chat_label");
           // 引擎徽标（09-06：429 降级静默换引擎，用户以为还在用本地模型）——
           // 仅进行中且路由信息可用时显示；本地路径截尾段作短名
           const badgeModel = routeInfo?.declaredModel
             ? (routeInfo.declaredModel.includes("/") ? routeInfo.declaredModel.split("/").filter(Boolean).pop() : routeInfo.declaredModel)
             : "";
           const badge = live && routeInfo?.engine && badgeModel
-            ? `${routeInfo.engine === "云端" ? "☁" : "💻"} ${badgeModel.slice(0, 28)}`
+            ? `${routeInfo.engine === "cloud" ? "☁" : "💻"} ${badgeModel.slice(0, 28)}`
             : "";
           // ZCode 分区渲染：用户消息 → 思考活动行 → 计划 → 工具聚合行 → 回答正文
           const userMsgs = seg.msgs.filter((m) => m.role === "user");
@@ -651,8 +652,8 @@ export default memo(function ChatView({
                     <span>Think</span>
                     <span className="thinking-meta">·</span>
                     <span className="thinking-row-summary">{thinkSummary(thinkRows[0].text)}</span>
-                    {lastRound > 0 && <span className="thinking-meta">· 第 {lastRound} 轮</span>}
-                    {thinkTotalDur > 0 && <span className="thinking-meta">· 持续 {fmtDur(thinkTotalDur)}</span>}
+                    {lastRound > 0 && <span className="thinking-meta">{t("chat.round_n", { n: lastRound })}</span>}
+                    {thinkTotalDur > 0 && <span className="thinking-meta">{t("chat.duration", { d: fmtDur(thinkTotalDur) })}</span>}
                   </summary>
                   <div className="thinking-row-body">
                     {thinkRows.map((r, i) => (
@@ -679,7 +680,7 @@ export default memo(function ChatView({
                     <summary className="tool-group-row-head">
                       <span className="tool-call-icon"><Icon size={14} /></span>
                       <span className="tool-call-name">{g.verb}</span>
-                      <span className="tool-group-row-meta">· {g.msgs.length} {g.noun}</span>
+                      <span className="tool-group-row-meta">· {g.msgs.length} {t(g.noun)}</span>
                       {gSummary && <span className="tool-group-row-summary">· {gSummary}</span>}
                       <span className="tool-group-row-chevron"><ChevronDown size={12} /></span>
                     </summary>

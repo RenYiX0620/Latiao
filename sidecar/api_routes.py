@@ -2015,7 +2015,7 @@ async def local_llm_benchmark(request: Request):
     try:
         import bench_service
         res = await bench_service.run_benchmark(api_url, headers, model, ctx,
-                                                port=port, large=large)
+                                                port=port, large=large, lang=str(body.get("lang") or "zh"))
         return {"status": "ok", **res}
     except httpx.HTTPStatusError as e:
         return {"status": "error", "message": f"引擎返回 HTTP {e.response.status_code}（需先加载模型）"}

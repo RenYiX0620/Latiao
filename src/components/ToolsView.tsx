@@ -36,18 +36,19 @@ interface ToolsViewProps {
   showToast: (msg: string, kind?: "warn") => void;
 }
 
+// 这两张表存**键**、用的时候再翻（模块级常量里拿不到组件内的 t）
 const PERM_LABEL: Record<string, string> = {
-  readonly: "只读",
-  files: "文件读写",
-  network: "网络",
-  shell: "命令执行",
+  readonly: "perm.readonly",
+  files: "perm.files",
+  network: "perm.network",
+  shell: "perm.shell",
 };
 
 const CAP_PERM_LABEL: Record<string, string> = {
-  safe: "安全",
-  confirm: "需确认",
-  danger: "高危",
-  deny: "禁止",
+  safe: "perm.safe",
+  confirm: "perm.confirm",
+  danger: "perm.danger",
+  deny: "perm.deny",
 };
 
 export default function ToolsView({ capabilities, setCapabilities, showToast }: ToolsViewProps) {
@@ -101,11 +102,11 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
           setMarketErr(errs.length ? errs.join("；") : "");
           break;
         }
-        setMarketErr(data.message || "市场加载失败");
+        setMarketErr(data.message || t("tools.market_fail"));
       } catch (e) {
         console.error("市场加载失败(尝试" + (attempt + 1) + "):", e);
         if (attempt === 0) { await new Promise(r => setTimeout(r, 800)); continue; }
-        setMarketErr("市场加载失败（" + String((e as Error)?.message || e) + "）");
+        setMarketErr(t("tools.market_fail") + "（" + String((e as Error)?.message || e) + "）");
       }
     }
     setMarketLoading(false);
@@ -138,11 +139,11 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
       const resp = await authFetch("/v1/marketplace/discover-refresh", { method: "POST" });
       const data = await resp.json();
       if (data.status === "ok") {
-        showToast(data.message || "GitHub 抓取已开始");
+        showToast(data.message || t("tools.discover_started"));
         // 轮询状态直到完成（抓取 3-5 分钟）
         setTimeout(async () => { await refreshDiscover(); await refreshMarket(); setDiscoverRefreshing(false); }, 12000);
-      } else { showToast(data.message || "刷新失败", "warn"); setDiscoverRefreshing(false); }
-    } catch (e) { console.error(e); showToast("刷新失败", "warn"); setDiscoverRefreshing(false); }
+      } else { showToast(data.message || t("tools.refresh_fail"), "warn"); setDiscoverRefreshing(false); }
+    } catch (e) { console.error(e); showToast(t("tools.refresh_fail"), "warn"); setDiscoverRefreshing(false); }
   };
 
   useEffect(() => { refreshMarket(); refreshSources(); refreshDiscover(); }, [refreshMarket, refreshSources, refreshDiscover]);
@@ -198,14 +199,14 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
           });
       const data = await resp.json();
       if (data.status === "ok") {
-        showToast(data.message || "已安装");
+        showToast(data.message || t("tools.installed"));
         setInstallSrc("");
         refreshExtensions();
         refreshCapabilities();
       } else {
-        showToast(data.message || "安装失败", "warn");
+        showToast(data.message || t("tools.install_fail"), "warn");
       }
-    } catch (e) { console.error(e); showToast("安装请求失败", "warn"); }
+    } catch (e) { console.error(e); showToast(t("tools.install_request_fail"), "warn"); }
     finally { setInstalling(false); setConfirming(null); }
   };
 
@@ -221,29 +222,29 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
 
   // ── 多市场源 & 生态安装（Phase 1） ──
   const addSource = async () => {
-    if (!newSourceUrl.trim()) { showToast("请粘贴市场地址", "warn"); return; }
+    if (!newSourceUrl.trim()) { showToast(t("tools.paste_market_url"), "warn"); return; }
     try {
       const resp = await authFetch("/v1/marketplace/sources", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ url: newSourceUrl.trim() }),
       });
       const data = await resp.json();
-      if (data.status === "ok") { showToast(data.message || "已添加"); setNewSourceUrl(""); setShowSourceForm(false); refreshSources(); refreshMarket(); }
-      else { showToast(data.message || "添加失败", "warn"); }
-    } catch (e) { console.error(e); showToast("添加失败", "warn"); }
+      if (data.status === "ok") { showToast(data.message || t("tools.added")); setNewSourceUrl(""); setShowSourceForm(false); refreshSources(); refreshMarket(); }
+      else { showToast(data.message || t("tools.add_fail"), "warn"); }
+    } catch (e) { console.error(e); showToast(t("tools.add_fail"), "warn"); }
   };
 
   const removeSource = async (src: any) => {
-    if (src.builtin && src.removed === false) { showToast("内置源不可删除", "warn"); return; }
+    if (src.builtin && src.removed === false) { showToast(t("tools.builtin_undeletable"), "warn"); return; }
     try {
       const resp = await authFetch("/v1/marketplace/sources", {
         method: "DELETE", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ url: src.url }),
       });
       const data = await resp.json();
-      if (data.status === "ok") { showToast(data.message || "已移除"); refreshSources(); refreshMarket(); }
-      else { showToast(data.message || "移除失败", "warn"); }
-    } catch (e) { console.error(e); showToast("移除失败", "warn"); }
+      if (data.status === "ok") { showToast(data.message || t("tools.removed")); refreshSources(); refreshMarket(); }
+      else { showToast(data.message || t("tools.remove_fail"), "warn"); }
+    } catch (e) { console.error(e); showToast(t("tools.remove_fail"), "warn"); }
   };
 
   // 生态条目安装：走 install-github（下载→打包→安装），复用确认流
@@ -257,14 +258,14 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
         body: JSON.stringify({ url: src.url, blocked: !isBlocked }),
       });
       const data = await resp.json();
-      if (data.status === "ok") { showToast(data.message || "已更新"); refreshSources(); }
-      else showToast(data.message || "操作失败", "warn");
-    } catch (e) { console.error(e); showToast("操作失败", "warn"); }
+      if (data.status === "ok") { showToast(data.message || t("tools.updated")); refreshSources(); }
+      else showToast(data.message || t("tools.op_fail"), "warn");
+    } catch (e) { console.error(e); showToast(t("tools.op_fail"), "warn"); }
   };
 
   const installGitHubItem = async (item: any) => {
     setConfirming({
-      source: `生态源: ${item.repo || item.source_url}`,
+      source: t("tools.source_eco", { repo: item.repo || item.source_url }),
       sha256: item.sha256 || "",
       permissions: item.permissions || [],
       githubItem: item,
@@ -279,10 +280,10 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
         body: JSON.stringify({ name: ext.name, enabled: !ext.enabled }),
       });
       const data = await resp.json();
-      if (data.status !== "ok") { showToast(data.message || "操作失败", "warn"); return; }
+      if (data.status !== "ok") { showToast(data.message || t("tools.op_fail"), "warn"); return; }
       refreshExtensions();
       refreshCapabilities();
-    } catch (e) { console.error(e); showToast("操作失败", "warn"); }
+    } catch (e) { console.error(e); showToast(t("tools.op_fail"), "warn"); }
   };
 
   const uninstallExt = async (ext: ExtensionInfo) => {
@@ -292,11 +293,11 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
         body: JSON.stringify({ name: ext.name }),
       });
       const data = await resp.json();
-      if (data.status !== "ok") { showToast(data.message || "卸载失败", "warn"); return; }
-      showToast(data.message || "已卸载");
+      if (data.status !== "ok") { showToast(data.message || t("tools.uninstall_fail"), "warn"); return; }
+      showToast(data.message || t("tools.uninstalled"));
       refreshExtensions();
       refreshCapabilities();
-    } catch (e) { console.error(e); showToast("卸载失败", "warn"); }
+    } catch (e) { console.error(e); showToast(t("tools.uninstall_fail"), "warn"); }
   };
 
   // ── 统一能力操作 ──
@@ -304,9 +305,9 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
     try {
       const resp = await authFetch(`/v1/capabilities/${cap.name}/toggle`, { method: "POST" });
       const data = await resp.json();
-      if (data.status !== "ok") { showToast(data.message || "操作失败", "warn"); return; }
+      if (data.status !== "ok") { showToast(data.message || t("tools.op_fail"), "warn"); return; }
       setCapabilities(prev => prev.map(c => c.name === cap.name ? { ...c, enabled: data.enabled } : c));
-    } catch (e) { console.error(e); showToast("操作失败", "warn"); }
+    } catch (e) { console.error(e); showToast(t("tools.op_fail"), "warn"); }
   };
 
   const togglePerm = async (cap: Capability) => {
@@ -317,35 +318,35 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
         body: JSON.stringify({ permission: newPerm }),
       });
       const data = await resp.json();
-      if (data.status !== "ok") { showToast(data.message || "操作失败", "warn"); return; }
+      if (data.status !== "ok") { showToast(data.message || t("tools.op_fail"), "warn"); return; }
       setCapabilities(prev => prev.map(c => c.name === cap.name ? { ...c, permission: newPerm } : c));
-      showToast(`${cap.name} → ${newPerm === "safe" ? "安全" : "需确认"}`);
-    } catch (e) { console.error(e); showToast("操作失败", "warn"); }
+      showToast(`${cap.name} → ${newPerm === "safe" ? t("perm.safe") : t("perm.confirm")}`);
+    } catch (e) { console.error(e); showToast(t("tools.op_fail"), "warn"); }
   };
 
   const deleteCap = async (cap: Capability) => {
     try {
       const resp = await authFetch(`/v1/capabilities/skills/${cap.name}`, { method: "DELETE" });
       const data = await resp.json();
-      if (data.status !== "ok") { showToast(data.message || "删除失败", "warn"); return; }
+      if (data.status !== "ok") { showToast(data.message || t("tools.delete_fail"), "warn"); return; }
       setCapabilities(prev => prev.filter(c => c.name !== cap.name));
-      showToast("已删除");
-    } catch (e) { console.error(e); showToast("删除失败", "warn"); }
+      showToast(t("tools.deleted"));
+    } catch (e) { console.error(e); showToast(t("tools.delete_fail"), "warn"); }
   };
 
   const createSkill = async () => {
-    if (!newSkillName.trim() || !newSkillContent.trim()) { showToast("请填写技能名称和内容", "warn"); return; }
+    if (!newSkillName.trim() || !newSkillContent.trim()) { showToast(t("tools.skill_need_name"), "warn"); return; }
     try {
       const resp = await authFetch("/v1/capabilities/skills", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name: newSkillName, content: newSkillContent }),
       });
       const data = await resp.json();
-      if (data.status !== "ok") { showToast(data.message || "创建失败", "warn"); return; }
+      if (data.status !== "ok") { showToast(data.message || t("tools.create_fail"), "warn"); return; }
       setCapabilities(prev => [...prev.filter(c => c.name !== data.skill.name), data.skill]);
       setNewSkillName(""); setNewSkillContent(""); setSkillFormOpen(false);
-      showToast("技能已创建");
-    } catch (e) { console.error(e); showToast("创建失败", "warn"); }
+      showToast(t("tools.skill_created"));
+    } catch (e) { console.error(e); showToast(t("tools.create_fail"), "warn"); }
   };
 
   const saveTavilyKey = async (key: string) => {
@@ -387,7 +388,7 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
 
   // 来源是唯一保留的区分信息：决定条目能否删除（只有自建可删）
   const sourceLabel = (src: string) =>
-    src === "builtin" ? "内置" : src === "user" ? "自建" : src.replace(/^extension:/, "扩展·");
+    src === "builtin" ? t("tools.source_builtin") : src === "user" ? t("tools.badge_custom") : src.replace(/^extension:/, t("tools.badge_ext"));
 
   // 市场搜索：按名称/描述/来源过滤（890 条纯前端，零压力）
   const q = marketQuery.trim().toLowerCase();
@@ -395,7 +396,7 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
     if (p.source_kind === "claude-plugin") return "claude";
     if (p.source_kind === "openclaw-skill" || p.source_kind === "generic-skill") {
       // 手动源 vs 发现源：靠 market_source 区分
-      return p.market_source === "GitHub 发现" ? "discovered" : "openclaw";
+      return p.market_source === "GitHub 发现" ? "discovered" : "openclaw";   // 后端字段值，不翻译
     }
     return "official";
   };
@@ -410,15 +411,15 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
     <div>
       {/* ═══ 扩展市场 ═══ */}
       <div className="card-desc" style={{ marginBottom: 12 }}>
-        无缝安装：拖入 .latiaoext 文件、粘贴 URL 或 GitHub 仓库地址即可安装工具插件、技能与子智能体组合包
+        {t("tools.market_desc")}
       </div>
 
       {/* 市场 / 已装 tab */}
       <div className="tab-bar" style={{ marginBottom: 12 }}>
         <button className={`tab-btn${marketTab === "market" ? " active" : ""}`}
-          onClick={() => setMarketTab("market")}>市场</button>
+          onClick={() => setMarketTab("market")}>{t("tools.market_tab")}</button>
         <button className={`tab-btn${marketTab === "installed" ? " active" : ""}`}
-          onClick={() => setMarketTab("installed")}>已安装</button>
+          onClick={() => setMarketTab("installed")}>{t("tools.installed_tab")}</button>
       </div>
 
       {marketTab === "market" && (
@@ -426,9 +427,9 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
         {/* 市场源管理 */}
         <div className="card" style={{ marginBottom: 14 }}>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-            <div className="card-title" style={{ marginBottom: 0 }}>市场源</div>
+            <div className="card-title" style={{ marginBottom: 0 }}>{t("tools.tab_sources")}</div>
             <button className="btn btn-sm btn-ghost" onClick={() => setShowSourceForm(!showSourceForm)}>
-              {showSourceForm ? "取消" : "＋ 添加源"}
+              {showSourceForm ? t("common.cancel") : t("tools.add_source")}
             </button>
           </div>
           {showSourceForm && (
@@ -436,16 +437,16 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
               <input
                 className="text-input"
                 style={{ flex: 1 }}
-                placeholder="marketplace.json URL / GitHub 仓库（自动识别格式）"
+                placeholder={t("tools.source_placeholder")}
                 value={newSourceUrl}
                 onChange={(e) => setNewSourceUrl(e.target.value)}
                 onKeyDown={(e) => { if (e.key === "Enter") addSource(); }}
               />
-              <button className="btn btn-sm btn-primary" onClick={addSource}>添加</button>
+              <button className="btn btn-sm btn-primary" onClick={addSource}>{t("common.add")}</button>
             </div>
           )}
           <div className="card-desc" style={{ marginTop: 8, fontSize: 11 }}>
-            官方市场是内置源；可添加任意 GitHub agent 仓库（OpenClaw 技能 / Claude Code 插件自动发现）或 marketplace.json 地址。
+            {t("tools.source_hint")}
           </div>
           <div style={{ marginTop: 6 }}>
             {marketSources.map((src) => (
@@ -453,7 +454,7 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
                 display: "flex", alignItems: "center", gap: 8, padding: "5px 0",
                 borderBottom: "1px solid var(--border-default)",
               }}>
-                <span style={{ fontSize: 12, fontWeight: 600 }}>{src.removed ? "(已忽略) " : ""}{src.name}</span>
+                <span style={{ fontSize: 12, fontWeight: 600 }}>{src.removed ? t("tools.ignored") + " " : ""}{src.name}</span>
                 <span className="badge badge-safe">{src.kind}</span>
                 <span style={{ flex: 1, fontSize: 10, color: "var(--text-muted)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                   {src.description || src.url}
@@ -463,16 +464,16 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
                   const isBlocked = blockedSources.some(b => b === key);
                   return (
                     <>
-                      {src.builtin && <span style={{ fontSize: 10, color: "var(--text-muted)" }}>内置</span>}
+                      {src.builtin && <span style={{ fontSize: 10, color: "var(--text-muted)" }}>{t("tools.source_builtin")}</span>}
                       <button className="btn btn-xs"
                         style={{ color: isBlocked ? "var(--danger)" : "var(--text-muted)", padding: "1px 6px", fontSize: 10 }}
                         onClick={() => toggleSourceBlocked(src)}
-                        title={isBlocked ? "解封该来源（恢复可安装）" : "封锁该来源（安装请求会被拒绝）"}>
-                        {isBlocked ? "已封锁" : "封锁"}
+                        title={isBlocked ? t("tools.unblock_source") : t("tools.block_source")}>
+                        {isBlocked ? t("tools.blocked") : t("tools.block")}
                       </button>
                       {!src.builtin && (
                         <button className="btn-icon" style={{ fontSize: 12, color: "var(--danger)" }}
-                          onClick={() => removeSource(src)} title="移除源">✕</button>
+                          onClick={() => removeSource(src)} title={t("tools.remove_source")}>✕</button>
                       )}
                     </>
                   );
@@ -485,19 +486,19 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
         {/* GitHub 自动发现（Discovery Engine：主动抓取生态仓库） */}
         <div className="card" style={{ marginBottom: 14 }}>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-            <div className="card-title" style={{ marginBottom: 0 }}>🌐 GitHub 自动发现</div>
+            <div className="card-title" style={{ marginBottom: 0 }}>{t("tools.discover_title")}</div>
             <button className="btn btn-sm btn-ghost" disabled={discoverRefreshing}
               onClick={triggerDiscoverRefresh}>
-              {discoverRefreshing ? "抓取中…" : "立即抓取"}
+              {discoverRefreshing ? t("tools.fetching") : t("tools.fetch_now")}
             </button>
           </div>
           <div className="card-desc" style={{ marginTop: 6, fontSize: 11 }}>
-            系统从 GitHub 搜索 agent 技能仓库并自动解析 SKILL.md。当前已发现：
-            <b style={{ color: "var(--accent)" }}> {discoverState.entries || 0} 个技能</b>
-            · 来自 <b>{discoverState.repos || 0}</b> 个仓库
+            {t("tools.discover_desc")}
+            <b style={{ color: "var(--accent)" }}> {t("tools.discover_skills", { n: discoverState.entries || 0 })}</b>
+            {t("tools.discover_from_repos", { n: discoverState.repos || 0 })}
             {discoverState.last_scan_ts
-              ? ` · 上次扫描 ${new Date(discoverState.last_scan_ts * 1000).toLocaleString("zh-CN")}`
-              : " · 尚未扫描（点击立即抓取或等待启动扫描）"}
+              ? t("tools.last_scan", { ts: new Date(discoverState.last_scan_ts * 1000).toLocaleString() })
+              : t("tools.never_scanned")}
           </div>
         </div>
 
@@ -506,52 +507,52 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", cursor: "pointer" }}
             onClick={() => setMarketCollapsed(c => !c)}>
             <div className="card-title" style={{ marginBottom: 0 }}>
-              {marketCollapsed ? "▸" : "▾"} 扩展市场
+              {marketCollapsed ? "▸" : "▾"} {t("tools.market_collapsed_title")}
               <span className="badge badge-safe" style={{ marginLeft: 6, fontFamily: "var(--font-mono)" }}>
                 {marketLoading ? "…" : marketPlugins.length}
               </span>
             </div>
             {!marketCollapsed && (
-              <button className="btn btn-xs btn-ghost" onClick={(e) => { e.stopPropagation(); setMarketCollapsed(true); }}>收起</button>
+              <button className="btn btn-xs btn-ghost" onClick={(e) => { e.stopPropagation(); setMarketCollapsed(true); }}>{t("common.collapse")}</button>
             )}
           </div>
           {!marketCollapsed && (<>
-          {marketLoading && <div className="card-desc">加载中…</div>}
+          {marketLoading && <div className="card-desc">{t("common.loading")}</div>}
           {marketErr && <div className="card-desc" style={{ color: "var(--danger)" }}>{marketErr}</div>}
           {/* 搜索框 */}
           <div style={{ display: "flex", gap: 8, marginBottom: 8, marginTop: 10 }}>
             <input
               className="text-input"
               style={{ flex: 1, fontSize: 12 }}
-              placeholder="搜索技能 / 插件 / 仓库…（名称、描述、来源）"
+              placeholder={t("tools.search_placeholder")}
               value={marketQuery}
               onChange={(e) => setMarketQuery(e.target.value)}
             />
             {marketQuery && (
-              <button className="btn btn-xs btn-ghost" onClick={() => setMarketQuery("")}>清空</button>
+              <button className="btn btn-xs btn-ghost" onClick={() => setMarketQuery("")}>{t("common.clear")}</button>
             )}
           </div>
           {/* 类别筛选 chips */}
           <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 8 }}>
             {([
-              ["all", "全部"],
-              ["official", "官方"],
+              ["all", t("common.all")],
+              ["official", t("tools.kind_official")],
               ["openclaw", "OpenClaw"],
-              ["claude", "Claude 插件"],
-              ["discovered", "GitHub 发现"],
+              ["claude", t("tools.kind_claude")],
+              ["discovered", t("tools.tab_discover")],
             ] as [string, string][]).map(([k, label]) => (
               <button key={k} className={`btn btn-xs ${marketCat === k ? "btn-primary" : "btn-ghost"}`}
                 onClick={() => setMarketCat(k as any)}>{label}</button>
             ))}
           </div>
           <div className="card-desc" style={{ marginBottom: 6, fontSize: 11 }}>
-            {marketPlugins.length} 条中匹配 <b style={{ color: "var(--accent)" }}>{filteredPlugins.length}</b> 条
+            {t("tools.matched_of", { total: marketPlugins.length, n: filteredPlugins.length })}
           </div>
           {!marketLoading && !marketErr && marketPlugins.length === 0 && (
-            <div className="card-desc" style={{ marginTop: 8 }}>市场为空——等待官方扩展上架或添加 GitHub 源。已支持：粘贴 URL/GitHub 仓库/本地文件安装。</div>
+            <div className="card-desc" style={{ marginTop: 8 }}>{t("tools.market_empty")}</div>
           )}
           {filteredPlugins.length === 0 && marketPlugins.length > 0 && (
-            <div className="card-desc" style={{ marginTop: 8 }}>没有匹配"{marketQuery}"的内容。</div>
+            <div className="card-desc" style={{ marginTop: 8 }}>{t("tools.no_match_query", { q: marketQuery })}</div>
           )}
           {filteredPlugins.map((item) => {
             const isEco = !!item.source_kind && item.source_kind !== "";
@@ -570,8 +571,8 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
                   <span style={{ fontWeight: 650, fontSize: 13 }}>{isEco ? "🌐" : "🧩"} {item.display_name || item.name}</span>
                   <span className="badge badge-safe">v{item.version}</span>
                   {item.market_source && <span className="badge badge-active">{item.market_source}</span>}
-                  {item.update_available && <span className="badge badge-confirm">有更新</span>}
-                  {item.external_deps && <span className="badge badge-inactive" title="该技能依赖外部 CLI/API 工具，安装后可读取说明但需自行安装依赖">⚠️ 依赖外部工具</span>}
+                  {item.update_available && <span className="badge badge-confirm">{t("tools.has_update")}</span>}
+                  {item.external_deps && <span className="badge badge-inactive" title={t("tools.ext_dep_hint")}>{t("tools.ext_dep_badge")}</span>}
                 </div>
                 <div className="card-desc" style={{ marginTop: 2 }}>{(item.description || "").slice(0, 140)}</div>
                 <div className="card-meta" style={{ marginTop: 2 }}>
@@ -584,7 +585,7 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
               <button className={`btn btn-sm ${item.installed && !item.update_available ? "btn-ghost" : "btn-primary"}`}
                 disabled={item.installed && !item.update_available}
                 onClick={onClick}>
-                {item.update_available ? "更新" : item.installed ? "已安装" : "安装"}
+                {item.update_available ? t("common.update") : item.installed ? t("tools.installed") : t("common.install")}
               </button>
             </div>
           )})}
@@ -596,22 +597,22 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
       {marketTab === "installed" && (
       <>
       <div className="card" style={{ marginBottom: 14 }}>
-        <div className="card-title" style={{ marginBottom: 8 }}>安装扩展</div>
+        <div className="card-title" style={{ marginBottom: 8 }}>{t("tools.install_ext")}</div>
         <div style={{ display: "flex", gap: 8 }}>
           <input
             className="text-input"
             style={{ flex: 1 }}
-            placeholder="粘贴 URL / GitHub 仓库 / .latiaoext 文件路径"
+            placeholder={t("tools.install_placeholder")}
             value={installSrc}
             onChange={(e) => setInstallSrc(e.target.value)}
           />
           <button className="btn btn-primary" disabled={installing || !installSrc.trim()}
             onClick={() => preflightInstall(installSrc)}>
-            {installing ? "安装中…" : "安装"}
+            {installing ? t("tools.installing") : t("common.install")}
           </button>
         </div>
         <div className="card-desc" style={{ marginTop: 6 }}>
-          支持：https://github.com/owner/repo（或 /tree/分支/子目录）、zip 直链、本地文件路径
+          {t("tools.install_source_hint")}
         </div>
       </div>
 
@@ -621,28 +622,28 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
             <div className="card-title">
               🧩 {ext.name}
               <span className="badge badge-safe">v{ext.version}</span>
-              {!ext.enabled && <span className="badge badge-confirm">已禁用</span>}
+              {!ext.enabled && <span className="badge badge-confirm">{t("tools.disabled")}</span>}
             </div>
             <div className="card-desc">{ext.description}</div>
             <div className="card-meta" style={{ marginTop: 6 }}>
-              <span>{authorName(ext.author) || "未知作者"}</span>
+              <span>{authorName(ext.author) || t("tools.unknown_author")}</span>
               <span> · </span>
-              <span>{(ext.permissions || []).map((p) => PERM_LABEL[p] || p).join(" / ") || "只读"}</span>
+              <span>{(ext.permissions || []).map((p) => (PERM_LABEL[p] ? t(PERM_LABEL[p]) : p)).join(" / ") || t("perm.readonly")}</span>
             </div>
             <div className="card-meta" style={{ marginTop: 4 }}>
-              <span>📦 {ext.has_plugin ? "插件" : ""}{ext.has_skills ? " 技能" : ""}{ext.has_agents ? " 子智能体" : ""}</span>
+              <span>📦 {ext.has_plugin ? t("tools.kind_plugin") : ""}{ext.has_skills ? " " + t("tools.kind_skill") : ""}{ext.has_agents ? " " + t("tools.kind_subagent") : ""}</span>
             </div>
             <div style={{ display: "flex", gap: 6, marginTop: 10 }}>
               <button className={`btn btn-sm ${ext.enabled ? "btn-ghost" : "btn-primary"}`}
-                onClick={() => toggleExt(ext)}>{ext.enabled ? "禁用" : "启用"}</button>
-              <button className="btn btn-sm btn-ghost" onClick={() => uninstallExt(ext)}>卸载</button>
+                onClick={() => toggleExt(ext)}>{ext.enabled ? t("common.disable") : t("common.enable")}</button>
+              <button className="btn btn-sm btn-ghost" onClick={() => uninstallExt(ext)}>{t("common.uninstall")}</button>
             </div>
           </div>
         ))}
         {extensions.length === 0 && (
           <div className="card" style={{ gridColumn: "1 / -1" }}>
             <div className="card-desc">
-              还没有安装扩展。上方粘贴来源即可无缝安装（插件 + 技能 + 子智能体组合包）。
+              {t("tools.no_ext_installed")}
             </div>
           </div>
         )}
@@ -662,25 +663,24 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
             borderLeft: "2px solid var(--warning)", background: "var(--bg-card)",
             boxShadow: "0 20px 60px rgba(0,0,0,0.5)",
           }} onClick={(e) => e.stopPropagation()}>
-            <div className="card-title">⚠️ 确认安装来源</div>
+            <div className="card-title">{t("tools.confirm_source")}</div>
             <div className="card-desc" style={{ marginTop: 4, wordBreak: "break-all" }}>
               {confirming.source}
             </div>
             <div className="card-desc" style={{ marginTop: 4 }}>
               {confirming.isGitHubItem
-                ? `社区内容将打包为扩展安装（权限：${(confirming.permissions || []).join("/") || "只读"}）。安装前请确认来源可信。`
-                : "扩展包将获得其 manifest 声明的权限（只读/文件/网络/命令）。安装前请确认来源可信。"}
+                ? t("tools.confirm_perms", { perms: (confirming.permissions || []).join("/") || t("perm.readonly") })
+                : t("tools.confirm_manifest")}
             </div>
             {confirming.isGitHubItem && confirming.githubItem?.external_deps && (
               <div className="card-desc" style={{ marginTop: 4, color: "var(--warning)" }}>
-                ⚠️ 该技能声明依赖外部 CLI/API 工具（如 ntask、特定二进制）。安装后 Latiao 可读取其使用说明，
-                但执行依赖的命令需自行安装对应工具，否则模型将无法完成该操作。
+                {t("tools.ext_dep_modal")}
               </div>
             )}
             <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
               <button className="btn btn-primary" disabled={installing}
-                onClick={() => doInstall(confirming.source, confirming.sha256)}>{installing ? "⏳ 安装中…（下载/校验）" : "确认安装"}</button>
-              <button className="btn btn-ghost" onClick={() => setConfirming(null)}>取消</button>
+                onClick={() => doInstall(confirming.source, confirming.sha256)}>{installing ? t("tools.installing_download") : t("tools.confirm_install")}</button>
+              <button className="btn btn-ghost" onClick={() => setConfirming(null)}>{t("common.cancel")}</button>
             </div>
           </div>
         </div>
@@ -688,9 +688,9 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
 
       {/* ═══ 统一能力列表（工具与技能，一个列表不分栏） ═══ */}
       <div className="page-header" style={{ margin: "14px 0 8px" }}>
-        <div className="card-title" style={{ fontSize: 14 }}>⚙️ 能力</div>
+        <div className="card-title" style={{ fontSize: 14 }}>{t("tools.capability")}</div>
         <div className="card-desc" style={{ marginTop: 2, fontSize: 11 }}>
-          工具与技能统一管理：启用开关、权限级别、使用次数共用一套能力表；技能由模型按需调用（use_skill）
+          {t("tools.caps_desc")}
         </div>
       </div>
 
@@ -711,18 +711,24 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
               {cap.display_name || cap.name}
             </span>
             <span className={`badge ${permBadge}`} style={{ flexShrink: 0 }}>
-              {CAP_PERM_LABEL[cap.permission] || cap.permission}
+              {CAP_PERM_LABEL[cap.permission] ? t(CAP_PERM_LABEL[cap.permission]) : cap.permission}
             </span>
-            {!cap.enabled && <span className="badge badge-confirm" style={{ flexShrink: 0 }}>已禁用</span>}
+            {!cap.enabled && <span className="badge badge-confirm" style={{ flexShrink: 0 }}>{t("tools.disabled")}</span>}
             <span style={{ flex: 1, minWidth: 0, fontSize: 11, color: "var(--text-muted)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-              {cap.description}
+              {(() => {
+                // 描述来自后端（同时是给模型的工具说明，不能动）→ 显示层优先用 i18n 摘要；
+                // t() 找不到键时会原样返回键名，正好用来判断"有没有本地化版本"。
+                const k = `cap.desc.${cap.name}`;
+                const localized = t(k);
+                return localized !== k ? localized : cap.description;
+              })()}
             </span>
             <span style={{ flexShrink: 0, fontSize: 10, color: "var(--text-muted)" }}>
               {t("tools.calls", { count: cap.usage_count })} · {sourceLabel(cap.source)}
             </span>
             <span style={{ display: "flex", gap: 4, flexShrink: 0, alignItems: "center" }}>
               <button className="btn btn-xs btn-ghost"
-                onClick={() => toggleCap(cap)}>{cap.enabled ? "禁用" : "启用"}</button>
+                onClick={() => toggleCap(cap)}>{cap.enabled ? t("common.disable") : t("common.enable")}</button>
               {isTool && (
                 <button className="btn btn-xs btn-ghost" onClick={() => togglePerm(cap)}>
                   {cap.permission === "safe" ? t("tools.set_confirm") : t("tools.set_safe")}
@@ -730,13 +736,13 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
               )}
               {!isTool && cap.source === "user" && (
                 <button className="btn btn-xs btn-ghost" style={{ color: "var(--danger)" }}
-                  onClick={() => deleteCap(cap)}>删除</button>
+                  onClick={() => deleteCap(cap)}>{t("common.delete")}</button>
               )}
             </span>
           </div>
         )})}
         {capabilities.length === 0 && (
-          <div className="card-desc">没有匹配的能力条目。</div>
+          <div className="card-desc">{t("tools.no_capability")}</div>
         )}
       </div>
 

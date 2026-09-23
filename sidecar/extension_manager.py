@@ -22,6 +22,7 @@ import io
 import json
 import logging
 import re
+import time
 import shutil
 import tempfile
 import zipfile
@@ -163,7 +164,7 @@ def _download(url: str) -> bytes:
             url = f"https://codeload.github.com/{owner}/{repo}/zip/refs/heads/{ref}"
         else:
             url = f"https://codeload.github.com/{owner}/{repo}/zip/refs/heads/main"
-    with httpx.Client(timeout=60, follow_redirects=True) as client:
+    with httpx.Client(timeout=15, follow_redirects=True) as client:
         try:
             resp = client.get(url)
             resp.raise_for_status()
@@ -315,7 +316,7 @@ MIRROR_SUFFIXES = (
 _ZIP_URL_RE = __import__("re").compile(r"cdn\.jsdelivr\.net/gh/([^/]+)/([^/]+)@main/(.+)$")
 
 
-def fetch_marketplace(url: str = "", timeout: float = 20) -> dict:
+def fetch_marketplace(url: str = "", timeout: float = 6) -> dict:
     """拉取 marketplace.json：返回规范化插件列表。
     支持 http(s) URL 或本地文件路径（开发用）。"""
     url = (url or DEFAULT_MARKETPLACE).strip()
@@ -564,6 +565,22 @@ def remove_market_source(url: str) -> dict:
     return {"status": "ok", "message": "已移除市场源"}
 
 
+# 源抓取结果缓存：生态源（jsDelivr 树发现）实测单个要 **55 秒**，而市场页每次打开/
+# 刷新都会调本函数 —— 不缓存就等于每次让用户等一分钟（前端请求先超时 → 显示"加载失败"）。
+_SOURCE_CACHE: dict[str, tuple[float, dict]] = {}
+_SOURCE_CACHE_TTL = 600.0        # 10 分钟；主动刷新仍会走真抓取
+
+
+def _cached_source_fetch(url: str, fetcher) -> dict:
+    now = time.monotonic()
+    hit = _SOURCE_CACHE.get(url)
+    if hit and now - hit[0] < _SOURCE_CACHE_TTL:
+        return hit[1]
+    data = fetcher()
+    _SOURCE_CACHE[url] = (now, data)
+    return data
+
+
 def fetch_all_markets() -> dict:
     """聚合所有源的条目（官方 marketplace + 生态源发现 + GitHub 自动发现索引）。
     去重：统一 key = (repo, skill_path) 生态条目 / (name, version) marketplace，
@@ -596,12 +613,20 @@ def fetch_all_markets() -> dict:
         p["update_available"] = False
         merged.append(p)
 
+    # 源是**串行**抓的：网络不通/被墙时每个源都要耗满自己的超时（20~60s），
+    # 三个源叠加就远超前端的请求超时（实测 25s 仍未返回 → 市场页报"加载失败"）。
+    # 给整个聚合一个总时限：到点就带着**已拿到的**结果返回，并如实标注哪些源没来得及。
+    _deadline = time.monotonic() + 8.0
+    _skipped: list[str] = []
     for src in sources:
         if src.get("removed"):
             continue
+        if time.monotonic() > _deadline:
+            _skipped.append(str(src.get("name") or src.get("url") or "?"))
+            continue
         try:
             if src.get("kind") == "marketplace" or src["url"].endswith((".json", ".yaml", ".yml")):
-                data = fetch_marketplace(src["url"])
+                data = _cached_source_fetch(src["url"], lambda u=src["url"]: fetch_marketplace(u))
                 if data.get("status") == "ok":
                     for p in data.get("plugins", []):
                         p["market_source"] = src["name"]
@@ -611,7 +636,7 @@ def fetch_all_markets() -> dict:
             else:
                 # 生态源：jsDelivr 树发现（openclaw / generic）
                 from adapters import discover_auto
-                data = discover_auto(src["url"])
+                data = _cached_source_fetch(src["url"], lambda u=src["url"]: discover_auto(u))
                 if data.get("status") == "ok":
                     for p in data.get("plugins", []):
                         p["market_source"] = src["name"]
@@ -621,6 +646,8 @@ def fetch_all_markets() -> dict:
         except Exception as e:
             logger.warning("fetch source %s failed", src.get("url"), exc_info=True)
             errors.append(f"{src['name']}: {e}")
+    if _skipped:
+        errors.append("未在时限内抓取（网络慢或被墙）：" + "、".join(_skipped))
     # GitHub 自动发现索引并入（主动抓取的结果，source_kind=openclaw-skill，带 repo/skill_path）
     try:
         from discovery import get_discovered_entries
