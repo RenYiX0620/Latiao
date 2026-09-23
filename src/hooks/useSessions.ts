@@ -215,6 +215,9 @@ export function useSessions() {
       }
       setBackendReady(true);
       } catch (e) {
+        // 初始化失败不该让应用起不来：降级用 localStorage（严格说上面每个网络调用
+        // 都各自兜了错，这里是最后一道）。
+        console.warn("[sessions] 初始化异常，继续用本地存储", e);
       }
     })();
     return () => { cancelled = true; };
