@@ -12,7 +12,6 @@ logger = logging.getLogger("latiao-sidecar")   # 与 agent_loop 同名：日志�
 async def _load_mcp_tools() -> None:
     # 依赖仍留在 agent_loop 的定义 → 函数内惰性导入（避免循环依赖）
     from agent_loop import TOOLS
-    from agent_loop import logger
     from agent_loop import TOOL_PERMISSIONS
     from agent_loop import TOOL_DISPATCH
     """扫描启用扩展的 mcpServers 声明，把远程工具并入 TOOLS/DISPATCH。"""
@@ -59,8 +58,6 @@ async def _load_mcp_tools() -> None:
         logger.warning("MCP 扩展扫描失败", exc_info=True)
 
 def ensure_mcp_loaded() -> None:
-    # 依赖仍留在 agent_loop 的定义 → 函数内惰性导入（避免循环依赖）
-    from agent_loop import logger
     """进程内一次性 MCP 注册（幂等）。api_routes 每个请求入口调用。"""
     global _MCP_LOADED
     if _MCP_LOADED:

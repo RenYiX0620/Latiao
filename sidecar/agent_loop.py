@@ -45,6 +45,21 @@ from agent.mcp_tools import (  # noqa: F401  —— re-export（旧导入路径�
     _mcp_tool_name,
     ensure_mcp_loaded,
 )
+from agent.verify import (  # noqa: F401  —— re-export（旧导入路径继续可用）
+    _auto_verify,
+    _enhance_auto_verify,
+    _semgrep_scan,
+)
+from agent.reflection import (  # noqa: F401  —— re-export（旧导入路径继续可用）
+    _REFLECT_CHECKLISTS,
+    _find_unverified_numbers,
+    _generate_plan,
+    _reflect_output,
+)
+from agent.routing import (  # noqa: F401  —— re-export（旧导入路径继续可用）
+    _get_best_cloud_config,
+    _resolve_api_target,
+)
 from agent.progress import (  # noqa: F401  —— re-export（兼容旧导入路径）
     PROGRESS_FILE,        # 规范所有者在 agent.progress：进度路径只留一份定义
     _clean_progress_tail,
@@ -276,135 +291,6 @@ _pending_lock = asyncio.Lock()
 # ║  _auto_verify, execute_tool, _handle_tool_execution  ║
 # ╚══════════════════════════════════════════════════════╝
 
-async def _auto_verify(tool_name: str, args: dict, result: str) -> str:
-    """Run programmatic verification after a tool executes.
-    Returns a verification report to inject into the LLM context, or '' if nothing to verify."""
-    checks = []
-    path = ''
-
-    if tool_name == "write_file":
-        path = args.get("path") or args.get("file") or ""
-        content_written = args.get("content") or ""
-
-        # ── Read-back verification ──
-        if path:
-            try:
-                loop = asyncio.get_running_loop()
-                actual = await loop.run_in_executor(None, lambda: Path(path).read_text(encoding="utf-8"))
-                if actual == content_written:
-                    checks.append(("OK", "回读比对", f"内容一致 ({len(content_written)} 字符)"))
-                else:
-                    diff = len(actual) - len(content_written)
-                    checks.append(("FAIL", "回读比对", f"内容不一致！期望 {len(content_written)} 字符，实际 {len(actual)} (差 {diff})"))
-                lines = actual.split("\n")
-                checks.append(("OK", "完整性", f"{len(lines)} 行, 首行: {lines[0][:60] if lines else '(空)'}"))
-            except FileNotFoundError:
-                checks.append(("FAIL", "文件存在", f"写入后文件不存在: {path}"))
-
-        # ── TypeScript type-check (find nearest tsconfig.json) ──
-        if path.endswith((".ts", ".tsx")):
-            p = Path(path)
-            for parent in [p.parent, p.parent.parent, p.parent.parent.parent]:
-                if (parent / "tsconfig.json").exists():
-                    try:
-                        proc = await asyncio.create_subprocess_exec(
-                            "npx", "tsc", "--noEmit", cwd=str(parent),
-                            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-                        )
-                        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-                        if proc.returncode == 0:
-                            checks.append(("OK", "TS 类型检查", "tsc --noEmit 通过"))
-                        else:
-                            output = (stderr or stdout or b"").decode("utf-8", errors="replace")
-                            errs = [line for line in output.strip().split("\n") if line.strip()]
-                            checks.append(("FAIL", "TS 类型检查", f"发现 {len(errs)} 个错误"))
-                            for el in errs[:3]:
-                                checks.append(("  ", "  ↳", el[:120]))
-                    except FileNotFoundError:
-                        pass
-                    except asyncio.TimeoutError:
-                        checks.append(("FAIL", "TS 类型检查", "超时"))
-                    except Exception:
-                        logger.warning("TypeScript check failed in auto-verify", exc_info=True)
-                    break
-
-    if tool_name == "run_cmd":
-        exit_match = re.search(r'退出码:\s*(\d+)', result)
-        if exit_match:
-            code = int(exit_match.group(1))
-            checks.append(("OK" if code == 0 else "FAIL", "退出码", f"exit {code}"))
-        elif "超时" in result:
-            checks.append(("FAIL", "超时", "命令执行超时 (30s)"))
-
-    if tool_name in ("write_file", "run_cmd"):
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "git", "diff", "--stat",
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
-            if proc.returncode == 0 and stdout.strip():
-                checks.append(("INFO", "Git 变更", "\n" + stdout.decode("utf-8", errors="replace").strip()))
-        except Exception:
-            logger.warning("Git diff check failed in auto-verify", exc_info=True)
-
-        # ── ESLint check for JS/TS files ──
-        if path.endswith((".ts", ".tsx", ".js", ".jsx")):
-            p = Path(path)
-            for parent in [p.parent, p.parent.parent, p.parent.parent.parent]:
-                if (parent / "eslint.config.js").exists() or (parent / ".eslintrc").exists():
-                    try:
-                        proc = await asyncio.create_subprocess_exec(
-                            "npx", "eslint", str(p),
-                            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-                        )
-                        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-                        output = (stdout or stderr or b"").decode("utf-8", errors="replace").strip()
-                        if proc.returncode == 0 and not output:
-                            checks.append(("OK", "ESLint", "无警告"))
-                        elif output:
-                            errs = [line for line in output.split("\n") if line.strip()][:5]
-                            checks.append(("FAIL", "ESLint", f"发现 {len(errs)} 个问题"))
-                            for el in errs[:3]:
-                                checks.append(("  ", "  ↳", el[:120]))
-                    except FileNotFoundError:
-                        pass
-                    except asyncio.TimeoutError:
-                        checks.append(("FAIL", "ESLint", "超时"))
-                    except Exception:
-                        logger.debug("ESLint check failed", exc_info=True)
-                    break
-
-        # ── Python syntax check ──
-        if path.endswith(".py"):
-            try:
-                try:
-                    with open(path, encoding="utf-8") as _f:
-                        source = _f.read()
-                    compile(source, path, "exec")
-                    checks.append(("OK", "Python 语法", "编译通过"))
-                except SyntaxError as _e:
-                    checks.append(("FAIL", "Python 语法", str(_e)[:150]))
-            except FileNotFoundError:
-                pass
-            except asyncio.TimeoutError:
-                checks.append(("FAIL", "Python 语法", "超时"))
-            except Exception:
-                logger.debug("Python syntax check failed", exc_info=True)
-
-    # ── Semgrep security scan ──
-    await _enhance_auto_verify(tool_name, args, result, checks)
-
-    if not checks:
-        return ""
-
-    report = ["\n## 🔍 自动验证"]
-    all_ok = all(s in ("OK", "INFO", "  ") for s, _, _ in checks)
-    report.append(f"**{'✅ 全部通过' if all_ok else '⚠️ 发现问题'}**\n")
-    for status, name, detail in checks:
-        icon = {"OK": "✅", "FAIL": "❌", "INFO": "📋", "  ": "  "}.get(status, status)
-        report.append(f"- {icon} **{name}**: {detail}")
-    return "\n".join(report)
 
 
 # Initialize plugin system at module load (seeded inside _load_plugins)
@@ -660,36 +546,6 @@ def _should_plan(user_text: str, is_local: bool) -> bool:
     return len(user_text.strip()) >= 30 and any(k in user_text.lower() for k in _PLAN_KEYWORDS)
 
 
-async def _generate_plan(user_text: str, model: str, api_url: str, headers: dict,
-                         client: httpx.AsyncClient) -> str:
-    """生成执行计划（3-8 步编号列表）。失败返回空串（降级为普通执行）。"""
-    sys_prompt = (
-        "你是任务规划器。用户给了一个复杂任务，请输出一份简洁、可执行的计划。\n"
-        "要求：\n"
-        "1. 用编号列表列出 3-8 个步骤\n"
-        "2. 每步说明具体要做什么（可提及将使用的工具，如查询行情、读取文件、运行命令、生成报告）\n"
-        "3. 步骤具体可执行，不要空话，不要重复用户原文\n"
-        "4. 只输出计划本身，不要任何前后缀说明"
-    )
-    body = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": sys_prompt},
-            {"role": "user", "content": user_text},
-        ],
-        "max_tokens": 1024,
-        "stream": False,
-        "temperature": 0.3,
-    }
-    try:
-        resp = await client.post(api_url, json=body, headers=headers)
-        resp.raise_for_status()
-        data = resp.json()
-        plan = (data.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
-        return plan.strip()
-    except Exception as e:
-        logger.warning("Plan generation failed (fallback to direct execution): %s", e)
-        return ""
 
 
 def _should_reflect(mode: str, text: str, is_local: bool) -> bool:
@@ -703,21 +559,6 @@ def _should_reflect(mode: str, text: str, is_local: bool) -> bool:
     return False
 
 
-_REFLECT_CHECKLISTS = {
-    "light": (
-        "1. 事实/数据与提供的上下文一致，没有编造数字\n"
-        "2. 结构完整，有明确的结论\n"
-        "3. 没有明显截断、乱码或格式损坏"
-    ),
-    "deep": (
-        "1. 事实/数据与提供的上下文一致，没有编造数字\n"
-        "2. 逻辑自洽，前后不矛盾\n"
-        "3. 结论完整，回应了用户的所有诉求\n"
-        "4. 建议/步骤可执行、无歧义\n"
-        "5. 语言通顺，格式规范\n"
-        "6. 篇幅合适，不啰嗦也不过于简略"
-    ),
-}
 
 
 _NUM_RE = re.compile(r"-?\d+(?:\.\d+)?%")
@@ -736,114 +577,16 @@ def _extract_numbers(text: str) -> list[str]:
     return out
 
 
-def _find_unverified_numbers(text: str, tool_outputs: list[str]) -> list[str]:
-    """报告中出现的、但未能在本次工具查询结果中找到来源的数字。
-    用于反思环节逐项核实——机制化防编造，不依赖模型自觉。"""
-    haystack = "\n".join(tool_outputs)
-    return [n for n in _extract_numbers(text) if n not in haystack]
 
 
-async def _reflect_output(text: str, model: str, api_url: str, headers: dict,
-                          mode: str, client: httpx.AsyncClient,
-                          tool_outputs: list[str] | None = None) -> tuple[str, bool]:
-    """对最终文本做一轮（light）或两轮（deep）自查反思。
-    返回 (最终文本, 是否有修正)。有修正时前端替换最后一条消息。"""
-    checklist = _REFLECT_CHECKLISTS.get(mode, _REFLECT_CHECKLISTS["light"])
-    rounds = 2 if mode == "deep" else 1
-    current = text
-    changed = False
-    # 机制化溯源核查：报告里的数字若在本会话工具查询结果中找不到来源，
-    # 列出供反思模型逐项核实（不硬删，交给模型判断口径）
-    unverified = _find_unverified_numbers(current, tool_outputs or [])
-    unverified_note = ""
-    if unverified:
-        unverified_note = (
-            "\n\n⚠️ 数字溯源核查：以下数字在本会话的**工具查询结果中未找到来源**，"
-            "请逐项处理：\n"
-            + "\n".join(f"- {n}" for n in unverified[:15])
-            + "\n处理规则：属于查询数据（可能因口径/表述不同而未匹配）→ 保留；"
-              "属于宏观/外部数据且本次**没有查询过** → 删除该数字或改为不带具体数字的定性描述。"
-        )
-    for _ in range(rounds):
-        sys_prompt = (
-            "你是输出质检员。检查下面这份回答，严格按清单逐项核对。\n"
-            f"检查清单：\n{checklist}{unverified_note}\n\n"
-            "规则：\n"
-            "- 如果发现实质问题（数据错误、遗漏关键结论、自相矛盾、格式损坏、明显不完整），"
-            "输出修正后的完整版本。\n"
-            "- 如果没有问题，**原样输出原文**，不要添加任何说明。\n"
-            "- 只输出最终版本本身，不要输出检查过程、不要加任何前缀。"
-        )
-        body = {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": sys_prompt},
-                {"role": "user", "content": current},
-            ],
-            "max_tokens": max(2048, len(current) + 2000),
-            "stream": False,
-            "temperature": 0.2,
-        }
-        try:
-            resp = await client.post(api_url, json=body, headers=headers)
-            resp.raise_for_status()
-            data = resp.json()
-            revised = (data.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
-            revised = revised.strip()
-            if revised and revised != current:
-                current = revised
-                changed = True
-        except Exception as e:
-            logger.warning("Reflection failed (keep original): %s", e)
-            break
-    return current, changed
 
 
 REASONING_MODEL_HINTS = ("reasoner", "r1", "reasoning", "thinking", "o1", "o3", "o4", "gpt-5")
 _session_states: dict[str, dict] = {}
 
 
-async def _semgrep_scan(filepath: str) -> str | None:
-    """Run semgrep on a file if available. Returns scan report or None."""
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "semgrep", "--config", "auto", "--quiet", filepath,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-        output = (stdout or b"").decode("utf-8", errors="replace").strip()
-        output += (stderr or b"").decode("utf-8", errors="replace").strip()
-        if output:
-            return output
-        return None
-    except FileNotFoundError:
-        return None  # semgrep not installed
-    except asyncio.TimeoutError:
-        return "semgrep 扫描超时"
-    except Exception:
-        logger.debug("Semgrep scan failed", exc_info=True)
-        return None
 
 
-async def _enhance_auto_verify(tool_name: str, args: dict, result: str, checks: list):
-    """Add semgrep scanning to the verification checks list."""
-    if tool_name != "write_file":
-        return
-    path = args.get("path") or args.get("file") or ""
-    if not path.endswith((".ts", ".tsx", ".js", ".jsx", ".py")):
-        return
-    scan_result = await _semgrep_scan(path)
-    if scan_result:
-        issue_count = scan_result.count("\n") + 1
-        checks.append(("FAIL" if "error" in scan_result.lower() else "OK",
-                       "Semgrep 安全扫描",
-                       f"发现 {issue_count} 行输出" if issue_count > 1 else "通过"))
-        if issue_count > 1:
-            for line in scan_result.split("\n")[:3]:
-                if line.strip():
-                    checks.append(("  ", "  ↳", line[:120]))
-    else:
-        checks.append(("OK", "Semgrep", "跳过 (未安装或无可扫描内容)"))
 
 
 
@@ -1382,61 +1125,5 @@ async def _handle_tool_execution_inner(tc: dict, current_msgs: list, session_id:
 
 
 
-async def _resolve_api_target(cloud_config: dict | None) -> tuple[str, str, dict, bool]:
-    """Resolve API URL, protocol, headers, and whether it's a local LLM (no cloud config).
-    Cloud models are detected by having an endpoint (key is optional for local proxies).
-
-    async：get_api_url 内含同步健康探测（最长 20s + 空闲复验 3s sleep），
-    必须放线程池执行，否则阻塞事件循环（P2-13）。"""
-    if cloud_config and cloud_config.get("endpoint"):
-        protocol = cloud_config.get("protocol", "openai")
-        api_url = cloud_config["endpoint"].rstrip("/") + "/chat/completions"
-        headers = {"Content-Type": "application/json"}
-        key = cloud_config.get("key", "")
-        if key and protocol != "local":
-            headers["Authorization"] = f"Bearer {key}"
-        # If the endpoint points to a local server, treat as cloud (native function calling)
-        return protocol, api_url, headers, False
-    else:
-        from starlette.concurrency import run_in_threadpool
-        protocol = "openai"
-        local_api = await run_in_threadpool(local_llm.get_api_url)
-        if local_api:
-            api_url = local_api + "/chat/completions"
-        else:
-            api_url = ""  # No local LLM running — will be caught as connection error
-        headers = {"Content-Type": "application/json"}
-        return protocol, api_url, headers, True
 
 
-# 闲聊识别（17:11 事故根治）：任务词表里的"做"字会把"你能做什么"判成任务型
-# ——model 因此进入工具结果追问链。闲聊标记优先于任务词：命中即按非任务处理。
-def _get_best_cloud_config() -> dict | None:
-    """Get the best available cloud model config for code tasks."""
-    try:
-        # First try: config.json cloud_models
-        config_file = CONFIG_FILE
-        if config_file.exists():
-            cfg = json.loads(config_file.read_text(encoding="utf-8"))
-            models = cfg.get("cloud_models", [])
-            # Prefer models with "mini" or "gpt" in name for code tasks
-            for m in models:
-                if m.get("endpoint"):
-                    return {
-                        "endpoint": m["endpoint"],
-                        "key": m.get("key", ""),
-                        "model": m.get("name", ""),
-                        "protocol": m.get("protocol", "openai"),
-                    }
-            # Fallback: first model with endpoint
-            for m in models:
-                if m.get("endpoint"):
-                    return {
-                        "endpoint": m["endpoint"],
-                        "key": m.get("key", ""),
-                        "model": m.get("name", ""),
-                        "protocol": m.get("protocol", "openai"),
-                    }
-    except Exception:
-        logger.warning("Failed to read best cloud config", exc_info=True)
-    return None
