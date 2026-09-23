@@ -122,6 +122,10 @@ def test_mx_query_child_env_injects_key_without_token(monkeypatch):
 
 
 def test_mx_data_prefers_memory_over_env(monkeypatch):
+    """进程内的妙想技能（模型的 use_skill 走这条，不走 mx_query 子进程）拿得到 key。
+
+    首版这个测试只断言"模块里有 MX* 名字"，等于什么都没验——改成真的构造对象、
+    检查 api_key 的来源优先级。"""
     import importlib.util
     runtime_secrets.reset_for_tests()
     runtime_secrets.put("MX_APIKEY", "mx-memory")
@@ -131,8 +135,13 @@ def test_mx_data_prefers_memory_over_env(monkeypatch):
         pathlib.Path(cmd_safety.__file__).parent / "skills" / "mx_data" / "mx_data.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    inst = [n for n in dir(mod) if n.lower().startswith("mx")] or None
-    assert inst, "mx_data 里应有 MX* 类"
+    assert mod.MXData().api_key == "mx-memory", "内存里的 key 优先于环境变量"
+    runtime_secrets.reset_for_tests()
+    assert mod.MXData().api_key == "mx-env", "内存为空时回退环境变量（独立运行场景）"
+    # 迁移后的真机形态：环境里没有 MX_APIKEY，只有内存里有
+    monkeypatch.delenv("MX_APIKEY", raising=False)
+    runtime_secrets.put("MX_APIKEY", "mx-only-memory")
+    assert mod.MXData().api_key == "mx-only-memory"
     runtime_secrets.reset_for_tests()
 
 

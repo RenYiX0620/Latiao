@@ -5,9 +5,10 @@ use tauri::Manager;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-/// Per-run sidecar auth token — generated once at startup, injected into the
-/// sidecar process via the LATIAO_AUTH_TOKEN env var and exposed to the
-/// frontend through the get_auth_token command. Stable across sidecar
+/// Per-run sidecar auth token — generated once at startup, handed to the
+/// sidecar over its stdin (never the environment: `ps eww` on macOS reveals a
+/// process's exec-time env, and the model itself can run commands) and exposed
+/// to the frontend through the get_auth_token command. Stable across sidecar
 /// restarts so the frontend's cached token stays valid.
 static AUTH_TOKEN: OnceLock<String> = OnceLock::new();
 

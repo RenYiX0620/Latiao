@@ -18,6 +18,7 @@ from __future__ import annotations
 import sys
 import re
 import secrets
+import time
 
 if __name__ == "__main__":
     # 以脚本方式运行时本模块名为 __main__，而子模块（api_routes/memory 等）
@@ -256,6 +257,9 @@ else:
     )
 
 
+_last_401_log: dict[str, float] = {}
+
+
 class _UnauthorizedError(Exception):
     """401 sentinel raised by _check_auth — 由全局 handler 渲染为统一 JSON。"""
 
@@ -272,7 +276,7 @@ def _check_auth(request: Request) -> None:
       请求不携带自定义 token（本地回环 + 安装包经 minisign 签名验证，安全）
     """
     if not AUTH_TOKEN:
-        raise _UnauthorizedError("sidecar 鉴权未初始化：请通过应用启动（Rust 注入 LATIAO_AUTH_TOKEN），或设置该环境变量后手动启动")
+        raise _UnauthorizedError("sidecar 鉴权未初始化：请通过应用启动（Rust 侧经子进程 stdin 送 token），或设置 LATIAO_AUTH_TOKEN 环境变量后手动启动")
     if request.url.path in ("/health", "/v1/update-latest.json", "/v1/update-file"):
         return
     token = request.headers.get("x-latiao-token", "") or ""
@@ -433,6 +437,16 @@ app = FastAPI(
 
 @app.exception_handler(_UnauthorizedError)
 async def _unauthorized_error_handler(request: Request, exc: _UnauthorizedError) -> JSONResponse:
+    # 401 记一条 warning（2026-09-23 补）：此前只有 JSON 返回、日志里一片空白，
+    # 既查不出"前端拿不到 token"这类故障，也无法判断鉴权到底有没有在生效。
+    # 按 path 限流（同一路径 30s 一条），避免坏掉的前端轮询把日志刷爆。
+    try:
+        now = time.time()
+        if now - _last_401_log.get(request.url.path, 0.0) > 30:
+            _last_401_log[request.url.path] = now
+            logger.warning("401 unauthorized: %s %s", request.method, request.url.path)
+    except Exception:
+        pass
     return JSONResponse(status_code=401, content={"status": "error", "message": "unauthorized"})
 
 app.add_middleware(
