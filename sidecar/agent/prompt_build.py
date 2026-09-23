@@ -25,10 +25,14 @@ from agent.context import (
 from agent.progress import _clean_progress_tail, _progress_tail
 from agent.transport import _safe_cwd
 from identity import _process_identity_intents, _read_identity
-from memory import _get_high_confidence_preferences, _retrieve_relevant_learnings
+from memory import _get_high_confidence_preferences
 from onboarding import process_message as _process_onboarding
 
 logger = logging.getLogger("latiao-sidecar")   # 与 agent_loop 同名：日志格式不变
+
+# 跨会话进展（PROGRESS）的注入节奏：首轮 + 每 N 个用户轮一次（2026-09-23）。
+# 1 = 每轮都注入。数字越大越省 token，但长会话里"我之前干过什么"的记忆越淡。
+_PROGRESS_INJECT_EVERY_TURNS = 6   # 与 agent_loop 同名：日志格式不变
 
 
 PROGRESSIVE_DELIVERY_PROMPT = """
@@ -80,7 +84,7 @@ def _build_chat_messages(body: dict, messages: list) -> list:
     # 分类打标：上下文统计面板按类别展示各段占比（context_stats.record_system_parts）
     part_tags: list[tuple[str, str]] = []
     _volatile_parts: list[str] = []          # 易变块（排到系统提示末尾，保前缀缓存）
-    _trailing_notes: list[str] = []          # 尾部块（追加到最后一条用户消息：时间/进展/记忆）
+    _trailing_notes: list[str] = []          # 尾部块（追加到最后一条用户消息：时间/进展）
 
 
     def _add_part(cat: str, text: str, volatile: bool = False) -> None:
@@ -343,7 +347,11 @@ def _build_chat_messages(body: dict, messages: list) -> list:
     #     09-20：只在**会话首轮**注入，且过滤掉工具调用日志行。这段记的是上个会话的
     #     `**mx_query** / Args: … / Result: 半导体板块…` 工具日志，贴在每条消息尾部
     #     （权重最高）会让弱模型"无论问什么都去找股市"（用户实测反馈）。
-    _is_first_turn = sum(1 for m in messages if m.get("role") == "user") <= 1
+    # 注入节奏（2026-09-23）：此前**只首轮**注入 → 长会话里模型对"我之前干过什么"
+    # 失忆；但每轮都贴也不划算（注入块贴在最后一条用户消息尾部、权重最高，噪声
+    # 成本高）。折中：首轮 + 每 6 轮一次。
+    _user_turns = sum(1 for m in messages if m.get("role") == "user")
+    _is_first_turn = _user_turns <= 1 or (_user_turns - 1) % _PROGRESS_INJECT_EVERY_TURNS == 0
     # 09-23 按会话注入：只读**本会话**的进度文件（此前读全局 PROGRESS.md 尾部，
     # 会把别的会话/别的会话的子代理输出贴进本会话的最后一条用户消息里）
     _prog_sid = str(body.get("session_id") or "").strip() or None
@@ -381,22 +389,11 @@ def _build_chat_messages(body: dict, messages: list) -> list:
     if extra_prompts:
         _add_part("other", "\n".join(extra_prompts))
 
-    # Cross-session memory: inject learnings semantically relevant to current query
-    # 记忆检索是**按本条消息**召回的 → 每轮都不同；而它在历史之前 → 每轮都把
-    # 历史位置错开（同时间块的病）。改为只在会话首轮注入（跨会话背景知识）。
-    # 记忆按消息召回、每轮都不同——但**放在尾部**就不伤前缀缓存（09-19 实测）
-    recent_data = (_retrieve_relevant_learnings(last_user_text, limit=5)
-                   if (last_user_text and not _no_notes) else [])
-    if recent_data:
-        recent_data = [r for r in recent_data if r.get("confidence", 0) >= 0.3]
-    if recent_data:
-        memory_label = _get_localized_text(user_lang, {
-            "zh": "以下是 AI 从过去交互学到的相关知识：",
-            "en": "Relevant learnings from past interactions:",
-            "ja": "過去の対話からの関連知識：",
-        })
-        _trailing_notes.append(memory_label + "\n" + "\n".join(
-            f"- {item['topic']}: {item['content'][:200]}" for item in recent_data))
+    # Cross-session memory（知识注入）**不在这里做**（2026-09-23 修正）：
+    # 这里曾经检索一次贴进尾部 notes，而薄循环 agent/loop.py（每轮都跑）又检索
+    # 一次以【参考知识】追加——同一批 learnings 一份进两份上下文，hit_count 也被
+    # 加两次。现在只由薄循环那处负责（它有 step 日志、按会话状态走）。
+    # 这里的 _trailing_notes 仅保留时间/PROGRESS 等非知识块。
 
     # Always-inject high-confidence preferences (independent of query matching)
     high_prefs = _get_high_confidence_preferences()

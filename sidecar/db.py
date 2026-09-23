@@ -99,10 +99,15 @@ def _init_db():
             "id TEXT PRIMARY KEY, key TEXT UNIQUE NOT NULL, value TEXT NOT NULL, "
             "source TEXT DEFAULT 'inferred', confidence REAL DEFAULT 0.5, "
             "created_at TEXT NOT NULL, updated_at TEXT NOT NULL",
-            [
-                "CREATE VIRTUAL TABLE IF NOT EXISTS preferences_fts USING fts5("
-                "key, value, content='preferences', content_rowid='rowid')",
-            ])
+            [])
+        # preferences_fts 是死索引（2026-09-23 审查）：建了虚表但**没有触发器**
+        # （真库实测触发器只有 tool_calls_*/learnings_*），因此永不更新；全仓库也没有
+        # 任何查询它（偏好是按 confidence 门槛读的，不是文本检索）。新库不再建，
+        # 旧库移除——留着只会让人以为偏好有全文检索。
+        try:
+            conn.execute("DROP TABLE IF EXISTS preferences_fts")
+        except Exception:
+            logger.debug("drop legacy preferences_fts failed", exc_info=True)
 
         # ── 统一能力模型：工具与技能合并为一张能力表（capability registry）──
         # kind: 'tool'（代码插件）| 'skill'（markdown 提示词）

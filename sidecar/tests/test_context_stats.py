@@ -830,15 +830,14 @@ class TestShortMessageNoInjection(unittest.TestCase):
         self.A, self.PB = A, PB
         # monkeypatch 面必须跟着代码搬：_build_chat_messages 现在在 prompt_build 里
         # 按自己的全局名查这些符号，改 agent_loop 的同名属性不会再生效
-        self._tail, self._mem, self._onb = (
-            PB._progress_tail, PB._retrieve_relevant_learnings, PB._process_onboarding)
+        # 知识注入（_retrieve_relevant_learnings）已移出 _build_chat_messages
+        # （2026-09-23：与薄循环重复注入，只保留 loop.py 那处）→ 这里不再需要打补丁
+        self._tail, self._onb = (PB._progress_tail, PB._process_onboarding)
         PB._progress_tail = lambda *a, **k: "- 上次在查半导体板块的资金流向"
-        PB._retrieve_relevant_learnings = lambda *a, **k: []
         PB._process_onboarding = lambda t, l: ("", False)
 
     def tearDown(self):
         self.PB._progress_tail = self._tail
-        self.PB._retrieve_relevant_learnings = self._mem
         self.PB._process_onboarding = self._onb
 
     def _last(self, text):

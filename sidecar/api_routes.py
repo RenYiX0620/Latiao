@@ -1357,8 +1357,12 @@ async def forget_learning(request: Request):
         with _db_write_lock:  # 快速 sqlite 操作，持锁时间短，用同步锁即可
             if lid:
                 conn.execute("DELETE FROM learnings WHERE id = ?", (lid,))
+                from memory import _mark_tfidf_dirty
+                _mark_tfidf_dirty()   # 删行必须让检索索引失效（此前不置脏 → 删掉的仍在结果里）
             elif topic:
                 conn.execute("DELETE FROM learnings WHERE topic = ?", (topic,))
+                from memory import _mark_tfidf_dirty
+                _mark_tfidf_dirty()
             conn.commit()
         return {"status": "ok", "deleted": True}
     except Exception as e:
