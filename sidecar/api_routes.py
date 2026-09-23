@@ -1595,13 +1595,16 @@ async def set_tavily_key(request: Request):
         # Then update macOS Keychain (best-effort)
         try:
             # 密钥经 stdin 传给 security（-w 不带值时从 stdin 读），
-            # 避免 key 出现在 argv 里被 `ps` 读到；同时线程池化防冻结
+            # 避免 key 出现在 argv 里被 `ps` 读到；同时线程池化防冻结。
+            # 2026-09-23 实测修正两处：① -U 必须排在 -w 之前（-w 会把紧跟的参数
+            # 当成密码值 —— 旧写法把字面量 "-U" 存进了 keychain）；
+            # ② security 会连问两遍（password + retype），stdin 必须送两行。
             from starlette.concurrency import run_in_threadpool
             def _sec_write():
                 return subprocess.run(
                     ["security", "add-generic-password", "-s", "com.latiao.desktop",
-                     "-a", "tavily_api_key", "-w", "-U"],
-                    input=key.encode(), capture_output=True, timeout=10,
+                     "-a", "tavily_api_key", "-U", "-w"],
+                    input=f"{key}\n{key}\n".encode(), capture_output=True, timeout=10,
                 )
             await run_in_threadpool(_sec_write)
         except Exception:

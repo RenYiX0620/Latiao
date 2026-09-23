@@ -1,6 +1,6 @@
+from cmd_safety import child_env   # ④ 子进程 env 白名单
 #!/usr/bin/env python3
 """mx_query - 妙想金融数据查询工具"""
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -89,7 +89,7 @@ def execute(args: dict) -> str:
                 result = subprocess.run(
                     [sys.executable, "--mx-query", q],
                     capture_output=True, text=True, timeout=120,
-                    env={**os.environ}
+                    env=child_env(allow_prefixes=("MX_",))   # ④ 白名单：只额外带上数据源自己的凭据
                 )
                 if result.returncode == 0:
                     return result.stdout.strip() or "查询完成，无输出"
@@ -123,7 +123,7 @@ def execute(args: dict) -> str:
             result = subprocess.run(
                 [sys.executable, str(mx_data), "--query", q],
                 capture_output=True, text=True, timeout=120,
-                env={**os.environ}
+                env=child_env(allow_prefixes=("MX_",))   # ④ 白名单：只额外带上数据源自己的凭据
             )
             if result.returncode == 0:
                 out_text = result.stdout.strip() or "查询完成，无输出"

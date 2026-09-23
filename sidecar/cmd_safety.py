@@ -239,3 +239,63 @@ def check_cmd(cmd: str) -> str | None:
         if re.search(pattern, low):
             return f"⛔ Blocked potentially unsafe command: {cmd}"
     return reject_sensitive_read(cmd)
+
+# ── ⑧ 自动加载目录的写入封印（2026-09-23 审计 P1）────────────────────
+# ~/.local-ai-os/extensions/<name>/<ver>/plugin.py 会被 tool_system 用
+# exec_module 加载（下次启动或热重载即执行）。write_file 此前只封了
+# sidecar/plugins/，模型（或被批准的一次写入）能把代码塞进扩展目录 → 与
+# sidecar 同权限的代码执行。
+def sensitive_write_block(path: str) -> str | None:
+    """写入自动加载目录/凭据文件的拒绝文案；允许时返回 None。"""
+    if not path:
+        return None
+    _rp = os.path.realpath(str(path))
+    _norm = _rp.replace(os.sep, "/")
+    for d in _app_data_dirs():
+        for sub in ("extensions", "skills"):
+            _dir = f"{d}{os.sep}{sub}"
+            if _rp == d + os.sep + sub or _rp.startswith(_dir + os.sep):
+                return (f"⛔ 不允许写入自动加载目录（{sub}）—— 写进去的代码会在下次启动/"
+                        f"热重载时执行: {_rp}")
+    # 应用配置含凭据（云端 key / Tavily key），且改它等于改安全开关；走设置界面
+    if os.path.basename(_rp).lower().startswith("config.json"):
+        for d in _app_data_dirs():
+            if _rp.startswith(d + os.sep):
+                return f"⛔ 不允许改写辣条自身配置（含 API 密钥）: {_rp}"
+    if "/.local-ai-os/config.json" in _norm:
+        return f"⛔ 不允许改写辣条自身配置（含 API 密钥）: {_rp}"
+    return None
+
+
+# ── ④ 子进程环境白名单（2026-09-23 审计 P1）──────────────────────────
+# 此前四处子进程全量继承 os.environ：LATIAO_AUTH_TOKEN（侧车全权令牌）与
+# 各家云端 key 对任何被 spawn 的进程可见——模型让 run_cmd 执行 `env` 就能读
+# 回来，MCP server（第三方代码）同样看得到。改为白名单：只透传运行必需项。
+_ENV_ALLOW = frozenset({
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "PWD", "OLDPWD",
+    "TMPDIR", "TEMP", "TMP", "LANG", "TZ", "DISPLAY",
+    # 代理：功能必需（很多用户靠它联网），且通常不含项目凭据
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+    "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+    # SSH agent 转发（git over ssh 需要）
+    "SSH_AUTH_SOCK",
+    # Windows 基本项
+    "SystemRoot", "SYSTEMROOT", "windir", "WINDIR", "ComSpec", "COMSPEC",
+    "PATHEXT", "APPDATA", "LOCALAPPDATA", "USERPROFILE", "ProgramData",
+    "ProgramFiles", "ProgramFiles(x86)", "PSModulePath",
+    "NUMBER_OF_PROCESSORS", "OS", "PROCESSOR_ARCHITECTURE",
+})
+
+
+def child_env(extra: dict | None = None, allow_prefixes: tuple = ()) -> dict:
+    """白名单化的子进程环境变量。
+
+    extra 覆盖/追加（如 MCP server 自己声明的变量）；allow_prefixes 供引擎类
+    子进程透传运行库变量（DYLD_/MTL_/GGML_ 等）——**仍不会放进凭据类变量**。
+    """
+    env = {k: v for k, v in os.environ.items() if k in _ENV_ALLOW}
+    if allow_prefixes:
+        env.update({k: v for k, v in os.environ.items() if k.startswith(allow_prefixes)})
+    if extra:
+        env.update({str(k): str(v) for k, v in extra.items()})
+    return env

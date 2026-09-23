@@ -1,3 +1,4 @@
+from cmd_safety import child_env   # ④ 子进程 env 白名单
 #!/usr/bin/env python3
 """控制类工具共享逻辑（私有模块，带 _ 前缀不会被当作插件加载）。"""
 import os
@@ -121,8 +122,11 @@ def launch_bg(command: str) -> str:
             return "❌ 命令无法解析"
         with open(out_path, "w", encoding="utf-8"), open(err_path, "w", encoding="utf-8") as err_f:
             proc = subprocess.Popen(
+                # ④ 子进程 env 白名单：控制类工具同样不该拿到 LATIAO_AUTH_TOKEN
+                # 与云端 key（此前继承整个 os.environ）
                 tokens, stdout=open(out_path, "w"), stderr=err_f,
                 start_new_session=True, stdin=subprocess.DEVNULL,
+                env=child_env(),
             )
         return (
             f"✅ 已启动: pid={proc.pid}（{command}）\n"

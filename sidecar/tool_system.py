@@ -232,6 +232,14 @@ def execute(args: dict) -> str:
     if os.path.basename(p) in _BLOCKED_FILE_NAMES:
         return f"⛔ Blocked: 不允许写入敏感文件 - {p}"
     # sidecar 的 plugins/ 目录一律拒绝（写入后下次启动会被 import 执行 = RCE）
+    # 自动加载目录（extensions/skills）与应用配置：写进去的代码下次启动即执行（审计 P1 ⑧）
+    try:
+        from cmd_safety import sensitive_write_block
+        _blk = sensitive_write_block(p)
+        if _blk:
+            return _blk
+    except Exception:
+        pass
     sidecar_plugins = os.path.realpath(os.path.dirname(__file__))
     if p == sidecar_plugins or p.startswith(sidecar_plugins + os.sep):
         return f"⛔ Blocked: 不允许写入插件目录 - {p}"
@@ -308,6 +316,7 @@ import subprocess
 # 安全不变量单点定义（破坏/混淆/白名单/敏感路径），
 # fallback 与 seed 共用同一模块，消除三处漂移（审计 P0）。
 from cmd_safety import (
+    child_env,
     DESTRUCTIVE_PATTERNS,
     OBFUSCATION_PATTERNS,
     SAFE_CMD_RE,
@@ -376,7 +385,7 @@ def execute(args: dict) -> str:
         if denied:
             return denied
         try:
-            r = subprocess.run(shlex.split(cmd), shell=False, capture_output=True, text=True, timeout=10)
+            r = subprocess.run(shlex.split(cmd), shell=False, capture_output=True, text=True, env=child_env(), timeout=10)
             return r.stdout.strip() or r.stderr.strip() or "(无输出)"
         except subprocess.TimeoutExpired:
             return f"超时: {cmd}"
@@ -395,7 +404,7 @@ def execute(args: dict) -> str:
     # ── Execute ──
     # 30s 会截断 npm install/构建类长任务——放宽到 300s（P2-15）
     try:
-        r = subprocess.run(shlex.split(cmd), shell=False, capture_output=True, text=True, timeout=300)
+        r = subprocess.run(shlex.split(cmd), shell=False, capture_output=True, text=True, env=child_env(), timeout=300)
         out = r.stdout.strip()
         if r.returncode != 0:
             out += f"\n(退出码: {r.returncode})"

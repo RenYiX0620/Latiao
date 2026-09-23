@@ -391,7 +391,6 @@ except Exception:
 
 
 
-_MCP_LOADED = False
 
 
 

@@ -6,6 +6,7 @@ import subprocess
 # 安全不变量单点定义（破坏/混淆/白名单/敏感路径），
 # fallback 与 seed 共用同一模块，消除三处漂移（审计 P0）。
 from cmd_safety import (
+    child_env,
     DESTRUCTIVE_PATTERNS,
     OBFUSCATION_PATTERNS,
     SAFE_CMD_RE,
@@ -74,7 +75,7 @@ def execute(args: dict) -> str:
         if denied:
             return denied
         try:
-            r = subprocess.run(shlex.split(cmd), shell=False, capture_output=True, text=True, timeout=10)
+            r = subprocess.run(shlex.split(cmd), shell=False, capture_output=True, text=True, env=child_env(), timeout=10)
             return r.stdout.strip() or r.stderr.strip() or "(无输出)"
         except subprocess.TimeoutExpired:
             return f"超时: {cmd}"
@@ -93,7 +94,7 @@ def execute(args: dict) -> str:
     # ── Execute ──
     # 30s 会截断 npm install/构建类长任务——放宽到 300s（P2-15）
     try:
-        r = subprocess.run(shlex.split(cmd), shell=False, capture_output=True, text=True, timeout=300)
+        r = subprocess.run(shlex.split(cmd), shell=False, capture_output=True, text=True, env=child_env(), timeout=300)
         out = r.stdout.strip()
         if r.returncode != 0:
             out += f"\n(退出码: {r.returncode})"
