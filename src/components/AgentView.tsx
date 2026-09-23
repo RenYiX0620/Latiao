@@ -110,7 +110,7 @@ export default function AgentView({ activeAgent, setActiveAgent, showToast }: Ag
     try {
       const url = "/v1/identity/open/" + encodeURIComponent(id) + (section ? "?section=" + encodeURIComponent(section) : "");
       const data = await sidecarFetch(url, "POST");
-      if (data.status !== "ok") showToast(data.message || "打开失败");
+      if (data.status !== "ok") showToast(data.message || t("common.open_fail"));
     } catch { showToast(t("agent.conn_fail")); }
   };
 

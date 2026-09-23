@@ -421,3 +421,39 @@ async def test_emotion_rejects_unknown_values(tmp_path, monkeypatch):
                         lambda conf: {"克隆·婷婷": ("indextts", "", "index_tts2")})
     await tts_service.synthesize("你好", "克隆·婷婷", None, _cfg(tmp_path), emotion="rm -rf /")
     assert "emotion" not in client.posts[-1][1]
+
+
+# ── 基准建议的文案跟界面语言（0.3.41：以前写死中文，英文界面里插一段中文）──
+class TestBenchAdviceI18n:
+    def _advice(self, lang, **res):
+        import bench_service
+        base = {"gen_tps": 30, "ttft_s": 0.5, "prefill": [], "rss_gb": 9.0, "total_ram_gb": 64.0}
+        base.update(res)
+        return bench_service._advice(base, lang)
+
+    def test_same_metrics_localized(self):
+        zh = self._advice("zh")[0]
+        en = self._advice("en")[0]
+        assert "生成" in zh and "Generation" in en
+        assert zh != en
+
+    def test_all_four_languages_exist(self):
+        import bench_service
+        for key, table in bench_service._ADVICE_TEXT.items():
+            for lang in ("zh", "en", "ja", "ru"):
+                assert table.get(lang), f"{key} 缺 {lang}"
+
+    def test_unknown_language_falls_back_not_crashes(self):
+        out = self._advice("xx")
+        assert out and isinstance(out[0], str)
+
+    def test_slow_path(self):
+        # tps 很低（含 0）都走"偏慢"分支 —— none 那条是兜底，正常不可达
+        assert "slow" in self._advice("en", gen_tps=1)[0].lower()
+        assert "slow" in self._advice("en", gen_tps=0, prefill=[], rss_gb=None, total_ram_gb=None)[0].lower()
+
+    def test_ram_and_prefill_advice_localized(self):
+        out = self._advice("en", prefill=[{"chars": 48000 * 1.5, "seconds": 80, "tps": 400}],
+                           rss_gb=63.0, total_ram_gb=64.0)
+        joined = " ".join(out).lower()
+        assert "reading" in joined and "headroom" in joined

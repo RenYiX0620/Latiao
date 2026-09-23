@@ -92,7 +92,7 @@ function buildApiMessages(session: SessionInfo, extraUser?: Message, planMode?: 
       // 工具消息不回灌会让"继续/重试"变成失忆的全新请求（P0-2）：
       // 转成 user 角色 [工具结果] 回灌，模型知道之前查过什么
       const raw = (msg.toolResult || msg.content || "").toString();
-      const preview = raw.length > 1000 ? raw.slice(0, 1000) + "\n...(结果过长已截断)" : raw;
+      const preview = raw.length > 1000 ? raw.slice(0, 1000) + "\n...(truncated)" : raw;
       if (preview.trim()) {
         msgs.push({
           role: "user",
@@ -383,15 +383,16 @@ const [timeFilter, setTimeFilter] = useState("all");
   }, []);
 
 
-  const [fetchDiag, setFetchDiag] = useState("🔍 正在获取...");
+  // 初值留空：t 在这里还没定义（useTranslation 在后面），马上会被状态更新填上
+  const [fetchDiag, setFetchDiag] = useState("");
 
 
   // Fetch capabilities (统一能力模型：工具+技能) from sidecar (via Rust IPC proxy) with health check + retry
   const fetchCapabilities = async () => {
-    setFetchDiag("🔍 检查 Sidecar 状态...");
+    setFetchDiag(t("app.sidecar_checking"));
     const healthy = await waitForSidecar();
     if (!healthy) {
-      setFetchDiag("❌ Sidecar 无响应，请确认 http://127.0.0.1:8765 已启动");
+      setFetchDiag(t("app.sidecar_down", { url: SIDECAR }));
       return;
     }
 
@@ -399,10 +400,10 @@ const [timeFilter, setTimeFilter] = useState("all");
     for (let attempt = 0; attempt < maxRetries; attempt++) {
       try {
         if (attempt > 0) {
-          setFetchDiag(`⏳ 重试获取能力列表... (${attempt}/${maxRetries})`);
+          setFetchDiag(t("app.sidecar_retry", { n: attempt, max: maxRetries }));
           await new Promise(r => setTimeout(r, 2000));
         } else {
-          setFetchDiag("⏳ 正在获取能力列表...");
+          setFetchDiag(t("app.sidecar_caps"));
         }
         const data = await sidecarFetch("/v1/capabilities");
         setFetchDiag(`✅ /v1/capabilities → status=${data.status}`);
@@ -413,7 +414,7 @@ const [timeFilter, setTimeFilter] = useState("all");
         return; // success
       } catch (e: any) {
         if (attempt === maxRetries - 1) {
-          setFetchDiag(`❌ 错误: ${e?.message || String(e)} (已重试${maxRetries}次)`);
+          setFetchDiag(t("app.sidecar_caps_error", { msg: String(e?.message || e), n: maxRetries }));
         }
       }
     }
@@ -442,14 +443,14 @@ const [timeFilter, setTimeFilter] = useState("all");
           const resp = await fetch(SIDECAR + "/health", { signal: AbortSignal.timeout(2000) });
           if (resp.ok) {
             setSidecarStatus("online");
-            showToast("Sidecar 已重启");
+            showToast(t("app.sidecar_restarted"));
             return;
           }
         } catch { /* still starting */ }
       }
-      showToast("Sidecar 重启后无响应，请检查");
+      showToast(t("app.sidecar_restart_dead"));
     } catch (e: any) {
-      showToast(`重启失败: ${e?.message || String(e)}`);
+      showToast(t("app.sidecar_restart_fail", { msg: String(e?.message || e) }));
     } finally {
       setRestartingSidecar(false);
     }
@@ -487,7 +488,7 @@ const [timeFilter, setTimeFilter] = useState("all");
               const header = t(ev.status === "error" ? "toast.cron_fail" : "toast.cron_done", { task: ev.task });
               showToast(header, ev.status === "error" ? "warn" : undefined);
               // 自动新建专属聊天会话，完整结果写入其中（不混入当前对话）
-              const content = `**${header}**\n\n${(ev.full || ev.summary || "").trim() || "(无输出)"}`;
+              const content = `**${header}**\n\n${(ev.full || ev.summary || "").trim() || t("app.no_output")}`;
               const s = newSession();
               const name = `⏰ ${ev.task
                   // emoji 要带 u 标志并用码点写：不加 u 时字符类匹配的是**代理半区**，
@@ -670,7 +671,7 @@ const [timeFilter, setTimeFilter] = useState("all");
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ model_id: modelId }),
       });
-    } catch { showToast("操作失败：后端未响应", "warn"); }
+    } catch { showToast(t("app.backend_no_reply"), "warn"); }
   };
 
   const resumeDownload = async (modelId: string) => {
@@ -679,7 +680,7 @@ const [timeFilter, setTimeFilter] = useState("all");
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ model_id: modelId }),
       });
-    } catch { showToast("操作失败：后端未响应", "warn"); }
+    } catch { showToast(t("app.backend_no_reply"), "warn"); }
   };
 
   const cancelDownload = async (modelId: string) => {
@@ -688,7 +689,7 @@ const [timeFilter, setTimeFilter] = useState("all");
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ model_id: modelId }),
       });
-    } catch { showToast("操作失败：后端未响应", "warn"); }
+    } catch { showToast(t("app.backend_no_reply"), "warn"); }
   };
 
   const startLocalLLM = async (modelId?: string) => {
@@ -754,14 +755,15 @@ const [timeFilter, setTimeFilter] = useState("all");
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const runUpdateCheck = useCallback(async (silent: boolean) => {
     if (checkingUpdate) {
-      if (!silent) showToast("更新检查已在进行中，请稍候（大版本下载可能持续数分钟）", "info");
+      if (!silent) showToast(t("app.update_busy"), "info");
       return;
     }
     setCheckingUpdate(true);
     const { checkForUpdates } = await import("./utils/updater");
-    const res = await checkForUpdates((msg) => showToast(msg), !silent);
+    // updater 只给键与参数（它不该依赖 i18n），这里翻成当前语言
+    const res = await checkForUpdates((key, params) => showToast(t(key, params)), !silent);
     setCheckingUpdate(false);
-    if (!silent && res === "none") showToast("已是最新版本");
+    if (!silent && res === "none") showToast(t("update.uptodate"));
   }, [checkingUpdate, showToast]);
   useEffect(() => {
     import("./utils/updater").then(({ getAppVersion }) => {
@@ -794,7 +796,7 @@ const [timeFilter, setTimeFilter] = useState("all");
         method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal,
       });
     } catch (e) {
-      throw new Error(`无法连接 Sidecar\n原始错误: ${e}`, { cause: e });
+      throw new Error(t("app.sidecar_unreachable", { err: String(e) }), { cause: e });
     }
     if (!response.ok || !response.body) throw new Error(`HTTP ${response.status}`);
 
@@ -908,7 +910,7 @@ const [timeFilter, setTimeFilter] = useState("all");
       if (done) {
         // watchdog 触发的 cancel 会让 read() 以 done:true 正常结束——
         // 若不当报错，截断的回答看起来像"自然结束"，用户无从分辨
-        if (watchdogFired) throw new Error("⏱ 流式响应超时（180s 无数据），已中断。可重试或检查模型服务状态。");
+        if (watchdogFired) throw new Error(t("app.stream_timeout"));
         break;
       }
       armWatchdog();
@@ -928,7 +930,7 @@ const [timeFilter, setTimeFilter] = useState("all");
                 // P0 路由透明化：如实告知用户本请求实际落地的引擎，
                 // 避免"选了云端模型名却静默跑本地最慢路径"的误导。
                 const declared = String(parsed.declared_model || "");
-                const ended = parsed.engine === "cloud" ? "云端" : "本地";
+                const ended = parsed.engine === "cloud" ? "cloud" : "local";   // 稳定枚举，渲染处再翻译
                 const isLocalEngine = parsed.engine === "local";
                 // sendMessage 里云配置已由 opts.cloudConfig 传递；模型名虽被选择但
                 // 未匹配到云端配置 → 实际跑本地，正是要提醒用户的情形
@@ -948,8 +950,8 @@ const [timeFilter, setTimeFilter] = useState("all");
                 // 429 降级切换引擎（09-06：静默切换让用户以为还在用本地模型）
                 const fbLocal = Boolean(parsed.is_local);
                 const fbModel = String(parsed.declared_model || "");
-                setRouteInfo({ engine: fbLocal ? "本地" : "云端", declaredModel: fbModel });
-                showToast(String(parsed.message || "模型已切换") + (fbModel ? `（${fbModel}）` : ""), "warn");
+                setRouteInfo({ engine: fbLocal ? "local" : "cloud", declaredModel: fbModel });
+                showToast(String(parsed.message || t("app.model_switched")) + (fbModel ? ` (${fbModel})` : ""), "warn");
                 continue;
               }
               if (parsed.event === "round_start") {
@@ -983,18 +985,18 @@ const [timeFilter, setTimeFilter] = useState("all");
                 if (plan.trim()) {
                   setMessages((prev) => [...prev, {
                     id: msgId(), role: "assistant",
-                    content: `📋 **执行计划**\n\n${plan}`,
+                    content: `${t("app.plan_title")}\n\n${plan}`,
                   }]);
                 }
               } else if (parsed.event === "plan_confirm") {
                 // 计划确认门控：批准后才开始执行（后端在等这个 call_id 的决定）
                 flushStream();
                 disarmWatchdog();
-                showToast(t("tool.confirm_toast", { tool: "执行计划" }), "warn");
-                setAgentPhase(t("agent.phase_confirm", { tool: "执行计划" }));
+                showToast(t("tool.confirm_toast", { tool: t("app.plan_tool") }), "warn");
+                setAgentPhase(t("agent.phase_confirm", { tool: t("app.plan_tool") }));
                 setMessages((prev) => [...prev, {
                   id: msgId(), role: "tool", type: "tool_call", content: "",
-                  callId: parsed.call_id, toolName: "执行计划",
+                  callId: parsed.call_id, toolName: t("app.plan_tool"),
                   toolArgs: parsed.args, toolStatus: "confirming",
                 }]);
               } else if (parsed.event === "reflection_revised") {
@@ -1012,7 +1014,7 @@ const [timeFilter, setTimeFilter] = useState("all");
                     const msgs = [...prev];
                     for (let i = msgs.length - 1; i >= 0; i--) {
                       if (msgs[i].role === "assistant" && msgs[i].content && msgs[i].content.trim()) {
-                        msgs[i] = { ...msgs[i], content: revised + "\n\n_✍️ 已自查修正_" };
+                        msgs[i] = { ...msgs[i], content: revised + "\n\n" + t("app.self_reviewed") };
                         break;
                       }
                     }
@@ -1068,7 +1070,7 @@ const [timeFilter, setTimeFilter] = useState("all");
                 setActiveTask(activeTaskStackRef.current[activeTaskStackRef.current.length - 1] || null);
                 const rawResult = String(parsed.result ?? "");
                 const toolResult = rawResult.length > 10000
-                  ? rawResult.slice(0, 10000) + `\n\n...(截断)`
+                  ? rawResult.slice(0, 10000) + "\n\n" + t("app.truncated")
                   : rawResult;
                 const isError = rawResult.startsWith("Error") || rawResult.startsWith("⛔");
                 const endTs = Number(parsed.ts) || Date.now();
@@ -1244,10 +1246,10 @@ const [timeFilter, setTimeFilter] = useState("all");
         // 太长截断：上下文有限，128KB 足够覆盖绝大多数源码/文档。
         const MAX_FILE_CHARS = 128 * 1024;
         let body = (pf.content || "").slice(0, MAX_FILE_CHARS);
-        if ((pf.content || "").length > MAX_FILE_CHARS) body += "\n\n...(文件过长已截断)";
+        if ((pf.content || "").length > MAX_FILE_CHARS) body += "\n\n" + t("app.file_truncated");
         userMsg.content =
           (text ? text + "\n\n" : "") +
-          `📎 文件「${pf.name}」内容如下：\n\n\`\`\`\n${body}\n\`\`\``;
+          `${t("app.attached_file", { name: pf.name })}\n\`\`\`\n${body}\n\`\`\``;
       }
     }
 
@@ -1285,7 +1287,7 @@ const [timeFilter, setTimeFilter] = useState("all");
           if (aborted) {
             // User pressed Stop: keep whatever was already generated instead of
             // overwriting it with an error. Drop only a still-empty placeholder.
-            if (last.content) msgs[msgs.length - 1] = { ...last, content: `${last.content}\n\n(已停止)` };
+            if (last.content) msgs[msgs.length - 1] = { ...last, content: `${last.content}\n\n${t("app.stopped_suffix")}` };
             else msgs.pop();
           } else {
             msgs[msgs.length - 1] = { ...last, content: `❌ ${e}` };
@@ -1354,12 +1356,12 @@ const [timeFilter, setTimeFilter] = useState("all");
         const data = await uploadSidecarFile(file);
         if (data?.status === "success" && data.content) {
           setPendingFile({ name: file.name, preview: "📄", type: "file", content: String(data.content) });
-          if (file.type === "application/pdf") showToast("PDF 已提取文字");
+          if (file.type === "application/pdf") showToast(t("app.pdf_extracted"));
         } else {
-          showToast(String(data?.message || "文件解析失败"), "warn");
+          showToast(String(data?.message || t("app.file_parse_fail")), "warn");
         }
       } catch {
-        showToast("文件上传失败", "warn");
+        showToast(t("app.file_upload_fail"), "warn");
       }
     }
   }, []);
@@ -1382,25 +1384,25 @@ const [timeFilter, setTimeFilter] = useState("all");
           lastDropRef.current = { path, ts: now };
           // 预览秒出：先显示"解析中"，后端解析+英化完成后更新内容
           //（翻译是云端调用，大文件可达 1-2 分钟——预览框不能等它）
-          const name0 = path.split("/").pop() || "文件";
-          setPendingFile({ name: name0, preview: "📄", type: "file", content: "⏳ 正在解析文件内容…" });
+          const name0 = path.split("/").pop() || t("app.file_word");
+          setPendingFile({ name: name0, preview: "📄", type: "file", content: t("app.parsing_file") });
           try {
             // 第一段：translate=false 秒回解析原文，预览立即显示真实内容；
             // 第二段：后台再请求 translate=true 的英文版，完成后替换预览。
             const data = await uploadLocalPath(path, false);
             if (data?.status !== "success") {
               setPendingFile(null);
-              showToast(String((data as { message?: string })?.message || "文件解析失败"), "warn");
+              showToast(String((data as { message?: string })?.message || t("app.file_parse_fail")), "warn");
               return;
             }
             const d = data as { content?: string; base64_data?: string; content_type?: string; filename?: string; is_image?: boolean };
-            const name = d.filename || path.split("/").pop() || "文件";
+            const name = d.filename || path.split("/").pop() || t("app.file_word");
             if (d.is_image === true || (d.base64_data && (d.content_type || "").startsWith("image/"))) {
               const mime = d.content_type || "image/png";
               setPendingFile({ name, preview: `data:${mime};base64,${d.base64_data}`, type: "image", content: `data:${mime};base64,${d.base64_data}`, base64: d.base64_data, mimeType: mime });
             } else {
               setPendingFile({ name, preview: "📄", type: "file", content: String(d.content || "") });
-              if ((d.content_type || "").includes("pdf") || name.toLowerCase().endsWith(".pdf")) showToast("PDF 已提取文字");
+              if ((d.content_type || "").includes("pdf") || name.toLowerCase().endsWith(".pdf")) showToast(t("app.pdf_extracted"));
               // 后台英化更新（不阻塞发送——发送时用当前已有内容）
               uploadLocalPath(path, true).then((td) => {
                 setPendingFile((prev) => prev && prev.name === name
@@ -1417,7 +1419,7 @@ const [timeFilter, setTimeFilter] = useState("all");
               });
             }
           } catch {
-            showToast("文件上传失败", "warn");
+            showToast(t("app.file_upload_fail"), "warn");
           }
         };
         const unlisteners: (() => void)[] = [];
@@ -1438,7 +1440,7 @@ const [timeFilter, setTimeFilter] = useState("all");
         // 去掉启动 toast（09-21 用户反馈：状态类提示不进右下角弹窗）
       } catch (e) {
         console.error("[drag-drop] 挂载失败", e);
-        showToast("拖放初始化失败: " + String((e as { message?: string })?.message || e), "warn");
+        showToast(t("app.drop_init_fail", { msg: String((e as { message?: string })?.message || e) }), "warn");
       }
     })();
     return () => { unlisten?.(); };
@@ -1456,12 +1458,12 @@ const [timeFilter, setTimeFilter] = useState("all");
         const data = await uploadSidecarFile(file);
         if (data?.status === "success" && data.content) {
           setPendingFile({ name: file.name, preview: "📄", type: "file", content: String(data.content) });
-          if (file.type === "application/pdf") showToast("PDF 已提取文字");
+          if (file.type === "application/pdf") showToast(t("app.pdf_extracted"));
         } else {
-          showToast(String(data?.message || "文件解析失败"), "warn");
+          showToast(String(data?.message || t("app.file_parse_fail")), "warn");
         }
       } catch {
-        showToast("文件上传失败", "warn");
+        showToast(t("app.file_upload_fail"), "warn");
       }
     }
     if (fileInputRef.current) fileInputRef.current.value = "";
@@ -1727,8 +1729,8 @@ const [timeFilter, setTimeFilter] = useState("all");
         body: JSON.stringify({ model: modelName, key, endpoint, protocol }),
       });
       const data = await resp.json();
-      setTestResult(data.status === "ok" ? "✅ 连接成功" : `❌ ${data.message || "连接失败"}`);
-    } catch { setTestResult("❌ 无法连接 Sidecar"); }
+      setTestResult(data.status === "ok" ? t("app.conn_ok") : t("app.conn_fail", { msg: data.message || t("app.conn_fail_default") }));
+    } catch { setTestResult(t("app.conn_no_sidecar")); }
     finally { setTestingModel(null); }
   };
 
@@ -1748,7 +1750,7 @@ const [timeFilter, setTimeFilter] = useState("all");
             <div className="sidebar-title">辣条</div>
             <div className="sidebar-subtitle">Latiao</div>
           </div>}
-          <button className="sidebar-collapse-btn" onClick={() => setSidebarCollapsed(!sidebarCollapsed)} title="折叠侧边栏">{sidebarCollapsed ? "☰" : "◁"}</button>
+          <button className="sidebar-collapse-btn" onClick={() => setSidebarCollapsed(!sidebarCollapsed)} title={t("sidebar.toggle")}>{sidebarCollapsed ? "☰" : "◁"}</button>
         </div>
 
         <nav className="sidebar-nav">
@@ -1855,7 +1857,7 @@ const [timeFilter, setTimeFilter] = useState("all");
             startRecording={startRecording} confirmTool={confirmTool}
             onSpeak={speak} speakingId={speakingId}
             chatEndRef={chatEndRef} handleDrop={handleDrop}
-            onPasteImage={(file) => processImageFile(file, `截图 ${new Date().toLocaleTimeString()}`)}
+            onPasteImage={(file) => processImageFile(file, t("app.screenshot", { ts: new Date().toLocaleTimeString() }))}
             cloudModels={cloudModels}
             selectedModel={session.selectedModel}
             onSelectModel={setSelectedModel}

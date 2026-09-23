@@ -30,7 +30,7 @@ function fmtTokens(n: number, lang: string): string {
   if (lang === "zh") {
     if (n >= 10000) {
       const w = n / 10000;
-      return `${w >= 100 ? Math.round(w) : w.toFixed(1).replace(/\.0$/, "")}万`;
+      return `${w >= 100 ? Math.round(w) : w.toFixed(1).replace(/\.0$/, "")}万`;   // 仅 zh 分支走到这里
     }
     return n.toLocaleString();
   }

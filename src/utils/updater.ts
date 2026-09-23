@@ -38,7 +38,7 @@ async function sidecarPrepare(version: string): Promise<boolean> {
 
 /** 轮询预下载进度直到终态。返回终态或 null（sidecar 掉线/超时）。 */
 async function pollPreDownload(
-  onProgress: (msg: string) => void,
+  onProgress: (key: string, params?: Record<string, string | number>) => void,
   maxMs: number,
 ): Promise<"done" | "failed" | "up_to_date" | "idle" | null> {
   const deadline = Date.now() + maxMs;
@@ -53,7 +53,7 @@ async function pollPreDownload(
         const pct = Math.floor((downloaded / total) * 100);
         const mb = (downloaded / 1024 / 1024).toFixed(0);
         const mbt = (total / 1024 / 1024).toFixed(0);
-        onProgress(`正在下载新版本 ${p.version}… ${pct}%（${mb}/${mbt} MB，断线自动续传）`);
+        onProgress("update.downloading", { version: p.version, pct, mb, mbt });
       }
       if (p.status === "done") return "done";
       if (p.status === "failed") return "failed";
@@ -74,11 +74,11 @@ async function pollPreDownload(
  *   预下载完成后下次手动检查或重启时会安装
  */
 export async function checkForUpdates(
-  onStatus: (msg: string) => void,
+  onStatus: (key: string, params?: Record<string, string | number>) => void,
   interactive = true,
 ): Promise<UpdateCheckResult> {
   try {
-    onStatus("正在检查更新…");
+    onStatus("update.checking");
     const version = await getAppVersion();
     const waitMs = interactive ? 60 * 60 * 1000 : 90 * 1000;
     let outcome: "done" | "failed" | "up_to_date" | "idle" | null = null;
@@ -88,11 +88,11 @@ export async function checkForUpdates(
     if (prepared) {
       outcome = await pollPreDownload(onStatus, waitMs);
       if (outcome === "up_to_date") {
-        if (interactive) onStatus("当前已是最新版本");
+        if (interactive) onStatus("update.uptodate_interactive");
         return "none";
       }
       if (outcome === "done") {
-        onStatus("下载完成，正在校验签名并安装…");
+        onStatus("update.verifying");
       }
       // failed / null → 落到下方 tauri updater 兜底
     }
@@ -102,17 +102,17 @@ export async function checkForUpdates(
     if (!update) {
       if (prepared && outcome === null) {
         // sidecar 掉线回退：endpoint 仍指向 sidecar → 清单不可得
-        onStatus("更新检查不可用（sidecar 未运行），请稍后重试或手动下载");
+        onStatus("update.unavailable");
         return "error";
       }
-      if (interactive) onStatus("已是最新版本");
+      if (interactive) onStatus("update.uptodate");
       return "none";
     }
-    onStatus(`发现新版本 ${update.version}，正在安装…`);
+    onStatus("update.found", { version: update.version });
     // 静默预下载模式只下不装：启动时自动安装并重启会在用户正聊天时
     // 强制退出（审计 P1）。下载安装/重启仅限用户显式点「检查更新」。
     if (!interactive) {
-      onStatus("更新包已准备好，下次手动检查或稍后重启时安装");
+      onStatus("update.prepared");
       return "prepared";
     }
     // 安装前停 sidecar/引擎：**仅 Windows 需要**（残留 sidecar.exe 会锁住自身
@@ -127,7 +127,7 @@ export async function checkForUpdates(
         const { invoke } = await import("@tauri-apps/api/core");
         await invoke("stop_sidecar_for_update");
         stoppedSidecar = true;
-        onStatus("已停止后台进程，开始安装…");
+        onStatus("update.stopping_backend");
       } catch { /* 命令不可用（旧版本）时忽略，NSIS 钩子仍会兜底 */ }
     }
 
@@ -135,10 +135,10 @@ export async function checkForUpdates(
     try {
       await update.downloadAndInstall((ev) => {
         if (ev.event === "Started") {
-          onStatus("校验签名完成，开始安装…");
+          onStatus("update.installing");
         } else if (ev.event === "Finished") {
           finished = true;
-          onStatus("更新已安装，即将重启应用…");
+          onStatus("update.installed_restart");
         }
       });
     } catch (e) {
@@ -147,7 +147,7 @@ export async function checkForUpdates(
         try {
           const { invoke } = await import("@tauri-apps/api/core");
           await invoke("restart_sidecar");
-          onStatus("安装未完成，已恢复后台进程");
+          onStatus("update.install_incomplete");
         } catch { /* 用户可手动点"重启后端进程" */ }
       }
       throw e;
@@ -163,13 +163,13 @@ export async function checkForUpdates(
       try {
         const { invoke } = await import("@tauri-apps/api/core");
         await invoke("restart_sidecar");
-        onStatus("更新未应用，已恢复后台进程");
+        onStatus("update.not_applied");
       } catch { /* 同上 */ }
     }
     return "none";
   } catch (e) {
     const msg = String((e as { message?: string })?.message ?? e ?? "").slice(0, 120);
-    onStatus(`更新失败：${msg || "未知错误"}`);
+    onStatus("update.failed", { msg: msg || "" });
     return "error";
   }
 }

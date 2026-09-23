@@ -106,7 +106,7 @@ function ModelDetailPanel({ modelId, detailData, detailLoading, downloadProgress
         </div>
         {caps.length > 0 && (<div style={{ marginBottom: 12 }}><div style={{ fontSize: 10, color: "#9ca3af", marginBottom: 4 }}>Capabilities:</div><div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>{caps.map(([icon, label, color, bg]) => (<span key={label} style={{ padding: "3px 8px", borderRadius: 12, fontSize: 10, fontWeight: 600, background: bg, color, border: `1px solid ${color}20`, display: "flex", alignItems: "center", gap: 3 }}>{icon} {label}</span>))}</div></div>)}
         {specs.length > 0 && (<div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "4px 12px", marginBottom: 14 }}>{specs.slice(0,4).map(([label, value, accent]) => (<div key={label} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11 }}><span style={{ color: "#9ca3af", minWidth: 44 }}>{label}</span><span style={{ padding: "1px 6px", borderRadius: 4, fontSize: 10, fontFamily: "var(--font-mono)", fontWeight: 600, background: accent ? "#dbeafe" : "#f3f4f6", color: accent ? "#2563eb" : "#4b5563" }}>{value}</span></div>))}</div>)}
-        {ggufFiles.length > 0 && (<div style={{ marginBottom: 14 }}><div style={{ fontSize: 11, fontWeight: 700, color: "#1f2937", marginBottom: 6 }}>📦 下载选项（{ggufFiles.length} 个版本）</div>{ggufFiles.map(sib => { const fullModelId = modelId + "/" + sib.filename; const dp = downloadProgress[sib.filename] || downloadProgress[fullModelId]; const sizeDisplay = estimateSize(sib.size_bytes, sib.quant); const label = sib.filename.split("/").pop()?.replace(/-\d{5}-of-\d{5}\.gguf$/, ".gguf") || sib.filename; return (<div key={sib.filename} style={{ display: "flex", alignItems: "center", gap: 6, padding: "6px 10px", background: dp?.status==="done"?"#ecfdf5":"#fff", borderRadius: 8, marginBottom: 4, border: `1px solid ${dp?.status==="done"?"#10b981":"#e5e7eb"}` }}><span style={{ fontSize: 9, fontWeight: 700, fontFamily: "var(--font-mono)", padding: "2px 6px", borderRadius: 4, background: "#ede9fe", color: "#7c3aed", minWidth: 52, textAlign: "center" }}>{sib.quant||"Weight"}</span><div style={{ flex: 1, minWidth: 0 }}><div style={{ fontSize: 9, fontFamily: "var(--font-mono)", color: "#4b5563", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{label}</div><div style={{ fontSize: 9, color: "#9ca3af" }}>{sizeDisplay}{sib.parts > 1 ? ` · ${sib.parts}分片` : ""}</div></div>{dp?.status==="done"?<div style={{ display:"flex", alignItems:"center", gap:4, flexShrink:0 }}><button className="btn btn-sm btn-primary" style={{ padding: "4px 10px", fontSize: 10, borderRadius: 6 }} onClick={() => startLocalLLM(fullModelId)}>🚀</button><button className="btn btn-sm" style={{ padding:"2px 6px", fontSize:9, borderRadius:4, background:"transparent", color:"#ef4444", border:"1px solid #fecaca" }} onClick={async (e) => { e.stopPropagation(); const ok = await ask(`确定要删除 ${label} 吗？`); if (ok) deleteModelFile(fullModelId); }} title="删除模型文件">🗑</button></div>:dp?.status==="downloading"?<div style={{ display:"flex", alignItems:"center", gap:4, flexShrink:0 }}><div style={{ width:40, height:4, borderRadius:2, background:"#e5e7eb", overflow:"hidden" }}><div style={{ width:dp?.progress+"%", height:"100%", borderRadius:2, background:"#7c3aed", transition:"width 0.5s" }} /></div><span style={{ fontSize:9, color:"#7c3aed", fontWeight:600, minWidth:24, textAlign:"right" }}>{dp?.progress||0}%</span><span style={{ fontSize:8, color:"#9ca3af", minWidth:44, textAlign:"right" }}>{(dp?.speed_bps||0)>0?((dp?.speed_bps||0)/(1024**2)).toFixed(1)+" MB/s":""}</span><span style={{ fontSize:8, color:"#d1d5db" }}>{(dp?.eta_seconds||0)>0?((dp?.eta_seconds||0)>3600?Math.floor((dp?.eta_seconds||0)/3600)+"h":(dp?.eta_seconds||0)>60?Math.floor((dp?.eta_seconds||0)/60)+"m":(dp?.eta_seconds||0)+"s"):""}</span><button className="btn btn-sm" style={{ padding:"2px 6px", fontSize:9, borderRadius:4, background:"#f59e0b", color:"#fff", border:"none" }} onClick={() => pauseDownload(fullModelId)} title="暂停">⏸</button><button className="btn btn-sm" style={{ padding:"2px 6px", fontSize:9, borderRadius:4, background:"#ef4444", color:"#fff", border:"none" }} onClick={() => cancelDownload(fullModelId)} title="取消">✕</button></div>:dp?.status==="error"||dp?.status==="cancelled"?<div style={{ display:"flex", alignItems:"center", gap:4 }}><span style={{ fontSize:8, color:"#ef4444", maxWidth:100, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }} title={dp?.message||""}>{dp?.status==="cancelled"?t("local.cancelled"):t("local.failed")}</span><button className="btn btn-sm" style={{ padding:"2px 6px", fontSize:9, borderRadius:4, background:"#ef4444", color:"#fff", border:"none" }} onClick={() => cancelDownload(fullModelId)} title="删除记录">🗑</button><button className="btn btn-sm" style={{ padding:"4px 10px", fontSize:10, borderRadius:6, background:"#7c3aed", color:"#fff", border:"none", fontWeight:600 }} onClick={() => downloadModel(fullModelId)}>↻</button></div>:dp?.status==="paused"?<div style={{ display:"flex", alignItems:"center", gap:4 }}><span style={{ fontSize:8, color:"#f59e0b" }}>已暂停</span><button className="btn btn-sm" style={{ padding:"2px 6px", fontSize:9, borderRadius:4, background:"#ef4444", color:"#fff", border:"none" }} onClick={() => cancelDownload(fullModelId)} title="取消">✕</button><button className="btn btn-sm" style={{ padding:"4px 10px", fontSize:10, borderRadius:6, background:"#f59e0b", color:"#fff", border:"none", fontWeight:600 }} onClick={() => resumeDownload(fullModelId)}>▶ 继续</button></div>:<button className="btn btn-sm" style={{ padding: "4px 10px", fontSize: 10, borderRadius: 6, background: "#7c3aed", color: "#fff", border: "none", fontWeight: 600 }} onClick={() => downloadModel(fullModelId)}>⬇</button>}</div>); })}</div>)}
+        {ggufFiles.length > 0 && (<div style={{ marginBottom: 14 }}><div style={{ fontSize: 11, fontWeight: 700, color: "#1f2937", marginBottom: 6 }}>{t("local.download_options", { count: ggufFiles.length })}</div>{ggufFiles.map(sib => { const fullModelId = modelId + "/" + sib.filename; const dp = downloadProgress[sib.filename] || downloadProgress[fullModelId]; const sizeDisplay = estimateSize(sib.size_bytes, sib.quant); const label = sib.filename.split("/").pop()?.replace(/-\d{5}-of-\d{5}\.gguf$/, ".gguf") || sib.filename; return (<div key={sib.filename} style={{ display: "flex", alignItems: "center", gap: 6, padding: "6px 10px", background: dp?.status==="done"?"#ecfdf5":"#fff", borderRadius: 8, marginBottom: 4, border: `1px solid ${dp?.status==="done"?"#10b981":"#e5e7eb"}` }}><span style={{ fontSize: 9, fontWeight: 700, fontFamily: "var(--font-mono)", padding: "2px 6px", borderRadius: 4, background: "#ede9fe", color: "#7c3aed", minWidth: 52, textAlign: "center" }}>{sib.quant||"Weight"}</span><div style={{ flex: 1, minWidth: 0 }}><div style={{ fontSize: 9, fontFamily: "var(--font-mono)", color: "#4b5563", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{label}</div><div style={{ fontSize: 9, color: "#9ca3af" }}>{sizeDisplay}{sib.parts > 1 ? t("local.shards", { n: sib.parts }) : ""}</div></div>{dp?.status==="done"?<div style={{ display:"flex", alignItems:"center", gap:4, flexShrink:0 }}><button className="btn btn-sm btn-primary" style={{ padding: "4px 10px", fontSize: 10, borderRadius: 6 }} onClick={() => startLocalLLM(fullModelId)}>🚀</button><button className="btn btn-sm" style={{ padding:"2px 6px", fontSize:9, borderRadius:4, background:"transparent", color:"#ef4444", border:"1px solid #fecaca" }} onClick={async (e) => { e.stopPropagation(); const ok = await ask(t("local.delete_confirm_label", { label })); if (ok) deleteModelFile(fullModelId); }} title={t("local.delete_model_file")}>🗑</button></div>:dp?.status==="downloading"?<div style={{ display:"flex", alignItems:"center", gap:4, flexShrink:0 }}><div style={{ width:40, height:4, borderRadius:2, background:"#e5e7eb", overflow:"hidden" }}><div style={{ width:dp?.progress+"%", height:"100%", borderRadius:2, background:"#7c3aed", transition:"width 0.5s" }} /></div><span style={{ fontSize:9, color:"#7c3aed", fontWeight:600, minWidth:24, textAlign:"right" }}>{dp?.progress||0}%</span><span style={{ fontSize:8, color:"#9ca3af", minWidth:44, textAlign:"right" }}>{(dp?.speed_bps||0)>0?((dp?.speed_bps||0)/(1024**2)).toFixed(1)+" MB/s":""}</span><span style={{ fontSize:8, color:"#d1d5db" }}>{(dp?.eta_seconds||0)>0?((dp?.eta_seconds||0)>3600?Math.floor((dp?.eta_seconds||0)/3600)+"h":(dp?.eta_seconds||0)>60?Math.floor((dp?.eta_seconds||0)/60)+"m":(dp?.eta_seconds||0)+"s"):""}</span><button className="btn btn-sm" style={{ padding:"2px 6px", fontSize:9, borderRadius:4, background:"#f59e0b", color:"#fff", border:"none" }} onClick={() => pauseDownload(fullModelId)} title={t("local.pause")}>⏸</button><button className="btn btn-sm" style={{ padding:"2px 6px", fontSize:9, borderRadius:4, background:"#ef4444", color:"#fff", border:"none" }} onClick={() => cancelDownload(fullModelId)} title={t("common.cancel")}>✕</button></div>:dp?.status==="error"||dp?.status==="cancelled"?<div style={{ display:"flex", alignItems:"center", gap:4 }}><span style={{ fontSize:8, color:"#ef4444", maxWidth:100, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }} title={dp?.message||""}>{dp?.status==="cancelled"?t("local.cancelled"):t("local.failed")}</span><button className="btn btn-sm" style={{ padding:"2px 6px", fontSize:9, borderRadius:4, background:"#ef4444", color:"#fff", border:"none" }} onClick={() => cancelDownload(fullModelId)} title={t("local.delete_record")}>🗑</button><button className="btn btn-sm" style={{ padding:"4px 10px", fontSize:10, borderRadius:6, background:"#7c3aed", color:"#fff", border:"none", fontWeight:600 }} onClick={() => downloadModel(fullModelId)}>↻</button></div>:dp?.status==="paused"?<div style={{ display:"flex", alignItems:"center", gap:4 }}><span style={{ fontSize:8, color:"#f59e0b" }}>{t("local.paused")}</span><button className="btn btn-sm" style={{ padding:"2px 6px", fontSize:9, borderRadius:4, background:"#ef4444", color:"#fff", border:"none" }} onClick={() => cancelDownload(fullModelId)} title={t("common.cancel")}>✕</button><button className="btn btn-sm" style={{ padding:"4px 10px", fontSize:10, borderRadius:6, background:"#f59e0b", color:"#fff", border:"none", fontWeight:600 }} onClick={() => resumeDownload(fullModelId)}>{t("local.resume")}</button></div>:<button className="btn btn-sm" style={{ padding: "4px 10px", fontSize: 10, borderRadius: 6, background: "#7c3aed", color: "#fff", border: "none", fontWeight: 600 }} onClick={() => downloadModel(fullModelId)}>⬇</button>}</div>); })}</div>)}
         {detailData.readme ? <details open><summary style={{ fontSize: 11, fontWeight: 700, color: "#1f2937", cursor: "pointer", marginBottom: 6 }}>📖 README</summary><div style={{ fontSize: 10, lineHeight: 1.6, color: "#374151", maxHeight: 300, overflowY:"auto", padding: "10px 12px", background: "#fff", borderRadius: 8, border: "1px solid #e5e7eb" }}><Suspense fallback={<div>{String(detailData.readme).slice(0, 500)}</div>}><ReactMarkdown>{String(detailData.readme).slice(0, 3000)}</ReactMarkdown></Suspense></div></details> : null}
       </div>
     </>
@@ -129,7 +129,7 @@ interface Props {
 
 export default function LocalModelsTab(props: Props) {
   const { localLLMStatus, localModelId, setLocalModelId, setupCheck, hfSearch, setHfSearch, hfResults, searching, searchHF, downloadProgress, downloadModel, pauseDownload, cancelDownload, resumeDownload, startLocalLLM, stopLocalLLM, fixing, runFix, showToast, contextLimit, setContextLimit, contextEstimate, fetchContextEstimate } = props;
-  const { t } = useTranslation();
+  const { t, lang } = useTranslation();
   const isRunning = localLLMStatus?.status === "running";
   const isStarting = localLLMStatus?.status === "starting";
   const [benchRunning, setBenchRunning] = useState(false);
@@ -157,23 +157,24 @@ export default function LocalModelsTab(props: Props) {
   const runBenchmark = useCallback(async () => {
     if (benchRunning) return;
     setBenchRunning(true);
-    showToast("⚡ 基准测试中：生成 256 token + 两档预填充（约 30 秒~2 分钟）", "info");
+    showToast(t("local.bench_started"), "info");
     try {
       const resp = await authFetch("/v1/local-llm/benchmark", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ large: true }),
+        // 建议文案由后端生成 → 把界面语言一起发过去（large: 跑大档预填充）
+        body: JSON.stringify({ large: true, lang }),
       });
       const data = await resp.json();
       if (data.status === "ok") {
         setBenchLatest(data);
-        showToast(`✅ 基准完成：${data.gen_tps} tok/s · 首字 ${data.ttft_s}s · 内存 ${data.rss_gb}GB`);
+        showToast(t("local.bench_done", { tps: data.gen_tps, ttft: data.ttft_s, rss: data.rss_gb }));
         void loadBenchmarks();
       } else {
-        showToast(data.message || "基准测试失败（需先加载模型）", "warn");
+        showToast(data.message || t("local.bench_failed"), "warn");
       }
     } catch (e) {
       console.error(e);
-      showToast("基准测试请求失败", "warn");
+      showToast(t("local.bench_request_failed"), "warn");
     } finally {
       setBenchRunning(false);
     }
@@ -201,14 +202,14 @@ export default function LocalModelsTab(props: Props) {
   const openSearch = () => { setShowSearch(true); setHfSearch(""); setDetailModelId(""); setDetailData(null); searchHF(""); };
   // Monotonic request id so a slow detail response can't clobber a newer selection
   const detailReqRef = useRef(0);
-  const fetchModelDetail = async (modelId: string) => { const reqId = ++detailReqRef.current; setDetailModelId(modelId); setDetailData(null); setDetailLoading(true); try { const resp = await authFetch("/v1/local-llm/model-detail?model_id=" + encodeURIComponent(modelId)); const data = await resp.json(); if (reqId === detailReqRef.current) setDetailData(data); } catch { if (reqId === detailReqRef.current) setDetailData({ status: "error", message: "加载失败" }); } if (reqId === detailReqRef.current) setDetailLoading(false); };
+  const fetchModelDetail = async (modelId: string) => { const reqId = ++detailReqRef.current; setDetailModelId(modelId); setDetailData(null); setDetailLoading(true); try { const resp = await authFetch("/v1/local-llm/model-detail?model_id=" + encodeURIComponent(modelId)); const data = await resp.json(); if (reqId === detailReqRef.current) setDetailData(data); } catch { if (reqId === detailReqRef.current) setDetailData({ status: "error", message: t("local.load_fail") }); } if (reqId === detailReqRef.current) setDetailLoading(false); };
   const deleteModelFile = async (modelId: string) => { try { const resp = await authFetch("/v1/local-llm/delete-model", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model_id: modelId }) }); const data = await resp.json(); showToast(data.message || t("local.deleted")); if (data.status === "ok" && detailModelId) fetchModelDetail(detailModelId); } catch(e) { console.error(e); showToast(t("local.delete_fail")); } };
 
   // 应用内目录选择器：点文件夹进入、点"选择"直接选中该目录——
-  // 绕开 macOS 原生目录面板"双击=进入"的歧义
+  // 绕开 macOS 原生目录面板t("local.dblclick_enter")的歧义
   const [showDirPicker, setShowDirPicker] = useState(false);
   const [browse, setBrowse] = useState<{ path: string; parent: string | null; roots: { path: string; label: string }[]; entries: { name: string; path: string; is_dir: boolean; size: number }[] } | null>(null);
-  const fetchBrowse = async (path?: string) => { try { const q = path ? "?path=" + encodeURIComponent(path) : ""; const resp = await authFetch("/v1/files/browse" + q); const data = await resp.json(); if (data.status === "ok") setBrowse(data); else showToast(data.detail || "无法读取目录"); } catch { showToast("目录读取失败"); } };
+  const fetchBrowse = async (path?: string) => { try { const q = path ? "?path=" + encodeURIComponent(path) : ""; const resp = await authFetch("/v1/files/browse" + q); const data = await resp.json(); if (data.status === "ok") setBrowse(data); else showToast(data.detail || t("local.dir_fail")); } catch { showToast(t("local.dir_fail")); } };
   const openDirPicker = () => { setShowDirPicker(true); fetchBrowse(); };
   const pickDir = (path: string) => { setShowDirPicker(false); setLocalModelId(path); startLocalLLM(path); };
 
@@ -243,7 +244,7 @@ export default function LocalModelsTab(props: Props) {
       </div>
 
       <div className="settings-group" style={{ marginBottom: 16 }}>
-        <div className="settings-group-header">上下文长度{contextEstimate && <span style={{ marginLeft: 8, fontSize: 11, fontWeight: 400, color: "var(--text-secondary)" }}>可用内存 {contextEstimate.ram_available_gb}GB · 推荐 {contextEstimate.recommended_context.toLocaleString()} tokens</span>}</div>
+        <div className="settings-group-header">{t("local.ctx_length")}{contextEstimate && <span style={{ marginLeft: 8, fontSize: 11, fontWeight: 400, color: "var(--text-secondary)" }}>{t("local.ram_hint", { gb: contextEstimate.ram_available_gb, rec: contextEstimate.recommended_context.toLocaleString() })}</span>}</div>
         <div style={{ padding: "12px 16px" }}>
           <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
             <input type="range" min={2048} max={131072} step={2048} value={contextLimit} onChange={e => setContextLimit(parseInt(e.target.value))} style={{ flex: 1, minWidth: 200 }} />
@@ -257,7 +258,7 @@ export default function LocalModelsTab(props: Props) {
             <button className="btn btn-sm btn-ghost" style={{ fontSize: 10, padding: "2px 8px" }} onClick={() => startLocalLLM()} disabled={!localLLMStatus.model_id}>{t("local.reload_model")}</button>
             <button className="btn btn-sm btn-ghost" style={{ fontSize: 10, padding: "2px 8px" }}
               onClick={() => void runBenchmark()} disabled={benchRunning || !localLLMStatus.model_id}>
-              {benchRunning ? "⚡ 测试中…" : "⚡ 基准测试"}
+              {benchRunning ? t("local.bench_running") : t("local.bench_run")}
             </button>
             {contextEstimate && <><span>| {t("local.max_safe")}: {contextEstimate.max_context.toLocaleString()} tokens</span><span>| {t("local.restart_effect")}</span></>}
           </div>
@@ -268,21 +269,21 @@ export default function LocalModelsTab(props: Props) {
       {/* 基准测试结果（一键实测：生成速度/首字延迟/预填充/内存 + 建议） */}
       {(benchLatest || benchHistory.length > 0) && (
         <div className="settings-group" style={{ marginBottom: 16 }}>
-          <div className="settings-group-header">⚡ 基准测试结果
+          <div className="settings-group-header">{t("local.bench_results")}
             <span style={{ marginLeft: 8, fontSize: 11, fontWeight: 400, color: "var(--text-secondary)" }}>
-              最近 {benchHistory.length} 次（新→旧）
+              {t("local.bench_recent", { count: benchHistory.length })}
             </span>
           </div>
           <div style={{ padding: "12px 16px", fontSize: 12 }}>
             {benchLatest && (
               <>
                 <div style={{ fontFamily: "var(--font-mono)", fontSize: 12, lineHeight: 1.9 }}>
-                  <div>模型：{benchLatest.model}{benchLatest.backend ? ` · ${benchLatest.backend}` : ""}</div>
-                  <div>生成 {benchLatest.gen_tps} tok/s · 首字 {benchLatest.ttft_s}s · 上下文 {Number(benchLatest.context_limit || 0).toLocaleString()}</div>
+                  <div>{t("local.bench_model", { model: `${benchLatest.model}${benchLatest.backend ? ` · ${benchLatest.backend}` : ""}` })}</div>
+                  <div>{t("local.bench_gen", { tps: benchLatest.gen_tps, ttft: benchLatest.ttft_s, ctx: Number(benchLatest.context_limit || 0).toLocaleString() })}</div>
                   {(benchLatest.prefill || []).map((pf: any, i: number) => (
-                    <div key={i}>预填充 {(pf.chars / 1000).toFixed(1)}K 字符 → {pf.seconds}s（≈{pf.tps} tok/s）</div>
+                    <div key={i}>{t("local.bench_prefill", { k: (pf.chars / 1000).toFixed(1), sec: pf.seconds, tps: pf.tps })}</div>
                   ))}
-                  <div>内存 {benchLatest.rss_gb ?? "?"}GB / 共 {benchLatest.total_ram_gb ?? "?"}GB</div>
+                  <div>{t("local.bench_mem", { used: benchLatest.rss_gb ?? "?", total: benchLatest.total_ram_gb ?? "?" })}</div>
                 </div>
                 {(benchLatest.advice || []).length > 0 && (
                   <div style={{ marginTop: 8, padding: "8px 10px", background: "var(--bg-tool-call)", borderRadius: "var(--radius-sm)", lineHeight: 1.7 }}>
@@ -293,9 +294,9 @@ export default function LocalModelsTab(props: Props) {
             )}
             {benchHistory.length > 1 && (
               <div style={{ marginTop: 10, fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--text-secondary)" }}>
-                <div style={{ marginBottom: 4 }}>历史对比：</div>
+                <div style={{ marginBottom: 4 }}>{t("local.bench_history")}</div>
                 {benchHistory.slice(1, 6).map((h: any, i: number) => (
-                  <div key={i}>{new Date(h.ts * 1000).toLocaleString()} · {h.model} · {h.gen_tps} tok/s · 首字 {h.ttft_s}s · {h.rss_gb}GB</div>
+                  <div key={i}>{t("local.bench_history_row", { ts: new Date(h.ts * 1000).toLocaleString(), model: h.model, tps: h.gen_tps, ttft: h.ttft_s, rss: h.rss_gb })}</div>
                 ))}
               </div>
             )}
@@ -319,7 +320,7 @@ export default function LocalModelsTab(props: Props) {
           <div style={{ padding: "12px 16px" }}>
             <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
               <input className="form-input" style={{ flex: 1, margin: 0, fontSize: 12, padding: "8px 12px", fontFamily: "var(--font-mono)" }} placeholder={t("local.model_id_placeholder")} value={localModelId} onChange={e => setLocalModelId(e.target.value)} onKeyDown={e => { if (e.key === "Enter") startLocalLLM(); }} />
-              <button className="btn btn-sm" onClick={openDirPicker} title="点文件夹进入；.gguf 文件点「加载」，MLX 目录点「选择」" style={{ minWidth: 100, padding: "8px 16px" }}>📂 选择模型</button>
+              <button className="btn btn-sm" onClick={openDirPicker} title={t("local.pick_dir_hint")} style={{ minWidth: 100, padding: "8px 16px" }}>📂 {t("local.pick_model")}</button>
               <button className="btn btn-md btn-primary" style={{ minWidth: 100, padding: "8px 16px" }} onClick={() => startLocalLLM()} disabled={isStarting}>{isStarting ? "⏳ " + t("local.starting") : "🚀 " + t("local.start")}</button>
             </div>
             <div style={{ fontSize: 10, color: "var(--text-muted)", marginTop: 8 }}>{t("local.start_hint")} {localLLMStatus.backend === "mlx" ? t("local.mlx") : t("local.llamacpp")}</div>
@@ -352,17 +353,17 @@ export default function LocalModelsTab(props: Props) {
           <div onClick={() => setShowDirPicker(false)} style={{ position: "absolute", inset: 0, background: "rgba(0,0,0,0.3)", backdropFilter: "blur(2px)", WebkitBackdropFilter: "blur(2px)", zIndex: 199 }} />
           <div style={{ position: "absolute", top: 40, left: "50%", transform: "translateX(-50%)", width: 560, maxWidth: "94%", maxHeight: "72vh", background: "var(--bg-card)", borderRadius: 14, boxShadow: "0 20px 60px rgba(0,0,0,0.25)", zIndex: 200, display: "flex", flexDirection: "column", overflow: "hidden" }}>
             <div style={{ padding: "12px 16px", borderBottom: "1px solid var(--border-default)", display: "flex", alignItems: "center", gap: 8 }}>
-              <span style={{ fontWeight: 700, fontSize: 14 }}>📂 选择模型（文件夹选为 MLX，.gguf 文件直接加载）</span>
-              <button className="btn btn-sm btn-primary" style={{ marginLeft: "auto" }} onClick={() => pickDir(browse.path)}>✅ 选中当前目录</button>
+              <span style={{ fontWeight: 700, fontSize: 14 }}>{t("local.pick_title")}</span>
+              <button className="btn btn-sm btn-primary" style={{ marginLeft: "auto" }} onClick={() => pickDir(browse.path)}>✅ {t("local.pick_current")}</button>
               <button className="btn btn-sm btn-ghost" onClick={() => setShowDirPicker(false)}>✕</button>
             </div>
             <div style={{ padding: "8px 16px", borderBottom: "1px solid var(--border-default)", display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
               {browse.roots.map(r => <button key={r.path} className="btn btn-sm btn-ghost" style={{ fontSize: 10, padding: "2px 8px" }} onClick={() => fetchBrowse(r.path)}>🏠 {r.label}</button>)}
-              {browse.parent && <button className="btn btn-sm btn-ghost" style={{ fontSize: 10, padding: "2px 8px" }} onClick={() => fetchBrowse(browse.parent!)}>⬆ 上一级</button>}
+              {browse.parent && <button className="btn btn-sm btn-ghost" style={{ fontSize: 10, padding: "2px 8px" }} onClick={() => fetchBrowse(browse.parent!)}>⬆ {t("local.parent_dir")}</button>}
               <span style={{ fontSize: 10, fontFamily: "var(--font-mono)", color: "var(--text-muted)", wordBreak: "break-all", width: "100%" }}>{browse.path}</span>
             </div>
             <div style={{ flex: 1, overflowY: "auto", padding: "8px 12px" }} className="custom-scrollbar">
-              {browse.entries.length === 0 && <div style={{ fontSize: 12, color: "var(--text-muted)", padding: 24, textAlign: "center" }}>空目录</div>}
+              {browse.entries.length === 0 && <div style={{ fontSize: 12, color: "var(--text-muted)", padding: 24, textAlign: "center" }}>{t("local.empty_dir")}</div>}
               {browse.entries.map(e => {
                 const isGgufFile = !e.is_dir && e.name.toLowerCase().endsWith(".gguf");
                 return (
@@ -371,8 +372,8 @@ export default function LocalModelsTab(props: Props) {
                   <span style={{ flex: 1, fontSize: 12, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: e.is_dir || isGgufFile ? "var(--text-primary)" : "var(--text-muted)" }} onClick={() => e.is_dir && fetchBrowse(e.path)}>{e.name}</span>
                   {!isGgufFile && e.size > 0 && <span style={{ fontSize: 9, color: "var(--text-muted)", flexShrink: 0 }}>{(e.size / 1073741824).toFixed(1)}GB</span>}
                   {isGgufFile && <span style={{ fontSize: 9, color: "var(--accent)", flexShrink: 0 }}>{(e.size / 1073741824).toFixed(1)}GB</span>}
-                  {e.is_dir && <button className="btn btn-sm btn-primary" style={{ fontSize: 10, padding: "2px 10px", flexShrink: 0 }} onClick={() => pickDir(e.path)}>选择</button>}
-                  {isGgufFile && <button className="btn btn-sm btn-primary" style={{ fontSize: 10, padding: "2px 10px", flexShrink: 0 }} onClick={() => pickDir(e.path)}>加载</button>}
+                  {e.is_dir && <button className="btn btn-sm btn-primary" style={{ fontSize: 10, padding: "2px 10px", flexShrink: 0 }} onClick={() => pickDir(e.path)}>{t("local.choose")}</button>}
+                  {isGgufFile && <button className="btn btn-sm btn-primary" style={{ fontSize: 10, padding: "2px 10px", flexShrink: 0 }} onClick={() => pickDir(e.path)}>{t("local.load")}</button>}
                 </div>
                 );
               })}
@@ -392,7 +393,7 @@ export default function LocalModelsTab(props: Props) {
                 <button className="btn btn-sm btn-ghost" onClick={() => { setShowSearch(false); setDetailModelId(""); }} style={{ fontSize: 18, padding: "4px 8px" }}>✕</button>
               </div>
               <div style={{ padding: "6px 12px", display: "flex", gap: 6, borderBottom: "1px solid #f0f0f0", flexWrap: "wrap" }}>
-                {[{ label: "全部", value: "" }, { label: "GGUF", value: "gguf" }, { label: "MLX", value: "mlx" }].map(f => (
+                {[{ label: t("local.all"), value: "" }, { label: "GGUF", value: "gguf" }, { label: "MLX", value: "mlx" }].map(f => (
                   <button key={f.label} onClick={() => { setSearchFilter(f.value); if (f.value) searchHF(hfSearch || f.value, f.value); else searchHF(hfSearch); }} style={{ padding: "4px 10px", borderRadius: 14, fontSize: 10, fontWeight: 500, cursor: "pointer", border: `1px solid ${searchFilter === f.value ? "#7c3aed" : "#e5e7eb"}`, background: searchFilter === f.value ? "#f5f3ff" : "#fff", color: searchFilter === f.value ? "#7c3aed" : "#6b7280" }}>{f.label}</button>
                 ))}
               </div>

@@ -320,7 +320,7 @@ export default function SettingsView({
             <button className="btn btn-sm btn-ghost"
               onClick={onRestartSidecar}
               disabled={restartingSidecar}>
-              {restartingSidecar ? "⏳" : "🔄"} {restartingSidecar ? "重启中..." : t("settings.restart")}
+              {restartingSidecar ? "⏳" : "🔄"} {restartingSidecar ? t("settings.restarting") : t("settings.restart")}
             </button>
           </div>
           <div className="settings-row">
