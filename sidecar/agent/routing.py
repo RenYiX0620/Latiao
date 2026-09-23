@@ -38,7 +38,6 @@ async def _resolve_api_target(cloud_config: dict | None) -> tuple[str, str, dict
 
 # 闲聊识别（17:11 事故根治）：任务词表里的"做"字会把"你能做什么"判成任务型
     # 依赖仍留在 agent_loop 的定义 → 函数内惰性导入（避免循环依赖）
-    from agent_loop import CONFIG_FILE
 # ——model 因此进入工具结果追问链。闲聊标记优先于任务词：命中即按非任务处理。
 def _get_best_cloud_config() -> dict | None:
     """Get the best available cloud model config for code tasks."""
