@@ -777,7 +777,7 @@ export default memo(function ChatView({
             </div>
             <div className="toolbar-right">
               <select className="form-input" style={{
-                fontSize: 13, padding: "2px 6px", margin: 0, width: "auto", maxWidth: 180,
+                fontSize: 13, padding: "2px 6px", margin: 0, width: "auto", maxWidth: 210,
                 background: "transparent", border: "0", color: "var(--text-secondary)",
                 cursor: "pointer", outline: "none",
               }}
@@ -796,16 +796,19 @@ export default memo(function ChatView({
                   <option key={m.name} value={m.name}>☁️ {m.name}</option>
                 ))}
               </select>
-              {/* 实际回答者与会话选择不一致时必须说出来——事件上"谁加载谁回答"，
-                  下拉框只是个标签，不说清楚就是"点了没反应"的又一种 */}
+              {/* 实际回答者与会话选择不一致时必须说出来——但**按钮行放不下长句**（首版被挤到
+                  换行、连发送键都推挤了，用户当场反馈）。这里只放紧凑徽标，完整说明进状态行。 */}
               {(() => {
                 const actual = loadedMismatch(selectedModel, engineStatus);
-                return actual ? (
-                  <span style={{ fontSize: 11, color: "var(--warning, #f59e0b)", marginLeft: 6 }}
+                if (!actual) return null;
+                const short = actual.length > 16 ? actual.slice(0, 15) + "…" : actual;
+                return (
+                  <span style={{ fontSize: 11, color: "var(--warning, #f59e0b)", marginLeft: 4,
+                                whiteSpace: "nowrap", flexShrink: 0 }}
                         title={t("chat.model_mismatch_hint", { model: actual })}>
-                    ⚠️ {t("chat.model_answering", { model: actual })}
+                    ⚠️ {t("chat.model_answering", { model: short })}
                   </span>
-                ) : null;
+                );
               })()}
               {isProcessing ? (
                 <button className="btn-send btn-circle" onClick={onStop} title={t("chat.stop")}>⏹</button>
@@ -825,6 +828,10 @@ export default memo(function ChatView({
               fallbackToolCalls={toolCalls}
               fallbackTokens={estTokens}
               fallbackLimit={contextEstimate?.max_context ?? null}
+              modelWarning={(() => {
+                const actual = loadedMismatch(selectedModel, engineStatus);
+                return actual ? t("chat.model_mismatch_hint", { model: actual }) : null;
+              })()}
             />
           ) : (
             <span>{t("chat.status_hint")}</span>
