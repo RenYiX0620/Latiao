@@ -264,3 +264,108 @@ async def test_thin_streams_content_deltas_live():
             transport._LOCAL_NATIVE_TOOLS_OVERRIDE = None
         contents = [e["content"] for e in events if "content" in e]
         assert contents == deltas, f"content delta 必须逐段原样流出：{contents}"
+
+
+
+def _gen_requests(engine) -> list[dict]:
+    """只数**生成**请求（stream=True）。交付闸门的翻译走 stream=False 且也会打到同一引擎，
+    不能混进来——首版测试因此把"翻译的 2 次"算成了多出来的重试。"""
+    return [r for r in engine.requests if r.get("stream")]
+
+
+# ── 语言漂移早退（2026-09-23 真机：中文提问收到英文，还要等翻译）────────
+
+_DRIFT_EN = ('**"嗯～主人要我看 it? Okay then~"** I crawl back onto all fours, pressing my chest '
+             'flat against the bed and lifting my hips high — just like a puppy waiting to be '
+             'ridden, and my ass is still young and tight in the way you remember it.')
+
+
+@pytest.mark.asyncio
+async def test_lang_drift_discards_and_retries_local():
+    """首段判为漂移 → 丢弃这次生成（不下发）→ 带更强语言要求重试一次。"""
+    import local_llm
+    from tests.test_loop_scenarios import _StubEngine
+    from agent.loop import ThinAgentLoop
+    with FakeEngine() as engine:
+        engine.push(engine.text_response(_DRIFT_EN))        # 第一次：英文（漂移）
+        engine.push(engine.text_response(NEUTRAL_TEXT))      # 第二次：中文（重试成功）
+        old = local_llm._engine
+        local_llm._engine = _StubEngine()
+        try:
+            events = await _collect(ThinAgentLoop(
+                MESSAGES, "fake-model", engine.url, HEADERS,
+                session_id=f"thin-drift-{time.time()}", access_mode="full").run())
+        finally:
+            local_llm._engine = old
+    reqs = _gen_requests(engine)
+    assert len(reqs) == 2, f"应重试一次（共 2 次生成），实际 {len(reqs)}"
+    last_msg = reqs[1]["messages"][-1]["content"]
+    assert "上一个回答因为用了英文已被丢弃" in last_msg, "重试请求必须带更强的语言要求"
+    texts = [e.get("content", "") for e in events if "content" in e]
+    assert any("根据刚才的目录输出" in t for t in texts), "应交付重试后的中文"
+    assert not any("I crawl back onto all fours" in t for t in texts), "被丢弃的那次绝不能下发"
+
+
+@pytest.mark.asyncio
+async def test_lang_drift_retries_only_once_local():
+    """重试仍漂移 → 不再重试（只一次），照常交付交给交付闸门翻译。"""
+    import local_llm
+    from tests.test_loop_scenarios import _StubEngine
+    from agent.loop import ThinAgentLoop
+    with FakeEngine() as engine:
+        engine.push(engine.text_response(_DRIFT_EN))
+        engine.push(engine.text_response(_DRIFT_EN))
+        old = local_llm._engine
+        local_llm._engine = _StubEngine()
+        try:
+            await _collect(ThinAgentLoop(
+                MESSAGES, "fake-model", engine.url, HEADERS,
+                session_id=f"thin-drift2-{time.time()}", access_mode="full").run())
+        finally:
+            local_llm._engine = old
+    assert len(_gen_requests(engine)) == 2, \
+        f"只允许重试一次，实际生成 {len(_gen_requests(engine))} 次"
+
+
+@pytest.mark.asyncio
+async def test_no_retry_when_language_matches():
+    """正常中文回复：一次请求，且实时下发（不因早退机制多花一次生成）。"""
+    import local_llm
+    from tests.test_loop_scenarios import _StubEngine
+    from agent.loop import ThinAgentLoop
+    with FakeEngine() as engine:
+        engine.push(engine.text_response(NEUTRAL_TEXT))
+        old = local_llm._engine
+        local_llm._engine = _StubEngine()
+        try:
+            events = await _collect(ThinAgentLoop(
+                MESSAGES, "fake-model", engine.url, HEADERS,
+                session_id=f"thin-nodrift-{time.time()}", access_mode="full").run())
+        finally:
+            local_llm._engine = old
+    assert len(_gen_requests(engine)) == 1, "语言正常不该重试"
+    texts = [e.get("content", "") for e in events if "content" in e]
+    assert any("根据刚才的目录输出" in t for t in texts)
+
+
+@pytest.mark.asyncio
+async def test_no_lang_guard_when_language_not_confident():
+    """语言判定不确定时不掐生成（detect_language_decision 文档：confident=False
+    不得据此判断回答是否符合用户语言）——否则纯符号/短消息会被误掐。"""
+    import local_llm
+    from tests.test_loop_scenarios import _StubEngine
+    from agent.loop import ThinAgentLoop
+    with FakeEngine() as engine:
+        engine.push(engine.text_response(_DRIFT_EN))      # 只推一次：若误掐就会请求第二次
+        old = local_llm._engine
+        local_llm._engine = _StubEngine()
+        try:
+            loop = ThinAgentLoop(
+                [{"role": "user", "content": "???"}],        # 纯符号 → 语言不确定
+                "fake-model", engine.url, HEADERS,
+                session_id=f"thin-noconf-{time.time()}", access_mode="full")
+            await _collect(loop.run())
+        finally:
+            local_llm._engine = old
+    assert loop.user_lang_confident is False, "前置条件：这条消息的语言判定应为不确定"
+    assert len(_gen_requests(engine)) == 1, "语言不确定时不该掐掉重试"
