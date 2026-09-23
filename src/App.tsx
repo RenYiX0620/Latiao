@@ -122,8 +122,7 @@ function App() {
   /* ── Session State ── */
   const {
     sessions, setSessions, currentIdx, setCurrentIdx,
-    session, messages, setSelectedModel, setMessages, setMessagesFor, newSession,
-  } = useSessions();
+    session, messages, setSelectedModel, setMessages, setMessagesFor, newSession, syncRemote } = useSessions();
   // 停止按钮服务端取消用（P0 修复）：会话 id 经 ref 取最新值，避免闭包过期
   const sessionIdRef = useRef<string>("");
   sessionIdRef.current = session.id;
@@ -341,6 +340,9 @@ const [timeFilter, setTimeFilter] = useState("all");
   useEffect(() => {
     const stripped = stripForStorage(sessions);
     const data = JSON.stringify(stripped);
+    // ⑩：后端为权威存储（localStorage 保留为降级路径）。syncRemote 内部按会话
+    // diff + 每会话防抖，流式期间不会每个 token 都发一次。
+    syncRemote(stripped);
     if (anyProcessing) {
       // Streaming: debounce to 1s to avoid thrashing
       const timer = setTimeout(() => saveSessions(data), 1000);
@@ -349,7 +351,7 @@ const [timeFilter, setTimeFilter] = useState("all");
       // Not streaming: save immediately
       saveSessions(data);
     }
-  }, [sessions, anyProcessing, stripForStorage, saveSessions]);
+  }, [sessions, anyProcessing, stripForStorage, saveSessions, syncRemote]);
 
   // Auto-scroll chat to bottom（instant，内容高度未定时 smooth 会滚错位）
   useEffect(() => {
@@ -1886,7 +1888,12 @@ const [timeFilter, setTimeFilter] = useState("all");
             <button key={s.id} className={`session-item${idx === currentIdx ? " active" : ""}`} onClick={() => switchSession(idx)}>
               <span className="session-info">
                 <div className="session-name">{s.name.startsWith("session.") ? t(s.name) : s.name}</div>
-                <div className="session-preview">{s.messages.length > 0 ? (s.messages[s.messages.length - 1].content || "").replace(/[#*|`>-]/g, " ").replace(/\s+/g, " ").slice(0, 30) + "..." : t("session.default")}</div>
+                <div className="session-preview">{(() => {
+                // ⑩：后端列表只带元数据，预览由服务端算好（本地已加载时仍可用消息兜底）
+                const last = s.messages.length > 0 ? (s.messages[s.messages.length - 1].content || "") : "";
+                const src = last || s.preview || "";
+                return src ? src.replace(/[#*|`>-]/g, " ").replace(/\s+/g, " ").slice(0, 30) + "..." : t("session.default");
+              })()}</div>
               </span>
               <span className="session-delete-btn" style={idx === currentIdx ? { opacity: 1 } : undefined}
                 onClick={(e) => { e.stopPropagation(); deleteSession(idx); }}>×</span>

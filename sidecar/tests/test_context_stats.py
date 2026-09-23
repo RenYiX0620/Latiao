@@ -15,6 +15,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import agent.tool_exec as TE  # noqa: E402  （工具执行簇 2026-09-23 拆出：patch 面在此）
+
 import context_stats as cs
 
 
@@ -387,8 +389,8 @@ class TestToolTimeoutWrapper(unittest.TestCase):
             await asyncio.sleep(3)
             return False, []
 
-        orig_inner, orig_limit = agent_loop._handle_tool_execution_inner, agent_loop._TOOL_TIMEOUTS.get("read_file")
-        agent_loop._handle_tool_execution_inner = slow_inner
+        orig_inner, orig_limit = TE._handle_tool_execution_inner, agent_loop._TOOL_TIMEOUTS.get("read_file")
+        TE._handle_tool_execution_inner = slow_inner
         agent_loop._TOOL_TIMEOUTS["read_file"] = 0.2
         try:
             tc = {"id": "call-1", "function": {"name": "read_file", "arguments": "{}"}}
@@ -398,7 +400,7 @@ class TestToolTimeoutWrapper(unittest.TestCase):
             verify_failed, events = asyncio.run(
                 _handle_tool_execution(tc, [], "sess-timeout", "latiao", "read_only"))
         finally:
-            agent_loop._handle_tool_execution_inner = orig_inner
+            TE._handle_tool_execution_inner = orig_inner
             if orig_limit is not None:
                 agent_loop._TOOL_TIMEOUTS["read_file"] = orig_limit
         self.assertFalse(verify_failed)                  # 超时不算验证失败
@@ -828,15 +830,14 @@ class TestShortMessageNoInjection(unittest.TestCase):
         self.A, self.PB = A, PB
         # monkeypatch 面必须跟着代码搬：_build_chat_messages 现在在 prompt_build 里
         # 按自己的全局名查这些符号，改 agent_loop 的同名属性不会再生效
-        self._tail, self._mem, self._onb = (
-            PB._progress_tail, PB._retrieve_relevant_learnings, PB._process_onboarding)
+        # 知识注入（_retrieve_relevant_learnings）已移出 _build_chat_messages
+        # （2026-09-23：与薄循环重复注入，只保留 loop.py 那处）→ 这里不再需要打补丁
+        self._tail, self._onb = (PB._progress_tail, PB._process_onboarding)
         PB._progress_tail = lambda *a, **k: "- 上次在查半导体板块的资金流向"
-        PB._retrieve_relevant_learnings = lambda *a, **k: []
         PB._process_onboarding = lambda t, l: ("", False)
 
     def tearDown(self):
         self.PB._progress_tail = self._tail
-        self.PB._retrieve_relevant_learnings = self._mem
         self.PB._process_onboarding = self._onb
 
     def _last(self, text):

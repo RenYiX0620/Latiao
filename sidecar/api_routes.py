@@ -23,6 +23,7 @@ from cmd_safety import redact_secrets   # 工具日志脱敏（09-23）
 import httpx
 from fastapi import File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from starlette.concurrency import run_in_threadpool
 
 import cron
 import local_llm
@@ -63,7 +64,7 @@ from agent_loop import (
     execute_tool,
     _THINK_FENCE_RE,
 )
-from config import PROGRESS_DIR
+from config import PROGRESS_DIR, save_config
 from db import MEMORY_DB, _db_write_lock, _get_db
 from identity import IDENTITY_FILES
 from onboarding import complete as _onboarding_complete
@@ -256,7 +257,7 @@ async def chat_completion(request: Request):
             _models.append(_entry)
             _cfg["cloud_models"] = _models[-10:]
             CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-            CONFIG_FILE.write_text(json.dumps(_cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+            save_config(_cfg)   # ⑤ 0600 + 原子写（唯一入口）
         except Exception:
             logger.debug("Failed to persist cloud_config on request", exc_info=True)
     use_stream = body.get("stream", False)
@@ -1324,6 +1325,7 @@ async def api_feedback(request: Request):
     kind = str(body.get("kind", ""))
     if not content or kind not in ("up", "down"):
         return {"status": "error", "message": "content and kind(up/down) required"}
+    session_id = str(body.get("session_id", "")).strip()
     try:
         from memory import _store_learning
         topic = "用户点赞的回答" if kind == "up" else "用户点踩的回答"
@@ -1331,7 +1333,14 @@ async def api_feedback(request: Request):
                         confidence=0.9, source_type="feedback")
     except Exception:
         logger.warning("feedback 存储失败", exc_info=True)
-    return {"status": "ok"}
+    # ④ 标签回流：点赞/点踩 → 该会话最近一条注入记录标成 used
+    tagged = 0
+    try:
+        from memory import mark_injection_used
+        tagged = mark_injection_used(session_id, kind == "up")
+    except Exception:
+        logger.debug("注入标签回流失败", exc_info=True)
+    return {"status": "ok", "tagged": tagged}
 
 
 @app.post("/v1/memory/learn")
@@ -1357,8 +1366,12 @@ async def forget_learning(request: Request):
         with _db_write_lock:  # 快速 sqlite 操作，持锁时间短，用同步锁即可
             if lid:
                 conn.execute("DELETE FROM learnings WHERE id = ?", (lid,))
+                from memory import _mark_tfidf_dirty
+                _mark_tfidf_dirty()   # 删行必须让检索索引失效（此前不置脏 → 删掉的仍在结果里）
             elif topic:
                 conn.execute("DELETE FROM learnings WHERE topic = ?", (topic,))
+                from memory import _mark_tfidf_dirty
+                _mark_tfidf_dirty()
             conn.commit()
         return {"status": "ok", "deleted": True}
     except Exception as e:
@@ -1511,7 +1524,7 @@ async def set_cloud_models(request: Request):
             cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
         cfg["cloud_models"] = clean
         CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        CONFIG_FILE.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+        save_config(cfg)   # ⑤ 0600 + 原子写（唯一入口）
     except Exception:
         logger.warning("Failed to save cloud models config", exc_info=True)
         return {"status": "error", "message": "写入配置失败"}
@@ -1591,17 +1604,20 @@ async def set_tavily_key(request: Request):
             cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
         cfg["tavily_api_key"] = key
         CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        CONFIG_FILE.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+        save_config(cfg)   # ⑤ 0600 + 原子写（唯一入口）
         # Then update macOS Keychain (best-effort)
         try:
             # 密钥经 stdin 传给 security（-w 不带值时从 stdin 读），
-            # 避免 key 出现在 argv 里被 `ps` 读到；同时线程池化防冻结
+            # 避免 key 出现在 argv 里被 `ps` 读到；同时线程池化防冻结。
+            # 2026-09-23 实测修正两处：① -U 必须排在 -w 之前（-w 会把紧跟的参数
+            # 当成密码值 —— 旧写法把字面量 "-U" 存进了 keychain）；
+            # ② security 会连问两遍（password + retype），stdin 必须送两行。
             from starlette.concurrency import run_in_threadpool
             def _sec_write():
                 return subprocess.run(
                     ["security", "add-generic-password", "-s", "com.latiao.desktop",
-                     "-a", "tavily_api_key", "-w", "-U"],
-                    input=key.encode(), capture_output=True, timeout=10,
+                     "-a", "tavily_api_key", "-U", "-w"],
+                    input=f"{key}\n{key}\n".encode(), capture_output=True, timeout=10,
                 )
             await run_in_threadpool(_sec_write)
         except Exception:
@@ -1631,7 +1647,7 @@ async def delete_tavily_key():
         if CONFIG_FILE.exists():
             cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
             cfg.pop("tavily_api_key", None)
-            CONFIG_FILE.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+            save_config(cfg)   # ⑤ 0600 + 原子写（唯一入口）
         return {"status": "ok", "has_key": False}
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -1871,6 +1887,18 @@ async def toggle_cron_job(job_id: str):
                 cron._save_cron(cron._cron_jobs)
                 return {"status": "ok", "job": job}
     return {"status": "error", "message": "Job not found"}
+
+
+@app.get("/v1/cron/history")
+async def api_cron_history(limit: int = Query(default=20, ge=1, le=200),
+                           offset: int = Query(default=0, ge=0),
+                           job: str = Query(default="")):
+    """定时任务的历史产出（memory 表 type='cron_job'）。
+
+    2026-09-23 补：这张表此前**只写不读**（155 行跑完即失，前端只有最近一次摘要）。
+    """
+    import cron as _cron
+    return await run_in_threadpool(_cron.list_cron_history, limit, offset, job)
 
 
 @app.get("/v1/cron/due")
@@ -2162,9 +2190,83 @@ async def api_extensions_list():
         return {"status": "error", "message": str(e)}
 
 
+# ═══════════════════════════════════════════════════════
+#  会话持久化（2026-09-23，审查⑩）：前端 localStorage → 后端权威存储
+#  列表只回元数据+预览；消息按需取；写入是"整会话快照"（前端防抖后 PUT）。
+# ═══════════════════════════════════════════════════════
+
+@app.post("/v1/sessions/report")
+async def api_sessions_report(request: Request):
+    """前端会话同步的诊断上报（2026-09-23）。
+
+    为什么需要：⑩ 上线时前端把"后端不可用"降级成 console.warn —— 日志里什么都
+    看不到，迁移静默不发生，只能靠读 webview 的 localStorage 才查出根因。会话
+    持久化是用户数据，它出问题必须在服务端日志里留痕。
+    """
+    body = await _json_body(request)
+    msg = str(body.get("message", ""))[:500]
+    level = str(body.get("level", "info")).lower()
+    if level in ("error", "warn", "warning"):
+        logger.warning("会话同步(前端): %s", msg)
+    else:
+        logger.info("会话同步(前端): %s", msg)
+    return {"status": "ok"}
+
+
+@app.get("/v1/sessions")
+async def api_sessions_list(limit: int = Query(default=500, ge=1, le=2000),
+                            offset: int = Query(default=0, ge=0)):
+    logger.info("会话列表请求")
+    import sessions as _sessions
+    return await run_in_threadpool(_sessions.list_sessions, limit, offset)
+
+
+@app.get("/v1/sessions/{session_id}")
+async def api_sessions_get(session_id: str):
+    logger.info("会话内容请求: %s", session_id[:18])
+    import sessions as _sessions
+    return await run_in_threadpool(_sessions.get_session, session_id)
+
+
+@app.post("/v1/sessions/{session_id}")
+async def api_sessions_save(session_id: str, request: Request):
+    """整会话快照 upsert：{name, selectedModel, lastActive, messages:[…]}。
+
+    用 POST 而非 PUT：前端走 Rust IPC 代理（sidecar_proxy），它只转发
+    GET/POST/DELETE；而 Tauri HTTP 插件那条路实测**挂住不返回**（⑩ 首版调试：
+    请求既不到服务端、也不报错、还没有超时，前端静默停住）。
+    """
+    body = await _json_body(request)
+    import sessions as _sessions
+    return await run_in_threadpool(
+        _sessions.save_session, session_id,
+        str(body.get("name", "")), str(body.get("selectedModel", "")),
+        int(body.get("lastActive", 0) or 0), body.get("messages") or [])
+
+
+@app.delete("/v1/sessions/{session_id}")
+async def api_sessions_delete(session_id: str):
+    import sessions as _sessions
+    return await run_in_threadpool(_sessions.delete_session, session_id)
+
+
+@app.post("/v1/sessions/import")
+async def api_sessions_import(request: Request):
+    """一次性迁移：把前端 localStorage 的会话整体搬进后端（幂等，默认只补不覆盖）。"""
+    body = await _json_body(request)
+    import sessions as _sessions
+    return await run_in_threadpool(_sessions.import_sessions,
+                                   body.get("sessions") or [],
+                                   bool(body.get("replace", False)))
+
+
 @app.post("/v1/extensions/install")
 async def api_extensions_install(request: Request):
-    """安装扩展：source=本地路径 | URL | GitHub repo，可选 sha256 校验。"""
+    """⑦ 安装第一阶段：取回内容 + 校验 + 算摘要，返回**预览**（不写盘）。
+
+    用户在前端看到预览（名称/版本/权限/文件数/sha256）并确认后，前端再调
+    /v1/extensions/install/confirm（带 pending_id + sha256）才真正安装。
+    """
     body = await _json_body(request)
     source = str(body.get("source", "")).strip()
     sha256 = str(body.get("sha256", "")).strip()
@@ -2172,8 +2274,20 @@ async def api_extensions_install(request: Request):
     if not source:
         return {"status": "error", "message": "source required"}
     from starlette.concurrency import run_in_threadpool
-    from extension_manager import install_extension
-    result = await run_in_threadpool(install_extension, source, sha256, label)
+    from extension_manager import stage_install
+    return await run_in_threadpool(stage_install, source, sha256, label)
+
+
+@app.post("/v1/extensions/install/confirm")
+async def api_extensions_install_confirm(request: Request):
+    """⑦ 安装第二阶段：回传预览里的 sha256 → 校验一致后落盘（⑥ 摘要绑定）。"""
+    body = await _json_body(request)
+    pending_id = str(body.get("pending_id", "")).strip()
+    digest = str(body.get("sha256", "")).strip()
+    label = str(body.get("label", "")).strip()
+    from starlette.concurrency import run_in_threadpool
+    from extension_manager import confirm_install
+    result = await run_in_threadpool(confirm_install, pending_id, digest, label)
     if isinstance(result, dict) and result.get("status") == "ok":
         # 热重载：插件/技能/MCP 立即可用，无需重启
         try:
@@ -2390,11 +2504,16 @@ async def api_market_discover_status():
 
 @app.post("/v1/extensions/install-github")
 async def api_extensions_install_github(request: Request):
-    """安装生态源条目（github 仓库 + skill_path + kind）。"""
+    """⑦ 生态源条目第一阶段：下载+打包 → 返回预览（不写盘）。
+
+    落盘走 /v1/extensions/install/confirm；原逻辑是"打包成本地临时文件直接安装"，
+    那会绕过"网络来源必须 sha256"的闸门（⑥）。
+    """
     body = await _json_body(request)
     repo = str(body.get("repo", "")).strip()
     skill_path = str(body.get("skill_path", "")).strip()
     kind = str(body.get("kind", "")).strip() or "openclaw-skill"
+    expect_sha256 = str(body.get("sha256", "")).strip()
     if not repo:
         return {"status": "error", "message": "repo 不能为空"}
     from extension_manager import is_source_blocked
@@ -2403,7 +2522,8 @@ async def api_extensions_install_github(request: Request):
     try:
         from starlette.concurrency import run_in_threadpool
         from extension_manager import install_github_item
-        result = await run_in_threadpool(install_github_item, repo, skill_path, kind)
+        result = await run_in_threadpool(install_github_item, repo, skill_path, kind,
+                                         expect_sha256)
         # 安装成功后热重载：技能/插件注册进能力表与工具表（否则要手动重启才生效）
         if isinstance(result, dict) and result.get("status") == "ok":
             try:

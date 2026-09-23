@@ -7,9 +7,14 @@ import logging
 
 import asyncio
 import re
+from cmd_safety import child_env
 from pathlib import Path
 
 logger = logging.getLogger("latiao-sidecar")   # 与 agent_loop 同名：日志格式不变
+
+# 自动验证要跑 npx/tsc/eslint/git/semgrep：这些工具自己的配置前缀保留，
+# 但不该拿到 sidecar token 与云模型密钥（安全批次 ④，2026-09-23）
+_VERIFY_ENV_PREFIXES = ("NODE_", "NPM_", "npm_", "SEMGREP_", "GIT_", "XDG_")
 
 async def _auto_verify(tool_name: str, args: dict, result: str) -> str:
     """Run programmatic verification after a tool executes.
@@ -45,6 +50,7 @@ async def _auto_verify(tool_name: str, args: dict, result: str) -> str:
                         proc = await asyncio.create_subprocess_exec(
                             "npx", "tsc", "--noEmit", cwd=str(parent),
                             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                            env=child_env(allow_prefixes=_VERIFY_ENV_PREFIXES),
                         )
                         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
                         if proc.returncode == 0:
@@ -76,6 +82,7 @@ async def _auto_verify(tool_name: str, args: dict, result: str) -> str:
             proc = await asyncio.create_subprocess_exec(
                 "git", "diff", "--stat",
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                env=child_env(allow_prefixes=_VERIFY_ENV_PREFIXES),
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
             if proc.returncode == 0 and stdout.strip():
@@ -92,6 +99,7 @@ async def _auto_verify(tool_name: str, args: dict, result: str) -> str:
                         proc = await asyncio.create_subprocess_exec(
                             "npx", "eslint", str(p),
                             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                            env=child_env(allow_prefixes=_VERIFY_ENV_PREFIXES),
                         )
                         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
                         output = (stdout or stderr or b"").decode("utf-8", errors="replace").strip()
@@ -167,6 +175,7 @@ async def _semgrep_scan(filepath: str) -> str | None:
         proc = await asyncio.create_subprocess_exec(
             "semgrep", "--config", "auto", "--quiet", filepath,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            env=child_env(allow_prefixes=_VERIFY_ENV_PREFIXES),
         )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
         output = (stdout or b"").decode("utf-8", errors="replace").strip()

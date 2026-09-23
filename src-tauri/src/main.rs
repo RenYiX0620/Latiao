@@ -5,9 +5,10 @@ use tauri::Manager;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-/// Per-run sidecar auth token — generated once at startup, injected into the
-/// sidecar process via the LATIAO_AUTH_TOKEN env var and exposed to the
-/// frontend through the get_auth_token command. Stable across sidecar
+/// Per-run sidecar auth token — generated once at startup, handed to the
+/// sidecar over its stdin (never the environment: `ps eww` on macOS reveals a
+/// process's exec-time env, and the model itself can run commands) and exposed
+/// to the frontend through the get_auth_token command. Stable across sidecar
 /// restarts so the frontend's cached token stays valid.
 static AUTH_TOKEN: OnceLock<String> = OnceLock::new();
 
@@ -21,14 +22,21 @@ fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
-/// Generate a random auth token. macOS/Linux: 32 bytes from /dev/urandom,
-/// hex-encoded (64 chars). Windows/fallback: timestamp + PID (simple — the
-/// threat model here is "local process can't guess it easily", not crypto).
+/// Generate a random auth token: 32 bytes from the OS random source,
+/// hex-encoded (64 chars).
+///
+/// 2026-09-23（审计 P1）：旧实现只在非 Windows 上读 /dev/urandom，Windows
+/// 必然落到"时间戳+PID"——可被枚举/预测，本机鉴权可被绕过。现在统一走
+/// getrandom（Windows 上内部用 BCryptGenRandom/ProcessPrng）。
 fn generate_auth_token() -> String {
+    let mut buf = [0u8; 32];
+    if getrandom::fill(&mut buf).is_ok() {
+        return hex_encode(&buf);
+    }
+    // 兜底（getrandom 失败极罕见）：Unix 上直接读 /dev/urandom
     #[cfg(not(target_os = "windows"))]
     {
         use std::io::Read;
-        let mut buf = [0u8; 32];
         if std::fs::File::open("/dev/urandom")
             .and_then(|mut f| f.read_exact(&mut buf))
             .is_ok()
@@ -36,10 +44,13 @@ fn generate_auth_token() -> String {
             return hex_encode(&buf);
         }
     }
+    // 最后手段：时间戳+PID。仅用于"随机源完全不可用"的退化环境，
+    // **不作为安全随机**（保留是为了让应用还能启动，而不是静默降级成弱鉴权）。
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or_default();
+    eprintln!("[latiao] 操作系统随机源不可用，token 退化为弱随机（请排查环境）");
     format!("{:x}-{:x}", now, std::process::id())
 }
 
@@ -104,18 +115,40 @@ fn get_auth_token() -> Result<String, String> {
 #[cfg(target_os = "macos")]
 #[tauri::command]
 fn store_secret(key: String, value: String) -> Result<(), String> {
-    let status = Command::new("security")
+    let mut child = Command::new("security")
         .args([
             "add-generic-password",
             "-s", "com.latiao.desktop",
             "-a", &key,
-            "-w", &value,
-            "-U", // update if exists
+            // ② 审计 P1：-w 不带值 → security 从 stdin 读密码。
+            // 旧写法是把值直接跟在这个开关后面 → 明文密钥进 argv，`ps` 就能看到
+            //（Python 侧写 keychain 一直是这么做的，Rust 侧照抄）。
+            "-U", // update if exists —— 必须在 -w 之前：-w 会把紧跟的参数当成密码值
+            "-w", // 值走 stdin（两行），见下
         ])
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status()
+        .spawn()
         .map_err(|e| format!("security CLI failed: {}", e))?;
+    {
+        use std::io::Write;
+        // take() 而不是 as_mut()：写完这块句柄即被 drop、管道关闭 → 子进程看到 EOF。
+        // 实测（2026-09-23）`security` 会一直等到 stdin EOF 才返回：用
+        // `(printf 'v\nv\n'; sleep 8) | security add-generic-password … -U -w` 量到
+        // 8.008s。若写端始终握在 child 手里，wait() 就永久阻塞、UI 存密钥卡死。
+        if let Some(mut stdin) = child.stdin.take() {
+            // security 会连问两遍（password + retype）→ stdin 必须送两行。
+            // 实测：只送一行会报 "passwords don't match"；把值跟着 -w 就会进 argv。
+            let payload = format!("{v}\n{v}\n", v = value);
+            stdin
+                .write_all(payload.as_bytes())
+                .map_err(|e| format!("write secret to stdin failed: {}", e))?;
+        }
+    }
+    let status = child
+        .wait()
+        .map_err(|e| format!("security CLI wait failed: {}", e))?;
     if status.success() {
         Ok(())
     } else {
@@ -230,36 +263,40 @@ fn delete_secret(_key: String) -> Result<(), String> {
 /// Restart the sidecar process — kills current child and spawns a new one.
 /// Note: kill+wait+spawn is short-lived blocking I/O (typically <500ms).
 /// Tauri commands run on a thread pool, so this won't block the UI.
+/// 给 sidecar 发一个本机回环 POST（detach 引擎 / 停引擎用）。
+///
+/// ① 审计 P1：旧实现 spawn `curl -H "Authorization: Bearer <token>"` ——
+/// token 出现在 argv 里，任何本机进程 `ps` 就能拿到。注释当时写的是
+/// "token 必须走 stdin 而不是 -H 参数"，代码却正好相反。现在改成**进程内
+/// reqwest 请求**：不 spawn 子进程、argv 里没有 token，也不再依赖 curl。
+fn post_to_sidecar(path: &str, timeout_ms: u64) -> bool {
+    let token = AUTH_TOKEN.get().map(|s| s.as_str()).unwrap_or("").to_string();
+    let url = format!("http://127.0.0.1:8765{}", path);
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_millis(timeout_ms))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let mut req = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({ "token": token }));
+    if !token.is_empty() {
+        req = req.header("Authorization", format!("Bearer {}", token));
+    }
+    matches!(req.send(), Ok(_))
+}
+
 #[tauri::command]
 fn restart_sidecar(state: tauri::State<'_, SidecarProcess>) -> Result<String, String> {
     let mut guard = state.0.lock().map_err(|e| format!("Lock failed: {}", e))?;
     if let Some(ref mut child) = *guard {
         // 先通知 sidecar detach 模型引擎（Python 子进程），使其在 sidecar
-        // 重启后继续存活（模型加载耗时巨大，重新加载会中断用户任务）
-        // token 必须走 stdin 而不是 -H 参数：argv 会出现在 `ps` 输出里泄漏
-        let token = AUTH_TOKEN.get().map(|s| s.as_str()).unwrap_or("").to_string();
-        // sidecar 的 _check_auth 只认 x-latiao-token / Authorization 头，
-        // 此前 token 只放 body → 生产模式必 401、detach 失效、引擎被杀（P1-8）
-        let auth_header = format!("Authorization: Bearer {}", token);
-        let mut curl = Command::new("curl")
-            .args([
-                "-s", "-m", "2", "-X", "POST",
-                "-H", "Content-Type: application/json",
-                "-H", &auth_header,
-                "--data-binary", "@-",
-                "http://127.0.0.1:8765/v1/engine/detach",
-            ])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .ok();
-        if let Some(ref mut c) = curl {
-            use std::io::Write;
-            if let Some(stdin) = c.stdin.as_mut() {
-                let _ = writeln!(stdin, "{{\"token\":\"{}\"}}", token);
-            }
-        }
+        // 重启后继续存活（模型加载耗时巨大，重新加载会中断用户任务）。
+        // 走进程内 reqwest（token 不进 argv，见 post_to_sidecar）。
+        let _ = post_to_sidecar("/v1/engine/detach", 2000);
         // detach 请求发出后稍候片刻再杀 sidecar（给 Python 处理时间）
         std::thread::sleep(std::time::Duration::from_millis(300));
 
@@ -396,14 +433,32 @@ fn start_sidecar() -> Option<Child> {
         c
     };
 
-    match cmd
+    let spawned = cmd
         .current_dir(&sidecar_dir)
         .env("LATIAO_CTX_LEN", "64000")
-        .env("LATIAO_AUTH_TOKEN", AUTH_TOKEN.get().map(|s| s.as_str()).unwrap_or(""))
         .env("LATIAO_APP_VERSION", env!("CARGO_PKG_VERSION"))
-        .spawn()
-    {
-        Ok(child) => {
+        // (A) token 不再进环境变量：实测 `ps eww -p <sidecar pid>` 能把同用户进程
+        // 启动时的整份环境打出来（运行时 os.environ.pop 也无效——ps 读的是 exec 时的
+        // 快照），而模型自己就能跑命令，等于把全权 token 送到它手上。改走子进程
+        // stdin 传一行（Python 侧启动时读一次）。
+        .env_remove("LATIAO_AUTH_TOKEN")
+        // (C) 妙想 key 同理：不再继承进 sidecar 环境，改由 sidecar 从 config.json
+        // 读入内存，需要时显式注入给子进程。
+        .env_remove("MX_APIKEY")
+        .stdin(std::process::Stdio::piped())
+        .spawn();
+
+    match spawned {
+        Ok(mut child) => {
+            // 把 token 写进子进程 stdin 后立刻 drop 写端（管道 EOF）：sidecar 读一行
+            // 即完成鉴权初始化；EOF 也让它知道没有更多输入。
+            if let Some(mut stdin) = child.stdin.take() {
+                let token = AUTH_TOKEN.get().map(|s| s.as_str()).unwrap_or("");
+                use std::io::Write;
+                if let Err(e) = stdin.write_all(format!("{}\n", token).as_bytes()) {
+                    eprintln!("[Latiao] Failed to hand token to sidecar over stdin: {}", e);
+                }
+            }
             println!("[Latiao] Sidecar started (pid {})", child.id());
             Some(child)
         }
@@ -531,19 +586,9 @@ fn main() {
 /// 先请 sidecar 优雅停掉引擎，再终止其子进程；NSIS 钩子另有一层 taskkill 兜底。
 #[tauri::command]
 fn stop_sidecar_for_update(state: tauri::State<'_, SidecarProcess>) -> Result<String, String> {
-    let token = AUTH_TOKEN.get().map(|s| s.as_str()).unwrap_or("").to_string();
-    let auth_header = format!("Authorization: Bearer {}", token);
-    // 停本地引擎（Windows 上 llama-server.exe 也在安装目录里，同样会锁文件）
-    let _ = Command::new("curl")
-        .args(["-s", "-m", "3", "-X", "POST",
-               "-H", "Content-Type: application/json",
-               "-H", &auth_header,
-               "--data-binary", "@-",
-               "http://127.0.0.1:8765/v1/local-llm/stop"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
+    // 停本地引擎（Windows 上 llama-server.exe 也在安装目录里，同样会锁文件）。
+    // 同样走进程内 reqwest：token 不进 argv。
+    let _ = post_to_sidecar("/v1/local-llm/stop", 3000);
     let mut guard = state.0.lock().map_err(|e| format!("Lock failed: {}", e))?;
     if let Some(mut child) = guard.take() {
         #[cfg(unix)]

@@ -63,6 +63,14 @@ def execute(args: dict) -> str:
     if os.path.basename(p) in _BLOCKED_FILE_NAMES:
         return f"⛔ Blocked: 不允许写入敏感文件 - {p}"
     # sidecar 的 plugins/ 目录一律拒绝（写入后下次启动会被 import 执行 = RCE）
+    # 自动加载目录（extensions/skills）与应用配置：写进去的代码下次启动即执行（审计 P1 ⑧）
+    try:
+        from cmd_safety import sensitive_write_block
+        _blk = sensitive_write_block(p)
+        if _blk:
+            return _blk
+    except Exception:
+        pass
     sidecar_plugins = os.path.realpath(os.path.dirname(__file__))
     if p == sidecar_plugins or p.startswith(sidecar_plugins + os.sep):
         return f"⛔ Blocked: 不允许写入插件目录 - {p}"

@@ -17,7 +17,7 @@ import httpx
 
 # 命令安全不变量单点定义（审计 P0）：插件、本 fallback、插件 seed 共用，
 # 消除三处漂移——fallback 此前缺解释器内联拦截（python3 -c / node -e）。
-from cmd_safety import check_cmd, reject_sensitive_read
+from cmd_safety import check_cmd, child_env, reject_sensitive_read
 
 logger = logging.getLogger("latiao-sidecar")
 
@@ -217,7 +217,10 @@ def run_cmd(cmd: str) -> str:
             tokens = shlex.split(cmd)
         except ValueError as e:
             return f"命令格式错误: {e}"
-        r = subprocess.run(tokens, shell=False, capture_output=True, text=True, timeout=30)
+        r = subprocess.run(tokens, shell=False, capture_output=True, text=True, timeout=30,
+                           # ④ 兜底执行器同样过白名单：命令由模型给出，子进程不该拿到
+                           # sidecar token 与云模型密钥（审查时靠 test_spawn_env_guard 抓到）
+                           env=child_env())
         out = r.stdout.strip()
         if r.returncode != 0:
             out += f"\n(退出码: {r.returncode})"

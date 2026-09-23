@@ -166,7 +166,13 @@ class MXData:
         初始化客户端
         :param api_key: MX API Key，如果不提供则从环境变量 MX_APIKEY 读取
         """
-        self.api_key = api_key or os.getenv("MX_APIKEY")
+        # 优先运行时内存（sidecar 启动时从 config.json 读入并已从环境移除；
+        # 独立运行本模块时仍回退环境变量）
+        try:
+            from runtime_secrets import get as _secret_get
+            self.api_key = api_key or _secret_get("MX_APIKEY") or os.getenv("MX_APIKEY")
+        except ImportError:
+            self.api_key = api_key or os.getenv("MX_APIKEY")
         if not self.api_key:
             raise ValueError(
                 "MX_APIKEY 环境变量未设置，请先设置环境变量：\n"

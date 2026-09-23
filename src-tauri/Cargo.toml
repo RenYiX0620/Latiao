@@ -1,6 +1,6 @@
 [package]
 name = "local-ai-os"
-version = "0.3.42"
+version = "0.3.43"
 description = "Integrated Local AI Agent + Local Model"
 authors = ["RenYiX0620"]
 license = "MIT"
@@ -22,8 +22,10 @@ tauri-plugin-updater = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-process = "2"
 serde = { version = "1", features = ["derive"] }
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "blocking"] }
 serde_json = "1"
+# ③ Windows token 随机源：不用时间戳+PID（可枚举），统一走操作系统随机源
+getrandom = "0.3"
 
 [features]
 default = ["default-tauri"]

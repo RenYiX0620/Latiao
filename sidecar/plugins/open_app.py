@@ -1,5 +1,6 @@
 """Open an application by name. macOS native, Windows via start."""
 import platform
+import re as _re
 import subprocess
 
 IS_WINDOWS = platform.system() == "Windows"
@@ -45,6 +46,11 @@ def execute(args: dict) -> str:
     name = args["name"]
     resolved = _APP_ALIASES.get(name, name)
     if IS_WINDOWS:
+        # Windows 那条走 cmd /c start：cmd.exe 会二次解释命令行，应用名里的
+        # & | ^ < > " % 会被当命令分隔符/转义（模型可以塞 "x & del ..."）。
+        # 应用名不需要这些字符，直接拒绝（审查 2026-09-23）。
+        if _re.search(r'[&|^<>"%\r\n\t]', resolved):
+            return f"⛔ 应用名含不允许的字符：{resolved}"
         try:
             subprocess.Popen(["cmd", "/c", "start", "", resolved])
             return f"✅ 已打开：{resolved}"

@@ -16,6 +16,8 @@ import re
 
 import httpx
 
+from cmd_safety import child_env   # ④ 子进程 env 白名单（MCP server 是第三方代码）
+
 logger = logging.getLogger("latiao-sidecar")
 
 PROTOCOL_VERSION = "2024-11-05"
@@ -74,7 +76,7 @@ class MCPClient:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
-                env={**dict(__import__("os").environ), **env},
+                env=child_env(extra=env),
             )
         except FileNotFoundError as e:
             raise MCPError(f"MCP {self.name}: 命令不存在 {cmd}") from e

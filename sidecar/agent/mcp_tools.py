@@ -7,6 +7,10 @@
 import logging
 
 
+# MCP 是否已加载（本模块的缓存标记——重构时它曾留在 agent_loop，
+# 导致 global 引用落到别的模块、启动即 NameError，2026-09-23 实测抓到）
+_MCP_LOADED = False
+
 logger = logging.getLogger("latiao-sidecar")   # 与 agent_loop 同名：日志格式不变
 
 async def _load_mcp_tools() -> None:

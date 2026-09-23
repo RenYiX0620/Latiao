@@ -1,6 +1,6 @@
+from cmd_safety import child_env   # ④ 子进程 env 白名单
 #!/usr/bin/env python3
 """mx_query - 妙想金融数据查询工具"""
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -73,6 +73,17 @@ def _sector_query_mismatch(query: str, result_text: str) -> bool:
     return False
 
 
+def _mx_child_env():
+    """子进程 env：白名单 + 显式注入妙想 key（它已不在 sidecar 的环境里）。"""
+    try:
+        from runtime_secrets import get as _secret_get
+        key = _secret_get("MX_APIKEY")
+    except Exception:
+        key = ""
+    return child_env(extra={"MX_APIKEY": key} if key else None,
+                     allow_prefixes=("MX_",))
+
+
 def execute(args: dict) -> str:
     """Execute a financial data query using the mx_data skill.
     查询失败（接口无法解析措辞）时自动用规范化变体重试。"""
@@ -89,7 +100,7 @@ def execute(args: dict) -> str:
                 result = subprocess.run(
                     [sys.executable, "--mx-query", q],
                     capture_output=True, text=True, timeout=120,
-                    env={**os.environ}
+                    env=_mx_child_env()   # ④ 白名单：只额外带上数据源自己的凭据
                 )
                 if result.returncode == 0:
                     return result.stdout.strip() or "查询完成，无输出"
@@ -123,7 +134,7 @@ def execute(args: dict) -> str:
             result = subprocess.run(
                 [sys.executable, str(mx_data), "--query", q],
                 capture_output=True, text=True, timeout=120,
-                env={**os.environ}
+                env=_mx_child_env()   # ④ 白名单：只额外带上数据源自己的凭据
             )
             if result.returncode == 0:
                 out_text = result.stdout.strip() or "查询完成，无输出"

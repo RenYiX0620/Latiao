@@ -537,9 +537,9 @@ class TestFullModeSkipsConfirmation(unittest.TestCase):
             calls["n"] += 1
             return False, [{"event": "tool_confirm", "call_id": call_id}]
 
-        import agent_loop as al
-        original = al._await_tool_confirmation
-        al._await_tool_confirmation = fake_confirm
+        import agent.tool_exec as TE   # 确认等待的调用方（2026-09-23 拆出）
+        original = TE._await_tool_confirmation
+        TE._await_tool_confirmation = fake_confirm
         try:
             tc = {"id": "t1", "function": {
                 "name": "write_file",
@@ -547,7 +547,7 @@ class TestFullModeSkipsConfirmation(unittest.TestCase):
             ok, events = asyncio.run(
                 _handle_tool_execution(tc, [], "sess", "latiao", access_mode))
         finally:
-            al._await_tool_confirmation = original
+            TE._await_tool_confirmation = original
         return calls["n"], os.path.exists(target), events
 
     def test_full_mode_executes_without_confirmation(self):

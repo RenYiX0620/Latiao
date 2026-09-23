@@ -28,6 +28,7 @@ from pathlib import Path
 
 import certifi
 
+from cmd_safety import child_env
 try:
     _ssl_ctx = ssl.create_default_context(cafile=certifi.where())
 except Exception:
@@ -35,6 +36,9 @@ except Exception:
     _ssl_ctx = ssl.create_default_context()
 
 logger = logging.getLogger("latiao-sidecar")
+
+# 引擎子进程需要透传的运行库/后端变量（凭据类一律不在白名单里）
+_ENGINE_ENV_PREFIXES = ("DYLD_", "LD_", "MTL_", "GGML_", "OMP_", "CUDA_", "VK_", "HF_", "MLX_")
 
 MODELS_DIR = Path(os.environ.get("LATIAO_MODELS_DIR", Path.home() / "Models"))
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
@@ -1863,7 +1867,7 @@ class LocalLLMEngine:
             chat_fmt = self._guess_chat_format(model_path)
             if chat_fmt:
                 cmd += ["--chat_format", chat_fmt]
-            env = os.environ.copy()
+            env = child_env(allow_prefixes=_ENGINE_ENV_PREFIXES)
             env["HF_ENDPOINT"] = self._get_hf_endpoint()  # 镜像优先（国内 huggingface.co 常不可达）
             env["HF_HUB_DISABLE_XET"] = "1"
             # stdout 无人读取，必须 DEVNULL，否则管道缓冲满后子进程死锁
@@ -2058,7 +2062,7 @@ class LocalLLMEngine:
         # 而非掐断当前生成），与 macOS 路径显式 --interrupt_requests False
         # 行为一致，无需额外参数。
 
-        env = os.environ.copy()
+        env = child_env(allow_prefixes=_ENGINE_ENV_PREFIXES)
         env.pop("HF_ENDPOINT", None)
         # stdout 无人读取，必须 DEVNULL，否则管道缓冲满后子进程死锁
         proc = subprocess.Popen(
@@ -2207,7 +2211,7 @@ class LocalLLMEngine:
                 "--port", str(port),
                 "--host", "127.0.0.1",
             ]
-            env = os.environ.copy()
+            env = child_env(allow_prefixes=_ENGINE_ENV_PREFIXES)
             env.pop("HF_ENDPOINT", None)
             # mlx_lm.server 的 GET /v1/models 会调 scan_cache_dir()：HF hub
             # 缓存目录缺失时抛 CacheNotFound → 该请求必崩 → 就绪/健康探测
@@ -2814,7 +2818,10 @@ def run_fix(fix_type: str, fix_pkg: str = "") -> dict:
         try:
             proc_result = subprocess.run(
                 [sys.executable, "-m", "pip", "install", fix_pkg],
-                capture_output=True, text=True, timeout=120
+                capture_output=True, text=True, timeout=120,
+                # ④ pip 同样不该拿到 sidecar token / 云模型密钥；PIP_/UV_ 前缀
+                # 保留镜像与索引配置（用户可能靠 PIP_INDEX_URL 走内网源）
+                env=child_env(allow_prefixes=("PIP_", "UV_")),
             )
             if proc_result.returncode == 0:
                 if fix_pkg == "mlx-lm":
