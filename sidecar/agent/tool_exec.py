@@ -23,7 +23,7 @@ from agent.verify import _auto_verify
 from cmd_safety import redact_secrets, tool_log_preview
 from datetime import datetime
 from db import _db_write_lock, _get_db
-from memory import _maybe_generate_skill, _quick_reflect, _record_reflection, _refine_learnings
+from memory import _maybe_generate_skill, _refine_learnings, record_tool_reflection
 from threat_scan import guard_tool_result
 from tool_executor import _resolve_permission
 
@@ -336,9 +336,8 @@ async def _handle_tool_execution_inner(tc: dict, current_msgs: list, session_id:
     ):
         verify_failed = True
 
-    reflection_note = _quick_reflect(tool_name, result)
-    if reflection_note:
-        _record_reflection(session_id, tool_name, args, result[:200], reflection_note, True)
+    # 反思链路唯一入口：生成文案 + 诚实 was_useful + 真失败提升为 learning（⑧）
+    reflection_note = record_tool_reflection(session_id, tool_name, args, result)
 
     tool_content = result
     # Inject reflection into conversation context so LLM benefits immediately

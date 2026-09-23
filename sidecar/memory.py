@@ -54,27 +54,61 @@ def _tokenize_zh(text: str) -> list[str]:
     return tokens
 
 
+# 错误签名提取（2026-09-23，审查⑧）：反思此前只有"工具 X 执行出错，建议重试"这类
+# 模板套话——真库 969 条里只有 136 种文本，mx_query 的同一句出现 237 次。模板对
+# 跨会话复用毫无价值（"上次踩过的坑"必须带上是什么坑）。这里从结果里抽一行错误
+# 特征，让反思（以及由它提升出的 learning）可定位、可检索。
+_ERROR_SIG_RE = re.compile(
+    r"(?:error|错误|failed|失败|traceback|denied|不存在|未找到|超时|timeout|"
+    r"频率过高|次数已用完|未返回数据)[^\n]{0,80}", re.IGNORECASE)
+
+
+def _error_signature(result: str, limit: int = 60) -> str:
+    """从工具结果里抽一段可辨识的错误特征；抽不到返回空串。"""
+    m = _ERROR_SIG_RE.search(result or "")
+    if not m:
+        return ""
+    return re.sub(r"\s+", " ", m.group(0)).strip()[:limit]
+
+
+# 反思类别：决定文案，也决定这条反思是否算"真踩到的坑"（⑧：was_useful 此前
+# 硬编码 True，于是"输出较大"这类提示也被当成失败经验——真库模拟显示 351 条
+# read_file"失败经验"其实是长输出提示）。只有 error/missing/empty 才值得提升为知识。
+REFLECTION_PITFALL_KINDS = ("error", "missing", "empty")
+
+
+def _reflection_kind(tool_name: str, result: str) -> str:
+    """判断反思类别：permission | error | missing | empty | large | ''。"""
+    result_lower = (result or "").lower()
+    if "permission denied" in result_lower or "权限不足" in result:
+        return "permission"
+    if ("error" in result_lower or "错误" in result or "failed" in result_lower
+            or "失败" in result or "traceback" in result_lower or "denied" in result_lower):
+        return "error"
+    if "not found" in result_lower or "不存在" in result:
+        return "missing"
+    if len((result or "").strip()) < 5:
+        return "empty"
+    if len(result or "") > 5000:
+        return "large"
+    return ""
+
+
 def _quick_reflect(tool_name: str, result: str) -> str:
     """Quick heuristic reflection on tool execution result.
     Returns a reflection note or empty string."""
-    result_lower = result.lower()
-    # 具体建议分支放在通用 is_error 判断之前，否则永远不可达
-    if "permission denied" in result_lower or "权限不足" in result:
-        return "权限不足，建议检查文件/目录权限"
-    # Error detection — covers both English and Chinese tool error messages
-    is_error = (
-        "error" in result_lower or "错误" in result
-        or "failed" in result_lower or "失败" in result
-        or "traceback" in result_lower
-        or "denied" in result_lower
-    )
-    if is_error:
-        return f"工具 {tool_name} 执行出错，可能需要重试或调整参数"
-    if "not found" in result_lower or "不存在" in result:
-        return "目标不存在，可能需要先确认路径或创建前置资源"
-    if len(result.strip()) < 5:
+    sig = _error_signature(result)
+    tail = f"（{sig}）" if sig else ""
+    kind = _reflection_kind(tool_name, result)
+    if kind == "permission":
+        return f"权限不足，建议检查文件/目录权限{tail}"
+    if kind == "error":
+        return f"工具 {tool_name} 执行出错，可能需要重试或调整参数{tail}"
+    if kind == "missing":
+        return f"目标不存在，可能需要先确认路径或创建前置资源{tail}"
+    if kind == "empty":
         return "工具返回为空，可能参数不正确或目标无内容"
-    if len(result) > 5000:
+    if kind == "large":
         return f"输出较大({len(result)}字符)，后续可能需要聚焦关键部分"
     return ""  # Everything looks fine, no reflection needed
 
@@ -588,7 +622,14 @@ def _get_high_confidence_preferences() -> list[dict]:
 
 
 def _record_reflection(session_id: str, tool_name: str, tool_args: dict, tool_result_summary: str, reflection: str, was_useful: bool):
-    """Store a post-tool-call reflection."""
+    """Store a post-tool-call reflection, and promote real pitfalls to learnings.
+
+    ⑧（2026-09-23 审查）：反思此前只拼进当轮工具结果，跨会话零复用——真库 969 条
+    反思里"工具 mx_query 执行出错"出现 237 次，而 learnings 里一条都没有。现在
+    真踩到的坑（was_useful=True，即 error/permission/missing/empty 四类）提升为
+    learning：topic 带错误签名 → 不同的坑各自成条、同一个坑重复踩则靠 topic upsert
+    累加置信度（真库 498 条错误反思 → 至多 81 个组合，量级可控）。
+    """
     try:
         conn = _get_db()
         rid = str(uuid.uuid4())
@@ -600,8 +641,41 @@ def _record_reflection(session_id: str, tool_name: str, tool_args: dict, tool_re
                  tool_result_summary, reflection, 1 if was_useful else 0, datetime.now().isoformat()),
             )
             conn.commit()
+        # 提升必须在 _db_write_lock **之外**：_store_learning 自己也要拿这把非可重入锁，
+        # 在锁内调用会死锁——首版就是这么写的，测试直接卡死（别挪回去）。
+        if was_useful and reflection:
+            _sig = _error_signature(tool_result_summary) or ""
+            _args_sig = ""
+            try:
+                if isinstance(tool_args, dict) and tool_args:
+                    _k = sorted(tool_args)[0]
+                    _args_sig = f"{_k}={str(tool_args[_k])[:40]}"
+            except Exception:
+                _args_sig = ""
+            _topic = f"工具 {tool_name} 失败：{_sig[:30]}" if _sig else f"工具 {tool_name} 失败经验"
+            _content = f"{tool_name}({_args_sig}) 失败：{reflection}"
+            if _sig and _sig not in _content:
+                _content += f"｜特征：{_sig}"
+            # 注意 _store_learning 无返回值（首版写成解包 → 每次静默抛异常）
+            _store_learning(session_id, _topic, _content[:200], 0.6, source_type="reflection")
     except Exception:
         logger.warning("Failed to store reflection in memory DB", exc_info=True)
+
+
+def record_tool_reflection(session_id: str, tool_name: str, tool_args: dict, result: str) -> str:
+    """工具执行后的反思链路唯一入口（2026-09-23，审查⑧）。
+
+    三件事一起做：①按结果判定类别并生成反思文案（返回给调用方拼进本轮工具结果）；
+    ②以**诚实**的 was_useful 落库（只有 error/permission/missing/empty 才算真踩到的坑，
+    "输出较大"这类提示不是）；③把真踩到的坑提升为 learning，才能跨会话被检索复用。
+    收成一个入口，是为了让"反思→知识"这条链可测、调用方也无法只做一半。
+    """
+    note = _quick_reflect(tool_name, result)
+    if not note:
+        return ""
+    is_pitfall = _reflection_kind(tool_name, result) in REFLECTION_PITFALL_KINDS
+    _record_reflection(session_id, tool_name, tool_args, (result or "")[:200], note, is_pitfall)
+    return note
 
 
 async def _refine_learnings(tool_name: str, args: dict, result: str, session_id: str):
