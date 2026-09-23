@@ -9,13 +9,17 @@ visible.
 import asyncio
 import json
 import logging
+import re
 import threading
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
 
 import httpx
 
+from agent.parsing import _looks_like_tool_markup   # 交付前兜底检查（模块级：_cron_can_finalize 用）
+from cmd_safety import redact_secrets, tool_log_preview   # 日志脱敏（09-23）
 from config import PROGRESS_DIR
 from db import _db_write_lock, _get_db
 
@@ -264,6 +268,35 @@ def _convert_tool_messages_for_local(msgs: list[dict]) -> list[dict]:
     ]
 
 
+# ── 收口判据（09-23）────────────────────────────────────────────
+# 此前拿到正文后只累加不退出，循环会一直问模型直到它回一个空响应（或跑满 10 轮）。
+# 真机实测（读配置写摘要的简单任务）：9 次调用 / 88.6s，其中第 4 轮就已写出可交付的
+# 160 字结论，后面 5 轮（含 7 次工具调用）全是空转。
+# 判据：非空正文 + 本轮**没有工具调用** + 不像过渡句 → 收口。
+# 有工具调用的轮次一律不在此列（那是在干活，不是在交付）。
+_CRON_FINAL_MIN_CHARS_TOOLED = 120   # 已走过工具轮：120 字即可认为在交付结论
+_CRON_FINAL_MIN_CHARS_CHAT = 250     # 一次工具都没用过：更保守（纯聊天/问答型任务）
+_CRON_TRANSITION_RE = re.compile(
+    r"(我先|让我先|我先来|接下来我|下面我|我将|我正在|先查一下|先去查|稍等|马上开始|正在执行)")
+
+
+def _cron_can_finalize(content: str, tool_count: int) -> tuple[bool, str]:
+    """本轮正文是否已可交付（收口）。返回 (是否收口, 原因) —— 原因进日志便于诊断。"""
+    _txt = (content or "").strip()
+    if not _txt:
+        return False, "空正文"
+    # 仍是工具标记就不算可交付（兜底：清洗若因新方言漏网，这里不让它当报告发出去）
+    if _looks_like_tool_markup(_txt):
+        return False, "正文里还有工具调用标记"
+    # 只看开头：正式报告的正文里可能带"接下来建议…"，不该被误判成过渡句
+    if _CRON_TRANSITION_RE.search(_txt[:80]):
+        return False, "像过渡句（模型还打算继续干活）"
+    _need = _CRON_FINAL_MIN_CHARS_TOOLED if tool_count > 0 else _CRON_FINAL_MIN_CHARS_CHAT
+    if len(_txt) < _need:
+        return False, f"正文偏短({len(_txt)}<{_need})"
+    return True, f"正文可交付({len(_txt)}字, 工具轮={tool_count})"
+
+
 async def _execute_cron_job(job: dict, force_local: bool = False):
     """Execute a due cron job: run the task through the agent loop with tools enabled."""
     # 依赖 agent_loop 的循环/工具符号 → 函数内 lazy import 避免循环依赖
@@ -279,16 +312,19 @@ async def _execute_cron_job(job: dict, force_local: bool = False):
         _filter_tools,
         _get_agent_config,
         _get_agent_tools,
+        _count_successful_duplicates,
         _get_best_cloud_config,
         _local_llm_serialized,
         _merge_system_messages,
         _parse_native_tool_calls,
         _parse_prompt_tool_calls,
+        _REPEAT_ALLOWED_TOOLS,
         _resolve_api_target,
         _safe_cwd,
         _strip_native_tool_calls,
         execute_tool,
     )
+    from agent.parsing import _scrub_tool_markup
     from main import SUBAGENT_MODEL
     from tool_executor import _resolve_permission
     task = job.get("task", "")
@@ -365,6 +401,11 @@ async def _execute_cron_job(job: dict, force_local: bool = False):
     current_msgs = [dict(m) for m in messages]
     full_content = ""
     tool_count = 0
+    # 调用次数/耗时诊断（09-23）：用来对比"收口"前后的模型调用数与墙钟——
+    # 此前 cron 每次任务的真实成本完全不可见
+    _llm_calls = 0
+    _dup_guard_hits = 0
+    _t_start = time.monotonic()
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(300)) as client:
             for _cron_iter in range(10):  # max 10 iterations for cron
@@ -401,22 +442,34 @@ async def _execute_cron_job(job: dict, force_local: bool = False):
                 # 内触发的任务此前一次瞬时 404/连接错误即整任务失败（L6）
                 _last_err: Exception | None = None
                 resp = None
+                # 成功解析出的响应体（唯一成功判据）：三次都失败时它是 None，
+                # 用"resp is None"判空会在"最后一次是 500/坏 JSON"时漏掉（resp 非
+                # None 但 resp_data 未赋值）→ NameError，比原本的报错更难查
+                resp_data: dict | None = None
                 for _cron_try in range(3):
+                    # 每次尝试前重置：否则第 1 次拿到 4xx/5xx、第 2/3 次传输失败时
+                    # resp 会残留那个错误响应 → 判空失效，直接对错误页做 json()
+                    # （审计 A4）
+                    resp = None
                     try:
                         async with _local_llm_serialized(api_url):
+                            _llm_calls += 1
                             resp = await client.post(api_url, json=req_body, headers=headers)
                         resp.raise_for_status()  # httpx 不自动抛 4xx/5xx，必须显式检查
-                        break
-                    except (httpx.TransportError, httpx.HTTPStatusError) as _e:
+                        _parsed = resp.json()     # 解析纳入重试：代理返回的 200 错误页
+                        if isinstance(_parsed, dict):
+                            resp_data = _parsed
+                            break
+                        raise ValueError(f"响应不是 JSON 对象：{type(_parsed).__name__}")
+                    except (httpx.TransportError, httpx.HTTPStatusError, ValueError) as _e:
                         _last_err = _e
                         if _cron_try < 2:
                             logger.warning("[CRON] 模型请求失败（%s），5s 后重试 %d/3",
                                            type(_e).__name__, _cron_try + 2)
                             await asyncio.sleep(5)
-                if resp is None:
+                if resp_data is None:
                     raise (_last_err if _last_err is not None
                            else RuntimeError("cron 模型请求失败"))
-                resp_data = resp.json()
                 choices = resp_data.get("choices", [])
                 if not choices:
                     break
@@ -450,14 +503,28 @@ async def _execute_cron_job(job: dict, force_local: bool = False):
                         except json.JSONDecodeError:
                             tool_args = {}
                         perm = _resolve_permission(tool_name, tool_args)
+                        _dups = _count_successful_duplicates(current_msgs, tool_name, tool_args)
                         if perm in ("confirm", "danger", "deny", "blocked"):
                             result = f"⛔ Cron 任务不支持需要确认或被权限规则阻止的操作: {tool_name}（级别 {perm}）"
+                        elif _dups >= 2 and tool_name not in _REPEAT_ALLOWED_TOOLS:
+                            # 重复调用守卫（09-23 从主循环搬来）：cron 此前没有这道护栏，
+                            # 实测同一个 read_file 被同参调 3 次——每轮都吃掉一次 10 轮
+                            # 预算与 2-35s 的生成时间，且上下文变长更容易撞 max_tokens
+                            # 截断（截断又会产出半截工具标记，见 _scrub_tool_markup）
+                            _dup_guard_hits += 1
+                            result = (
+                                f"⛔ 该调用与此前已成功执行的调用完全相同（{tool_name}，"
+                                f"相同参数已成功 {_dups} 次），结果已在上方历史中，不再重复执行。\n"
+                                "请直接基于已收集的数据写出完整分析（简体中文，含关键数字与结论）；"
+                                "或改用其他工具/其他参数补充数据。不要再次发起相同调用。")
                         else:
                             # 与主循环同款工具日志——此前 cron 工具执行零日志，
                             # "参数传递问题"这类失败完全无从排查（09-01 18:58 事故）
-                            logger.info("Tool executing (cron): %s %s", tool_name, str(tool_args)[:120])
+                            logger.info("Tool executing (cron): %s %s", tool_name,
+                                        redact_secrets(str(tool_args))[:120])
                             result = await execute_tool(tool_name, tool_args)
-                            logger.info("Tool result (cron): %s → %s", tool_name, result[:80].replace("\n", " "))
+                            logger.info("Tool result (cron): %s → %s", tool_name,
+                                        tool_log_preview(tool_name, result))
                         if len(result) > 3000:
                             result = result[:3000] + "\n...(截断)"
                         # 与主循环同款时间锚：截断后追加，防模型被检索结果旧日期锚定
@@ -466,8 +533,17 @@ async def _execute_cron_job(job: dict, force_local: bool = False):
                         current_msgs.append({"role": "tool", "tool_call_id": tc.get("id", "cron"), "content": result})
                     continue
 
+                # 交付前清洗（09-23）：被 max_tokens 截断的半截调用标记（载荷 JSON 裸在
+                # 正文里）此前会被当"分析结果"交付。清理后若整轮都是标记 → 视为空响应，
+                # 走下面的 nudge 分支让模型重新作答，而不是把垃圾写进报告。
+                content = _scrub_tool_markup(content)
                 if content:
                     full_content += content
+                    _final, _why = _cron_can_finalize(content, tool_count)
+                    if _final:
+                        # 收口：本轮已经把结论写出来了，不再空转（详见判据注释）
+                        logger.info("[CRON] 收口于第 %d 轮：%s", _cron_iter + 1, _why)
+                        break
                 elif full_content:
                     # Already have content from earlier iterations, stop
                     break
@@ -497,6 +573,11 @@ async def _execute_cron_job(job: dict, force_local: bool = False):
                             "content": "轮次已用完，禁止再调用任何工具。请立即输出最终完整报告：直接给出任务要求的所有部分（如大盘走势、板块资金流向明细、操作建议），基于已收集的工具结果，写完整的分析文字。",
                         })
                         _cron_msgs = _merge_system_messages(current_msgs)
+                        # 本地引擎只认 system/user/assistant——role:"tool" 会致空响应
+                        # （主循环 388 行同款转换；收尾轮此前漏做，实测本地引擎收尾轮
+                        # 空响应 → 用户拿到的是原始工具输出兜底而不是总结。审计 A1）
+                        if is_local:
+                            _cron_msgs = _convert_tool_messages_for_local(_cron_msgs)
                         # 收尾轮不注入任何工具提示（云端原生 tools 也不发）——
                         # 带着工具清单模型会继续"过渡句+下轮调用"而不是写报告
                         # （15:03 事故：收尾轮仍只回 90 字过渡句）。纯文字模式
@@ -509,6 +590,7 @@ async def _execute_cron_job(job: dict, force_local: bool = False):
                         }
                         async with httpx.AsyncClient(timeout=httpx.Timeout(300)) as _fc:
                             async with _local_llm_serialized(api_url):
+                                _llm_calls += 1
                                 _fr = await _fc.post(api_url, json=_final_body, headers=headers)
                         if _fr.status_code == 200:
                             _fm = (_fr.json().get("choices") or [{}])[0].get("message", {})
@@ -525,6 +607,9 @@ async def _execute_cron_job(job: dict, force_local: bool = False):
                     else:
                         full_content = "(无输出)"
         ai_content = full_content or "(无输出)"
+        logger.info("[CRON] 完成：任务=%s 工具轮=%d LLM 调用=%d 耗时=%.1fs 正文=%d字 重复拦截=%d",
+                    str(job.get("task") or "")[:40], tool_count, _llm_calls,
+                    time.monotonic() - _t_start, len(ai_content), _dup_guard_hits)
         _record_cron_result(job, "success", ai_content)
     except Exception as e:
         # 云端 API 429 限流 → 回退本地引擎完整重跑一次（本地引擎不受

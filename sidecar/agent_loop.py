@@ -46,6 +46,7 @@ from tool_executor import (
 from tool_system import load_plugins
 
 # ── Stage 1 拆分：实现移至 agent/ 包（兼容导入，既有引用继续可用）──
+from cmd_safety import redact_secrets, tool_log_preview   # 日志/落盘脱敏（09-23）
 from agent.transport import (  # noqa: F401
     _is_local_llm_url, _local_llm_serialized, _local_llm_stream,
     _safe_cwd, _verify_llm_health, clear_llm_suspect, mark_llm_suspect,
@@ -74,6 +75,7 @@ from agent.context import (  # noqa: F401
     _get_localized_text, _inject_image, _inject_thinking_disabled,
     _is_chat_query, _is_light_query, _local_native_tools_ok,
     _maybe_add_inline_file_note, _merge_system_messages, _normalize_access,
+    subagent_tool_gate,
     _recover_tool_name, _resolve_max_tokens, _sanitize_tool_messages,
     _slim_history_for_local, _strip_transient_reminders,
 )
@@ -729,35 +731,59 @@ async def execute_tool(tool_name: str, arguments: dict) -> str:
     return result
 
 
-def _record_progress(entry: str):
-    """Append a progress entry to PROGRESS.md for cross-session continuity."""
-    try:
-        PROGRESS_DIR.mkdir(parents=True, exist_ok=True)
-        now = datetime.now().isoformat()
-        with open(PROGRESS_FILE, "a", encoding="utf-8") as f:
-            f.write(f"### {now}\n{entry}\n\n")
-        # 体积轮转（审计 B10）：append-only 已长到 1.1MB 且无上限。
-        # 超 1MB 时保留尾部 500KB——read_file 从头截断读最旧 5 万字符，
-        # 轮转同时保证最近进度仍在文件里（尾部注入读的也是最新段）
-        if PROGRESS_FILE.stat().st_size > 1024 * 1024:
-            _rotate_progress_file()
-    except Exception:
-        logger.warning("Failed to record progress", exc_info=True)
+def _progress_file(session_id: str | None = None) -> Path:
+    """本会话的进度文件（09-23 按会话隔离）。
+
+    此前所有会话共写一个 PROGRESS.md，而注入是把它的**尾部贴到最后一条用户消息**
+    里（权重最高）——于是 B 会话会"看到"A 会话（含 A 的子代理）的文件/命令输出，
+    表现为答非所问（用户实测："无论问什么都去找股市"）。按会话分文件后，注入只取
+    本会话自己的记录。没有 session_id（cron/旧调用）时退回共享文件，行为同旧版。
+    """
+    sid = str(session_id or "").strip()
+    if not sid:
+        return PROGRESS_FILE
+    # 会话 id 来自前端（session_<uuid>）或 uuid；白名单化避免路径穿越
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", sid)[:64] or "anon"
+    return PROGRESS_DIR / f"PROGRESS.{safe}.md"
 
 
-def _rotate_progress_file():
-    """把 PROGRESS.md 截到最近 500KB（保留尾部，即最新进度）。
+def _record_progress(entry: str, session_id: str | None = None):
+    """Append a progress entry for cross-session continuity.
+
+    写两处：本会话文件（注入只读它）+ 共享 PROGRESS.md（保持"断点续作"与
+    read_file 启动协议不变——那是模型显式发起的读取，不是无条件注入）。
+    """
+    for path in {_progress_file(session_id), PROGRESS_FILE}:
+        try:
+            PROGRESS_DIR.mkdir(parents=True, exist_ok=True)
+            now = datetime.now().isoformat()
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(f"### {now}\n{entry}\n\n")
+            # 体积轮转（审计 B10）：append-only 已长到 1.1MB 且无上限。
+            # 超 1MB 时保留尾部 500KB——read_file 从头截断读最旧 5 万字符，
+            # 轮转同时保证最近进度仍在文件里（尾部注入读的也是最新段）
+            if path.stat().st_size > 1024 * 1024:
+                _rotate_progress_file(path)
+        except Exception:
+            logger.warning("Failed to record progress", exc_info=True)
+
+
+def _rotate_progress_file(path: Path | None = None):
+    """把进度文件截到最近 500KB（保留尾部，即最新进度）。
 
     切点必须对齐 UTF-8 字符边界：按字节直切会在多字节汉字中间断开，
     文件从此不再是合法 UTF-8 → read_file 整个拒绝读取 → 断点续作失效
     （22:46 事故根因："文件编码不是 UTF-8"）。
+    09-23：写临时文件再 os.replace——旧实现直接 "wb" 截断再写，同会话内
+    并发写（后台子代理与父回合）会踩到这个窗口丢记录。
     """
+    target = path or PROGRESS_FILE
     try:
         keep = 500 * 1024
-        size = PROGRESS_FILE.stat().st_size
+        size = target.stat().st_size
         if size <= keep:
             return
-        with open(PROGRESS_FILE, "rb") as f:
+        with open(target, "rb") as f:
             f.seek(size - keep)
             tail = f.read()
         # 对齐字符边界：跳过开头的残缺多字节字符（找下一个 UTF-8 合法起始字节）
@@ -769,23 +795,26 @@ def _rotate_progress_file():
                 break
             offset += 1
         tail = tail[offset:]
-        with open(PROGRESS_FILE, "wb") as f:
+        tmp = target.with_suffix(target.suffix + ".tmp")
+        with open(tmp, "wb") as f:
             f.write("(早期进度已轮转)\n\n".encode("utf-8") + tail)
+        os.replace(tmp, target)
     except Exception:
         logger.warning("PROGRESS 轮转失败", exc_info=True)
 
 
-def _progress_tail(max_chars: int = 600) -> str:
-    """读取 PROGRESS.md 尾部（最新进度），用于注入 system prompt。
+def _progress_tail(max_chars: int = 600, session_id: str | None = None) -> str:
+    """读取**本会话**进度文件尾部（最新进度），用于注入。
 
-    600 而非 2000：PROGRESS.md 是 2/3 英文的工具日志，2000 字符的英文注入
+    600 而非 2000：这段是 2/3 英文的工具日志，2000 字符的英文注入
     是新会话被带偏成英文回复的最大英文源（09-03 事故）。"""
+    path = _progress_file(session_id)
     try:
-        if not PROGRESS_FILE.exists():
+        if not path.exists():
             return ""
-        size = PROGRESS_FILE.stat().st_size
+        size = path.stat().st_size
         read = min(size, max_chars * 4)  # 多读些字节再截字符，中文占 3 字节
-        with open(PROGRESS_FILE, "rb") as f:
+        with open(path, "rb") as f:
             f.seek(max(0, size - read))
             tail = f.read().decode("utf-8", errors="replace")
         return tail[-max_chars:]
@@ -1411,6 +1440,28 @@ async def _handle_tool_execution_inner(tc: dict, current_msgs: list, session_id:
         current_msgs.append({"role": "tool", "tool_call_id": call_id, "content": result})
         return False, [{"event": "tool_end", "call_id": call_id, "tool": tool_name, "result": result, "ts": int(time.time() * 1000)}]
 
+    # ── 子代理执行层闸门（09-23 审计 A3，必须在权限规则之前）──
+    # 子代理（access_mode="subagent"）没有确认通道：run_cmd 只放行只读 ∪ 构建/测试
+    # 白名单，其余 confirm 级工具一律拒绝。位置必须在 _resolve_permission 之前——
+    # 用户在 permissions.json 里把 run_cmd/write_file 降成 safe 的规则不能重新打开
+    # 这条路径（否则子代理又变成免确认任意执行）。
+    # 判定为放行的命令在下面**跳过确认**（_sub_gate_checked）：闸门已按白名单全权
+    # 判定，再进确认流程就是等一个没人能点的确认（子流事件不转发给前端）直到超时
+    # ——首版没跳过，实测"只读命令"直接挂死。
+    _sub_gate_checked = False
+    if _normalize_access(access_mode) == "subagent":
+        try:
+            _sub_deny = subagent_tool_gate(tool_name, args)
+        except Exception:
+            logger.warning("子代理闸门判定异常，按拒绝处理", exc_info=True)
+            _sub_deny = "⛔ 子代理权限判定异常，已拒绝执行（fail-closed）"
+        if _sub_deny:
+            result = _sub_deny
+            current_msgs.append({"role": "tool", "tool_call_id": call_id, "content": result})
+            return False, [{"event": "tool_end", "call_id": call_id, "tool": tool_name,
+                            "result": result, "ts": int(time.time() * 1000)}]
+        _sub_gate_checked = True
+
     # ── 权限规则拒绝（deny/danger）──
     # 自定义权限规则返回 danger/deny 时必须拦截，此前落空直接执行——
     # 权限语义严重不一致（实测 list_dir 设 danger 仍读到目录）
@@ -1437,7 +1488,7 @@ async def _handle_tool_execution_inner(tc: dict, current_msgs: list, session_id:
     # full（完全访问）档：confirm 级工具免确认直接执行——此前 5 档中
     # confirm/plan/full 三档无门控、与默认档完全等价（审计 A2）。
     # danger/deny 规则拦截仍在上方生效，不受此豁免影响。
-    _full_bypass = (_access == "full")
+    _full_bypass = (_access == "full") or _sub_gate_checked
     # 事件列表必须先初始化：confirm 分支的 pre_started 路径（当前两个 SSE
     # 循环的唯一调用方式）此前从未绑定 events 就 extend → UnboundLocalError
     # 整个任务崩溃（审计 P0：每次确认弹窗路径必炸）
@@ -1467,9 +1518,12 @@ async def _handle_tool_execution_inner(tc: dict, current_msgs: list, session_id:
 
     # ── Execute + Post-hooks ──
     events.append({"event": "tool_start", "call_id": call_id, "tool": tool_name, "args": args, "ts": int(time.time() * 1000)})
-    logger.info("Tool executing: %s %s", tool_name, json.dumps(args, ensure_ascii=False)[:120])
+    # 参数预览也要脱敏：run_cmd 的 token、api key 常出现在参数里（09-23）
+    logger.info("Tool executing: %s %s", tool_name,
+                redact_secrets(json.dumps(args, ensure_ascii=False))[:120])
     result = await execute_tool(tool_name, args)
-    logger.info("Tool result: %s → %s", tool_name, result[:80].replace("\n", " "))
+    # 结果预览脱敏：read_file 这类内容工具只记长度（真机实测原样落盘过 API key）
+    logger.info("Tool result: %s → %s", tool_name, tool_log_preview(tool_name, result))
 
     post_hook = TOOL_HOOKS.get(tool_name, {}).get("post_tool_call")
     if post_hook:
@@ -1481,8 +1535,11 @@ async def _handle_tool_execution_inner(tc: dict, current_msgs: list, session_id:
     events.append({"event": "tool_end", "call_id": call_id, "tool": tool_name, "result": result, "ts": int(time.time() * 1000)})
 
     # ── State tracking + Verification + Reflection ──
-    _record_progress(f"**{tool_name}**\nArgs: `{json.dumps(args)}`\nResult: {result[:200]}")
-    _record_tool_call_db(session_id, tool_name, args, result)
+    # 进度文件同样脱敏（它会按会话注入回提示词，密钥不该进去）
+    _record_progress(f"**{tool_name}**\nArgs: `{redact_secrets(json.dumps(args, ensure_ascii=False))}`"
+                     f"\nResult: {redact_secrets(result)[:200]}",
+                     session_id=session_id)
+    _record_tool_call_db(session_id, tool_name, args, redact_secrets(result))
 
     # Self-evolution: background-refine learning + auto-skill generation
     _spawn(_refine_learnings(tool_name, args, result, session_id))
@@ -1560,16 +1617,28 @@ def _clean_progress_tail(text: str, max_lines: int = 12) -> str:
     09-20 事故：PROGRESS.md 尾部记着上一会话的 `**mx_query** / Args: {...} /
     Result: 半导体板块…` 工具日志，被贴到用户每条消息尾部（权重最高）→ 用户问
     任何事，弱模型都以为本轮要查行情（"我说什么他都去找股市"）。
+
+    09-23 改为**按条目整块**判定：旧实现只按行丢弃（`### ` / `**` / `Args:` /
+    `Result:` 开头的行），多行工具结果（JSON、表格）的续行不在这些前缀里 →
+    模型看到半截数据。现在整块含工具日志标记就整块丢掉，`### ` 视为条目分界。
     """
-    keep = []
+    blocks: list[list[str]] = []
+    cur: list[str] = []
     for ln in str(text or "").splitlines():
-        t = ln.strip()
-        if not t:
+        if ln.lstrip().startswith("### "):
+            blocks.append(cur)
+            cur = []
             continue
-        if (t.startswith(("Args:", "Result:", "```", "### ", "**"))
-                or "Args: `" in t or "Result: `" in t or "Tool result" in t):
+        cur.append(ln)
+    blocks.append(cur)
+    keep: list[str] = []
+    for blk in blocks:
+        body = "\n".join(x for x in (l.strip() for l in blk) if x)
+        if not body:
             continue
-        keep.append(t)
+        if any(m in body for m in ("Args: `", "Result: `", "Tool result", "```")):
+            continue
+        keep.extend(body.splitlines())
     return "\n".join(keep[-max_lines:])
 
 
@@ -1859,7 +1928,10 @@ def _build_chat_messages(body: dict, messages: list) -> list:
     #     `**mx_query** / Args: … / Result: 半导体板块…` 工具日志，贴在每条消息尾部
     #     （权重最高）会让弱模型"无论问什么都去找股市"（用户实测反馈）。
     _is_first_turn = sum(1 for m in messages if m.get("role") == "user") <= 1
-    _tail = _clean_progress_tail(_progress_tail()) if _is_first_turn else ""
+    # 09-23 按会话注入：只读**本会话**的进度文件（此前读全局 PROGRESS.md 尾部，
+    # 会把别的会话/别的会话的子代理输出贴进本会话的最后一条用户消息里）
+    _prog_sid = str(body.get("session_id") or "").strip() or None
+    _tail = _clean_progress_tail(_progress_tail(session_id=_prog_sid)) if _is_first_turn else ""
     if _tail.strip() and not _no_notes:
         _pt_label = _get_localized_text(user_lang, {
             "zh": "## 上次会话进展（最近记录）",

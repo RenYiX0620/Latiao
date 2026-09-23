@@ -270,6 +270,39 @@ _TOOL_MARKUP_RE = re.compile(
     r"|<?/?(?:function_calls|invoke|parameter|function|tool_call)\b[^>]*>",
     re.DOTALL)
 
+# ── 半截调用标记（09-23）───────────────────────────────────────────
+# 输出被 max_tokens 截断（或模型没写外层包裹）时，标记只剩开头，**载荷 JSON 会留在
+# 正文里被当报告交付**。真机实测 `<tool_call>\n<function=read_file>\n{"path": "…"}`
+# 这种形态解析失败、清洗后仍残留 68 字原始 JSON，cron 把它当"分析结果"写进事件与
+# 会话（用户直接读到垃圾）。上面那条正则只治完整标记，这里补两种半截形态。
+_FUNCTION_SPAN_RE = re.compile(
+    r"<\s*function\b[^>]*>.*?</\s*function\s*>", re.DOTALL | re.IGNORECASE)
+_CALL_TAG_CLOSERS = {"tool_call": "</tool_call>", "function_calls": "</function_calls>",
+                     "invoke": "</invoke>", "function": "</function>"}
+# 兼容管道形态（Gemma 的 <|tool_call|> / <tool_call|>）
+_OPEN_CALL_TAG_RE = re.compile(
+    r"<\s*\|?\s*(tool_call|function_calls|invoke|function)\s*\|?\s*>", re.IGNORECASE)
+# 载荷形态：JSON 对象、嵌套标记，或 Gemma 的 call:name{…}
+_CALL_PAYLOAD_HEAD_RE = re.compile(r"^(?:[\{<\[]|call\s*:\s*\w+)")
+
+
+def _drop_unclosed_call_tail(text: str) -> str:
+    """丢掉"开了没关"的调用标记及其后所有内容（截断输出的典型形态）。
+
+    只在标记后面紧跟**载荷形态**（`{` / `<` / `[` 或行尾）时才切——解释性正文
+    （"模型会输出 <tool_call> 标记"）后面跟的是汉字，不会被误伤。
+    """
+    src = text or ""
+    for m in _OPEN_CALL_TAG_RE.finditer(src):
+        tag = m.group(1).lower()
+        closer = _CALL_TAG_CLOSERS.get(tag, "")
+        if closer and closer in src[m.end():].lower():
+            continue                      # 有闭合 → 交给完整块那条规则处理
+        _tail = src[m.end():m.end() + 24].lstrip()
+        if not _tail or _CALL_PAYLOAD_HEAD_RE.match(_tail):
+            return src[:m.start()].rstrip()
+    return src
+
 
 def _known_tool_names() -> set:
     """已知工具名集合（只用 schema 里的名字，避免把正文里的动词当工具）。"""
@@ -311,8 +344,27 @@ def _salvage_invoke_style(text: str) -> list:
 
 
 def _scrub_tool_markup(text: str) -> str:
-    """清洗任何形状的调用标记（交付与语言判定前都要用）。"""
-    return _TOOL_MARKUP_RE.sub(" ", text or "").strip()
+    """清洗任何形状的调用标记（交付与语言判定前都要用）。
+
+    09-23 起也治"半截标记"：先丢未闭合的尾部残块（含其载荷 JSON），再丢带载荷的
+    `<function …>{…}</function>` 整段，最后清完整标记与孤立标签。
+    """
+    t = _drop_unclosed_call_tail(text or "")
+    t = _FUNCTION_SPAN_RE.sub(" ", t)
+    return _TOOL_MARKUP_RE.sub(" ", t).strip()
+
+
+# 交付前兜底检查用的信号（含 Hermes/ak_finance 那类 arg_key/arg_value 片段）
+_MARKUP_SIGNAL_RE = re.compile(
+    r"<\s*/?\s*(?:tool_call|function_calls|invoke|parameter|function)\b"
+    r"|<\s*\|?\s*tool_call\s*\|?\s*>"
+    r"|</?\s*arg_(?:key|value)\b",
+    re.IGNORECASE)
+
+
+def _looks_like_tool_markup(text: str) -> bool:
+    """正文里是否还留有工具调用标记（交付前兜底：清洗漏网时不让它当报告发出去）。"""
+    return bool(_MARKUP_SIGNAL_RE.search(text or ""))
 
 
 def _parse_prompt_tool_calls(text: str) -> tuple[str, list[dict]]:

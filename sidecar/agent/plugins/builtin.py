@@ -236,7 +236,7 @@ def setup_compaction(scope, *, local_threshold=18000, cloud_threshold=80000):
                 if not c:
                     continue
                 if c == _seen_sig:
-                    msgs[i] = {**m, "content": f"（与前一条相同的声明，已出现多次）"}
+                    msgs[i] = {**m, "content": "（与前一条相同的声明，已出现多次）"}
                 else:
                     _seen_sig = c
             loop.current_msgs = msgs

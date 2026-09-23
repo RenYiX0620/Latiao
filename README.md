@@ -34,12 +34,15 @@ Latiao is a desktop AI agent built with Tauri + React + Python FastAPI. It auton
 | 📈 **Market Data** | A-share/HK/fund quotes, capital flows, financial indicators (东方财富 data) |
 | 🧠 **Multi-Model** | Local models (MLX / llama.cpp) or cloud APIs (OpenAI / DeepSeek / Anthropic) — switch anytime |
 | 🤖 **Multi-Agent** | Delegate sub-tasks to specialists — explorer, code-reviewer, debugger, doc-generator, translator. Run in background and watch them work in the activity bar |
+| 🧵 **Parallel Sessions** | Several chats run at the same time, each with its own full context window |
 | 🧩 **Skills & Plugins** | SKILL.md knowledge packs + editable Python plugins (survive your edits across updates) |
+| 🛒 **Extension Marketplace** | Browse and one-click install community skills/plugins, with a permission review before install |
 | 💾 **Persistent Memory** | SQLite + TF-IDF semantic search — remembers across sessions |
 | ✅ **Self-Verification** | Auto-validates its own work (re-reads files, runs linters, syntax checks, type-checks) |
 | ⏰ **Scheduled Tasks** | Cron-style automation — recurring jobs, catch-up runs after restart |
 | 🛡️ **5-Level Permissions** | read_only / confirm / auto_edit / plan / full — you decide how much autonomy it gets |
 | 🌐 **Multilingual** | UI in English, 中文, 日本語, Русский |
+| 🗣️ **Read-Aloud (TTS)** | Local voice synthesis — Kokoro (100+ Chinese voices) or IndexTTS-2.5 voice cloning; speaks replies on demand |
 
 ## How It Works
 
@@ -88,6 +91,7 @@ When the daily quota runs out, the agent automatically falls through to the next
 ### 🧠 Local Model Compatibility Tips
 
 - Works out of the box: MLX models (4bit/6bit/8bit), GGUF models (llama.cpp engine) — including LM Studio's folder-style layouts (`Model.gguf/Model.gguf`).
+- The bundled engine is refreshed automatically from upstream llama.cpp prebuilt releases on every release — no manual upgrade needed.
 - New architectures may need a newer engine: very recent model types (e.g. `muse_glimmer`) aren't in the bundled `mlx-lm` yet — prefer mainstream models (Qwen, Ornith, GLM) or run those in LM Studio via the external-engine bridge.
 
 ## 🤖 Sub-Agents
@@ -99,8 +103,8 @@ Complex tasks get split. The main agent can delegate to specialist sub-agents �
 | **Explorer** | files + read-only shell + web search | Codebase recon, research, fact-finding |
 | **Code Reviewer** | read-only files | Security & quality review |
 | **Debugger** | files + whitelisted shell | Log analysis, bug hunting |
-| **Doc Generator** | files + write | README/API docs/changelogs |
-| **Translator** | files + write | i18n and localization |
+| **Doc Generator** | read-only files | README/API docs/changelogs — content goes back to the main agent, which writes it after your confirmation |
+| **Translator** | read-only files | i18n and localization — the translation goes back to the main agent, which writes it after your confirmation |
 
 Run them in the background (`background: true`) and watch steps, terminal commands, and file operations stream into the activity bar in real time — results land back in your chat when done.
 

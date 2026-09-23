@@ -18,6 +18,7 @@ import subprocess
 import uuid
 from datetime import datetime
 from pathlib import Path
+from cmd_safety import redact_secrets   # 工具日志脱敏（09-23）
 
 import httpx
 from fastapi import File, HTTPException, Query, Request, UploadFile
@@ -552,7 +553,8 @@ async def chat_completion(request: Request):
                             elif perm in ("danger", "deny", "blocked"):
                                 result = f"⛔ 权限规则已阻止: {tool_name}（级别 {perm}）。"
                             else:
-                                logger.info("Tool executing (non-streaming): %s %s", tool_name, str(tool_args)[:100])
+                                logger.info("Tool executing (non-streaming): %s %s", tool_name,
+                            redact_secrets(str(tool_args))[:100])
                                 result = await execute_tool(tool_name, tool_args)
                                 # Self-evolution: record + background-refine learning
                                 _record_tool_call_db(session_id, tool_name, tool_args, result)
@@ -1067,15 +1069,13 @@ async def get_context_stats(session_id: str = ""):
     数据由 agent 循环在组装请求时快照（context_stats），这里只做读取与容量补全。
     """
     import context_stats
-    is_local = True
     limit, limit_source = 0, "unknown"
     try:
         engine = getattr(local_llm, "_engine", None)
         if engine is not None and not getattr(engine, "_external_engine", ""):
             limit = int(getattr(engine, "model_token_limit", 0) or 0)
             limit_source = "local_engine" if limit else "unknown"
-        else:
-            is_local = False
+        # 非本地引擎/无引擎：limit 维持默认（0/unknown）
     except Exception:
         logger.debug("读取本地引擎上下文上限失败", exc_info=True)
     return context_stats.stats(session_id, limit=limit, limit_source=limit_source)
@@ -1194,13 +1194,20 @@ async def set_permissions(request: Request):
 
 
 @app.get("/v1/progress")
-async def get_progress():
-    """Return PROGRESS.md content for cross-session continuity."""
+async def get_progress(session_id: str = Query(default="", description="按会话读该会话的进度文件")):
+    """Return progress content for continuity.
+
+    带 session_id 时读**该会话**的文件（09-23 起进度按会话分文件）；不带时读共享
+    PROGRESS.md（旧行为，cron/外部调用兼容）。
+    """
     try:
-        if PROGRESS_FILE.exists():
-            content = PROGRESS_FILE.read_text(encoding="utf-8")
-            return {"status": "ok", "content": content}
-        return {"status": "ok", "content": ""}
+        from agent_loop import _progress_file
+        path = _progress_file(session_id) if session_id else PROGRESS_FILE
+        if path.exists():
+            content = path.read_text(encoding="utf-8")
+            return {"status": "ok", "content": content, "session_id": session_id or "",
+                    "file": path.name}
+        return {"status": "ok", "content": "", "session_id": session_id or "", "file": path.name}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
@@ -1680,8 +1687,17 @@ async def get_logs(limit: int = Query(default=100, ge=1, le=500)):
     return {"status": "ok", "logs": logs[-limit:]}
 
 
+def _engine_gate_snapshot() -> dict:
+    """引擎闸门状态（容量/在飞/排队）——多会话并行的诊断入口。"""
+    try:
+        from agent.transport import stream_gate_snapshot
+        return stream_gate_snapshot()
+    except Exception:
+        return {}
+
+
 @app.get("/v1/heartbeat")
-async def heartbeat():
+async def heartbeat(session_id: str = Query(default="", description="只返回该会话的子任务")):
     """Unified polling endpoint: returns downloads, LLM status, and learnings in one call."""
     from starlette.concurrency import run_in_threadpool
     from tool_executor import _subtask_snapshot
@@ -1693,15 +1709,17 @@ async def heartbeat():
         "local_llm": await run_in_threadpool(local_llm.get_status),
         "learnings": get_recent_learnings_for_ui(8),  # 对象格式（UI 需要 topic/confidence）
         "cron_events": cron.get_recent_cron_events(10),
-        "subagents": _subtask_snapshot(),
+        "subagents": _subtask_snapshot(session_id),
+        # 引擎并发槽位/排队（多会话并行诊断：容量=N 时第 N+1 个请求排队）
+        "engine_gate": _engine_gate_snapshot(),
     }
 
 
 @app.get("/v1/subagents")
-def list_subagents():
-    """列出后台子智能体任务（含状态与结果摘要）。"""
+def list_subagents(session_id: str = Query(default="", description="只列出该会话的子任务")):
+    """列出后台子智能体任务（含状态与结果摘要）。带 session_id 时只列本会话的。"""
     from tool_executor import _subtask_snapshot
-    return {"status": "ok", "subagents": _subtask_snapshot()}
+    return {"status": "ok", "subagents": _subtask_snapshot(session_id)}
 
 
 @app.get("/v1/subagents/{task_id}")
@@ -2031,6 +2049,15 @@ def local_llm_benchmarks():
     return {"status": "ok", "items": bench_service.history(20)}
 
 
+def _busy_local_turns() -> int:
+    """当前正在使用本地引擎的回合数（闸门在飞计数）。"""
+    try:
+        from agent.transport import stream_gate_snapshot
+        return int(stream_gate_snapshot().get("in_flight") or 0)
+    except Exception:
+        return 0
+
+
 @app.post("/v1/local-llm/start")
 async def local_llm_start(request: Request):
     """Start a local model.
@@ -2042,14 +2069,36 @@ async def local_llm_start(request: Request):
     port = body.get("port", 1235)
     if not model_id:
         return {"status": "error", "message": "model_id required"}
+    # 09-23 收口：加载/切换模型会杀掉当前引擎进程，正在跑的其他会话会当场断流。
+    # 有其他回合在用本地引擎时拒绝（用户先停止那些回合，或等它们跑完）。
+    _busy = _busy_local_turns()
+    if _busy > 0 and not body.get("force"):
+        return {"status": "error", "code": "engine_busy",
+                "message": f"还有 {_busy} 个回合正在使用本地模型，切换/加载会让它们中断。"
+                           "请先停止那些会话的回合，或等它们完成。",
+                "busy": _busy}
     from starlette.concurrency import run_in_threadpool
     return await run_in_threadpool(local_llm.start_model, model_id, port)
 
 
 @app.post("/v1/local-llm/stop")
-async def local_llm_stop():
+async def local_llm_stop(request: Request):
     """Stop the running local model. stop_model 内含 lsof/kill 子进程调用，
-    放线程池避免阻塞事件循环（停止必须即时响应）。"""
+    放线程池避免阻塞事件循环（停止必须即时响应）。
+
+    09-23：有其他回合正在用本地模型时拒绝（除非 force）——停止引擎会让那些
+    会话当场断流，而用户点的是"停止模型"，未必知道别的会话在跑。"""
+    _busy = _busy_local_turns()
+    _force = False
+    try:
+        _force = bool((await _json_body(request)).get("force"))
+    except Exception:
+        _force = False
+    if _busy > 0 and not _force:
+        return {"status": "error", "code": "engine_busy",
+                "message": f"还有 {_busy} 个回合正在使用本地模型，停止引擎会让它们中断。"
+                           "请先停止那些会话的回合。",
+                "busy": _busy}
     from starlette.concurrency import run_in_threadpool
     return await run_in_threadpool(local_llm.stop_model)
 

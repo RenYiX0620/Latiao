@@ -247,7 +247,7 @@ def test_plan_reject_stops(e2e):
 def test_confirm_unknown_id_not_found(e2e):
     base, _ = e2e
     cs = ChatSession(base, f"e2e-nf-{uuid.uuid4().hex[:10]}")
-    plan = cs.wait_event("plan_confirm")  # 使请求进入等待态
+    cs.wait_event("plan_confirm")  # 副作用：使请求进入等待态（返回值不用）
     r = cs.confirm("no-such-call-id", True)  # 服务端不应直接崩，返回 not_found
     assert r.get("status") == "not_found", r
 

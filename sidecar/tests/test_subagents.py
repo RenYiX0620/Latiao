@@ -51,7 +51,6 @@ class TestSubtaskRegistry(unittest.TestCase):
         async def run():
             return await _delegate_task_bg("code-reviewer", "检查 foo.py 的安全性")
 
-        tid = asyncio.get_event_loop().run_until_complete(run()) if False else None
         # _delegate_task_bg 需要事件循环（create_task），用新 loop 跑
         loop = asyncio.new_event_loop()
         try:

@@ -115,6 +115,14 @@ def read_file(path: str, offset: int = 0, limit: int = 0) -> str:
     # Block path traversal
     if ".." in path.split("/") or ".." in path.split("\\"):
         return "⛔ Blocked: path traversal not allowed"
+    # 敏感路径判定与插件/命令路径同源（审计 P1：此 fallback 此前连黑名单都没有）
+    try:
+        from cmd_safety import sensitive_read_block
+        _blk = sensitive_read_block(path)
+        if _blk:
+            return _blk
+    except Exception:
+        logger.debug("敏感路径判定不可用（fallback read_file）", exc_info=True)
     try:
         with open(path, "r", encoding="utf-8") as f:
             if offset > 1:

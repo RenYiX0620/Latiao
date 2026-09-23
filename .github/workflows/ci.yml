@@ -1,0 +1,79 @@
+# CI 质量门禁（2026-09-23 加入）。
+#
+# 为什么加：此前仓库只有 release.yml（仅 push tag v* 触发，且只做构建/发布），
+# 测试与静态检查完全不在 CI 里 —— 220 条 ruff、5 条 eslint error、类型错误、测试失败
+# 都能直接打包发到用户手上（全项目审计 P0#1）。这里把本地已经在跑的四件事固化成门禁。
+#
+# 门禁策略（上线即绿，新增问题才拦）：
+#   - 硬拦：pytest / tsc / vitest / ruff --select F,E9 / eslint errors / 版本号一致性
+#   - 仅报告：ruff 全量（style 债 220 条待分批清）；eslint 的 5 个已知
+#     react-hooks/set-state-in-effect 降级为 warning（P2 待人工修）
+name: CI
+
+on:
+  push:
+    branches: [main, windows]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend — pytest + ruff
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # 与随包运行时对齐（安装包内是 sidecar/python/lib/python3.11）
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: sidecar/requirements-test.txt
+
+      - name: 安装测试依赖（轻量集：不含 mlx / llama_cpp_python / akshare 等重包）
+        run: pip install -r sidecar/requirements-test.txt
+
+      - name: 版本号一致性（package.json / tauri.conf.json / Cargo.toml / Cargo.lock）
+        run: python3 scripts/check_versions.py
+
+      - name: ruff 硬门禁（F 未定义名/未用导入、E9 语法级）
+        working-directory: sidecar
+        run: ruff check --select F,E9 .
+
+      - name: ruff 全量（style 债，仅报告不拦）
+        continue-on-error: true
+        working-directory: sidecar
+        run: ruff check .
+
+      - name: pytest（从仓库根跑，与本地一致：sidecar/pytest.ini 固定 rootdir）
+        run: python -m pytest sidecar/tests -q
+
+  frontend:
+    name: Frontend — tsc + vitest + eslint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - run: npm ci
+
+      - name: 类型检查
+        run: npx tsc --noEmit
+
+      - name: 单元测试
+        run: npx vitest run
+
+      - name: eslint
+        # 5 个已知 error 全是 react-hooks/set-state-in-effect（effect 内同步 setState
+        # 触发级联渲染，涉及 ToolsView:159 / LocalModelsTab / ChatView / RunMetrics），
+        # 需要按组件重构、不能用 --fix 解决 → 在 CI 里暂降级为 warning 并放宽上限，
+        # 保证"新引入的 lint error 会被拦下"，这 5 条作为 P2 债单独一批修。
+        run: npx eslint src/ --rule '{"react-hooks/set-state-in-effect":"warn"}' --max-warnings 200

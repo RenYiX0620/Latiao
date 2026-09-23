@@ -22,6 +22,8 @@ _CURRENT_PARENT_SESSION: ContextVar[str] = ContextVar("subagent_parent_session",
 # 父循环运行中 → queue_steer 即时认领；父空闲 → 下次该会话循环启动时注入。
 # 通知被任一路径消费后标记 delivered，两路不重复。
 _PENDING_BG_RESULTS: dict[str, list[dict]] = {}
+# 通知保留时长：超过就丢（父会话已删/父循环长期没再跑，远古结论不该再注入）
+_BG_RESULT_TTL = 1800.0
 
 
 def push_bg_result(parent_session: str, agent_type: str, task: str, result: str) -> None:
@@ -45,11 +47,22 @@ def push_bg_result(parent_session: str, agent_type: str, task: str, result: str)
 
 
 def claim_bg_results(parent_session: str) -> list[dict]:
-    """父循环启动时取走未投递的后台结果通知（一次性）。"""
+    """父循环启动时取走未投递的后台结果通知（一次性）。
+
+    09-23：认领后**顺手清理过期项**——旧实现只标 delivered 永不出队，队列随
+    会话数无限增长；且父会话被删/父循环崩掉后，那批"未投递"的远古结果会在
+    下一次启动时被注入（模型看到几天前的子代理结论，答非所问）。
+    """
     pending = _PENDING_BG_RESULTS.get(parent_session) or []
     fresh = [n for n in pending if not n["delivered"]]
     for n in fresh:
         n["delivered"] = True
+    now = _time.time()
+    kept = [n for n in pending if (now - float(n.get("ts") or 0)) < _BG_RESULT_TTL]
+    if kept:
+        _PENDING_BG_RESULTS[parent_session] = kept
+    else:
+        _PENDING_BG_RESULTS.pop(parent_session, None)
     return fresh
 
 # ── 子任务注册表（前端活动栏/结果面板的数据源，契约不变）────────────
@@ -164,7 +177,7 @@ async def run_sub_agent(agent_type: str, task: str, *, task_id: str | None = Non
 
     sub_session = f"{parent_session or 'root'}:{sub_id}"
     child = ThinAgentLoop(messages, sub_model, api_url, headers,
-                          session_id=sub_session, access_mode="full",
+                          session_id=sub_session, access_mode="subagent",  # 受限档（09-23 A3）：run_cmd 只放行只读∪构建/测试，其余 confirm 级拒绝
                           tool_whitelist=allowed, is_local=is_local)
     # 子代理收紧（09-13 实测：子代理与主循环共用宽松阈值，重复读同一文件、
     # 乱翻无关文件、40 分钟不收口）——步数 14、同参 3 轮即收口、6 个工具轮
@@ -225,11 +238,19 @@ async def _delegate_task(agent_type: str, task: str, task_id: str | None = None,
 _STALE_RUNNING_SEC = 180
 
 
-def _subtask_snapshot() -> list[dict]:
-    """后台子任务列表快照（heartbeat 附带，前端活动栏渲染）。"""
+def _subtask_snapshot(session: str | None = None) -> list[dict]:
+    """后台子任务列表快照（heartbeat 附带，前端活动栏渲染）。
+
+    09-23：带 session 时只返回**该会话**派发的子任务（此前是所有会话混在一起，
+    用户在 A 会话的活动栏里看到 B 会话的子代理）。注意：活动栏只是显示，
+    不进模型输入，所以这是体验问题不是正确性问题。
+    """
     out = []
     now = _time.time()
+    _want = str(session or "").strip()
     for tid, s in _SUBTASKS.items():
+        if _want and str(s.get("session") or "") != _want:
+            continue
         status = s["status"]
         if status == "running" and now - float(s.get("updated_at") or 0) > _STALE_RUNNING_SEC:
             status = "stale"
@@ -241,6 +262,7 @@ def _subtask_snapshot() -> list[dict]:
             "last_activity": s.get("last_activity", ""),
             "started_at": s["started_at"], "updated_at": s["updated_at"],
             "summary": (s["result"] or "")[:160],
+            "session": s.get("session", ""),
         })
     return out
 
@@ -260,6 +282,7 @@ async def _delegate_task_bg(agent_type: str, task: str, parent_session: str = ""
     _SUBTASKS[task_id] = {
         "agent": agent_type, "task": task, "status": "running",
         "steps": 0, "result": "", "started_at": _time.time(), "updated_at": _time.time(),
+        "session": str(parent_session or _CURRENT_PARENT_SESSION.get() or ""),
     }
     _SUBTASK_EVENTS.append({"id": task_id, "status": "started", "summary": task[:80]})
     try:
@@ -283,6 +306,7 @@ async def _delegate_task_fg(agent_type: str, task: str) -> str:
     _SUBTASKS[task_id] = {
         "agent": agent_type, "task": task, "status": "running",
         "steps": 0, "result": "", "started_at": _time.time(), "updated_at": _time.time(),
+        "session": str(_CURRENT_PARENT_SESSION.get() or ""),
     }
     try:
         result = await _delegate_task(agent_type, task, task_id=task_id)

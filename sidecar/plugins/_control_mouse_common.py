@@ -225,8 +225,6 @@ def keyboard_type(text: str) -> str:
         return "❌ text 过长（≤500 字符）"
     try:
         # 逐个字符生成 keyDown/keyUp（不模拟组合键，字母数字直接映射）
-        cf_str = ctypes.c_char_p(text.encode("utf-8"))
-        unicode_str = ctypes.c_void_p(_cg.CFStringCreateWithCString(None, cf_str, 0x08000100)) if hasattr(_cg, "CFStringCreateWithCString") else None
         # 简化：直接用 CGEventKeyboardSetUnicodeString 走 unicode 输入
         _cg.CGEventCreateKeyboardEvent.restype = ctypes.c_void_p
         _cg.CGEventCreateKeyboardEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint16, ctypes.c_bool]

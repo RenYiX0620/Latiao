@@ -34,26 +34,63 @@ def _safe_cwd() -> str:
         return str(Path.home())
 
 
-# llama_cpp.server 是单模型实例，多个流式生成请求并发时会崩溃
-# （连接被 peer 关闭 → 上层表现为"空响应/任务执行一半停止"）。
-# 主对话 agent 循环与 cron 任务并发调用本地模型是实际触发场景——
-# 所有打到本地端口的模型请求必须串行执行。
+# 本地引擎放行闸门（09-23 由"全局互斥锁"改为"容量 = 引擎并发槽位"）：
+# llama_cpp.server（python 后端）是单模型单线程实例，多个流式请求并发会崩溃
+# （连接被 peer 关闭 → 上层表现为"空响应/任务执行一半停止"）——所以**容量恒为 1**。
+# 自带上游 llama-server 用 --parallel N 显式开了 N 个槽（每槽独占一个会话窗口，
+# 见 local_llm._launched_slots），此时容量 = N：两个会话才可能真并行。
+# 超出容量的请求在队列里等（asyncio.Semaphore 按等待顺序唤醒 = FIFO），等待有上限
+# （LATIAO_ENGINE_WAIT_MAX，默认 900s）——旧实现 acquire 无超时，卡住的回合会永久
+# 占位且无法被发现。
 # 引擎疑似损坏的时间戳：流被取消（停止按钮/新消息）或空响应后置位，
-# 下一次本地请求在锁内先验证引擎健康，避免向残留线程竞争损坏的引擎发请求。
+# 下一次本地请求在闸门内先验证引擎健康，避免向残留线程竞争损坏的引擎发请求。
 _llm_suspect_since: float | None = None
 
-# 串行锁按事件循环持有：生产单循环=单锁；测试多循环互不绑定
-# （模块级单一 Lock 会被首个使用它的循环绑定，跨循环抛 RuntimeError）
-_stream_locks: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock]" = weakref.WeakKeyDictionary()
+# 闸门按事件循环持有：生产单循环=单闸门；测试多循环互不绑定
+# （模块级单一对象会被首个使用它的循环绑定，跨循环抛 RuntimeError）。
+# 值是 (Semaphore, 容量)：切模型后槽位数变化 → 容量不等时重建；acquire/release
+# 用同一个对象配成对（见 _local_llm_serialized），旧闸门上的在飞流不会误释放到新闸门。
+_stream_gates: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, tuple[asyncio.Semaphore, int]]" = weakref.WeakKeyDictionary()
+# 排队可见性（/v1/context_stats 与日志用）
+_gate_stats: dict[str, float] = {"capacity": 0.0, "in_flight": 0.0, "waiting": 0.0}
 
 
-def _stream_lock() -> asyncio.Lock:
+def _engine_slots() -> int:
+    """引擎**实际**启动的并发槽位（未启动/取不到 → 1，退化为旧串行行为）。"""
+    try:
+        return max(1, int(getattr(local_llm._engine, "_launched_slots", 1) or 1))
+    except Exception:
+        return 1
+
+
+def _queue_wait_max() -> float:
+    try:
+        return max(5.0, float(os.environ.get("LATIAO_ENGINE_WAIT_MAX", "900")))
+    except ValueError:
+        return 900.0
+
+
+def _stream_lock() -> asyncio.Semaphore:
     loop = asyncio.get_running_loop()
-    lock = _stream_locks.get(loop)
-    if lock is None:
-        lock = asyncio.Lock()
-        _stream_locks[loop] = lock
-    return lock
+    cap = _engine_slots()
+    entry = _stream_gates.get(loop)
+    if entry is None or entry[1] != cap:
+        entry = (asyncio.Semaphore(cap), cap)
+        _stream_gates[loop] = entry
+    _gate_stats["capacity"] = float(cap)
+    return entry[0]
+
+
+def stream_gate_snapshot() -> dict:
+    """当前引擎闸门状态（诊断/前端展示用）：容量、在飞、排队。
+
+    容量取引擎**实际**启动槽位（不是"上次建闸门时的值"）——引擎还没被请求过时
+    也要报出真实容量，否则诊断显示 0 槽（09-23 自测发现）。
+    """
+    return {"slots": _engine_slots(),
+            "in_flight": int(_gate_stats.get("in_flight", 0) or 0),
+            "waiting": int(_gate_stats.get("waiting", 0) or 0),
+            "wait_max_s": _queue_wait_max()}
 
 
 def _is_local_llm_url(api_url: str | None) -> bool:
@@ -97,23 +134,53 @@ async def _verify_llm_health(api_url: str) -> bool:
         return True
 
 
+class EngineQueueTimeout(RuntimeError):
+    """在闸门队列里等到超过上限仍未轮到（引擎被长时间占用/流泄漏）。"""
+
+
 @asynccontextmanager
-async def _local_llm_serialized(api_url: str | None):
-    """非流式本地请求串行化：本地 llama.cpp 时持锁，云端不设限。"""
+async def _local_llm_serialized(api_url: str | None, wait_info: dict | None = None):
+    """本地请求按引擎槽位放行（容量 = --parallel N）；云端不设限。
+
+    wait_info 传入时回填 {"waited": 秒数}——调用方据此向前端报"等待引擎"。
+    """
     _local = _is_local_llm_url(api_url)
+    sem = None
     if _local:
-        await _stream_lock().acquire()
+        sem = _stream_lock()
+        _t0 = time.monotonic()
+        _gate_stats["waiting"] = _gate_stats.get("waiting", 0) + 1
+        try:
+            await asyncio.wait_for(sem.acquire(), timeout=_queue_wait_max())
+        except asyncio.TimeoutError:
+            waited = time.monotonic() - _t0
+            logger.warning("本地引擎排队超时：等待 %.1fs（容量 %d，排队 %d）",
+                           waited, _engine_slots(), int(_gate_stats.get("waiting", 0)))
+            raise EngineQueueTimeout(
+                f"等待本地引擎超过 {int(_queue_wait_max())} 秒仍未轮到；"
+                "另一会话可能正在长生成，可稍后重试或在设置里提高并发槽位") from None
+        finally:
+            # 放行或超时都要把"排队计数"退掉（只在这里退一次，避免双退）
+            _gate_stats["waiting"] = max(0, _gate_stats.get("waiting", 0) - 1)
+        waited = time.monotonic() - _t0
+        if isinstance(wait_info, dict):
+            wait_info["waited"] = waited
+        if waited >= 5.0:
+            logger.info("本地引擎排队 %.1fs 后放行（容量 %d）", waited, _engine_slots())
+        _gate_stats["in_flight"] = _gate_stats.get("in_flight", 0) + 1
     try:
         yield
     finally:
-        if _local:
-            _stream_lock().release()
+        if sem is not None:
+            _gate_stats["in_flight"] = max(0, _gate_stats.get("in_flight", 0) - 1)
+            sem.release()
 
 
 @asynccontextmanager
-async def _local_llm_stream(client, api_url: str, body: dict, headers: dict):
-    """流式请求本地/云端模型。本地 llama.cpp 时持锁直到流读完，
-    防止并发流式生成导致 server 崩溃（连接被 peer 关闭）。
+async def _local_llm_stream(client, api_url: str, body: dict, headers: dict,
+                            wait_info: dict | None = None):
+    """流式请求本地/云端模型。本地按引擎槽位放行（容量 = --parallel N），
+    超出的请求 FIFO 排队；排队本身不崩溃（旧实现是全局串行锁）。
 
     引擎死亡时的恢复语义（修复"任务执行一半停止"）：
     - 有可恢复资源（模型记录在、非用户主动停止、是我们自己管理的引擎）：
@@ -122,7 +189,7 @@ async def _local_llm_stream(client, api_url: str, body: dict, headers: dict):
     - 无可恢复资源（用户手动停止 / 从未加载模型 / 外部引擎 / 重载已失败）：
       快速失败并给出明确的下一步指引。
     """
-    async with _local_llm_serialized(api_url):
+    async with _local_llm_serialized(api_url, wait_info=wait_info):
         global _llm_suspect_since
         engine = local_llm._engine
         _local = _is_local_llm_url(api_url)

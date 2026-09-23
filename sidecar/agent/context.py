@@ -1,6 +1,7 @@
 """上下文与工具选配：用户文本提取、语言检测、工具筛选/裁剪/权限映射、原生模式判定。"""
 import os
 import re
+import shlex
 
 import local_llm
 
@@ -160,7 +161,7 @@ def _ensure_market_tools(active_tools: list, user_text: str) -> list:
     return active_tools
 
 
-ACCESS_LEVELS = {"read_only", "confirm", "auto_edit", "plan", "full"}
+ACCESS_LEVELS = {"read_only", "confirm", "auto_edit", "plan", "full", "subagent"}
 # 旧版本 workspace 档位迁移到 auto_edit（语义对应）
 _LEGACY_ACCESS_MAP = {"workspace": "auto_edit"}
 
@@ -189,6 +190,120 @@ def _check_access(tool_name: str, access: str) -> str | None:
     access = _normalize_access(access)
     if access == "read_only" and tool_name not in READ_ONLY_TOOLS:
         return f"⛔ 当前为只读模式，工具 {tool_name} 不可用。请切换到自动编辑/计划模式/完全访问后重试。"
+    return None
+
+
+# ── 子代理执行层闸门（09-23，审计 A3）─────────────────────────────
+# 背景：子代理曾以 access_mode="full" 运行，且 _is_readonly_cmd 从未在**执行层**
+# 被调用（只有测试引用），于是 explore/debugger 子代理可以免确认执行任意未命中
+# 破坏性黑名单的命令（实测 npm install / git commit / curl -o / pip install /
+# chmod +x / git push 全部放行），而用户处于 confirm 档、连"要派子代理"都不弹窗
+# （delegate_task 是 safe 级）。
+# 策略（已与用户确认，选项 b）：
+#   safe 级工具放行；run_cmd 只放行"只读白名单 ∪ 构建/测试白名单"；
+#   其余 confirm 级工具（write_file 等）一律**拒绝**。
+# 为什么是拒绝而不是"转人工确认"：子代理的确认事件只走它自己那条流，而子流的
+# 消费者（agent/subagent.py）只读 tool_start 做活动栏计数、其余事件不转发——前端
+# 的 tool_confirm 处理器只挂在父流上。让子代理进确认流程 = 等一个没人能点的确认，
+# 直到超时，等于把每个 debugger/explore 任务拖死。
+# 判定用 TOOL_PERMISSIONS 的**规范档位**，不走 _resolve_permission（用户自建规则
+# 能把 confirm 降成 safe，若走规则就把这条路重新打开了）。
+_SUBAGENT_DENY_HINT = (
+    "子代理没有确认通道，{tool}（{level} 级）不能执行。"
+    "若确实需要，请在回复里说明这一步与理由，由主对话向用户请求确认后执行；"
+    "写盘类需求请把内容返回主对话，由主对话写文件（会经用户确认）。"
+)
+
+# 允许子代理运行的"构建/测试"命令：命令名 → 允许的子命令集合（"*" = 无子命令形态）
+_SUBAGENT_BUILD_CMDS: dict[str, set[str]] = {
+    "pytest": {"*"}, "py.test": {"*"}, "tox": {"*"}, "nox": {"*"},
+    "ruff": {"*"}, "mypy": {"*"}, "flake8": {"*"}, "pylint": {"*"},
+    "black": {"*"}, "isort": {"*"}, "bandit": {"*"},
+    "eslint": {"*"}, "tsc": {"*"}, "vitest": {"*"}, "jest": {"*"},
+    "cargo": {"test", "build", "check", "clippy", "fmt"},
+    "go": {"test", "build", "vet"},
+    "npm": {"test", "run"}, "pnpm": {"test", "run"}, "yarn": {"test", "run"},
+    "bun": {"test", "run"},
+    "make": {"test", "build", "check", "lint"},
+}
+# 允许的脚本名（npm/pnpm/yarn/bun run <script>）：前缀族，挡住 deploy/postinstall 之类
+_SUBAGENT_SCRIPT_RE = re.compile(
+    r"^(test|tests|build|lint|check|typecheck|types?|fmt|format|verify|unit)"
+    r"([:.\-][A-Za-z0-9_:.\-]+)?$")
+# 允许的 python -m 模块（python -m http.server 之类一律拒绝）
+_SUBAGENT_PY_MODULES = {"pytest", "unittest", "mypy", "ruff", "compileall", "flit", "build"}
+# 参数形态：与只读白名单同级严格——任何 shell 花活/重定向/引号内空格都不放行
+_SUBAGENT_ARG_RE = re.compile(r"-{1,2}[A-Za-z0-9][A-Za-z0-9_.=-]*|[\w./@+~:=-]+")
+_SUBAGENT_SHELL_META_RE = re.compile(r"[;&|><`$(){}\[\]\n\r\\]")
+
+
+def subagent_cmd_allowed(cmd: str) -> str | None:
+    """子代理 run_cmd 闸门：返回拒绝原因，或 None（放行）。
+
+    只读命令（ls/cat/git log…，含 safety.rules 的 AST 语义层）直接放行；
+    构建/测试命令按白名单放行；其余一律拒绝。
+    """
+    _cmd = (cmd or "").strip()
+    if not _cmd:
+        return "子代理收到空命令"
+    try:
+        from tool_executor import _is_readonly_cmd
+        if _is_readonly_cmd(_cmd):
+            return None
+    except Exception:
+        pass
+    if _SUBAGENT_SHELL_META_RE.search(_cmd):
+        return (f"子代理不允许 shell 操作符/重定向/嵌套：{_cmd[:80]}。"
+                "请改用单条只读命令或构建/测试命令。")
+    try:
+        tokens = shlex.split(_cmd)
+    except ValueError:
+        return f"命令无法解析：{_cmd[:80]}"
+    if not tokens:
+        return "子代理收到空命令"
+    first = tokens[0].rsplit("/", 1)[-1]
+    args = tokens[1:]
+    # python -m <allowed module> …
+    if first in ("python", "python3", "python3.11", "python3.12", "python3.13"):
+        if len(args) >= 2 and args[0] == "-m" and args[1] in _SUBAGENT_PY_MODULES:
+            rest = args[2:]
+        else:
+            return (f"子代理只允许 python -m {'/'.join(sorted(_SUBAGENT_PY_MODULES))}，"
+                    f"不接受：{_cmd[:80]}")
+    else:
+        subs = _SUBAGENT_BUILD_CMDS.get(first)
+        if subs is None:
+            return (f"子代理不允许执行 {first}（只允许只读命令与构建/测试命令）。"
+                    "安装依赖、写盘、网络下载、进程管理等操作请让主对话请求用户确认。")
+        if "*" in subs:
+            rest = args
+        else:
+            if not args or args[0] not in subs:
+                return (f"子代理只允许 {first} {'/'.join(sorted(subs))}，不接受：{_cmd[:80]}")
+            rest = args[1:]
+            if first in ("npm", "pnpm", "yarn", "bun") and tokens[1] == "run":
+                if not rest or not _SUBAGENT_SCRIPT_RE.match(rest[0]):
+                    return (f"子代理只允许 {first} run test/build/lint/check/typecheck 等，"
+                            f"不接受脚本：{(rest[0] if rest else '(无)')[:60]}")
+                rest = rest[1:]
+    # 参数必须是"简单形态"，杜绝引号/花活混进目标
+    if not all(_SUBAGENT_ARG_RE.fullmatch(a) for a in rest):
+        return f"子代理命令参数形态不允许：{_cmd[:80]}"
+    return None
+
+
+def subagent_tool_gate(tool_name: str, args: dict) -> str | None:
+    """子代理工具闸门：返回拒绝原因，或 None（放行）。见上文策略说明。"""
+    try:
+        from agent_loop import TOOL_PERMISSIONS
+        _level = TOOL_PERMISSIONS.get(tool_name, "confirm")
+    except Exception:
+        _level = "confirm"
+    if tool_name == "run_cmd":
+        _deny = subagent_cmd_allowed(str((args or {}).get("cmd") or ""))
+        return _deny
+    if _level == "confirm":
+        return "⛔ " + _SUBAGENT_DENY_HINT.format(tool=tool_name, level=_level)
     return None
 
 
@@ -393,7 +508,7 @@ _LOCAL_NATIVE_TOOLS_OVERRIDE: bool | None = None
 if os.environ.get("LATIAO_LOCAL_NATIVE", "") == "0":
     _LOCAL_NATIVE_TOOLS_OVERRIDE = False
 
-# 任务关键词（与 agent_loop_v2._TASK_KW 同表；v1 原为内联列表，提出来共用）
+# 任务关键词（原为旧循环 agent_loop_v2 的内联列表，提出来共用；该模块已删除）
 _TASK_KW = ("运行", "执行", "做", "帮我", "写", "创建", "查", "搜", "找", "分析",
             "修复", "构建", "部署", "安装", "配置", "列出", "读取", "读", "总结",
             "生成", "打开", "查看", "解释", "整理", "统计", "告诉",

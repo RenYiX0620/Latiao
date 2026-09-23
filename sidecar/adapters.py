@@ -511,7 +511,7 @@ def discover_auto(url: str) -> dict:
                 text = _jsdelivr_file(repo, f)
                 if text:
                     try:
-                        data = json.loads(text)
+                        json.loads(text)  # 解析校验：坏了就跳过这个候选（结果本身不用）
                         return discover_claude_marketplace(f"https://cdn.jsdelivr.net/gh/{repo}@main/{f}")
                     except Exception:
                         pass

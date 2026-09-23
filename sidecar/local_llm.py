@@ -579,6 +579,16 @@ class LocalLLMEngine:
             LocalLLMEngine._atexit_registered = True
         self.model_token_limit = int(os.environ.get("LATIAO_CTX_LEN", "8192"))
         self.n_gpu_layers = int(os.environ.get("LATIAO_GPU_LAYERS", "-1"))
+        # 并发槽位（09-23）：model_token_limit 是**每个会话**的窗口，引擎总量 = 槽位 × 窗口。
+        # 不显式声明 --parallel 时该构建按 auto 处理（n_parallel=4 且 kv_unified=true）：
+        # 4 个槽**共用一个** -c 池 —— 多会话同跑时每路只分到 1/4 窗口。显式声明后
+        # llama-server 按 n_ctx/n_parallel 均分，每槽拿到完整窗口。
+        # 来源：环境变量 LATIAO_LLM_SLOTS > config.json 的 local_llm.slots > 2；上限 4。
+        self.parallel_slots = self._resolve_parallel_slots()
+
+        # 引擎**实际**按几个槽启动（未启动/取不到时由 transport 退化为串行）；切模型后
+        # 才生效，transport 用这个而不是配置值，避免"配置已改、引擎还是旧参数"的不一致。
+        self._launched_slots = 1
 
         # Download state
         self._download_lock = threading.Lock()
@@ -1252,6 +1262,25 @@ class LocalLLMEngine:
         except Exception:
             logger.warning("Failed to restore engine state", exc_info=True)
 
+    def _resolve_parallel_slots(self) -> int:
+        """并发槽位数：环境变量 LATIAO_LLM_SLOTS > config.json local_llm.slots > 2，钳到 1..4。
+
+        1 = 老行为（transport 串行、-c 就是窗口总量）；>1 = 每槽独占 model_token_limit，
+        引擎总量按槽位线性放大（q4_0 KV 实测每 64k 约 0.4GB）。
+        """
+        _raw = os.environ.get("LATIAO_LLM_SLOTS", "")
+        if not _raw:
+            try:
+                _ll = _read_config().get("local_llm") or {}
+                _raw = str(_ll.get("slots", "") or "")
+            except Exception:
+                _raw = ""
+        try:
+            _n = int(_raw)
+        except (TypeError, ValueError):
+            _n = 2
+        return max(1, min(4, _n))
+
     def _auto_reload(self, model_id: str):
         """后台自动重载：加载完成后复位 _auto_reloading 标记。"""
         try:
@@ -1810,6 +1839,8 @@ class LocalLLMEngine:
             return self._start_llama_native(model_path, port)
 
         try:
+            # python 引擎（llama_cpp.server）单实例单线程，永远只有 1 个槽
+            self._launched_slots = 1
             cmd = [
                 sys.executable, "-m", "llama_cpp.server",
                 "--model", model_path,
@@ -1958,6 +1989,9 @@ class LocalLLMEngine:
         不传则用辣条自带的上游 llama-server。两种情况的进程管理/健康检查完全一致。
         """
         _custom = backend != "llama-cpp-native"
+        # 先按串行保守复位：只有下面真正拼出带 --parallel 的命令行才抬高（启动失败/非原生
+        # 引擎时留 1，transport 不会对单线程的 python 引擎并发下发）。
+        self._launched_slots = 1
         exe = exe or self._find_llama_server(model_path)
         if not exe:
             self.server_status = "error"
@@ -1972,14 +2006,33 @@ class LocalLLMEngine:
         # 要求非负（0-999）——启动即被拒 → “exited early/HTTP timeout”
         # （09-08 Spark 回退失败根因）。映射为 999（全部 layer），两版兼容。
         _ngl = self.n_gpu_layers if self.n_gpu_layers >= 0 else 999
+        # 并发槽位：只对**自带引擎**声明 --parallel。自定义引擎（fork）不代加——fork 未必
+        # 认这个开关，启动即被拒就是 09-08 那类"exited early"事故；容量按用户自己 args 里
+        # 有没有 --parallel 算，没写就是 1（等于今天的串行行为）。python 引擎（llama_cpp
+        # .server）单实例单线程，容量恒为 1，走下面另一个分支。
+        if _custom:
+            _slots = 1
+            try:
+                _ai = extra_args.index("--parallel")
+                _slots = max(1, min(4, int(extra_args[_ai + 1])))
+            except (ValueError, IndexError, TypeError):
+                pass
+        else:
+            _slots = max(1, int(self.parallel_slots))
+        self._launched_slots = _slots
         cmd = [
             str(exe),
             "-m", model_path,
             "--port", str(port),
             "--host", "127.0.0.1",
-            "-c", str(self.model_token_limit),
+            # 总量 = 槽位 × 每会话窗口（llama-server 按 n_ctx/n_parallel 均分给每个槽）
+            "-c", str(self.model_token_limit * _slots),
             "-ngl", str(_ngl),
         ]
+        if _slots > 1:
+            cmd += ["--parallel", str(_slots)]
+            self.status_message = (f"正在加载 {self.current_model_name}"
+                                   f"（{_slots} 并发 × {self.model_token_limit} 上下文）...")
         kv_k, kv_v = _auto_cache_type(model_path)
         # cache-type 值兼容：旧版 CLI 接受数字（8），新版（XHToken fork）要求
         # 字符串（q8_0）——统一用字符串（llama.cpp 各版本 CLI 均接受）
@@ -2039,6 +2092,8 @@ class LocalLLMEngine:
             logger.error("llama-server native: %s",
                 "exited early" if proc.poll() is not None else "HTTP timeout")
             self.stop_model()
+            # 启动失败 → 回到串行容量：引擎没起来，别让 transport 以为有几个槽可并发
+            self._launched_slots = 1
             self.server_status = "error"
             # 引擎原始报错对用户没意义（尤其"failed to read magic"这种误导文案，
             # 实际是"架构不被支持"）。读 GGUF 架构名换成可执行的提示。
@@ -2075,8 +2130,8 @@ class LocalLLMEngine:
                         "② 换用同一模型的常规量化版本（Q4_K_M / Q8_0 等）；"
                         f"③ 若确实要低位量化，请选上游标准写法（如 TQ2_0）。"
                         f"（引擎原始报错：{_m_type.group(0)}）" if _m_type else
-                        (f"该模型的量化格式不被当前引擎支持"
-                         f"（引擎在读取张量表时失败）。可选：① 换用产出该量化的 fork 引擎；"
+                        ("该模型的量化格式不被当前引擎支持"
+                         "（引擎在读取张量表时失败）。可选：① 换用产出该量化的 fork 引擎；"
                          "② 换用同一模型的常规量化版本（Q4_K_M / Q8_0 等）。"))
                 elif _need and _size and _size < _need * 0.995:
                     self.status_message = (

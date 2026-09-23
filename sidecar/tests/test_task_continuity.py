@@ -168,8 +168,7 @@ class TestConnectErrorRecoveryRace(unittest.TestCase):
 
             async def main():
                 try:
-                    async with agent_loop._local_llm_stream(
-                            client, api_url, {}, {}) as r:
+                    async with agent_loop._local_llm_stream(client, api_url, {}, {}):
                         pass
                 except httpx.ConnectError as e:
                     return ("connect", e)

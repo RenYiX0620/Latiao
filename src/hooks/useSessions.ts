@@ -48,7 +48,9 @@ export function useSessions() {
     });
     if (currentIdx >= idx) setCurrentIdx((c) => Math.max(0, c - 1));
   };
-  const setMessages = (fn: (prev: Message[]) => Message[]) => {
+  // 写入目标：显式会话 id（流式回合在发起时固化，见 setMessagesFor）或
+  // "当前正在查看的会话"（普通交互）。
+  const _applyMessages = (explicitId: string | null, fn: (prev: Message[]) => Message[]) => {
     setSessions((prev) => {
       // If the list is somehow empty, materialize a real session so the new
       // messages live inside `sessions` instead of a throwaway fallback.
@@ -57,7 +59,9 @@ export function useSessions() {
       // 插入/删除会话（cron 心跳、用户删会话）会使索引指向别的会话，
       // 内容串话。id 是稳定标识，插入删除不影响定位。
       const idx = Math.min(Math.max(currentIdx, 0), prev.length - 1);
-      const targetId = prev[idx]?.id;
+      // 09-23：显式 id 优先——流式回合的目标在发起时固化，用户中途切到别的
+      // 会话（或删掉它）都不会把这一轮流的内容写进别的会话。
+      const targetId = explicitId || prev[idx]?.id;
       return prev.map((s, i) => {
         if (targetId ? s.id !== targetId : i !== idx) return s;
         const newMsgs = fn(s.messages);
@@ -70,13 +74,17 @@ export function useSessions() {
       });
     });
   };
+  const setMessages = (fn: (prev: Message[]) => Message[]) => _applyMessages(null, fn);
+  /** 按**指定会话 id** 写入：流式回合发起时固化目标，中途切会话也不串话。 */
+  const setMessagesFor = (sessionId: string, fn: (prev: Message[]) => Message[]) =>
+    _applyMessages(sessionId, fn);
 
   return {
     sessions, setSessions,
     currentIdx, setCurrentIdx,
     session, messages,
     updateSession, setSelectedModel,
-    switchSession, deleteSession, setMessages,
+    switchSession, deleteSession, setMessages, setMessagesFor,
     newSession,
   };
 }

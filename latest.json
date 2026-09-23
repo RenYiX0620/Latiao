@@ -1,15 +1,15 @@
 {
-  "version": "0.3.18",
-  "notes": "Latiao v0.3.18",
-  "pub_date": "2026-09-06T12:25:44Z",
+  "version": "0.3.41",
+  "notes": "Latiao v0.3.41",
+  "pub_date": "2026-09-23T01:19:40Z",
   "platforms": {
     "darwin-aarch64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSNlJGdmtETXY3WkZBQm92aE04cEZERysrcWJXUGFSK05ETjJ5aU9QK3dFMTFiMVQvYndsbWtxaEVodmdYV2orL2Mra3F0eGNlK3pXTENXcEFDM1JPVzhrWlJEckZ3UEFvPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg4Njk3NTQzCWZpbGU6TGF0aWFvXzAuMy4xOF9hYXJjaDY0LmFwcC50YXIuZ3oKM21lcTBoeWZ4bzVndkV4VU5hVEZ5L2pJSUlWUThnV3RJM0lmYjYyWmhKWG9UWEpzcWNlbGRLZ0trRm9TNExSS1EyZ1YzeVQ1bDc1VGJMVVlYaHl2Q0E9PQo=",
-      "url": "https://github.com/RenYiX0620/Latiao/releases/download/v0.3.18/Latiao_0.3.18_aarch64.app.tar.gz"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSNlJGdmtETXY3Wk1DUFRRakFOdkdUazNjV3BWWU5WNEdFTlVwMGdZWjNVTDZXMVNmYkFualpBM2RySEFybXpON3FqQ2hzdEtkMmdYOEhKbzNyMERxNEJNa1JCemIyQXdzPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkwMTI1NTk2CWZpbGU6TGF0aWFvXzAuMy40MV9hYXJjaDY0LmFwcC50YXIuZ3oKYVMzZ1MrRkdhSDI1ODBlWGZkeEZlRUVQak56S2RDOE9teHhmT21nQjVGMGVtc1RvU0ZORk9BSWJ3K3hjWGlLcnF1QkZ6UUFwdk13Q2x6QVAvRVM1Q3c9PQo=",
+      "url": "https://github.com/RenYiX0620/Latiao/releases/download/v0.3.41/Latiao_0.3.41_aarch64.app.tar.gz"
     },
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSNlJGdmtETXY3Wk9MWGpsUUdXWGs5SGR2T1BsUWtiZHRNaXRLS1dpODAxYU5pTkJqOW93Qy9mc0NuL1p3VDNjMU84NWdZbGdzSStkS1kzV2diRE5HRnhzdnMxSTQzM2dBPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg4Njk4MjM5CWZpbGU6TGF0aWFvXzAuMy4xOF94NjQtc2V0dXAuZXhlCnE2eWU0WUx2dTFzTVc3VitTb0t3VXBWZ1pER3M4OE1Ja3pCbUNIdjlGa09WMU9IL0MxazYyU09yS25Ob0dEbEh6RkdyTWNHc0doYXYwU2UxSGs3Q0FnPT0K",
-      "url": "https://github.com/RenYiX0620/Latiao/releases/download/v0.3.18/Latiao_0.3.18_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSNlJGdmtETXY3WkRGK1Y3bU5ITEVwWFNCRjdhZzF2c3dzMWpzR3B2WXZOWGtOVUgvRnFSN1JaZkYxKzhFSGJ0UGh6K3haSFBqTUNnT0w2S2cwK3FYNVFJQjNXWVhRZmdBPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkwMTI2MzY0CWZpbGU6TGF0aWFvXzAuMy40MV94NjQtc2V0dXAuZXhlCjBGTkVxZ1FVWWpLQzZFVXEwYWtsa2lCODJXTmpXMVZ3YzNJbm5pNHJiVmhnNTAwdFZCQ2dONEd5QXV5ZVRMSVc0dE0zM2E0dzRBR1B4ZGxlTHBEbkF3PT0K",
+      "url": "https://github.com/RenYiX0620/Latiao/releases/download/v0.3.41/Latiao_0.3.41_x64-setup.exe"
     }
   }
 }

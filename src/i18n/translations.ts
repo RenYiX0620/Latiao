@@ -598,6 +598,8 @@ const T: Record<string, Record<Lang, string>> = {
   // ── SSE / Stream ──
   "agent.phase_analyze": { zh: "分析中...", en: "Analyzing...", ja: "分析中...", ru: "Анализ..." },
   "agent.phase_confirm": { zh: "确认: {tool}", en: "Confirm: {tool}", ja: "確認: {tool}", ru: "Подтв: {tool}" },
+  // 多会话并行时排在别的会话后面（后端引擎闸门等待）
+  "agent.phase_engine_wait": { zh: "等待引擎（另一会话在生成）...", en: "Waiting for engine (another session is generating)...", ja: "エンジン待機中（別セッションが生成中）...", ru: "Ожидание движка (другая сессия генерирует)..." },
   // ── Error overlay (main.tsx) ──
   "session.default": { zh: "新会话", en: "New Session", ja: "新規セッション", ru: "Новая сессия" },
   // ── Local Models Tab extras ──

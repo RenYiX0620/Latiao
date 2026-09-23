@@ -32,31 +32,33 @@ User → React UI → Tauri Rust → HTTP proxy → Python FastAPI → LLM API
 │  POST /v1/chat/completions                               │
 │                                                          │
 │  1. Parse request body                                   │
-│  2. Match skill (keyword → SKILL.md)                     │
-│  3. Build messages (system prompt + history + skill)     │
-│  4. Choose model route:                                  │
-│     ├─ Local model  → _local_agent_loop_stream()         │
-│     └─ Cloud API    → _agent_loop_stream()               │
-│  5. Stream events via SSE to frontend                    │
+│  2. 组装上下文：identity/persona + 工具表 + 会话历史      │
+│     （agent_loop._build_chat_messages）                   │
+│  3. 选路：本地 or 云端 → 都交给同一个 ThinAgentLoop       │
+│     （agent/loop.py；本地经 transport 闸门，容量=引擎槽位）│
+│  4. Stream events via SSE to frontend                    │
 └─────────────────────────────────────────────────────────┘
 
                     ▼
 
 ┌─────────────────────────────────────────────────────────┐
-│              _agent_loop_stream() (Cloud)                 │
+│        ThinAgentLoop.run()（agent/loop.py，唯一循环）     │
 │                                                          │
-│  while iteration < 50:                                   │
-│    ├─ Call LLM API with tools definition                 │
-│    ├─ Stream tokens → yield SSE "content" events         │
-│    ├─ Detect tool_calls in response:                     │
-│    │   ├─ OpenAI native format (delta.tool_calls)        │
-│    │   └─ Text-embedded format (parse_prompt_tool_calls) │
-│    ├─ Execute tools → _handle_tool_execution()           │
-│    ├─ Check stagnation (repeated calls)                  │
-│    └─ Nudge if model stalls (text-only streaks)          │
-│  End                                                     │
+│  while 未达步数上限:                                      │
+│    ├─ 组请求体（含 max_tokens/思考开关，按引擎类型分流）  │
+│    ├─ 流式采样 → 实时 yield content / reasoning           │
+│    ├─ 解析工具调用：原生 delta.tool_calls                 │
+│    │   └─ 或文本式方言（agent/parsing.py 的               │
+│    │      _parse_native/_parse_prompt + 半截标记清洗）     │
+│    ├─ 执行工具 → _handle_tool_execution()（含子代理闸门/  │
+│    │   权限档判定/确认流）                                │
+│    ├─ 停滞检测与去重（同参重复、纯文本空转）              │
+│    └─ 轮次/收口判定（cron 路径另有"正文可交付即收口"）    │
 │  Yield "[DONE]"                                          │
 └─────────────────────────────────────────────────────────┘
+
+注：2026-09-23 校正 —— 此前本文档描述的 `_agent_loop_stream()` /
+`_local_agent_loop_stream()`（云/本地双循环）已随薄循环重构删除，代码里 0 处存在。
 ```
 
 ---
