@@ -824,17 +824,20 @@ class TestShortMessageNoInjection(unittest.TestCase):
 
     def setUp(self):
         import agent_loop as A
-        self.A = A
+        import agent.prompt_build as PB     # _build_chat_messages 的规范模块（2026-09-23 拆出）
+        self.A, self.PB = A, PB
+        # monkeypatch 面必须跟着代码搬：_build_chat_messages 现在在 prompt_build 里
+        # 按自己的全局名查这些符号，改 agent_loop 的同名属性不会再生效
         self._tail, self._mem, self._onb = (
-            A._progress_tail, A._retrieve_relevant_learnings, A._process_onboarding)
-        A._progress_tail = lambda *a, **k: "- 上次在查半导体板块的资金流向"
-        A._retrieve_relevant_learnings = lambda *a, **k: []
-        A._process_onboarding = lambda t, l: ("", False)
+            PB._progress_tail, PB._retrieve_relevant_learnings, PB._process_onboarding)
+        PB._progress_tail = lambda *a, **k: "- 上次在查半导体板块的资金流向"
+        PB._retrieve_relevant_learnings = lambda *a, **k: []
+        PB._process_onboarding = lambda t, l: ("", False)
 
     def tearDown(self):
-        self.A._progress_tail = self._tail
-        self.A._retrieve_relevant_learnings = self._mem
-        self.A._process_onboarding = self._onb
+        self.PB._progress_tail = self._tail
+        self.PB._retrieve_relevant_learnings = self._mem
+        self.PB._process_onboarding = self._onb
 
     def _last(self, text):
         b = {"messages": [{"role": "user", "content": text}]}

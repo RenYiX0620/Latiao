@@ -13,14 +13,34 @@ import pytest
 def A(monkeypatch, tmp_path):
     """把进度目录指到临时目录。
 
-    注意用 monkeypatch 改模块常量，**不要** importlib.reload——重新导入会让
-    别的测试模块手里的旧类引用和新模块身份不一致（全量跑时 test_thin_loop
-    出现 AttributeError 就是 reload 造成的）。
+    注意两点：
+    1. 用 monkeypatch 改模块常量，**不要** importlib.reload——重新导入会让别的
+       测试模块手里的旧类引用和新模块身份不一致（全量跑时 test_thin_loop 出现
+       AttributeError 就是 reload 造成的）。
+    2. **规范模块是 `agent.progress`**（2026-09-23 拆分后进度读写搬到这里，
+       agent_loop 只 re-export）。路径常量必须打规范模块——只改 agent_loop 的
+       同名属性拦不住写入，会落到别处（拆分后首次跑全量就挂了 2 个用例）。
     """
     import agent_loop
-    monkeypatch.setattr(agent_loop, "PROGRESS_DIR", tmp_path, raising=False)
-    monkeypatch.setattr(agent_loop, "PROGRESS_FILE", tmp_path / "PROGRESS.md", raising=False)
+    import agent.progress as progress
+    for mod in (progress, agent_loop):      # 规范模块 + 旧路径同步，兼容两种读法
+        monkeypatch.setattr(mod, "PROGRESS_DIR", tmp_path, raising=False)
+        monkeypatch.setattr(mod, "PROGRESS_FILE", tmp_path / "PROGRESS.md", raising=False)
     yield agent_loop
+
+
+def test_reexport_identity_holds():
+    """re-export 必须指向同一个函数对象。
+
+    拆分时用的是"搬走 + 旧位置 re-export"的模式；如果有人哪天在 agent_loop 里
+    又复制一份同名实现，就会出现两份会各自漂移的代码（正是审计里"静默漂移"的
+    成因）。这条断言把模式钉死。
+    """
+    import agent_loop
+    import agent.progress as progress
+    for name in ("_progress_file", "_record_progress", "_rotate_progress_file",
+                 "_progress_tail", "_clean_progress_tail"):
+        assert getattr(agent_loop, name) is getattr(progress, name), f"{name} 不是同一对象"
 
 
 def test_session_files_are_separate(A):
