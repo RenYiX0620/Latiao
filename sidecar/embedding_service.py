@@ -112,8 +112,14 @@ def start() -> bool:
             logger.info("语义检索不可用（缺 llama-server 或嵌入模型）：%s", mp or "(无模型)")
             _start_failed_at = time.time()
             return False
-        cmd = [str(exe), "-m", str(mp), "--embeddings", "-c", "1024", "-b", "1024",
-               "-ub", "1024", "--port", str(EMBED_PORT), "--host", "127.0.0.1",
+        # 参数是量出来的（真库 415 条满载）：-ub 越大 Metal 缓冲越大且不释放
+        #   ngl99 ub1024 → 满载 2462MB / 全量编码 2.8s / 单条 10ms
+        #   ngl99 ub512  → 满载 2155MB / 3.3s / 12ms
+        #   ngl0  ub128  → 满载 3265MB / 16.5s / 13ms（纯 CPU 反而更费，实测）
+        # 另外批量回填完由 semantic 侧调用 stop() 回收实例（见 recycle_note），
+        # 下次查询按需重启 —— 平时常驻只有 ~850MB。
+        cmd = [str(exe), "-m", str(mp), "--embeddings", "-c", "512", "-b", "512",
+               "-ub", "512", "--port", str(EMBED_PORT), "--host", "127.0.0.1",
                "-ngl", "99", "--no-webui"]
         try:
             # ④ 子进程 env 白名单：模型服务不需要 sidecar 的凭据；与聊天引擎用同一份

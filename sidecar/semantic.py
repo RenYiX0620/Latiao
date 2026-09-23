@@ -23,7 +23,7 @@ from db import _db_write_lock, _get_db
 logger = logging.getLogger("latiao-sidecar")
 
 MIN_COS = 0.50          # 语义门槛（标定值见模块文档）
-BATCH = 32
+BATCH = 8        # 请求批量（实测批量越小 Metal 缓冲增长越少）
 VECTOR_CACHE_MAX = 20000   # 内存里最多缓存多少条向量（1.6MB/415 条 → 上万条也才几十 MB）
 
 _lock = threading.Lock()
@@ -88,7 +88,7 @@ def missing_count() -> int:
     return max(0, total - have)
 
 
-def ensure_vectors(allow_cold_start: bool = True, max_batches: int = 40) -> int:
+def ensure_vectors(allow_cold_start: bool = True, max_batches: int = 200) -> int:
     """给缺向量的学习补向量（批量编码 + 落库 + 更新内存缓存）。返回本次编码条数。"""
     if not emb.available():
         return 0
@@ -125,6 +125,19 @@ def ensure_vectors(allow_cold_start: bool = True, max_batches: int = 40) -> int:
         done += len(vecs)
     if done:
         logger.info("语义向量已更新: %d 条（模型 %s）", done, emb.MODEL_ID)
+        # 大批量回填后回收服务实例：实测满载时 Metal 缓冲把 RSS 从 850MB 顶到 2.2~2.5GB
+        # 且不释放；下次查询会按需重启（且那一刻直接回退词频，不会卡对话）。
+        # 只在**积压清空**后回收（首版按"编了 N 条就回收"写，结果在批次上限处
+        # 提前回收，还剩 95 条没编码就停了）。
+        try:
+            remaining = missing_count()
+        except Exception:
+            remaining = 0
+        if done >= 64 and remaining == 0:
+            logger.info("批量回填 %d 条完成（无积压）后回收嵌入服务实例以释放内存", done)
+            emb.stop()
+        elif remaining:
+            logger.info("语义向量仍缺 %d 条（本次编码 %d 条），下次继续", remaining, done)
     return done
 
 
