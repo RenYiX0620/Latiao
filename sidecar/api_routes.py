@@ -1325,6 +1325,7 @@ async def api_feedback(request: Request):
     kind = str(body.get("kind", ""))
     if not content or kind not in ("up", "down"):
         return {"status": "error", "message": "content and kind(up/down) required"}
+    session_id = str(body.get("session_id", "")).strip()
     try:
         from memory import _store_learning
         topic = "用户点赞的回答" if kind == "up" else "用户点踩的回答"
@@ -1332,7 +1333,14 @@ async def api_feedback(request: Request):
                         confidence=0.9, source_type="feedback")
     except Exception:
         logger.warning("feedback 存储失败", exc_info=True)
-    return {"status": "ok"}
+    # ④ 标签回流：点赞/点踩 → 该会话最近一条注入记录标成 used
+    tagged = 0
+    try:
+        from memory import mark_injection_used
+        tagged = mark_injection_used(session_id, kind == "up")
+    except Exception:
+        logger.debug("注入标签回流失败", exc_info=True)
+    return {"status": "ok", "tagged": tagged}
 
 
 @app.post("/v1/memory/learn")

@@ -154,6 +154,19 @@ def _init_db():
         except Exception:
             logger.error("Failed to create sessions tables", exc_info=True)
 
+        # ④ 记忆注入日志（09-23）：记录"哪一轮注入了哪些知识"，供点赞/点踩时
+        # 标成标签（used=1/0）——门槛怎么调，长期只能靠真实标签说话，不能再拿
+        # 我编的 13 个查询去拟合（那样是过拟合）。
+        try:
+            conn.execute("CREATE TABLE IF NOT EXISTS memory_injections ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT DEFAULT '', "
+                "query TEXT DEFAULT '', injected TEXT NOT NULL, used INTEGER, "
+                "created_at TEXT NOT NULL)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_inj_created "
+                "ON memory_injections(created_at DESC)")
+        except Exception:
+            logger.error("Failed to create memory_injections", exc_info=True)
+
         # ⑥ 语义检索（09-23）：learnings 加向量列。ALTER 在旧库上补列，幂等包裹
         # （列已存在会抛，忽略即可——与 capabilities.perm_override 同一套路）。
         for _stmt in ("ALTER TABLE learnings ADD COLUMN embedding BLOB",
@@ -318,6 +331,28 @@ def prune_learnings(max_rows: int | None = None) -> dict:
         pass
     logger.info("learnings 超限淘汰: %d 条（上限 %d，保留 %d）", deleted, cap, kept)
     return {"deleted": deleted, "kept": kept, "max": cap}
+
+
+def prune_injections(retention_days: int = 90) -> dict:
+    """清理注入日志（默认 90 天）。标签是长期资产，但日志行本身不该无限长。"""
+    if retention_days <= 0:
+        return {"deleted": 0, "kept": -1, "skipped": "retention disabled"}
+    conn = _get_db()
+    with _db_write_lock:
+        try:
+            cur = conn.execute(
+                "DELETE FROM memory_injections WHERE created_at != '' "
+                "AND created_at < datetime('now', ?)", (f"-{retention_days} days",))
+            deleted = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+            conn.commit()
+        except Exception:
+            logger.warning("注入日志清理失败", exc_info=True)
+            return {"deleted": 0, "kept": -1, "skipped": "error"}
+        try:
+            kept = conn.execute("SELECT COUNT(*) FROM memory_injections").fetchone()[0]
+        except Exception:
+            kept = -1
+    return {"deleted": deleted, "kept": kept, "retention_days": retention_days}
 
 
 def prune_reflections(retention_days: int | None = None) -> dict:

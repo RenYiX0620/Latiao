@@ -195,3 +195,124 @@ def test_tool_prefixed_knowledge_is_retrievable(env):
     assert memory._learning_is_garbage("x", "先用 mx_query 查大盘再回答"), "事故短语仍要拦"
     assert memory._learning_is_garbage("x", "思考碎片 <think> abc</think>"), "<think> 碎片仍要拦"
     assert memory._learning_is_garbage("t", "The user wants me to extract a reusable knowledge")
+
+
+# ── ② 查询窗口 ──────────────────────────────────────────────────────
+
+def test_build_query_window_for_referential(env):
+    _, _, semantic, _ = env
+    # 自身没内容的（剥掉指代词后剩 <4 字）才借上文：否则向量里什么主题都没有
+    assert "电子布" in semantic.build_query("继续", "帮我看看电子布板块")
+    assert "电子布" in semantic.build_query("还有呢", "帮我看看电子布板块")
+    assert "电子布" in semantic.build_query("上次那个", "帮我看看电子布板块")
+    # **自带主题的不借**：实测借了反而被上文稀释（"上次那个风电项目的数据" 被
+    # 在聊电子布的上文带跑，召回了电子布而不是风电）
+    assert semantic.build_query("上次那个风电项目的数据", "帮我看看电子布板块") == "上次那个风电项目的数据"
+    # 正常问题原样（保持与既有查询的可比性）
+    assert semantic.build_query("为什么有些股票查不到数据", "帮我看看电子布板块") == "为什么有些股票查不到数据"
+    assert semantic.build_query("上次那个", "") == "上次那个"
+
+
+# ── ③ LLM 裁判（只判重叠区）────────────────────────────────────────
+
+class _FakeResp:
+    def __init__(self, text, status=200):
+        self.status_code = status
+        self._text = text
+    def json(self):
+        return {"choices": [{"message": {"content": self._text}}]}
+
+
+def _patch_judge(monkeypatch, semantic, reply, calls):
+    def fake_post(url, json=None, timeout=None):
+        calls.append(json)
+        if callable(reply):
+            return reply(json)
+        return _FakeResp(reply)
+    import httpx
+    monkeypatch.setattr(httpx, "post", fake_post, raising=False)
+
+
+def test_judge_parses_yes_no(env, monkeypatch):
+    _, _, semantic, _ = env
+    calls = []
+    _patch_judge(monkeypatch, semantic, "1.相关\n2.不相关\n3.相关", calls)
+    cands = [("a", "甲"), ("b", "乙"), ("c", "丙")]
+    assert semantic.judge_relevance("问题", cands) == {"a", "c"}
+    assert calls, "应真的调了一次模型"
+    # 模型出错 → None（调用方按原门槛走）
+    _patch_judge(monkeypatch, semantic, "随便乱说没有序号", [])
+    assert semantic.judge_relevance("问题", cands) == set()
+    monkeypatch.setattr("httpx.post", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")), raising=False)
+    assert semantic.judge_relevance("问题", cands) is None
+
+
+def test_judge_only_called_for_ambiguous_band(env, monkeypatch):
+    """延迟护栏：候选都在明确区间（≥0.55 或 <0.40）时，一次模型调用都不该发。"""
+    db, memory, semantic, emb = env
+    conn = db._get_db()
+    strong = _add(conn, "强相关", "查询证券持仓明细的方法")
+    _add(conn, "弱相关噪声", "完全无关的另一件事")   # 落在重叠区之外：不该触发裁判
+    _VEC_TABLE["问题甲"] = [1.0, 0.02, 0.0, 0.0]          # 与强相关 cos≈1
+    _VEC_TABLE["完全无关的另一件事"] = [0.0, 1.0, 0.0, 0.0]
+    _install_fake_embedder(monkeypatch, emb, semantic)
+    semantic.ensure_vectors(allow_cold_start=True)
+    calls = []
+    _patch_judge(monkeypatch, semantic, "1.相关", calls)
+    hits = semantic.hybrid_search("问题甲", [], limit=5)
+    assert [h["id"] for h in hits] == [strong], "只有强相关该进"
+    assert calls == [], "没有重叠区候选却调了裁判 = 白加延迟"
+
+
+def test_judge_rescues_ambiguous_candidate(env, monkeypatch):
+    """重叠区的候选由裁判决定进不进——这正是单一阈值分不开的那一带。"""
+    db, memory, semantic, emb = env
+    conn = db._get_db()
+    mid = _add(conn, "中间分候选", "板块资金流向怎么看")
+    # 余弦正好 0.50：落在实测重叠带 [0.40, 0.55) 内、又低于门槛 0.50 之上的判定——
+    # 把门槛抬到 0.55 来模拟"分数落在带内但不达门槛"（带是固定的，不随门槛变）
+    _VEC_TABLE["问题乙"] = [1.0, 0.0, 0.0, 0.0]
+    _VEC_TABLE["板块资金流向怎么看"] = [0.5, 0.866, 0.0, 0.0]
+    _install_fake_embedder(monkeypatch, emb, semantic)
+    semantic.ensure_vectors(allow_cold_start=True)
+    monkeypatch.setattr(semantic, "MIN_COS", 0.55)
+    monkeypatch.setenv("LATIAO_SEMANTIC_JUDGE", "1")   # 裁判默认关，本例要开
+    calls = []
+    _patch_judge(monkeypatch, semantic, "1.相关", calls)
+    hits = semantic.hybrid_search("问题乙", [], limit=5)
+    assert [h["id"] for h in hits] == [mid], "裁判说相关就该进"
+    assert len(calls) == 1
+    calls.clear()
+    _patch_judge(monkeypatch, semantic, "1.不相关", calls)
+    assert semantic.hybrid_search("问题乙", [], limit=5) == [], "裁判说不相关就不该进"
+
+
+# ── ④ 注入日志与标签回流 ────────────────────────────────────────────
+
+def test_injection_log_and_label_roundtrip(env):
+    db, memory, semantic, emb = env
+    conn = db._get_db()
+    memory._log_injection("sess-1", "查询持仓", [{"id": "x", "topic": "t", "score": 0.9}])
+    row = conn.execute("SELECT session_id, query, injected, used FROM memory_injections").fetchone()
+    assert row[0] == "sess-1" and "查询持仓" in row[1] and '"x"' in row[2] and row[3] is None
+    assert memory.mark_injection_used("sess-1", True) == 1
+    assert conn.execute("SELECT used FROM memory_injections").fetchone()[0] == 1
+    assert memory.mark_injection_used("sess-1", False) == 1
+    assert conn.execute("SELECT used FROM memory_injections").fetchone()[0] == 0
+    assert memory.mark_injection_used("", True) == 0, "没有会话 id 就不标（不做无根据的关联）"
+    assert db.prune_injections(90)["deleted"] == 0
+
+
+def test_judge_default_off_and_configurable(env, monkeypatch):
+    """裁判默认关（实测负收益），config/env 可开——这条防止有人"顺手打开"。"""
+    _, _, semantic, _ = env
+    monkeypatch.delenv("LATIAO_SEMANTIC_JUDGE", raising=False)
+    assert semantic.judge_enabled() is False
+    monkeypatch.setenv("LATIAO_SEMANTIC_JUDGE", "1")
+    assert semantic.judge_enabled() is True
+    monkeypatch.setenv("LATIAO_SEMANTIC_JUDGE", "0")
+    assert semantic.judge_enabled() is False
+    monkeypatch.delenv("LATIAO_SEMANTIC_JUDGE", raising=False)
+    import config
+    config.save_config({"memory": {"semantic_judge": True}})
+    assert semantic.judge_enabled() is True

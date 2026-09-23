@@ -203,7 +203,8 @@ export default memo(function ChatView({
         authFetch("/v1/feedback", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ content: content.slice(0, 500), kind: next }),
+          // session_id：后端据此把该会话最近一条记忆注入记录标成 used 标签
+          body: JSON.stringify({ content: content.slice(0, 500), kind: next, session_id: sessionId || "" }),
         }).catch(() => { /* 反馈失败不打扰用户 */ });
       });
     }

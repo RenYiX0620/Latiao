@@ -419,6 +419,7 @@ async def lifespan(app: FastAPI):
                 # ⑦（09-23）：反思保留 + learnings 超限淘汰（与工具历史同一轮里做）
                 await run_in_threadpool(db.prune_reflections)
                 await run_in_threadpool(db.prune_learnings)
+                await run_in_threadpool(db.prune_injections)
                 # ⑥：空闲就停掉嵌入服务（腾内存）；下次检索按需再起
                 try:
                     import embedding_service as _emb

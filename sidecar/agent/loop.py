@@ -1152,7 +1152,14 @@ class ThinAgentLoop:
             _lq = (self.last_user_text or "").strip()
             _notes_ok = len(_lq) >= 6 and not _is_chat_query(_lq)
             if self.last_user_text and _notes_ok:
-                _rel = [r for r in _retrieve_relevant_learnings(self.last_user_text, limit=5)
+                # ② 查询窗口：指代类问题（"上次那个风电项目"）要把上一轮用户消息
+                # 一起编码；④ 带上会话 id 供注入日志/标签回流
+                _prev_user = next((str(m.get("content") or "") for m in reversed(self.current_msgs[:-1])
+                                   if m.get("role") == "user" and str(m.get("content") or "").strip()),
+                                  "")
+                _rel = [r for r in _retrieve_relevant_learnings(
+                            self.last_user_text, limit=5, prev_user_text=_prev_user,
+                            session_id=self.session_id)
                         if r.get("confidence", 0) >= 0.3]
                 if _rel:
                     self.current_msgs.append(_note_msg(

@@ -385,7 +385,46 @@ def _is_junk_learning(topic, content, include_topic_prefix: bool = True) -> bool
     return False
 
 
-def _retrieve_relevant_learnings(query: str, limit: int = MAX_LEARNINGS_INJECT) -> list[dict]:
+def _log_injection(session_id: str, query: str, items: list[dict]) -> None:
+    """记一条注入日志（④）：供点赞/点踩回流成标签。失败只记 debug（不影响检索）。"""
+    try:
+        import json as _json
+        payload = _json.dumps([{"id": r.get("id"), "topic": r.get("topic"),
+                                "score": r.get("score"), "sem": r.get("_semantic")}
+                               for r in items], ensure_ascii=False)
+        conn = _get_db()
+        with _db_write_lock:
+            conn.execute("INSERT INTO memory_injections(session_id, query, injected, created_at) "
+                         "VALUES(?,?,?,?)",
+                         (session_id or "", (query or "")[:200], payload, datetime.now().isoformat()))
+            conn.commit()
+    except Exception:
+        logger.debug("注入日志写入失败", exc_info=True)
+
+
+def mark_injection_used(session_id: str, used: bool) -> int:
+    """把该会话最近一条注入记录标成 used=1/0（点赞=用了它，点踩=没用上）。"""
+    if not session_id:
+        return 0
+    try:
+        conn = _get_db()
+        row = conn.execute(
+            "SELECT id FROM memory_injections WHERE session_id = ? ORDER BY created_at DESC LIMIT 1",
+            (session_id,)).fetchone()
+        if not row:
+            return 0
+        with _db_write_lock:
+            conn.execute("UPDATE memory_injections SET used = ? WHERE id = ?",
+                         (1 if used else 0, row[0]))
+            conn.commit()
+        return 1
+    except Exception:
+        logger.debug("注入标签回流失败", exc_info=True)
+        return 0
+
+
+def _retrieve_relevant_learnings(query: str, limit: int = MAX_LEARNINGS_INJECT,
+                                 prev_user_text: str = "", session_id: str = "") -> list[dict]:
     """Search past learnings using TF-IDF semantic similarity.
     Falls back to FTS5/LIKE if TF-IDF returns nothing."""
     # Priority 1: 混合检索（⑥）——语义 + 词频两道门槛；语义不可用时就是原来的词频
@@ -395,7 +434,8 @@ def _retrieve_relevant_learnings(query: str, limit: int = MAX_LEARNINGS_INJECT) 
     results = None
     try:
         from semantic import hybrid_search
-        results = hybrid_search(query, tf_candidates, limit=limit)
+        results = hybrid_search(query, tf_candidates, limit=limit,
+                                prev_user_text=prev_user_text)
     except Exception:
         logger.debug("语义检索不可用，回退词频", exc_info=True)
     if results is None:
@@ -404,6 +444,7 @@ def _retrieve_relevant_learnings(query: str, limit: int = MAX_LEARNINGS_INJECT) 
                if not _learning_is_garbage(r.get("topic", ""), r.get("content", ""))]
 
     if results:
+        _log_injection(session_id, query, results)
         try:
             conn = _get_db()
             for r in results:
