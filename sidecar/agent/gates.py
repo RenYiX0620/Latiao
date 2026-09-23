@@ -231,11 +231,44 @@ async def _ensure_final_language_with_retry(client, api_url: str, headers: dict,
     return deliver, False
 
 
-def _split_translation_chunks(text: str, limit: int = 2500) -> list:
-    """按段落把长文本切成 ≤limit 的块（长文本一次性翻译会超输出预算而失败）。"""
+def _split_translation_chunks(text: str, limit: int = 600) -> list:
+    """按段落把长文本切成 ≤limit 的块。
+
+    阈值是**按超时**定的（2026-09-23 真机事故）：翻译请求用的是调用方的
+    httpx 客户端（60s 超时），而本地 35B 当时约 12 字/秒 → 一块 1500 字要 ~120s，
+    必然超时；两次重试各 60s 都失败，用户只看到"自动翻译也没成功"。
+    现在每块 ~600 字（关思考后 ~15-30s 一块），并保持按段落切、不切断句子。
+    原来只在 >3000 字时才切——那条界线是按"输出 token 预算"定的，与超时无关。
+    """
     text = text or ""
-    if len(text) <= 3000:
+    if len(text) <= limit:
         return [text]
+
+    def _hard_split(s: str) -> list:
+        """把仍然超长的一段切开：优先在句末切，实在没标点才按字数硬切。
+
+        为什么必须有这步（2026-09-23 真机事故）：模型的长回复常常是**一个没有空行
+        的大段落**，只按空行切的话它会整块留下 → 仍是一次 120s 的大请求 → 超时。
+        """
+        parts = re.split(r"(?<=[。！？!?；;\n])", s)
+        buf, out = "", []
+        for part in parts:
+            if len(buf) + len(part) > limit and buf:
+                out.append(buf)
+                buf = part
+            else:
+                buf += part
+        if buf:
+            out.append(buf)
+        final = []
+        for c in out:
+            while len(c) > limit * 1.5:      # 极长句（无标点）→ 按字数切；
+                                             # 上限 1.5×limit≈900 字，仍按 60s 超时留余量
+                final.append(c[:limit])
+                c = c[limit:]
+            final.append(c)
+        return [c for c in final if c.strip()]
+
     chunks, buf = [], ""
     for para in re.split(r"(\n\s*\n)", text):
         if len(buf) + len(para) > limit and buf.strip():
@@ -245,7 +278,10 @@ def _split_translation_chunks(text: str, limit: int = 2500) -> list:
             buf += para
     if buf.strip():
         chunks.append(buf)
-    return chunks or [text]
+    out = []
+    for c in chunks or [text]:
+        out.extend(_hard_split(c) if len(c) > limit else [c])
+    return out or [text]
 
 
 async def _force_translate(client, api_url: str, headers: dict, engine_model: str,
@@ -271,7 +307,11 @@ async def _force_translate(client, api_url: str, headers: dict, engine_model: st
         {"role": "user", "content": text[:6000]},
     ]
     _tb = {"model": engine_model, "messages": _tmsgs, "max_tokens": 4096,
-           "stream": False, "temperature": 0.2, "stop": ["<|im_end|>", "<eos>"]}
+           "stream": False, "temperature": 0.2, "stop": ["<|im_end|>", "<eos>"],
+           # 关思考（2026-09-23）：本地是思考模型，不关的话 max_tokens 会先被
+           # reasoning_content 吃掉一大截 → 更慢、更容易撞 60s 超时。薄循环、LLM
+           # 裁判、技能合成三处都用了同一个开关。
+           "chat_template_kwargs": {"enable_thinking": False}}
     # 引擎长流刚结束时偶发连接重置（17:17 实测 608ms 内 read 失败）——重试一次
     for _attempt in range(2):
         try:
