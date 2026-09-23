@@ -432,14 +432,32 @@ fn start_sidecar() -> Option<Child> {
         c
     };
 
-    match cmd
+    let spawned = cmd
         .current_dir(&sidecar_dir)
         .env("LATIAO_CTX_LEN", "64000")
-        .env("LATIAO_AUTH_TOKEN", AUTH_TOKEN.get().map(|s| s.as_str()).unwrap_or(""))
         .env("LATIAO_APP_VERSION", env!("CARGO_PKG_VERSION"))
-        .spawn()
-    {
-        Ok(child) => {
+        // (A) token 不再进环境变量：实测 `ps eww -p <sidecar pid>` 能把同用户进程
+        // 启动时的整份环境打出来（运行时 os.environ.pop 也无效——ps 读的是 exec 时的
+        // 快照），而模型自己就能跑命令，等于把全权 token 送到它手上。改走子进程
+        // stdin 传一行（Python 侧启动时读一次）。
+        .env_remove("LATIAO_AUTH_TOKEN")
+        // (C) 妙想 key 同理：不再继承进 sidecar 环境，改由 sidecar 从 config.json
+        // 读入内存，需要时显式注入给子进程。
+        .env_remove("MX_APIKEY")
+        .stdin(std::process::Stdio::piped())
+        .spawn();
+
+    match spawned {
+        Ok(mut child) => {
+            // 把 token 写进子进程 stdin 后立刻 drop 写端（管道 EOF）：sidecar 读一行
+            // 即完成鉴权初始化；EOF 也让它知道没有更多输入。
+            if let Some(mut stdin) = child.stdin.take() {
+                let token = AUTH_TOKEN.get().map(|s| s.as_str()).unwrap_or("");
+                use std::io::Write;
+                if let Err(e) = stdin.write_all(format!("{}\n", token).as_bytes()) {
+                    eprintln!("[Latiao] Failed to hand token to sidecar over stdin: {}", e);
+                }
+            }
             println!("[Latiao] Sidecar started (pid {})", child.id());
             Some(child)
         }

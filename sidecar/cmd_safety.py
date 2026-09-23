@@ -203,6 +203,77 @@ def tool_log_preview(tool_name: str, result: str, limit: int = 80) -> str:
     return redact_secrets(txt)[:limit].replace("\n", " ")
 
 
+# ── 进程环境读取拦截（2026-09-23 审计，与 token 移出环境配套）────────
+# 实测：`ps eww -p <pid>` / `ps -E -p <pid>` 能把同用户进程**启动时**的环境整份
+# 打出来（运行时 os.environ.pop() 无效——ps 读的是 exec 快照）；sysctl
+# kern.procargs2 不含环境（0 命中）、launchctl procinfo 需 root。
+# 这条是纵深防御：token 已经改走 stdin、妙想 key 也搬出启动环境，但只要还有
+# 别的进程把凭据放进环境，模型一条 ps 就能读到。只拦"带 e/E 标志的 ps"，普通
+# `ps aux` / `ps -p <pid>`（看进程是否在跑）保持可用。
+_PS_ENV_FLAG_RE = re.compile(r"^(?:[a-zA-Z]{0,5}[eE][a-zA-Z]{0,5})$")
+
+
+def reject_process_env_read(cmd: str) -> str | None:
+    """读其他进程环境变量的命令 → 拒绝（返回文案），否则 None。"""
+    import shlex
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        tokens = cmd.split()
+    if not tokens:
+        return None
+    if os.path.basename(tokens[0]).lower() in ("ps", "busybox"):
+        for tok in tokens[1:]:
+            flag = tok.lstrip("-")
+            if not flag or flag[0].isdigit():
+                continue
+            if os.sep in flag or flag.startswith("/"):
+                continue
+            if _PS_ENV_FLAG_RE.match(flag):
+                return (f"⛔ 不允许读取其他进程的环境变量（ps 的 e/E 标志会把启动环境"
+                        f"整份打出来，里面有凭据）: {cmd[:80]}")
+    # Linux 的 /proc/<pid>/environ 同理
+    if "/proc/" in cmd and "environ" in cmd:
+        return f"⛔ 不允许读取 /proc/*/environ（进程环境含凭据）: {cmd[:80]}"
+    return None
+
+
+# ── 敏感路径出现在命令里 → 拒绝（2026-09-23 审计，读/写/命令三层同源同心）──
+# 实测暴露的两个洞：(a) 读拦截只认 cat/head/tail/find 这几个**动词**，换 grep 就
+# 放行——`grep -o 'tvly[^"]*' ~/.local-ai-os/config.json` 能直接把 key 打出来；
+# (b) `cp ~/.ssh/id_rsa /tmp/k.txt` 放行，把私钥拷到可读位置再 cat。所以判定要按
+# **路径**做：命令里出现敏感路径（复用 sensitive_read_block 的同一份判定）就拒，
+# 只放行"只看存在性/元数据"的动词（ls/stat/file/test/wc…），内容读取一律不给。
+_METADATA_ONLY_VERBS = frozenset({
+    "ls", "stat", "file", "test", "du", "wc", "readlink", "realpath", "dirname",
+    "basename", "which", "type", "echo", "printf", "true", "false",
+})
+
+
+def reject_sensitive_path(cmd: str) -> str | None:
+    """命令的任何参数命中敏感路径 → 拒绝（元数据类动词除外）。"""
+    import shlex
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        tokens = cmd.split()
+    if not tokens:
+        return None
+    verb = os.path.basename(tokens[0]).lower()
+    if verb in _METADATA_ONLY_VERBS:
+        return None
+    for tok in tokens[1:]:
+        if not tok or tok.startswith("-") or "=" in tok:
+            continue
+        try:
+            rp = os.path.realpath(os.path.abspath(os.path.expanduser(tok)))
+        except OSError:
+            continue
+        if sensitive_read_block(rp):
+            return (f"⛔ 命令里出现敏感路径（密钥/凭据/配置），已拒绝：{rp}")
+    return None
+
+
 def check_cmd(cmd: str) -> str | None:
     """整条命令的安全检查（阶段 3 双层）。返回拒绝文案或 None（放行）。
 
@@ -238,7 +309,8 @@ def check_cmd(cmd: str) -> str | None:
     for pattern in OBFUSCATION_PATTERNS:
         if re.search(pattern, low):
             return f"⛔ Blocked potentially unsafe command: {cmd}"
-    return reject_sensitive_read(cmd) or reject_sensitive_write(cmd)
+    return (reject_sensitive_read(cmd) or reject_sensitive_write(cmd)
+            or reject_process_env_read(cmd) or reject_sensitive_path(cmd))
 
 # ── ⑧ 自动加载目录的写入封印（2026-09-23 审计 P1）────────────────────
 # ~/.local-ai-os/extensions/<name>/<ver>/plugin.py 会被 tool_system 用
