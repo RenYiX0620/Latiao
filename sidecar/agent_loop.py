@@ -12,7 +12,6 @@ import json
 import logging
 import os
 import re
-import threading
 import time
 import uuid
 from datetime import datetime
@@ -31,18 +30,29 @@ from config import PROGRESS_DIR
 from agent.prompt_build import (  # noqa: F401  —— re-export（api_routes/main/6 个测试按旧路径导入）
     _build_chat_messages,
 )
+from agent.session_events import (  # noqa: F401  —— re-export（旧导入路径继续可用）
+    _clear_session_cancel,
+    _EVENT_LOGS,
+    _EVENT_LOGS_LOCK,
+    _EVENT_LOGS_MAX,
+    _event_log_for,
+    _request_session_cancel,
+    _session_cancel_requested,
+)
 from agent.progress import (  # noqa: F401  —— re-export（兼容旧导入路径）
+    PROGRESS_FILE,        # 规范所有者在 agent.progress：进度路径只留一份定义
     _clean_progress_tail,
     _progress_file,
     _progress_tail,
     _record_progress,
     _rotate_progress_file,
 )
+AGENTS_FILE = PROGRESS_DIR / "agents.json"
+CONFIG_FILE = PROGRESS_DIR / "config.json"
+
 from cron import _create_cron
 from db import _db_write_lock, _get_db
 from identity import _load_agent_identity
-from session_log import SessionLog
-from loop_state import turn_state_for
 from memory import (
     _maybe_generate_skill,
     _quick_reflect,
@@ -250,83 +260,6 @@ TOOL_HOOKS: dict[str, dict] = {}
 _pending_confirmations: dict[str, dict] = {}
 _pending_lock = asyncio.Lock()
 
-# 会话级取消注册表：POST /v1/chat/cancel 置位。两个循环在每轮迭代开头与
-# 每次工具执行前检查——停止按钮此前只断前端流，服务端循环继续烧 GPU/
-# 执行工具/扣云端费用（P0）。set 的 add/discard/contains 原子，无需锁。
-_session_cancelled: set[str] = set()
-
-# 事件日志（阶段 1，灰度）：LATIAO_EVENT_LOG=1 时取消/回合边界事件写入
-# session_events 表（sidecar/session_log.py，移植 dsh append 契约）。
-# 有会话级取消事件时，重放/审计能还原"用户何时按过停止"——0.3.14 审计发现
-# 停止按钮此前只断前端流，这类时序信息在旧日志里是彻底丢失的。
-# 日志实例按会话缓存：seq 连续性契约要求同一会话共用同一实例（否则每个
-# 新实例 seq 都从 0 开始，回放时"连续序号"语义失效）。缓存有界（LRU 32），
-# 会话结束不清理——事件是审计事实，实例只是写入口。
-_EVENT_LOGS: dict[str, SessionLog] = {}
-_EVENT_LOGS_LOCK = threading.Lock()
-_EVENT_LOGS_MAX = 32
-
-
-def _event_log_for(session_id: str) -> SessionLog | None:
-    try:
-        with _EVENT_LOGS_LOCK:
-            log = _EVENT_LOGS.get(session_id)
-            if log is None:
-                log = SessionLog(session_id)
-                if len(_EVENT_LOGS) >= _EVENT_LOGS_MAX:
-                    _EVENT_LOGS.pop(next(iter(_EVENT_LOGS)))
-                _EVENT_LOGS[session_id] = log
-            return log
-    except Exception:
-        logger.warning("event log unavailable for %s", session_id, exc_info=True)
-        return None
-
-
-def _request_session_cancel(session_id: str) -> None:
-    """置位会话取消标记（/v1/chat/cancel 调用）。"""
-    if session_id:
-        _session_cancelled.add(session_id)
-        # 相位状态机镜像（阶段 2a，与事件日志同源）：stopping 相位 + 先行原因
-        try:
-            turn_state_for(session_id).request_stop("user", "button")
-        except Exception:
-            logger.warning("failed to mirror cancel to turn state", exc_info=True)
-        log = _event_log_for(session_id)
-        if log is not None:
-            try:
-                log.append("cancel/request", {"cause": "user"})
-            except Exception:
-                logger.warning("failed to log cancel/request", exc_info=True)
-
-
-def _clear_session_cancel(session_id: str) -> None:
-    """新请求开始时清除标记（重发消息不应被上一次停止影响）。"""
-    _session_cancelled.discard(session_id)
-    # 上一次停止若因断连/异常未结算，新请求强制放弃旧 turn（产品语义：重发必须可用）
-    try:
-        turn_state_for(session_id).abandon()
-    except Exception:
-        logger.warning("failed to abandon turn state", exc_info=True)
-
-
-def _session_cancel_requested(session_id: str) -> bool:
-    """会话是否已被请求取消。
-
-    子代理会话形如 "<父会话>:sub_xxx"——父被取消（用户点停止 / 客户端断流）时
-    子代理必须同步骤内停，否则断连后仍会继续烧算力（09-13 事故）。
-    """
-    if not session_id:
-        return False
-    if session_id in _session_cancelled:
-        return True
-    root = session_id.split(":", 1)[0]
-    return root != session_id and root in _session_cancelled
-
-# PROGRESS_DIR is imported from config
-PROGRESS_FILE = PROGRESS_DIR / "PROGRESS.md"
-AGENTS_FILE = PROGRESS_DIR / "agents.json"
-CONFIG_FILE = PROGRESS_DIR / "config.json"
-_merge_agents()
 
 # ═══════════════════════════════════════════════════════
 #  Self-Verification: programmatic post-tool quality checks

@@ -12,6 +12,7 @@ import inspect
 
 EXTRACTED = {
     "agent.progress": [
+        "PROGRESS_FILE",       # 常量同样只能有一份定义（路径漂移是最隐蔽的一类）
         "_progress_file", "_record_progress", "_rotate_progress_file",
         "_progress_tail", "_clean_progress_tail",
     ],
