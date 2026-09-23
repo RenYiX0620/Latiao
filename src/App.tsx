@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import logoUrl from "./assets/logo.png";
 import type { Message, PendingFile, SessionInfo, ViewId, CloudModel, DownloadState, HFModelResult, LLMStatus } from "./types";
 import { parseSSEDataLine } from "./utils/sse";
+import { resolveStopTarget } from "./utils/sessionTarget";
 import { saveSessionsWithFallback } from "./utils/storage";
 import { localVoicesForLang, pickVoice, speechSupported, splitSentences, stripForSpeech, voicesForLang } from "./utils/speech";
 // API keys stored in OS keychain via Rust commands (store_secret/get_secret/delete_secret)
@@ -1232,8 +1233,13 @@ const [timeFilter, setTimeFilter] = useState("all");
   // 停止**指定会话**（默认=当前查看的会话）的回合：控制器/取消请求/显示状态
   // 全部按会话定位（09-23）。此前用跟随视图的 sessionIdRef + 单一控制器，
   // 切走再点停止会停错会话。
-  const stopGeneration = useCallback((targetSession?: string) => {
-    const sid = targetSession || sessionIdRef.current;
+  // ⚠️ 入参类型是 unknown 而不是 string：这个函数**同时**被当作按钮处理器用
+  // （onStop={stopGeneration} → 子组件 onClick={onStop}），React 会把点击事件对象
+  // 塞进来。事件对象带 DOM 引用（循环结构）→ 之后 JSON.stringify 直接抛
+  // TypeError，真机 2026-09-23 崩过一次。所以这里只认非空字符串，其余回落到
+  // sessionIdRef。类型写成 unknown 是刻意的：让将来再想直接挂它也躲不过检查。
+  const stopGeneration = useCallback((targetSession?: unknown) => {
+    const sid = resolveStopTarget(targetSession, sessionIdRef.current);
     const ctl = abortControllersRef.current[sid];
     if (ctl) ctl.abort();
     abortControllersRef.current[sid] = null;
@@ -1954,7 +1960,7 @@ const [timeFilter, setTimeFilter] = useState("all");
             prompt={prompt} setPrompt={setPrompt}
             fileInputRef={fileInputRef} mediaRecorderRef={mediaRecorderRef}
             isRecording={isRecording}
-            sendMessage={sendMessage} onStop={stopGeneration} handleFileSelect={handleFileSelect}
+            sendMessage={sendMessage} onStop={() => stopGeneration()} handleFileSelect={handleFileSelect}
             startRecording={startRecording} confirmTool={confirmTool}
             onSpeak={speak} speakingId={speakingId}
             chatEndRef={chatEndRef} handleDrop={handleDrop}
