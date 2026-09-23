@@ -356,7 +356,10 @@ _JUNK_TEXT_RE = re.compile(
     r"<think>|</think>|The user wants me to|知识提炼|reusable knowledge or finding|"
     r"\*\*分析请求|强制流程|必须用 mx_query|必须先用|先用 mx_query|"
     # 自我污染：应用自己注入的尾部块被自学习当成知识存回来（09-21 实测）
-    r"用户本轮的要求|不是用户本轮的|【背景资料】|【参考信息】|【系统提示】|【参考知识】",
+    r"用户本轮的要求|不是用户本轮的|【背景资料】|【参考信息】|【系统提示】|【参考知识】|"
+    # 历史反思里的注入残留（09-23 回填时实测：一条反思的文本本身是我们自己的
+    # "结构化错误文本回填上下文"这类注入说明，被当成工具失败经验存了进来）
+    r"回填上下文|结构化错误文本的|错误即结果",
     re.IGNORECASE)
 
 
@@ -644,20 +647,8 @@ def _record_reflection(session_id: str, tool_name: str, tool_args: dict, tool_re
         # 提升必须在 _db_write_lock **之外**：_store_learning 自己也要拿这把非可重入锁，
         # 在锁内调用会死锁——首版就是这么写的，测试直接卡死（别挪回去）。
         if was_useful and reflection:
-            _sig = _error_signature(tool_result_summary) or ""
-            _args_sig = ""
-            try:
-                if isinstance(tool_args, dict) and tool_args:
-                    _k = sorted(tool_args)[0]
-                    _args_sig = f"{_k}={str(tool_args[_k])[:40]}"
-            except Exception:
-                _args_sig = ""
-            _topic = f"工具 {tool_name} 失败：{_sig[:30]}" if _sig else f"工具 {tool_name} 失败经验"
-            _content = f"{tool_name}({_args_sig}) 失败：{reflection}"
-            if _sig and _sig not in _content:
-                _content += f"｜特征：{_sig}"
-            # 注意 _store_learning 无返回值（首版写成解包 → 每次静默抛异常）
-            _store_learning(session_id, _topic, _content[:200], 0.6, source_type="reflection")
+            promote_reflection_to_learning(session_id, tool_name, tool_args,
+                                           tool_result_summary, reflection)
     except Exception:
         logger.warning("Failed to store reflection in memory DB", exc_info=True)
 
@@ -676,6 +667,45 @@ def record_tool_reflection(session_id: str, tool_name: str, tool_args: dict, res
     is_pitfall = _reflection_kind(tool_name, result) in REFLECTION_PITFALL_KINDS
     _record_reflection(session_id, tool_name, tool_args, (result or "")[:200], note, is_pitfall)
     return note
+
+
+def reflection_learning_key(tool_name: str, tool_result_summary: str) -> tuple[str, str]:
+    """（topic, 特征）——同一工具 + 同一错误特征 → 同一条 learning（topic upsert 累加）。"""
+    sig = _error_signature(tool_result_summary or "") or ""
+    topic = f"工具 {tool_name} 失败：{sig[:30]}" if sig else f"工具 {tool_name} 失败经验"
+    return topic, sig
+
+
+def promote_reflection_to_learning(session_id: str, tool_name: str, tool_args: dict,
+                                   tool_result_summary: str, reflection: str) -> bool:
+    """把一条"真踩到的坑"写成 learning（⑧ 的核心动作，实时路径与回填脚本共用）。
+
+    共用一份实现是刻意的：回填脚本若自己抄一遍，两边的 topic/置信度/内容格式迟早
+    漂移（拆模块那轮踩过同型的坑）。返回是否写入成功。
+    """
+    if not reflection:
+        return False
+    topic, sig = reflection_learning_key(tool_name, tool_result_summary)
+    args_sig = ""
+    _probe_content = f"{tool_name} 失败：{reflection}"
+    if _is_junk_learning(topic, _probe_content):
+        logger.debug("反思提升被噪声闸门拦下: %s", topic[:40])
+        return False
+    try:
+        if isinstance(tool_args, dict) and tool_args:
+            k = sorted(tool_args)[0]
+            args_sig = f"{k}={str(tool_args[k])[:40]}"
+    except Exception:
+        args_sig = ""
+    content = f"{tool_name}({args_sig}) 失败：{reflection}"
+    if sig and sig not in content:
+        content += f"｜特征：{sig}"
+    try:
+        _store_learning(session_id, topic, content[:200], 0.6, source_type="reflection")
+        return True
+    except Exception:
+        logger.debug("reflection→learning promote failed", exc_info=True)
+        return False
 
 
 async def _refine_learnings(tool_name: str, args: dict, result: str, session_id: str):
