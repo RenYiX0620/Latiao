@@ -113,6 +113,42 @@ def get_recent_cron_events(minutes: int = 10) -> list[dict]:
 _FIELD_RANGES = {"minute": (0, 59), "hour": (0, 23), "dom": (1, 31), "month": (1, 12), "dow": (0, 7)}
 
 
+def list_cron_history(limit: int = 20, offset: int = 0, job: str = "") -> dict:
+    """读定时任务的历史产出（memory 表 type='cron_job'，2026-09-23 修）。
+
+    为什么补这个读取点：这张表从 5 月底起记了 155 行"每次跑完的完整 AI 产出"
+    （如"A股大盘资金走势报告"），但**全库没有一个读取点**——跑完就再也看不到，
+    前端只显示每个任务最近一次的 60 字摘要。现在它有三个读者：/v1/cron/history
+    端点、cron_history 工具（模型按需查）、前端历史区。
+
+    过滤：job 关键字匹配 topic（任务描述）。返回不含 meta（里面是执行参数，体积大）。
+    """
+    try:
+        conn = _get_db()
+    except Exception as e:
+        return {"status": "error", "message": str(e), "items": []}
+    where = "type = 'cron_job'"
+    args: list = []
+    if job:
+        where += " AND topic LIKE ?"
+        args.append(f"%{job}%")
+    try:
+        total = conn.execute(f"SELECT COUNT(*) FROM memory WHERE {where}", args).fetchone()[0]
+        rows = conn.execute(
+            f"SELECT rowid, topic, content, created_at FROM memory WHERE {where} "
+            f"ORDER BY created_at DESC LIMIT ? OFFSET ?", (*args, int(limit), int(offset))).fetchall()
+    except Exception as e:
+        logger.warning("读取定时任务历史失败", exc_info=True)
+        return {"status": "error", "message": str(e), "items": []}
+    items = []
+    for rid, topic, content, created_at in rows:
+        # content 形如 "Cron: <task>\n执行时间: …\n\nAI 分析结果:\n<body>"，剥出正文
+        body = content.split("AI 分析结果:", 1)[1].strip() if "AI 分析结果:" in (content or "") else (content or "")
+        items.append({"id": rid, "task": topic or "", "created_at": created_at or "",
+                      "result": body, "summary": " ".join(body.split())[:120]})
+    return {"status": "ok", "total": total, "items": items}
+
+
 def _validate_schedule(expr: str) -> str | None:
     """校验 5 段 cron 表达式，合法返回 None，否则返回中文错误说明。"""
     if not expr or not isinstance(expr, str):

@@ -1889,6 +1889,18 @@ async def toggle_cron_job(job_id: str):
     return {"status": "error", "message": "Job not found"}
 
 
+@app.get("/v1/cron/history")
+async def api_cron_history(limit: int = Query(default=20, ge=1, le=200),
+                           offset: int = Query(default=0, ge=0),
+                           job: str = Query(default="")):
+    """定时任务的历史产出（memory 表 type='cron_job'）。
+
+    2026-09-23 补：这张表此前**只写不读**（155 行跑完即失，前端只有最近一次摘要）。
+    """
+    import cron as _cron
+    return await run_in_threadpool(_cron.list_cron_history, limit, offset, job)
+
+
 @app.get("/v1/cron/due")
 async def get_due_jobs():
     """Check and return currently due cron jobs (纯查询，不标记执行状态)。"""
