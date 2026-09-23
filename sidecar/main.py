@@ -389,6 +389,20 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.warning("config 权限收紧失败", exc_info=True)
 
+    # ⑥ 语义检索预热（后台线程）：起嵌入服务 + 补齐向量。不阻塞启动——
+    # 检索路径本身不会等冷启动（embedding_service.embed 默认后台起服务、本次返回 None）。
+    try:
+        import embedding_service as _emb
+        if _emb.available():
+            import threading as _th
+            import semantic as _sem
+            _th.Thread(target=_sem.warmup, name="semantic-warmup", daemon=True).start()
+            logger.info("语义检索已启用（模型 %s；预热中）", _emb.MODEL_ID)
+        else:
+            logger.info("语义检索未启用（无嵌入模型或缺 llama-server）——使用词频检索")
+    except Exception:
+        logger.warning("语义检索预热启动失败", exc_info=True)
+
     _orphan_watchdog()
     cron_task = asyncio.create_task(_cron_loop())
     catchup_task = asyncio.create_task(run_cron_catchup())  # 补跑关闭期间错过的任务
@@ -405,6 +419,12 @@ async def lifespan(app: FastAPI):
                 # ⑦（09-23）：反思保留 + learnings 超限淘汰（与工具历史同一轮里做）
                 await run_in_threadpool(db.prune_reflections)
                 await run_in_threadpool(db.prune_learnings)
+                # ⑥：空闲就停掉嵌入服务（腾内存）；下次检索按需再起
+                try:
+                    import embedding_service as _emb
+                    await run_in_threadpool(_emb.maybe_stop_idle)
+                except Exception:
+                    pass
             except Exception:
                 logger.warning("工具历史清理任务失败", exc_info=True)
             await asyncio.sleep(24 * 3600)

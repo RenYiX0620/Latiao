@@ -331,15 +331,19 @@ def _learning_is_garbage(topic: str, content: str) -> bool:
     "无论用户说什么都去找股市"（用户实测反馈）。
     """
     blob = f"{topic} {content}"
-    if _is_junk_learning(topic, content):
+    if _is_junk_learning(topic, content, include_topic_prefix=False):
         return True
     if "<think>" in blob or "＜think＞" in blob:
         return True
     if content.strip().lower().startswith(("the user wants", "the user is asking")):
         return True
-    if topic.startswith(("read_file:", "list_dir:", "tavily_search:", "mx_query:",
-                         "run_cmd:", "search_files:", "write_file:")):
-        return True  # 工具名前缀 = 工具日志碎片，不是可复用知识
+    # 2026-09-23（⑥ 连带修正）：这里原有一条"topic 以工具名开头即垃圾"的规则，
+    # 它把**工具学到的真知识**一并判死（`ak_finance: 长电科技…实时价71.66`、
+    # `tavily_search: 武威100万千瓦风电指标…`），也是"学到的数据记不住"的一个隐藏原因。
+    # 真机 A/B（9 个真实查询 + 4 个无关查询，真库 415 条）：
+    #   保留该规则 命中@5 3/9；去掉后 4/9，而无关查询的注入条数两轮都是 0（门槛仍在把关）。
+    # 事故要防的是"机制描述"，那类由 _JUNK_TEXT_RE 的具体短语覆盖（"必须先用"、
+    # "先用 mx_query"、"强制流程"、"知识提炼"、"<think>" 等）——不靠工具名前缀这种粗判。
     return False
 
 
@@ -363,14 +367,18 @@ _JUNK_TEXT_RE = re.compile(
     re.IGNORECASE)
 
 
-def _is_junk_learning(topic, content) -> bool:
+def _is_junk_learning(topic, content, include_topic_prefix: bool = True) -> bool:
     """判断一条"学习/偏好"是不是噪声（工具产物、抽取过程输出、强制的工具流程）。
 
     这些不是用户知识，注入它们会劫持每一轮（09-21 用户实测反馈）。
+
+    include_topic_prefix：是否套用"topic 以工具名开头即垃圾"这条粗规则。
+    写入侧保留（当便宜的预过滤）；**检索侧关掉**——实测它把工具学到的真知识
+    一起判死（A/B：关掉后命中 3/9→4/9，无关查询注入仍为 0，见 _learning_is_garbage）。
     """
     t = str(topic or "").strip()
     c = str(content or "")
-    if _JUNK_TOPIC_RE.match(t):
+    if include_topic_prefix and _JUNK_TOPIC_RE.match(t):
         return True
     if _JUNK_TEXT_RE.search(t) or _JUNK_TEXT_RE.search(c[:400]):
         return True
@@ -380,8 +388,19 @@ def _is_junk_learning(topic, content) -> bool:
 def _retrieve_relevant_learnings(query: str, limit: int = MAX_LEARNINGS_INJECT) -> list[dict]:
     """Search past learnings using TF-IDF semantic similarity.
     Falls back to FTS5/LIKE if TF-IDF returns nothing."""
-    # Priority 1: TF-IDF semantic search (handles Chinese well)
-    results = [r for r in _tfidf_search(query, limit)
+    # Priority 1: 混合检索（⑥）——语义 + 词频两道门槛；语义不可用时就是原来的词频
+    # 路径（fail-open：嵌入服务没起来/没模型，检索照常工作，只是少了语义召回）。
+    # 候选池给大一些：语义可能把词频名次靠后的正确条目拉上来。
+    tf_candidates = _tfidf_search(query, max(limit * 4, 20))
+    results = None
+    try:
+        from semantic import hybrid_search
+        results = hybrid_search(query, tf_candidates, limit=limit)
+    except Exception:
+        logger.debug("语义检索不可用，回退词频", exc_info=True)
+    if results is None:
+        results = tf_candidates[:limit]
+    results = [r for r in results
                if not _learning_is_garbage(r.get("topic", ""), r.get("content", ""))]
 
     if results:

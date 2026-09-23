@@ -154,6 +154,15 @@ def _init_db():
         except Exception:
             logger.error("Failed to create sessions tables", exc_info=True)
 
+        # ⑥ 语义检索（09-23）：learnings 加向量列。ALTER 在旧库上补列，幂等包裹
+        # （列已存在会抛，忽略即可——与 capabilities.perm_override 同一套路）。
+        for _stmt in ("ALTER TABLE learnings ADD COLUMN embedding BLOB",
+                      "ALTER TABLE learnings ADD COLUMN embedding_model TEXT"):
+            try:
+                conn.execute(_stmt)
+            except Exception:
+                pass
+
         try:
             conn.execute("CREATE TABLE IF NOT EXISTS reflections ("
                 "id TEXT PRIMARY KEY, session_id TEXT NOT NULL, tool_name TEXT NOT NULL, "
