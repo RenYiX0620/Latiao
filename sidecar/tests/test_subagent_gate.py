@@ -124,6 +124,8 @@ def _stub_background(monkeypatch, A):
         except Exception:
             pass
     monkeypatch.setattr(A, "_spawn", _no_spawn, raising=False)
+    import agent.tool_exec as TE2
+    monkeypatch.setattr(TE2, "_spawn", _no_spawn, raising=False)
 
 
 def test_subagent_execution_layer_denies(monkeypatch):
@@ -136,6 +138,8 @@ def test_subagent_execution_layer_denies(monkeypatch):
     async def _fake_exec(tool_name, args):
         return f"[stub] {tool_name} {args}"
     monkeypatch.setattr(A, "execute_tool", _fake_exec, raising=False)
+    import agent.tool_exec as TE
+    monkeypatch.setattr(TE, "execute_tool", _fake_exec, raising=False)   # 执行簇已拆出
     _stub_background(monkeypatch, A)
 
     async def _run():
@@ -161,6 +165,8 @@ def test_subagent_execution_layer_allows_readonly(monkeypatch):
     async def _fake_exec(tool_name, args):
         return "[stub] ok"
     monkeypatch.setattr(A, "execute_tool", _fake_exec, raising=False)
+    import agent.tool_exec as TE
+    monkeypatch.setattr(TE, "execute_tool", _fake_exec, raising=False)   # 执行簇已拆出
     _stub_background(monkeypatch, A)
 
     async def _run():

@@ -10,6 +10,8 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import agent.tool_exec as TE  # noqa: E402  （工具执行簇 2026-09-23 拆出：patch 面在此）
+
 from plugins import _control_common as cc
 from plugins import _control_mouse_common as mc
 
@@ -180,19 +182,19 @@ class TestConfirmFlowIntegration(unittest.TestCase):
 
         async def run():
             msgs = []
-            orig = agent_loop._await_tool_confirmation
+            orig = TE._await_tool_confirmation
 
             async def fake_approve(call_id, tool_name, args):
                 return True, []
 
-            agent_loop._await_tool_confirmation = fake_approve
+            TE._await_tool_confirmation = fake_approve
             try:
                 tc = {"id": "c1", "function": {"name": "control_launch", "arguments": '{"command":"sleep 3"}'}}
                 failed, _ = await agent_loop._handle_tool_execution(tc, msgs, "s", "latiao", "confirm")
                 # 批准后工具真实执行
                 return failed, msgs[-1].get("content", "") if msgs else ""
             finally:
-                agent_loop._await_tool_confirmation = orig
+                TE._await_tool_confirmation = orig
 
         failed, content = asyncio.run(run())
         self.assertFalse(failed)
@@ -204,18 +206,18 @@ class TestConfirmFlowIntegration(unittest.TestCase):
 
         async def run():
             msgs = []
-            orig = agent_loop._await_tool_confirmation
+            orig = TE._await_tool_confirmation
 
             async def fake_deny(call_id, tool_name, args):
                 return False, []
 
-            agent_loop._await_tool_confirmation = fake_deny
+            TE._await_tool_confirmation = fake_deny
             try:
                 tc = {"id": "c2", "function": {"name": "control_launch", "arguments": '{"command":"sleep 3"}'}}
                 failed, _ = await agent_loop._handle_tool_execution(tc, msgs, "s", "latiao", "confirm")
                 return failed, msgs[-1].get("content", "") if msgs else ""
             finally:
-                agent_loop._await_tool_confirmation = orig
+                TE._await_tool_confirmation = orig
 
         failed, content = asyncio.run(run())
         self.assertTrue(failed)

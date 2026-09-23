@@ -115,7 +115,9 @@ def test_report_and_progress_writes_are_redacted():
     """接线点检查：进度文件与记忆库写入前都过脱敏。"""
     import inspect
     import agent_loop
-    src = inspect.getsource(agent_loop)
+    import agent.tool_exec
+    # 工具执行簇 2026-09-23 拆到 agent/tool_exec.py：日志/进度/DB 脱敏点在那边
+    src = inspect.getsource(agent_loop) + inspect.getsource(agent.tool_exec)
     assert "redact_secrets(json.dumps(args" in src, "进度/参数写入未脱敏"
     assert "_record_tool_call_db(session_id, tool_name, args, redact_secrets(result))" in src, \
         "记忆库写入未脱敏"

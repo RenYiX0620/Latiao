@@ -19,6 +19,14 @@ EXTRACTED = {
     "agent.prompt_build": [
         "_build_chat_messages",
     ],
+    "agent.tool_exec": [
+        "execute_tool", "_handle_tool_execution", "_handle_tool_execution_inner",
+        "_record_tool_call_db", "_stamp_time_sensitive", "_get_agent_tools",
+    ],
+    "agent.confirm": [
+        "_start_tool_confirmation", "_await_tool_confirmation", "_confirm_bypassed",
+        "_count_successful_duplicates",
+    ],
 }
 
 
@@ -53,5 +61,6 @@ def test_hub_still_exposes_the_old_api():
     """旧导入路径（api_routes/main/测试）必须继续可用。"""
     hub = importlib.import_module("agent_loop")
     for n in ("_progress_file", "_record_progress", "_progress_tail",
-              "_clean_progress_tail", "_build_chat_messages"):
+              "_clean_progress_tail", "_build_chat_messages", "execute_tool",
+              "_handle_tool_execution", "_await_tool_confirmation"):
         assert callable(getattr(hub, n, None)), f"agent_loop.{n} 丢失（re-export 断了）"

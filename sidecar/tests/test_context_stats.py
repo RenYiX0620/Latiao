@@ -15,6 +15,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import agent.tool_exec as TE  # noqa: E402  （工具执行簇 2026-09-23 拆出：patch 面在此）
+
 import context_stats as cs
 
 
@@ -387,8 +389,8 @@ class TestToolTimeoutWrapper(unittest.TestCase):
             await asyncio.sleep(3)
             return False, []
 
-        orig_inner, orig_limit = agent_loop._handle_tool_execution_inner, agent_loop._TOOL_TIMEOUTS.get("read_file")
-        agent_loop._handle_tool_execution_inner = slow_inner
+        orig_inner, orig_limit = TE._handle_tool_execution_inner, agent_loop._TOOL_TIMEOUTS.get("read_file")
+        TE._handle_tool_execution_inner = slow_inner
         agent_loop._TOOL_TIMEOUTS["read_file"] = 0.2
         try:
             tc = {"id": "call-1", "function": {"name": "read_file", "arguments": "{}"}}
@@ -398,7 +400,7 @@ class TestToolTimeoutWrapper(unittest.TestCase):
             verify_failed, events = asyncio.run(
                 _handle_tool_execution(tc, [], "sess-timeout", "latiao", "read_only"))
         finally:
-            agent_loop._handle_tool_execution_inner = orig_inner
+            TE._handle_tool_execution_inner = orig_inner
             if orig_limit is not None:
                 agent_loop._TOOL_TIMEOUTS["read_file"] = orig_limit
         self.assertFalse(verify_failed)                  # 超时不算验证失败
