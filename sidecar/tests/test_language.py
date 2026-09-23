@@ -163,3 +163,33 @@ class TestGateDirection(unittest.TestCase):
         self.assertIn("English", _rewrite_lang_instruction("en"))
         self.assertIn("日本語", _rewrite_lang_instruction("ja"))
         self.assertIn("русском", _rewrite_lang_instruction("ru"))
+
+
+# ── 交付期翻译的两条修正（2026-09-23 真机事故）──────────────────────
+
+def test_translation_chunks_single_long_paragraph():
+    """模型的长回复常常是**一个没有空行的大段落**——只按空行切会整块留下，
+    仍是一次超时的大请求（真机：1491 字英文回复 → 两次各 60s 超时）。"""
+    from agent.gates import _split_translation_chunks
+    one_para = "这是一个很长的段落。" * 300          # 无空行
+    chunks = _split_translation_chunks(one_para)
+    assert len(chunks) > 1, "单段超长文本必须被切开"
+    assert max(len(c) for c in chunks) <= 900, f"块过大：{max(len(c) for c in chunks)}"
+    assert "".join(chunks) == one_para, "切块不得丢字"
+    # 短文不切
+    assert _split_translation_chunks("短短一句话。") == ["短短一句话。"]
+    # 无标点也能切开并给上界
+    nopunct = _split_translation_chunks("a" * 3000)
+    assert len(nopunct) > 1 and max(len(c) for c in nopunct) <= 900
+
+
+def test_translation_request_disables_thinking():
+    """翻译请求必须关思考：实测开思考时 6867 字推理吃掉 55s（客户端超时 60s），
+    关掉后同一段文本 6.4s。这条用源码断言钉住，防止有人把开关删了。"""
+    import pathlib
+    import agent.gates as gates
+    src = pathlib.Path(gates.__file__).read_text("utf-8")
+    idx = src.index("_tb = {\"model\": engine_model")
+    body = src[idx:idx + 700]
+    assert "enable_thinking" in body and "False" in body, \
+        "翻译请求里少了 enable_thinking: False（实测会因思考而撞 60s 超时）"
