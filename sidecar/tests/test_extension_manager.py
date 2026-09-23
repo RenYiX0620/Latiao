@@ -50,7 +50,7 @@ class TestExtensionManager(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
 
     def _install(self, files):
-        return em.install_extension("", "", "")  # placeholder
+        return em.install_extension("", "", "", confirmed=True)  # placeholder
 
     def test_path_traversal_blocked(self):
         evil = _make_zip({"../evil.txt": "x"})
@@ -71,7 +71,7 @@ class TestExtensionManager(unittest.TestCase):
         with tf.TemporaryDirectory() as td:
             zp = Path(td) / "x.zip"
             zp.write_bytes(_make_zip({"plugin.py": PLUGIN_PY}))  # 无 manifest
-            res = em.install_extension(str(zp))
+            res = em.install_extension(str(zp), confirmed=True)
             self.assertEqual(res["status"], "error")
             self.assertIn("manifest", res["message"])
 
@@ -83,7 +83,7 @@ class TestExtensionManager(unittest.TestCase):
                 "manifest.yaml": MANIFEST.replace("demo-ext", "BAD NAME!!"),
                 "plugin.py": PLUGIN_PY,
             }))
-            res = em.install_extension(str(zp))
+            res = em.install_extension(str(zp), confirmed=True)
             self.assertEqual(res["status"], "error")
 
     def test_full_install_flow(self):
@@ -95,7 +95,7 @@ class TestExtensionManager(unittest.TestCase):
                 "plugin.py": PLUGIN_PY,
                 "skills/demo.md": SKILL_MD,
             }))
-            res = em.install_extension(str(zp))
+            res = em.install_extension(str(zp), confirmed=True)
             self.assertEqual(res["status"], "ok", res)
             self.assertEqual(res["name"], "demo-ext")
             self.assertEqual(res["permissions"], ["network"])
@@ -110,7 +110,7 @@ class TestExtensionManager(unittest.TestCase):
             self.assertTrue((pkg / "plugin.py").exists())
             self.assertTrue((pkg / "skills" / "demo.md").exists())
             # 重复安装
-            res2 = em.install_extension(str(zp))
+            res2 = em.install_extension(str(zp), confirmed=True)
             self.assertEqual(res2["status"], "error")
             # active dirs
             active = [d.name for d in em.active_extension_dirs()]
@@ -156,7 +156,7 @@ class TestSingleDirWrapper(unittest.TestCase):
                 "finance-pack/manifest.yaml": MANIFEST,
                 "finance-pack/plugin.py": PLUGIN_PY,
             }))
-            res = em.install_extension(str(zp))
+            res = em.install_extension(str(zp), confirmed=True)
             self.assertEqual(res["status"], "ok", res)
             em.uninstall_extension("demo-ext")
 

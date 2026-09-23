@@ -82,7 +82,10 @@ def execute(args: dict) -> str:
     with tempfile.TemporaryDirectory() as tmp:
         p = Path(tmp) / f"{meta['name']}.latiaoext"
         p.write_bytes(zip_bytes)
-        result = install_extension(str(p), "", label=f"local:{kind}")
+        # confirmed=True 的依据：本工具是 confirm 级（PERMISSION），能被调用就说明
+        # 用户已在界面上批准了这次安装；cron/子代理没有确认通道，会在工具闸门那层
+        # 被拒、到不了这里——这是 ⑦ 服务端闸门之外的第二道。
+        result = install_extension(str(p), "", label=f"local:{kind}", confirmed=True)
 
     if result.get("status") != "ok":
         return f"⛔ 安装失败：{result.get('message', '未知错误')}"

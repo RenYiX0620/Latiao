@@ -337,6 +337,16 @@ async def lifespan(app: FastAPI):
                     break
         _th.Thread(target=_watch, daemon=True).start()
 
+    # ⑤ config.json 权限补齐（审计 2026-09-23）：老版本装出来的文件是 0644，
+    # 里面是云端/Tavily 明文密钥；只收紧不放松，启动补一次。
+    try:
+        from config import harden_config_perms
+        _tightened = harden_config_perms()
+        if _tightened:
+            logger.info("config 权限已收紧到 0600: %s", ", ".join(_tightened))
+    except Exception:
+        logger.warning("config 权限收紧失败", exc_info=True)
+
     _orphan_watchdog()
     cron_task = asyncio.create_task(_cron_loop())
     catchup_task = asyncio.create_task(run_cron_catchup())  # 补跑关闭期间错过的任务

@@ -21,8 +21,11 @@ import hashlib
 import io
 import json
 import logging
+import os
 import re
+import threading
 import time
+import uuid
 import shutil
 import tempfile
 import zipfile
@@ -197,73 +200,104 @@ def _subdir_zip(zip_bytes: bytes, subdir: str) -> bytes:
     return out.getvalue()
 
 
-def install_extension(source: str, sha256: str = "", label: str = "") -> dict:
-    """安装扩展：本地路径 / URL / GitHub repo。返回 {status, name, version, permissions}。"""
-    source = (source or "").strip()
-    if not source:
-        return {"status": "error", "message": "扩展来源不能为空"}
+def _is_local_source(source: str) -> bool:
+    """本地文件 = 管理员显式操作；其余视为网络来源。只看形态，不下载。"""
     try:
-        if Path(source).expanduser().is_file():
-            zip_bytes = Path(source).expanduser().read_bytes()
-            src_desc = f"file:{source}"
-        else:
-            zip_bytes = _download(source)
-            src_desc = source
-    except Exception as e:
-        return {"status": "error", "message": f"下载失败: {e}"}
+        return Path(source).expanduser().is_file()
+    except OSError:
+        return False
 
-    # sha256 校验（审计 P1-10）：网络来源必须提供 sha256——扩展无签名体系，
-    # 传输完整性 hash 是仅有的防线；本地文件视为管理员显式操作，允许免传。
-    # 封锁来源直接拒绝（在任何下载动作之前）
-    if not Path(source).expanduser().is_file() and is_source_blocked(source):
+
+def _source_policy_error(source: str) -> dict | None:
+    """网络来源的准入检查（**必须在下载之前**）：封锁名单 + 摘要必填。
+
+    原先这两项写在 _load_source_bytes 之后——被封锁的来源也照样先下载了一遍，
+    与注释声明的"在任何下载动作之前"相反（2026-09-23 实测暴露）。
+    """
+    if _is_local_source(source):
+        return None
+    if is_source_blocked(source):
         logger.warning("install blocked by policy: %s", source)
         return {"status": "error",
                 "message": f"该来源已被封锁，拒绝安装：{source}（可在扩展页解封后重试）"}
-    if not Path(source).expanduser().is_file() and not sha256:
-        return {"status": "error",
-                "message": "网络来源安装必须提供 sha256（防传输篡改）；请从可信市场清单或发布页获取后重试"}
-    if sha256:
-        actual = hashlib.sha256(zip_bytes).hexdigest()
-        if actual.lower() != sha256.lower():
-            return {"status": "error", "message": f"sha256 校验失败（期望 {sha256[:12]}…）"}
-    digest = hashlib.sha256(zip_bytes).hexdigest()
+    return None
 
-    # 先解压到临时目录读 manifest，再定稿
+
+def _load_source_bytes(source: str) -> tuple[bytes | None, str, str | None]:
+    """取回扩展包字节。返回 (zip_bytes, src_desc, error)。"""
+    try:
+        if Path(source).expanduser().is_file():
+            return Path(source).expanduser().read_bytes(), f"file:{source}", None
+        return _download(source), source, None
+    except Exception as e:
+        return None, "", f"下载失败: {e}"
+
+
+def _extract_and_validate(zip_bytes: bytes, tmp: Path) -> tuple[Path | None, dict, dict | None]:
+    """安全解压 + manifest 定位校验 + 内容检查 → (pkg_root, manifest, error)。
+
+    预览（stage）与落盘（install）共用这一份判定，避免"预览放行、安装又拒绝"漂移。
+    """
+    try:
+        _safe_extract(zip_bytes, tmp)
+    except ValueError as e:
+        return None, {}, {"status": "error", "message": f"包校验失败: {e}"}
+    # 包根定位：支持 zip -r 产生的单层目录包装（finance-pack/manifest.yaml）
+    pkg_root = tmp
+    manifest = _read_manifest(pkg_root)
+    if not manifest and pkg_root.is_dir():
+        for d in [d for d in pkg_root.iterdir() if d.is_dir()]:
+            mf = _read_manifest(d)
+            if mf:
+                pkg_root, manifest = d, mf
+                break
+    if not manifest:
+        return None, {}, {"status": "error", "message": "扩展包缺少 manifest.yaml"}
+    name = str(manifest.get("name", "")).strip()
+    version = str(manifest.get("version", "")).strip()
+    if not _NAME_RE.match(name):
+        return None, {}, {"status": "error", "message": f"manifest name 非法: {name!r}"}
+    if not _VERSION_RE.match(version):
+        return None, {}, {"status": "error", "message": f"manifest version 非法: {version!r}"}
+    perms = manifest.get("permissions") or []
+    if not isinstance(perms, list) or any(p not in _VALID_PERMISSIONS for p in perms):
+        return None, {}, {"status": "error", "message": f"manifest permissions 非法: {perms!r}"}
+    if not perms:
+        perms = ["readonly"]                      # 无声明 → 默认只读
+    has_content = any((pkg_root / f).exists() for f in ("plugin.py", "skills", "agents"))
+    if not has_content:
+        return None, {}, {"status": "error", "message": "扩展包没有任何内容（plugin.py/skills/agents）"}
+    return pkg_root, {**manifest, "name": name, "version": version, "permissions": perms}, None
+
+
+def _package_preview(zip_bytes: bytes) -> tuple[dict | None, dict | None]:
+    """只读预检 → (preview, error)。不落任何文件、不改任何状态。"""
+    digest = hashlib.sha256(zip_bytes).hexdigest()
     with tempfile.TemporaryDirectory() as tmp:
-        try:
-            _safe_extract(zip_bytes, Path(tmp))
-        except ValueError as e:
-            return {"status": "error", "message": f"包校验失败: {e}"}
-        # 包根定位：支持 zip -r 产生的单层目录包装（finance-pack/manifest.yaml）
-        pkg_root = Path(tmp)
-        manifest = _read_manifest(pkg_root)
-        if not manifest and pkg_root.is_dir():
-            child_dirs = [d for d in pkg_root.iterdir() if d.is_dir()]
-            for d in child_dirs:
-                mf = _read_manifest(d)
-                if mf:
-                    pkg_root = d
-                    manifest = mf
-                    break
-        if not manifest:
-            return {"status": "error", "message": "扩展包缺少 manifest.yaml"}
-        name = str(manifest.get("name", "")).strip()
-        version = str(manifest.get("version", "")).strip()
-        if not _NAME_RE.match(name):
-            return {"status": "error", "message": f"manifest name 非法: {name!r}"}
-        if not _VERSION_RE.match(version):
-            return {"status": "error", "message": f"manifest version 非法: {version!r}"}
-        perms = manifest.get("permissions") or []
-        if not isinstance(perms, list) or any(p not in _VALID_PERMISSIONS for p in perms):
-            return {"status": "error", "message": f"manifest permissions 非法: {perms!r}"}
-        # 无 permissions 声明时默认只读
-        if not perms:
-            perms = ["readonly"]
-        has_content = any(
-            (pkg_root / f).exists() for f in ("plugin.py", "skills", "agents")
-        )
-        if not has_content:
-            return {"status": "error", "message": "扩展包没有任何内容（plugin.py/skills/agents）"}
+        pkg_root, manifest, err = _extract_and_validate(zip_bytes, Path(tmp))
+        if err:
+            return None, err
+        files = sorted(str(q.relative_to(pkg_root)) for q in pkg_root.rglob("*") if q.is_file())
+        return {
+            "name": str(manifest.get("name", "")),
+            "version": str(manifest.get("version", "")),
+            "permissions": list(manifest.get("permissions") or ["readonly"]),
+            "files": files[:200],
+            "file_count": len(files),
+            "digest": digest,
+            "size": len(zip_bytes),
+        }, None
+
+
+def _install_bytes(zip_bytes: bytes, src_desc: str, digest: str, label: str = "") -> dict:
+    """把已校验、已确认的字节落到 extensions/ 并记账（install 与 confirm 共用）。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        pkg_root, manifest, err = _extract_and_validate(zip_bytes, Path(tmp))
+        if err:
+            return err
+        name = str(manifest["name"])
+        version = str(manifest["version"])
+        perms = list(manifest["permissions"])
 
         state = _load_installed()
         existing = _find_record(state, name)
@@ -298,12 +332,155 @@ def install_extension(source: str, sha256: str = "", label: str = "") -> dict:
         else:
             state["extensions"].append(record)
         _save_installed(state)
-        logger.info("扩展已安装: %s@%s (%s)", name, version, src_desc)
+        logger.info("扩展已安装: %s@%s (%s, sha256=%s…)", name, version, src_desc, digest[:12])
         return {
             "status": "ok", "name": name, "version": version,
-            "permissions": perms,
+            "permissions": perms, "sha256": digest,
             "message": f"已安装 {name}@{version}",
         }
+
+
+def install_extension(source: str, sha256: str = "", label: str = "",
+                      confirmed: bool = False) -> dict:
+    """安装扩展：本地路径 / URL / GitHub repo。返回 {status, name, version, permissions}。
+
+    ⑦ 服务端确认闸门（审计 2026-09-23）：扩展代码会在下次启动/热重载时执行，
+    安装因此**必须**带 confirmed=True，且只应由"用户已在界面上确认过"的调用方
+    设置（API 的 confirm 端点、confirm 级的 create_skill 工具）。默认 False 意味着
+    将来新增的调用点若忘了走确认流，会被明确拒绝而不是静默装进去。
+    """
+    source = (source or "").strip()
+    if not source:
+        return {"status": "error", "message": "扩展来源不能为空"}
+    if not confirmed:
+        return {"status": "error",
+                "message": "⛔ 安装扩展需要用户确认（扩展代码会在下次启动/热重载时执行）："
+                           "先调 /v1/extensions/install 取预览，用户确认后再调 "
+                           "/v1/extensions/install/confirm（带 pending_id 与 sha256）"}
+    # 准入检查先于下载：封锁来源不接触、无摘要的网络来源不下载
+    policy_err = _source_policy_error(source)
+    if policy_err:
+        return policy_err
+    # sha256 校验（审计 P1-10）：网络来源必须提供 sha256——扩展无签名体系，
+    # 传输完整性 hash 是仅有的防线；本地文件视为管理员显式操作，允许免传。
+    if not _is_local_source(source) and not sha256:
+        return {"status": "error",
+                "message": "网络来源安装必须提供 sha256（防传输篡改）；请从可信市场清单或发布页获取后重试"}
+    zip_bytes, src_desc, err = _load_source_bytes(source)
+    if err:
+        return {"status": "error", "message": err}
+    digest = hashlib.sha256(zip_bytes).hexdigest()
+    if sha256 and digest.lower() != sha256.lower():
+        return {"status": "error", "message": f"sha256 校验失败（期望 {sha256[:12]}…）"}
+    return _install_bytes(zip_bytes, src_desc, digest, label)
+
+
+# ── ⑦ 分阶段安装：stage → 用户确认 → confirm（⑥ 摘要绑定）──────────────
+# 为什么两阶段：扩展是"下次启动就执行的代码"，安装不该是某个请求的副作用。
+# 服务端先取回内容、算摘要、给出预览（文件清单/权限/摘要），只有携带**预览里
+# 那个摘要**的确认请求才会落盘——预览与安装之间内容若变了（URL 内容可变、仓库
+# 被改），摘要对不上就装不进去。⑥ 的"sha256 必填"落在同一处：确认必须回传非空
+# 摘要，空摘要直接拒。
+_PENDING_LOCK = threading.Lock()
+_PENDING: dict[str, dict] = {}
+_PENDING_TTL = 900.0      # 15 分钟未确认即作废
+_PENDING_MAX = 8
+_PENDING_DIR = Path(tempfile.gettempdir()) / "latiao-pending-install"
+
+
+def _pending_gc() -> None:
+    now = time.time()
+    for pid, rec in list(_PENDING.items()):
+        if now - rec["created"] > _PENDING_TTL:
+            _PENDING.pop(pid, None)
+            try:
+                rec["path"].unlink()
+            except OSError:
+                pass
+
+
+def stage_package(zip_bytes: bytes, src_desc: str, expect_sha256: str = "",
+                  label: str = "") -> dict:
+    """第一阶段：校验 + 算摘要 + 落待确认区（**不安装**）→ 返回预览。"""
+    preview, err = _package_preview(zip_bytes)
+    if err:
+        return err
+    if expect_sha256 and preview["digest"].lower() != expect_sha256.lower():
+        return {"status": "error",
+                "message": f"sha256 校验失败（期望 {expect_sha256[:12]}…，"
+                           f"实际 {preview['digest'][:12]}…）"}
+    _PENDING_DIR.mkdir(parents=True, exist_ok=True)
+    pending_id = uuid.uuid4().hex
+    p = _PENDING_DIR / f"{pending_id}.latiaoext"
+    fd = os.open(str(p), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(zip_bytes)
+    with _PENDING_LOCK:
+        _pending_gc()
+        if len(_PENDING) >= _PENDING_MAX:
+            oldest = min(_PENDING, key=lambda k: _PENDING[k]["created"])
+            gone = _PENDING.pop(oldest, None)
+            if gone:
+                try:
+                    gone["path"].unlink()
+                except OSError:
+                    pass
+        _PENDING[pending_id] = {"path": p, "digest": preview["digest"],
+                                "src_desc": src_desc, "label": label,
+                                "created": time.time()}
+    return {"status": "pending", "pending_id": pending_id, "preview": preview,
+            "message": f"待确认安装 {preview['name']}@{preview['version']}（确认前不写入磁盘）"}
+
+
+def stage_install(source: str, sha256: str = "", label: str = "") -> dict:
+    """第一阶段（路径/URL 形态）：取回 → 校验 → 返回预览，不安装。"""
+    source = (source or "").strip()
+    if not source:
+        return {"status": "error", "message": "扩展来源不能为空"}
+    policy_err = _source_policy_error(source)
+    if policy_err:
+        return policy_err
+    if not _is_local_source(source) and not sha256:
+        return {"status": "error",
+                "message": "网络来源安装必须提供 sha256（防传输篡改）；请从可信市场清单或发布页获取后重试"}
+    zip_bytes, src_desc, err = _load_source_bytes(source)
+    if err:
+        return {"status": "error", "message": err}
+    return stage_package(zip_bytes, src_desc, expect_sha256=sha256, label=label)
+
+
+def confirm_install(pending_id: str, digest: str, label: str = "") -> dict:
+    """第二阶段：必须回传预览里的 sha256（⑥），一致才真正安装（⑦）。"""
+    pending_id = (pending_id or "").strip()
+    digest = (digest or "").strip()
+    if not pending_id or not digest:
+        return {"status": "error",
+                "message": "确认安装需要 pending_id 与 sha256（摘要必须回传：防预览之后内容被替换）"}
+    with _PENDING_LOCK:
+        _pending_gc()
+        rec = _PENDING.get(pending_id)
+    if not rec:
+        return {"status": "error", "message": "待确认安装不存在或已过期，请重新发起安装"}
+    try:
+        zip_bytes = rec["path"].read_bytes()
+    except OSError:
+        return {"status": "error", "message": "待确认包已失效，请重新发起安装"}
+    actual = hashlib.sha256(zip_bytes).hexdigest()
+    if actual.lower() != digest.lower() or actual.lower() != rec["digest"].lower():
+        logger.warning("confirm install digest mismatch: pending=%s 确认=%s 实际=%s",
+                       pending_id[:8], digest[:12], actual[:12])
+        return {"status": "error",
+                "message": f"sha256 不匹配（确认的摘要与待安装内容不一致，可能已被替换）："
+                           f"实际 {actual[:12]}…"}
+    result = _install_bytes(zip_bytes, rec["src_desc"], actual, label or rec["label"])
+    if result.get("status") == "ok":
+        with _PENDING_LOCK:
+            _PENDING.pop(pending_id, None)
+        try:
+            rec["path"].unlink()
+        except OSError:
+            pass
+    return result
 
 
 # ── 市场（Phase 2a）──
@@ -660,8 +837,16 @@ def fetch_all_markets() -> dict:
     return {"status": "ok", "plugins": merged, "errors": errors, "count": len(merged)}
 
 
-def install_github_item(repo: str, skill_path: str = "", kind: str = "openclaw-skill") -> dict:
-    """安装生态源条目：下载/打包成 .latiaoext 走 install_extension。"""
+def install_github_item(repo: str, skill_path: str = "", kind: str = "openclaw-skill",
+                        expect_sha256: str = "") -> dict:
+    """生态源条目：下载/打包成 .latiaoext → **落待确认区**（不直接安装）。
+
+    ⑥（审计 2026-09-23）：此前这里把网络下载的内容打包成**本地临时文件**再交给
+    install_extension —— 而"网络来源必须提供 sha256"的闸门只认 URL 形态，本地文件
+    一律免检，于是整条 GitHub 安装路径绕过了摘要校验。现在改成：包摘要由服务端算，
+    调用方（市场清单）若声明 expect_sha256 则必须一致；最后由用户确认时回传摘要
+    （confirm_install），保证"下载的内容"与"确认安装的内容"是同一份字节。
+    """
     from adapters import (install_openclaw_skill, install_claude_plugin,
                           parse_github_repo)
     repo = parse_github_repo(repo)
@@ -678,15 +863,9 @@ def install_github_item(repo: str, skill_path: str = "", kind: str = "openclaw-s
         logger.warning("install github item failed at download/pack: repo=%s skill_path=%s kind=%s",
                        repo, skill_path or "(无)", kind)
         return {"status": "error", "message": "下载/打包失败（源不可达或格式不符）"}
-    import tempfile as _tf
     label = skill_path or f"{repo}"
-    with _tf.TemporaryDirectory() as tmp:
-        p = Path(tmp) / "pkg.latiaoext"
-        p.write_bytes(zip_bytes)
-        result = install_extension(str(p), "", label=label)
-        logger.info("install github item done: repo=%s skill_path=%s → %s",
-                    repo, label, result.get("status"))
-        return result
+    src_desc = f"github:{repo}" + (f"/{skill_path}" if skill_path else "")
+    return stage_package(zip_bytes, src_desc, expect_sha256=expect_sha256, label=label)
 
 
 # ═══════════════════════════════════════════════════════

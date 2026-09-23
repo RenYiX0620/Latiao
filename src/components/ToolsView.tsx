@@ -59,6 +59,8 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
   const [installSrc, setInstallSrc] = useState("");
   const [installing, setInstalling] = useState(false);
   const [confirming, setConfirming] = useState<{ source: string; sha256: string; permissions: string[]; githubItem?: any; isGitHubItem?: boolean } | null>(null);
+  // ⑦ 服务端预览：stage 之后的待确认安装（pending_id + 预览），用户点"确认安装"才落盘
+  const [staged, setStaged] = useState<{ pendingId: string; preview: any; source: string } | null>(null);
   // ── 市场 ──
   const [marketTab, setMarketTab] = useState<"market" | "installed">("market");
   const [marketPlugins, setMarketPlugins] = useState<any[]>([]);
@@ -179,10 +181,11 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
     })();
   }, [capabilities]);
 
+  // ⑦ 第一阶段：服务端取回内容 → 返回预览（名称/版本/权限/文件数/sha256），**不写盘**
   const doInstall = async (source: string, sha256: string) => {
     setInstalling(true);
     try {
-      // 生态源条目：download+pack 后安装（install-github）；否则走现有 install
+      // 生态源条目：download+pack 后取预览（install-github）；否则走本地/URL install
       const isGitHub = !!confirming?.isGitHubItem && confirming?.githubItem;
       const resp = isGitHub
         ? await authFetch("/v1/extensions/install-github", {
@@ -191,12 +194,33 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
               repo: confirming.githubItem.repo || confirming.githubItem.source_url,
               skill_path: confirming.githubItem.skill_path || "",
               kind: confirming.githubItem.source_kind || "openclaw-skill",
+              sha256: confirming.githubItem.sha256 || "",
             }),
           })
         : await authFetch("/v1/extensions/install", {
             method: "POST", headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ source, sha256 }),
           });
+      const data = await resp.json();
+      if (data.status === "pending" && data.pending_id) {
+        setStaged({ pendingId: data.pending_id, preview: data.preview || {}, source });
+      } else {
+        showToast(data.message || t("tools.install_preview_fail"), "warn");
+        setConfirming(null);
+      }
+    } catch (e) { console.error(e); showToast(t("tools.install_request_fail"), "warn"); }
+    finally { setInstalling(false); }
+  };
+
+  // ⑦ 第二阶段：把预览里的 sha256 回传给服务端（⑥ 摘要绑定）→ 一致才安装
+  const doConfirmInstall = async () => {
+    if (!staged) return;
+    setInstalling(true);
+    try {
+      const resp = await authFetch("/v1/extensions/install/confirm", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ pending_id: staged.pendingId, sha256: staged.preview?.digest || "" }),
+      });
       const data = await resp.json();
       if (data.status === "ok") {
         showToast(data.message || t("tools.installed"));
@@ -207,7 +231,7 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
         showToast(data.message || t("tools.install_fail"), "warn");
       }
     } catch (e) { console.error(e); showToast(t("tools.install_request_fail"), "warn"); }
-    finally { setInstalling(false); setConfirming(null); }
+    finally { setInstalling(false); setStaged(null); setConfirming(null); }
   };
 
   // 两步安装：先读 manifest 权限 → 弹确认 → 真正安装
@@ -657,7 +681,7 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
           position: "fixed", inset: 0, zIndex: 1000,
           background: "rgba(0,0,0,0.55)",
           display: "flex", alignItems: "center", justifyContent: "center",
-        }} onClick={() => { if (!installing) setConfirming(null); }}>
+        }} onClick={() => { if (!installing) { setStaged(null); setConfirming(null); } }}>
           <div className="card" style={{
             width: "min(560px, 92vw)", maxHeight: "80vh", overflowY: "auto",
             borderLeft: "2px solid var(--warning)", background: "var(--bg-card)",
@@ -677,10 +701,31 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
                 {t("tools.ext_dep_modal")}
               </div>
             )}
+            {staged && (
+              <div style={{ marginTop: 10, padding: "8px 10px", borderRadius: 6,
+                            background: "var(--bg-secondary, rgba(255,255,255,0.04))",
+                            border: "1px solid var(--border, rgba(255,255,255,0.12))" }}>
+                <div className="card-title" style={{ fontSize: 12 }}>{t("tools.install_preview_title")}</div>
+                <div className="card-desc" style={{ marginTop: 4 }}>
+                  {staged.preview?.name}@{staged.preview?.version} · {t("tools.install_preview_files", { n: String(staged.preview?.file_count ?? 0) })} · {t("tools.install_preview_perms", { perms: (staged.preview?.permissions || []).join("/") || t("perm.readonly") })}
+                </div>
+                <div className="card-desc" style={{ marginTop: 4, wordBreak: "break-all", fontSize: 11 }}>
+                  sha256: {(staged.preview?.digest || "").slice(0, 32)}…
+                </div>
+                <div className="card-desc" style={{ marginTop: 4, fontSize: 11 }}>
+                  {t("tools.install_preview_hint")}
+                </div>
+              </div>
+            )}
             <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
-              <button className="btn btn-primary" disabled={installing}
-                onClick={() => doInstall(confirming.source, confirming.sha256)}>{installing ? t("tools.installing_download") : t("tools.confirm_install")}</button>
-              <button className="btn btn-ghost" onClick={() => setConfirming(null)}>{t("common.cancel")}</button>
+              {staged ? (
+                <button className="btn btn-primary" disabled={installing}
+                  onClick={doConfirmInstall}>{installing ? t("tools.install_confirming") : t("tools.install_confirm_final")}</button>
+              ) : (
+                <button className="btn btn-primary" disabled={installing}
+                  onClick={() => doInstall(confirming.source, confirming.sha256)}>{installing ? t("tools.installing_download") : t("tools.confirm_install")}</button>
+              )}
+              <button className="btn btn-ghost" onClick={() => { setStaged(null); setConfirming(null); }}>{t("common.cancel")}</button>
             </div>
           </div>
         </div>
