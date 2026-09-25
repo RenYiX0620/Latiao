@@ -17,8 +17,9 @@ html, body, #root {
   font-size: 14px;
   line-height: 1.5;
   color: var(--text-primary);
-  /* 透明：让窗口 vibrancy（系统侧栏磨砂）透出——左侧栏映射后面窗口的关键 */
-  background: transparent;
+  /* Windows：窗口不再透明（hudWindow 毛玻璃是 macOS 专属），根元素用不透明主题背景，
+     否则桌面内容会透射进来 —— macOS 下与 vibrancy 的叠加效果不受影响 */
+  background: var(--bg-root, #0a0a12);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }

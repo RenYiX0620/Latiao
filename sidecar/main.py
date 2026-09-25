@@ -213,17 +213,37 @@ except Exception:
 # argv，ps/ps -E/ps aux 都看不到。环境变量仍作开发/手动启动的兜底（优先级更高）。
 def _read_token_from_stdin(timeout: float = 5.0) -> str:
     """读 Rust 侧通过 stdin 递来的一行 token；读不到返回空串（不阻塞启动）。"""
+    line = ""
     try:
         if sys.stdin is None or sys.stdin.isatty():
             return ""
-        import select
-        try:
-            ready, _, _ = select.select([sys.stdin], [], [], timeout)
-        except (OSError, ValueError):
-            return ""
-        if not ready:
-            return ""
-        line = (sys.stdin.readline() or "").strip()
+        if sys.platform == "win32":
+            # Windows 的 select() 只支持 socket，对 stdin 会抛 OSError(WinError 10038)
+            # → 早返回空串导致鉴权失效。改用线程 + 队列做带超时的阻塞读。
+            import queue as _queue
+            import threading as _threading
+            q: "_queue.Queue[str]" = _queue.Queue()
+
+            def _reader() -> None:
+                try:
+                    q.put((sys.stdin.readline() or "").strip())
+                except Exception:
+                    q.put("")
+
+            _threading.Thread(target=_reader, daemon=True).start()
+            try:
+                line = q.get(timeout=timeout)
+            except _queue.Empty:
+                line = ""
+        else:
+            import select
+            try:
+                ready, _, _ = select.select([sys.stdin], [], [], timeout)
+            except (OSError, ValueError):
+                return ""
+            if not ready:
+                return ""
+            line = (sys.stdin.readline() or "").strip()
     except Exception:
         return ""
     # 只认形如 token 的串，避免把别的东西（如误接的管道内容）当 token
@@ -275,6 +295,10 @@ def _check_auth(request: Request) -> None:
     - /v1/update-latest.json、/v1/update-file 豁免：Tauri updater 插件的
       请求不携带自定义 token（本地回环 + 安装包经 minisign 签名验证，安全）
     """
+    # 失败关闭（fail-closed）：token 未初始化时**一律拒**，连 /health 也不放行
+    # —— tests/test_security.py 的 TestAuthFailClosed 钉的就是这条。
+    # Windows 上 token 读不到属于读取本身的问题，修在 _read_token_from_stdin 的
+    # win32 分支（线程 + 队列），不靠"豁免 /health"兜底（那会放宽安全语义）。
     if not AUTH_TOKEN:
         raise _UnauthorizedError("sidecar 鉴权未初始化：请通过应用启动（Rust 侧经子进程 stdin 送 token），或设置 LATIAO_AUTH_TOKEN 环境变量后手动启动")
     if request.url.path in ("/health", "/v1/update-latest.json", "/v1/update-file"):
