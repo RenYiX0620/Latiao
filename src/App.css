@@ -87,11 +87,13 @@
 }
 
 /* ── Light-theme hard overrides (belt-and-suspenders, in case variable cascade fails) ── */
-[data-theme="light"] body {
-  background: var(--bg-root);
-}
+[data-theme="light"] .btn-primary,
+[data-theme="light"] .btn-send { background: #ffffff; }
 [data-theme="light"] .main {
   background: var(--bg-main);
+}
+[data-theme="light"] body {
+  background: transparent;
 }
 [data-theme="light"] .sidebar {
   background: transparent;
@@ -101,7 +103,7 @@
 
 body {
   font-family: var(--font-sans);
-  background: var(--bg-root);
+  background: transparent;
   color: var(--text-primary);
   -webkit-font-smoothing: antialiased;
   overflow: hidden;

@@ -19,10 +19,16 @@
         "height": 800,
         "useHttpsScheme": false,
         "dragDropEnabled": true,
-        "transparent": false,
+        "transparent": true,
         "titleBarStyle": "Overlay",
         "hiddenTitle": true,
-        "theme": "Dark"
+        "theme": "Dark",
+        "windowEffects": {
+          "effects": [
+            "hudWindow"
+          ],
+          "state": "followsWindowActiveState"
+        }
       }
     ],
     "security": {
