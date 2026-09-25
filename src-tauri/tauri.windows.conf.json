@@ -15,5 +15,10 @@
         "theme": "Dark"
       }
     ]
+  },
+  "bundle": {
+    "targets": [
+      "nsis"
+    ]
   }
 }
