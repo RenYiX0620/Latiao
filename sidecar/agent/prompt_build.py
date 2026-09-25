@@ -60,6 +60,30 @@ GOAL_MODE_PROMPT = """
 用户只关心目标是否达成，不关心你用什么工具。
 """
 
+
+def _append_tail_to_content(content, tail: str):
+    """把尾部指令追加进用户消息，**保留多模态 content 列表结构**。
+
+    2026-09-24：此前 `str(content) + tail` 会把
+    [{type:text},{type:image_url}] 压成 Python repr 字符串 →
+    引擎收到非法 image 消息体 → HTTP 400（识图失败根因）。
+    """
+    if not tail:
+        return content
+    if isinstance(content, str):
+        return content + tail
+    if isinstance(content, list):
+        out = [dict(p) if isinstance(p, dict) else p for p in content]
+        for i in range(len(out) - 1, -1, -1):
+            part = out[i]
+            if isinstance(part, dict) and part.get("type") == "text":
+                out[i] = {**part, "text": str(part.get("text") or "") + tail}
+                return out
+        out.append({"type": "text", "text": tail})
+        return out
+    return str(content or "") + tail
+
+
 def _build_chat_messages(body: dict, messages: list) -> list:
     # AGENT_PROFILES 归 agent_loop（枢纽）所有；此处惰性取用，避免复制第二份数据
     from agent_loop import _get_agent_config
@@ -480,7 +504,7 @@ def _build_chat_messages(body: dict, messages: list) -> list:
             non_system_msgs = list(non_system_msgs)
             non_system_msgs[-1] = {
                 **non_system_msgs[-1],
-                "content": str(non_system_msgs[-1].get("content") or "") + _tail_text}
+                "content": _append_tail_to_content(non_system_msgs[-1].get("content"), _tail_text)}
             messages = [{"role": "system", "content": merged_system}] + non_system_msgs
 
     image_base64 = body.get("image_base64")

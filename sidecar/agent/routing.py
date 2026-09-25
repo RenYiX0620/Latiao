@@ -10,6 +10,29 @@ import local_llm
 
 logger = logging.getLogger("latiao-sidecar")   # 与 agent_loop 同名：日志格式不变
 
+
+def _lookup_cloud_key(cloud_config: dict) -> str:
+    """从 config.json 的 cloud_models 按 endpoint/名称回填 API key。
+
+    前端聊天请求可不带 key（UI 不持明文），由 sidecar 持久化配置回填（密钥代理化）。
+    """
+    try:
+        from config import CONFIG_FILE
+        cfg = json.loads(CONFIG_FILE.read_text("utf-8"))
+        models = cfg.get("cloud_models") or []
+        ep = (cloud_config.get("endpoint") or "").rstrip("/")
+        name = cloud_config.get("name") or cloud_config.get("model") or ""
+        for m in models:
+            if not isinstance(m, dict):
+                continue
+            if ep and (m.get("endpoint") or "").rstrip("/") == ep:
+                return str(m.get("key") or "")
+            if name and (m.get("name") == name or m.get("model") == name):
+                return str(m.get("key") or "")
+    except Exception:
+        logger.debug("cloud key lookup failed", exc_info=True)
+    return ""
+
 async def _resolve_api_target(cloud_config: dict | None) -> tuple[str, str, dict, bool]:
     """Resolve API URL, protocol, headers, and whether it's a local LLM (no cloud config).
     Cloud models are detected by having an endpoint (key is optional for local proxies).
@@ -21,6 +44,8 @@ async def _resolve_api_target(cloud_config: dict | None) -> tuple[str, str, dict
         api_url = cloud_config["endpoint"].rstrip("/") + "/chat/completions"
         headers = {"Content-Type": "application/json"}
         key = cloud_config.get("key", "")
+        if not key and protocol != "local":
+            key = _lookup_cloud_key(cloud_config)
         if key and protocol != "local":
             headers["Authorization"] = f"Bearer {key}"
         # If the endpoint points to a local server, treat as cloud (native function calling)

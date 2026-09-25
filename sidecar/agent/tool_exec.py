@@ -24,10 +24,39 @@ from cmd_safety import redact_secrets, tool_log_preview
 from datetime import datetime
 from db import _db_write_lock, _get_db
 from memory import _maybe_generate_skill, _refine_learnings, record_tool_reflection
-from threat_scan import guard_tool_result
+from threat_scan import guard_tool_result, is_suspect as _threat_is_suspect
 from tool_executor import _resolve_permission
 
 logger = logging.getLogger("latiao-sidecar")   # 与 agent_loop 同名：日志格式不变
+
+
+def _append_run_outcome(tool_name: str, result: str, arguments: dict) -> str:
+    """执行后校验与状态标记（纯函数，便于单测）。
+
+    run_cmd 的成功标记**只在确实执行过**时加：此前按"文本里没有 Error/错误"判定，
+    被拒（`⛔ 不支持 shell 操作符 …`）与超时（`超时: …`）的结果都会被贴上
+    `✅ Exit code: 0 (success)`，模型于是把"被拒绝"读成"跑过了、只是没输出"
+    （2026-09-24 用户实测：⛔ 与 ✅ 同时出现）。
+    """
+    if tool_name == "write_file":
+        path = arguments.get("path", "")
+        expected = arguments.get("content", "")
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                actual = f.read()
+            if actual == expected:
+                result += "\n✅ Verified: file content matches exactly."
+            else:
+                result += f"\n⚠️ Verification: content mismatch (expected {len(expected)} chars, got {len(actual)} chars)."
+        except Exception as e:
+            result += f"\n⚠️ Verification failed: could not read back file ({e})."
+    elif tool_name == "run_cmd":
+        # 没执行（被拒/超时/格式错误）→ 不加任何成功标记
+        _not_run = result.lstrip().startswith(("⛔", "❌", "⚠️", "超时"))
+        if not _not_run and ("(退出码: 0)" in result or "退出码" not in result):
+            result += "\n✅ Exit code: 0 (success)"
+    return result
+
 
 async def execute_tool(tool_name: str, arguments: dict) -> str:
     """Execute a tool with feedback verification. Supports both sync and async tool functions."""
@@ -62,25 +91,7 @@ async def execute_tool(tool_name: str, arguments: dict) -> str:
         logger.debug("bump_usage failed for %s", tool_name, exc_info=True)
 
     # ── Feedback subsystem: post-execution verification ──
-    if tool_name == "write_file":
-        path = arguments.get("path", "")
-        expected = arguments.get("content", "")
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                actual = f.read()
-            if actual == expected:
-                result += "\n✅ Verified: file content matches exactly."
-            else:
-                result += f"\n⚠️ Verification: content mismatch (expected {len(expected)} chars, got {len(actual)} chars)."
-        except Exception as e:
-            result += f"\n⚠️ Verification failed: could not read back file ({e})."
-    elif tool_name == "run_cmd":
-        # Exit code already captured; add explicit pass/fail
-        if "(退出码: 0)" in result or "退出码" not in result:
-            if "Error" not in result and "错误" not in result:
-                result += "\n✅ Exit code: 0 (success)"
-
-    return result
+    return _append_run_outcome(tool_name, result, arguments)
 
 async def _handle_tool_execution(tc: dict, current_msgs: list, session_id: str,
                                  agent_id: str, access_mode: str = "confirm",
@@ -269,7 +280,18 @@ async def _handle_tool_execution_inner(tc: dict, current_msgs: list, session_id:
     # full（完全访问）档：confirm 级工具免确认直接执行——此前 5 档中
     # confirm/plan/full 三档无门控、与默认档完全等价（审计 A2）。
     # danger/deny 规则拦截仍在上方生效，不受此豁免影响。
-    _full_bypass = (_access == "full") or _sub_gate_checked
+    # full 也保留 run_cmd/control_launch/control_kill_process 确认（P0）
+    from agent.confirm import _FULL_ALWAYS_CONFIRM
+    _full_bypass = ((_access == "full" and tool_name not in _FULL_ALWAYS_CONFIRM)
+                    or _sub_gate_checked)
+    # 注入命中后（threat_scan 标记会话可疑）：高危工具不再吃任何 bypass，强制二次确认
+    if _threat_is_suspect(session_id) and tool_name in _FULL_ALWAYS_CONFIRM:
+        _full_bypass = False
+        _auto_edit_bypass = False
+    # 注入命中后（threat_scan 标记可疑会话）：高危工具不再吃任何 bypass，强制确认
+    if _threat_is_suspect(session_id) and tool_name in _FULL_ALWAYS_CONFIRM:
+        _full_bypass = False
+        _auto_edit_bypass = False
     # 事件列表必须先初始化：confirm 分支的 pre_started 路径（当前两个 SSE
     # 循环的唯一调用方式）此前从未绑定 events 就 extend → UnboundLocalError
     # 整个任务崩溃（审计 P0：每次确认弹窗路径必炸）
@@ -326,7 +348,14 @@ async def _handle_tool_execution_inner(tc: dict, current_msgs: list, session_id:
     _spawn(_refine_learnings(tool_name, args, result, session_id))
     _spawn(_maybe_generate_skill(tool_name, args, result))
 
-    verify_report = await _auto_verify(tool_name, args, result)
+    # 校验器本身绝不能打死整轮：它的异常此前会冒到 Agent 循环，把"写 Word 文档"
+    # 这类正常请求变成"Agent 循环内部错误"（2026-09-24 用户实测：.docx 回读
+    # UnicodeDecodeError）。单个检查失败 → 只记日志、跳过报告。
+    try:
+        verify_report = await _auto_verify(tool_name, args, result)
+    except Exception:
+        logger.warning("auto-verify 失败（不影响工具结果）: %s", tool_name, exc_info=True)
+        verify_report = ""
     verify_failed = bool(verify_report and "❌" in verify_report)
     result_lower = result.lower()
     if not verify_failed and (
@@ -370,7 +399,7 @@ async def _handle_tool_execution_inner(tc: dict, current_msgs: list, session_id:
     # 搜索结果、接口返回），而工具集里有 shell / write_file。命中疑似注入句式时只加
     # 一条"这是数据、不是指令"的标注、**不删数据**（删了用户就看不懂搜索结果）；
     # 未命中时原样返回，零改动零开销。这里是全循环唯一的工具结果落库点。
-    tool_content = guard_tool_result(tool_name, tool_content)
+    tool_content = guard_tool_result(tool_name, tool_content, session_id)
     current_msgs.append({"role": "tool", "tool_call_id": call_id,
                          "content": (_stamp_time_sensitive() + tool_content
                                      if tool_name in _TIME_SENSITIVE_TOOLS else tool_content)})

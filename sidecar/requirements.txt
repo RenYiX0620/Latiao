@@ -56,3 +56,9 @@ typing-inspection==0.4.2
 typing_extensions==4.15.0
 uvicorn==0.48.0
 playwright==1.62.0
+
+# 文档排版引擎（2026-09-25）：Word(.docx) / PDF(.pdf) 由 plugins/write_file.py 生成；
+# PDF 用随包 OFL 字体 assets/fonts/NotoSansSC-*.ttf（reportlab 直接读文件、嵌子集）。
+python-docx==1.2.0
+reportlab==5.0.1
+pillow==12.3.0

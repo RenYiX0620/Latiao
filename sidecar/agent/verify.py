@@ -16,6 +16,19 @@ logger = logging.getLogger("latiao-sidecar")   # 与 agent_loop 同名：日志�
 # 但不该拿到 sidecar token 与云模型密钥（安全批次 ④，2026-09-23）
 _VERIFY_ENV_PREFIXES = ("NODE_", "NPM_", "npm_", "SEMGREP_", "GIT_", "XDG_")
 
+# 二进制交付物：不能按 UTF-8 文本回读（.docx/.xlsx 是 ZIP，读它必抛
+# UnicodeDecodeError）。2026-09-24 用户实测："以 Word 格式分析今天大盘" →
+# 回读 .docx 崩溃 → 异常冒到 Agent 循环 → 整轮报"Agent 循环内部错误"。
+_BINARY_SUFFIXES = (
+    ".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt", ".pdf", ".zip", ".gz", ".tar",
+    ".7z", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".dylib", ".so", ".exe",
+    ".dmg", ".bin", ".mp3", ".mp4", ".wav", ".sq", ".db", ".gguf",
+)
+
+
+def _looks_binary(path: str) -> bool:
+    return Path(path).suffix.lower() in _BINARY_SUFFIXES
+
 async def _auto_verify(tool_name: str, args: dict, result: str) -> str:
     """Run programmatic verification after a tool executes.
     Returns a verification report to inject into the LLM context, or '' if nothing to verify."""
@@ -28,18 +41,28 @@ async def _auto_verify(tool_name: str, args: dict, result: str) -> str:
 
         # ── Read-back verification ──
         if path:
-            try:
-                loop = asyncio.get_running_loop()
-                actual = await loop.run_in_executor(None, lambda: Path(path).read_text(encoding="utf-8"))
-                if actual == content_written:
-                    checks.append(("OK", "回读比对", f"内容一致 ({len(content_written)} 字符)"))
-                else:
-                    diff = len(actual) - len(content_written)
-                    checks.append(("FAIL", "回读比对", f"内容不一致！期望 {len(content_written)} 字符，实际 {len(actual)} (差 {diff})"))
-                lines = actual.split("\n")
-                checks.append(("OK", "完整性", f"{len(lines)} 行, 首行: {lines[0][:60] if lines else '(空)'}"))
-            except FileNotFoundError:
-                checks.append(("FAIL", "文件存在", f"写入后文件不存在: {path}"))
+            if _looks_binary(path):
+                checks.append(("INFO", "回读比对",
+                               f"二进制文件（{Path(path).suffix or '未知类型'}），跳过文本比对"))
+            else:
+                try:
+                    loop = asyncio.get_running_loop()
+                    actual = await loop.run_in_executor(None, lambda: Path(path).read_text(encoding="utf-8"))
+                    if actual == content_written:
+                        checks.append(("OK", "回读比对", f"内容一致 ({len(content_written)} 字符)"))
+                    else:
+                        diff = len(actual) - len(content_written)
+                        checks.append(("FAIL", "回读比对", f"内容不一致！期望 {len(content_written)} 字符，实际 {len(actual)} (差 {diff})"))
+                    lines = actual.split("\n")
+                    checks.append(("OK", "完整性", f"{len(lines)} 行, 首行: {lines[0][:60] if lines else '(空)'}"))
+                except FileNotFoundError:
+                    checks.append(("FAIL", "文件存在", f"写入后文件不存在: {path}"))
+                except UnicodeDecodeError as _e:
+                    # 扩展名没认出但内容不是 UTF-8（自定义后缀的二进制/GBK 文本）：
+                    # 只报告不比对，绝不抛
+                    checks.append(("INFO", "回读比对", f"不是 UTF-8 文本（{_e.reason}），跳过比对"))
+                except OSError as _e:
+                    checks.append(("INFO", "回读比对", f"回读失败（{type(_e).__name__}），跳过比对"))
 
         # ── TypeScript type-check (find nearest tsconfig.json) ──
         if path.endswith((".ts", ".tsx")):

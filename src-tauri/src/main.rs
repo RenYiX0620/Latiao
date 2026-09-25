@@ -78,6 +78,8 @@ async fn sidecar_proxy(
     }
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
+        // 禁止跟随 3xx：allowlist 只校验了初始 URL（P1 SSRF 逃逸）
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| format!("Client build failed: {}", e))?;
     let mut req = match method.as_str() {
@@ -89,9 +91,9 @@ async fn sidecar_proxy(
     if let Some(b) = body {
         req = req.header("Content-Type", "application/json").body(b);
     }
-    // Local auth: forward the frontend-supplied token as X-Latiao-Token so the
-    // sidecar can verify it. Empty token (non-Tauri/no-auth mode) is skipped.
-    if let Some(t) = token {
+    // Local auth: always attach process-level AUTH_TOKEN (ignore frontend value).
+    let _ = token;
+    if let Some(t) = AUTH_TOKEN.get() {
         if !t.is_empty() {
             req = req.header("X-Latiao-Token", t);
         }
@@ -172,12 +174,30 @@ fn get_secret(key: String) -> Result<String, String> {
         .output()
         .map_err(|e| format!("security CLI failed: {}", e))?;
     if output.status.success() {
+        // 只去掉尾部换行；trim() 会吞掉密钥首尾空白
         String::from_utf8(output.stdout)
-            .map(|s| s.trim().to_string())
+            .map(|s| s.trim_end_matches(['\n', '\r']).to_string())
             .map_err(|e| format!("Invalid UTF-8: {}", e))
     } else {
         Err("Not found".into())
     }
+}
+
+/// Whether a secret exists — without returning its value.
+#[cfg(target_os = "macos")]
+#[tauri::command]
+fn has_secret(key: String) -> Result<bool, String> {
+    let output = Command::new("security")
+        .args([
+            "find-generic-password",
+            "-s", "com.latiao.desktop",
+            "-a", &key,
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|e| format!("security CLI failed: {}", e))?;
+    Ok(output.success())
 }
 
 /// Delete a secret from the macOS Keychain via the `security` CLI.
@@ -207,39 +227,50 @@ fn delete_secret(key: String) -> Result<(), String> {
 /// Windows: store secrets in %APPDATA%\latiao\secrets\<key>.
 /// (cmdkey 写入的凭据无法读取明文，改为文件存储保证读写一致)
 #[cfg(target_os = "windows")]
-fn secret_file(key: &str) -> std::path::PathBuf {
-    let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".into());
-    let dir = std::path::Path::new(&base).join("latiao").join("secrets");
-    let _ = std::fs::create_dir_all(&dir);
-    dir.join(sanitize_secret_key(key))
+fn sanitize_secret_key(key: &str) -> String {
+    key.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-').collect()
 }
 
 #[cfg(target_os = "windows")]
-fn sanitize_secret_key(key: &str) -> String {
-    // 防止路径穿越：只保留安全字符
-    key.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-').collect()
+fn win_keyring(key: &str) -> Result<keyring::Entry, String> {
+    keyring::Entry::new("com.latiao.desktop", &sanitize_secret_key(key))
+        .map_err(|e| format!("keyring entry failed: {}", e))
 }
 
 #[cfg(target_os = "windows")]
 #[tauri::command]
 fn store_secret(key: String, value: String) -> Result<(), String> {
-    std::fs::write(secret_file(&key), value).map_err(|e| format!("write secret failed: {}", e))
+    win_keyring(&key)?
+        .set_password(&value)
+        .map_err(|e| format!("write secret failed: {}", e))
 }
 
 #[cfg(target_os = "windows")]
 #[tauri::command]
 fn get_secret(key: String) -> Result<String, String> {
-    std::fs::read_to_string(secret_file(&key)).map_err(|_| "Not found".into())
+    win_keyring(&key)?
+        .get_password()
+        .map_err(|_| "Not found".into())
 }
 
 #[cfg(target_os = "windows")]
 #[tauri::command]
 fn delete_secret(key: String) -> Result<(), String> {
-    let f = secret_file(&key);
-    if f.exists() {
-        std::fs::remove_file(&f).map_err(|e| format!("delete secret failed: {}", e))?;
+    match win_keyring(&key)?.delete_credential() {
+        Ok(()) => Ok(()),
+        Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(format!("delete secret failed: {}", e)),
     }
-    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+#[tauri::command]
+fn has_secret(key: String) -> Result<bool, String> {
+    match win_keyring(&key)?.get_password() {
+        Ok(_) => Ok(true),
+        Err(keyring::Error::NoEntry) => Ok(false),
+        Err(e) => Err(format!("has_secret failed: {}", e)),
+    }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -260,6 +291,37 @@ fn delete_secret(_key: String) -> Result<(), String> {
     Err("Secret storage not yet implemented on this platform".into())
 }
 
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[tauri::command]
+fn has_secret(_key: String) -> Result<bool, String> {
+    Ok(false)
+}
+
+/// 一次性迁移：旧版把全部渠道 token 塞在单个 `channel_tokens` JSON 里，
+/// 新版改成 `channel_tokens:<channel>` 逐项存放（避免整包进 webview）。
+/// 在 Rust 侧拆开写入后删掉旧键，明文不经前端。
+#[tauri::command]
+fn migrate_channel_tokens() -> Result<u32, String> {
+    let raw = match get_secret("channel_tokens".to_string()) {
+        Ok(v) => v,
+        Err(_) => return Ok(0),
+    };
+    let parsed: std::collections::HashMap<String, String> = match serde_json::from_str(&raw) {
+        Ok(m) => m,
+        Err(_) => return Ok(0),
+    };
+    let mut n = 0u32;
+    for (ch, val) in parsed {
+        if ch.is_empty() || val.is_empty() {
+            continue;
+        }
+        store_secret(format!("channel_tokens:{}", ch), val)?;
+        n += 1;
+    }
+    let _ = delete_secret("channel_tokens".to_string());
+    Ok(n)
+}
+
 /// Restart the sidecar process — kills current child and spawns a new one.
 /// Note: kill+wait+spawn is short-lived blocking I/O (typically <500ms).
 /// Tauri commands run on a thread pool, so this won't block the UI.
@@ -274,6 +336,7 @@ fn post_to_sidecar(path: &str, timeout_ms: u64) -> bool {
     let url = format!("http://127.0.0.1:8765{}", path);
     let client = match reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_millis(timeout_ms))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
     {
         Ok(c) => c,
@@ -357,14 +420,98 @@ fn open_model_dir() -> Result<String, String> {
     let models_dir = home_dir().join("Models");
     std::fs::create_dir_all(&models_dir).map_err(|e| e.to_string())?;
     let path = models_dir.to_string_lossy().to_string();
-    if cfg!(target_os = "macos") {
-        std::process::Command::new("open").arg(&path).spawn().map_err(|e| e.to_string())?;
-    } else if cfg!(target_os = "windows") {
-        std::process::Command::new("explorer").arg(&path).spawn().map_err(|e| e.to_string())?;
-    } else {
-        std::process::Command::new("xdg-open").arg(&path).spawn().map_err(|e| e.to_string())?;
-    }
+    open_with_system(&path)?;
     Ok(path)
+}
+
+/// 用系统默认程序打开/显示文件（Office 走这条；图/PDF/代码也提供作兜底）。
+#[tauri::command]
+fn open_path(path: String) -> Result<(), String> {
+    if path.trim().is_empty() {
+        return Err("empty path".into());
+    }
+    // 只允许绝对路径，拒绝穿越片段——避免把 webview 来的相对路径/命令行塞进 open
+    if !std::path::Path::new(&path).is_absolute() || path.contains("..") {
+        return Err("path must be absolute and without ..".into());
+    }
+    open_with_system(&path)
+}
+
+fn open_with_system(path: &str) -> Result<(), String> {
+    if cfg!(target_os = "macos") {
+        std::process::Command::new("open").arg(path).spawn().map_err(|e| e.to_string())?;
+    } else if cfg!(target_os = "windows") {
+        std::process::Command::new("explorer").arg(path).spawn().map_err(|e| e.to_string())?;
+    } else {
+        std::process::Command::new("xdg-open").arg(path).spawn().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// 残留 pid 文件里那个进程的归属（三态）。
+///
+/// 必须是三态：pid 文件只在 sidecar 优雅退出时才删，而所有强杀路径（重启后端、
+/// 更新前停后端、Python 看门狗 os._exit）都会留下它，所以"文件在、进程已死"是常态。
+/// 早期实现把"进程不存在"和"身份不符"混为一谈并直接中止启动，后果是重启后端第一次
+/// 必失败、带残留 pid 文件的冷启动直接没有 sidecar（2026-09-24 复查发现）。
+enum StalePidState {
+    /// 进程不存在（或判定不出来）→ 清 pid 文件，继续启动
+    Gone,
+    /// 进程存在但不是自家 sidecar（PID 复用）→ 不杀，继续启动
+    NotOurs,
+    /// 自家 sidecar → 先杀再启动
+    Ours,
+}
+
+fn classify_stale_pid(pid: i32) -> StalePidState {
+    if pid <= 1 {
+        return StalePidState::Gone;
+    }
+    #[cfg(unix)]
+    {
+        match Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "comm="])
+            .output()
+        {
+            // 进程不存在时 ps 退出码非 0、stdout 为空 —— 这是"已死"，不是"不是自家"
+            Ok(out) => {
+                let comm = String::from_utf8_lossy(&out.stdout).to_lowercase();
+                if comm.trim().is_empty() {
+                    StalePidState::Gone
+                } else if comm.contains("python")
+                    || comm.contains("sidecar")
+                    || comm.contains("latiao")
+                {
+                    StalePidState::Ours
+                } else {
+                    StalePidState::NotOurs
+                }
+            }
+            Err(_) => StalePidState::Gone,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        match Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {}", pid), "/FO", "CSV", "/NH"])
+            .output()
+        {
+            Ok(out) => {
+                let line = String::from_utf8_lossy(&out.stdout).to_lowercase();
+                if line.trim().is_empty() || line.contains("no tasks") {
+                    StalePidState::Gone
+                } else if line.contains("python")
+                    || line.contains("sidecar")
+                    || line.contains("latiao")
+                {
+                    StalePidState::Ours
+                } else {
+                    StalePidState::NotOurs
+                }
+            }
+            Err(_) => StalePidState::Gone,
+        }
+    }
 }
 
 fn start_sidecar() -> Option<Child> {
@@ -391,26 +538,37 @@ fn start_sidecar() -> Option<Child> {
         return None;
     }
 
-    // Kill stale sidecar via PID file (precise — avoids killing unrelated processes)
-    // Uses platform-specific commands: kill on macOS/Linux, taskkill on Windows
+    // 清残留 sidecar（PID 文件）。三态：进程已死（常态）或不是自家进程（PID 复用）
+    // 都只清文件、**继续启动**；只有确认是自家 sidecar 才杀。
     let pid_file = home_dir().join(".local-ai-os").join("sidecar.pid");
     if let Ok(pid_str) = std::fs::read_to_string(&pid_file) {
         if let Ok(pid) = pid_str.trim().parse::<i32>() {
-            let _ = std::thread::spawn(move || {
-                #[cfg(target_os = "windows")]
-                let _ = Command::new("taskkill")
-                    .args(["/PID", &pid.to_string(), "/F"])
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn();
-                #[cfg(not(target_os = "windows"))]
-                let _ = Command::new("kill")
-                    .arg(pid.to_string())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn();
-            }).join();
-            std::thread::sleep(std::time::Duration::from_millis(500));
+            match classify_stale_pid(pid) {
+                StalePidState::Ours => {
+                    let _ = std::thread::spawn(move || {
+                        #[cfg(target_os = "windows")]
+                        let _ = Command::new("taskkill")
+                            .args(["/PID", &pid.to_string(), "/F"])
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .spawn();
+                        #[cfg(not(target_os = "windows"))]
+                        let _ = Command::new("kill")
+                            .arg(pid.to_string())
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .spawn();
+                    }).join();
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+                StalePidState::NotOurs => {
+                    eprintln!("[Latiao] stale pid {} is not a sidecar (PID reuse); skip kill", pid);
+                    let _ = std::fs::remove_file(&pid_file);
+                }
+                StalePidState::Gone => {
+                    let _ = std::fs::remove_file(&pid_file);
+                }
+            }
         }
     }
 
@@ -536,24 +694,25 @@ fn main() {
     #[cfg(target_os = "macos")]
     clear_webview_cache();
     let _ = AUTH_TOKEN.set(generate_auth_token());
-    let sidecar = start_sidecar();
-    let sidecar_ok = sidecar.is_some();
-    if !sidecar_ok {
-        eprintln!("[Latiao] WARNING: sidecar failed to start — AI features will be unavailable");
-    }
-    // 单一来源：sidecar 子进程只存 managed state——此前 managed 恒为 None，
-    // restart_sidecar 的 detach 分支永不执行，每次重启都 SIGTERM 旧 sidecar →
-    // lifespan 关闭钩子杀模型引擎（审计 P1：重启侧车=模型白加载一轮）
-    let managed_sidecar = SidecarProcess(Mutex::new(sidecar));
 
     tauri::Builder::default()
+        // 单实例必须在**启动 sidecar 之前**生效：插件的 setup 早于应用 setup，而
+        // start_sidecar 会清残留 pid 文件、必要时杀旧 sidecar —— 顺序反了就会变成
+        // "第二实例先杀掉第一实例的 sidecar、再自己退出"，第一实例从此没有 sidecar
+        // （2026-09-24 复查发现）。所以 sidecar 启动搬进 .setup()。
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.show();
+                let _ = w.unminimize();
+                let _ = w.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_process::init())
-        .manage(managed_sidecar)
-        .invoke_handler(tauri::generate_handler![sidecar_proxy, get_auth_token, restart_sidecar, stop_sidecar_for_update, store_secret, get_secret, delete_secret, open_model_dir])
+        .invoke_handler(tauri::generate_handler![sidecar_proxy, get_auth_token, restart_sidecar, stop_sidecar_for_update, store_secret, get_secret, delete_secret, has_secret, migrate_channel_tokens, open_model_dir, open_path])
         .on_window_event(|window, event| {
             // 关闭 = 隐藏到托盘（定时任务/sidecar 持续运行），托盘菜单可退出
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
@@ -563,10 +722,18 @@ fn main() {
         })
         .setup(move |app| {
             setup_tray(app.handle())?;
-            if !sidecar_ok {
+            // sidecar 在这里启动：单实例插件（上面注册，setup 早于本回调）此时已判定完，
+            // 第二实例已退出，不会再来抢 pid 文件 / 杀第一实例的 sidecar。
+            let sidecar = start_sidecar();
+            if sidecar.is_none() {
                 // 启动失败：前端恢复面板会自动检测并展示自助恢复能力
                 // （健康探测 / 重启 sidecar / 导出日志），不再弹阻塞对话框。
+                eprintln!("[Latiao] WARNING: sidecar failed to start — AI features will be unavailable");
             }
+            // 单一来源：sidecar 子进程只存 managed state——此前 managed 恒为 None，
+            // restart_sidecar 的 detach 分支永不执行，每次重启都 SIGTERM 旧 sidecar →
+            // lifespan 关闭钩子杀模型引擎（审计 P1：重启侧车=模型白加载一轮）
+            app.manage(SidecarProcess(Mutex::new(sidecar)));
             Ok(())
         })
         .build(tauri::generate_context!())

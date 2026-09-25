@@ -10,7 +10,7 @@ import json
 import unittest.mock as mock
 from pathlib import Path
 
-import local_llm
+import local_llm_engine
 
 
 class _StubEngine:
@@ -64,7 +64,7 @@ def _capture(engine, model_path="/tmp/models/Test-Model.gguf", **kw):
         return _Proc()
 
     with mock.patch("subprocess.Popen", side_effect=_popen):
-        local_llm.LocalLLMEngine._start_llama_native(
+        local_llm_engine.EngineProcess._start_llama_native(
             engine, model_path, 1234, exe="/tmp/fake-llama-server", **kw)
     return captured.get("cmd", [])
 
@@ -93,7 +93,7 @@ def test_native_1_slot_keeps_old_behavior():
 
 def test_slots_clamped_to_4():
     """配置里写再大也钳到 4（KV 内存按槽位线性增长）。"""
-    assert local_llm.LocalLLMEngine._resolve_parallel_slots(
+    assert local_llm_engine.EngineProcess._resolve_parallel_slots(
         type("E", (), {"model_token_limit": 1})()) in (1, 2, 3, 4)
 
 
@@ -101,11 +101,11 @@ def test_resolve_slots_env_wins(monkeypatch):
     """环境变量 LATIAO_LLM_SLOTS 优先于 config.json；非法值回退默认 2。"""
     eng = _StubEngine()
     monkeypatch.setenv("LATIAO_LLM_SLOTS", "3")
-    assert local_llm.LocalLLMEngine._resolve_parallel_slots(eng) == 3
+    assert local_llm_engine.EngineProcess._resolve_parallel_slots(eng) == 3
     monkeypatch.setenv("LATIAO_LLM_SLOTS", "99")
-    assert local_llm.LocalLLMEngine._resolve_parallel_slots(eng) == 4
+    assert local_llm_engine.EngineProcess._resolve_parallel_slots(eng) == 4
     monkeypatch.setenv("LATIAO_LLM_SLOTS", "abc")
-    assert local_llm.LocalLLMEngine._resolve_parallel_slots(eng) == 2
+    assert local_llm_engine.EngineProcess._resolve_parallel_slots(eng) == 2
     monkeypatch.delenv("LATIAO_LLM_SLOTS")
 
 
@@ -113,10 +113,10 @@ def test_resolve_slots_from_config(monkeypatch):
     """没设环境变量时读 config.json 的 local_llm.slots。"""
     eng = _StubEngine()
     monkeypatch.delenv("LATIAO_LLM_SLOTS", raising=False)
-    monkeypatch.setattr(local_llm, "_read_config", lambda: {"local_llm": {"slots": 3}})
-    assert local_llm.LocalLLMEngine._resolve_parallel_slots(eng) == 3
-    monkeypatch.setattr(local_llm, "_read_config", lambda: {"local_llm": {"slots": "x"}})
-    assert local_llm.LocalLLMEngine._resolve_parallel_slots(eng) == 2
+    monkeypatch.setattr(local_llm_engine, "_read_config", lambda: {"local_llm": {"slots": 3}})
+    assert local_llm_engine.EngineProcess._resolve_parallel_slots(eng) == 3
+    monkeypatch.setattr(local_llm_engine, "_read_config", lambda: {"local_llm": {"slots": "x"}})
+    assert local_llm_engine.EngineProcess._resolve_parallel_slots(eng) == 2
 
 
 def test_custom_engine_never_gets_parallel_flag():
@@ -161,7 +161,7 @@ def test_loading_status_shows_slots():
         return _Proc()
 
     with mock.patch("subprocess.Popen", side_effect=_popen):
-        local_llm.LocalLLMEngine._start_llama_native(
+        local_llm_engine.EngineProcess._start_llama_native(
             eng, "/tmp/models/M.gguf", 1234, exe="/tmp/fake-llama-server")
     assert "2 并发" in captured["status"] and "64000" in captured["status"]
 

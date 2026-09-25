@@ -73,6 +73,33 @@ def _scan_enabled() -> bool:
     return v not in ("0", "off", "false", "no")
 
 
+# ── 会话级可疑标记（命中注入后，后续高危工具强制二次确认）──
+_SUSPECT_SESSIONS: dict[str, float] = {}
+_SUSPECT_TTL_S = 1800.0
+_SUSPECT_MAX = 256
+
+
+def mark_suspect(session_id: str) -> None:
+    import time as _t
+    if not session_id:
+        return
+    now = _t.time()
+    _SUSPECT_SESSIONS[session_id] = now
+    if len(_SUSPECT_SESSIONS) > _SUSPECT_MAX:
+        for sid in [k for k, v in _SUSPECT_SESSIONS.items() if now - v > _SUSPECT_TTL_S]:
+            _SUSPECT_SESSIONS.pop(sid, None)
+
+
+def is_suspect(session_id: str) -> bool:
+    import time as _t
+    ts = _SUSPECT_SESSIONS.get(session_id or "")
+    return bool(ts) and (_t.time() - ts) < _SUSPECT_TTL_S
+
+
+def clear_suspect(session_id: str) -> None:
+    _SUSPECT_SESSIONS.pop(session_id or "", None)
+
+
 def scan_for_threats(text: str) -> list[str]:
     """返回命中的模式标签（去重、按首次出现顺序），未命中返回 []。"""
     if not text or not _scan_enabled():
@@ -95,16 +122,22 @@ _TOOL_PREFIX = (
 )
 _TOOL_SUFFIX = "\n----- 外部数据结束 -----"
 
+_UNTRUSTED_OPEN = '<untrusted_data tool="{tool}">\n'
+_UNTRUSTED_CLOSE = "\n</untrusted_data>"
 
-def guard_tool_result(tool_name: str, text: str) -> str:
+
+def guard_tool_result(tool_name: str, text: str, session_id: str = "") -> str:
     """工具结果注入扫描：命中则加"这是数据"标注，未命中原样返回（零改动零开销）。"""
     hits = scan_for_threats(text)
     if not hits:
         return text
+    mark_suspect(session_id)  # 命中注入 → 后续高危工具强制二次确认
     logger.info("注入扫描：%s 结果命中 %d 项可疑模式（%s）——已标注为外部数据",
                 tool_name or "?", len(hits), "、".join(hits))
+    # 结构隔离：标注之外再套 untrusted 伪角色，降低模型把内容当指令执行的概率
     return (_TOOL_PREFIX.format(tool=tool_name or "?", labels="、".join(hits))
-            + text + _TOOL_SUFFIX)
+            + _UNTRUSTED_OPEN.format(tool=tool_name or "?") + text + _UNTRUSTED_CLOSE
+            + _TOOL_SUFFIX)
 
 
 # ── 上下文文件（身份文件）扫描：带信任分级 ──────────────────────

@@ -1,4 +1,6 @@
 # -*- mode: python -*-
+# 文档引擎（python-docx）自带数据文件必须显式收集：
+from PyInstaller.utils.hooks import collect_data_files
 a = Analysis(
     ['main.py'],
     pathex=['plugins'],
@@ -7,6 +9,10 @@ a = Analysis(
         ('agents/*.txt', 'agents'),
         ('skills/', 'skills'),
         ('plugins/', 'plugins'),
+        # 随包 OFL 中文字体（PDF 排版用；reportlab 直接读文件）
+        ('assets/fonts', 'assets/fonts'),
+        # python-docx 自带 templates/default.docx：不收集 → Document() 报 PackageNotFoundError
+        *collect_data_files('docx'),
         # 注意：不要把 .env 打进 exe（含密钥）
     ],
     hiddenimports=[
@@ -14,6 +20,11 @@ a = Analysis(
         'fastapi', 'httpx', 'certifi',
         'sqlite3', 'asyncio',
         'yaml',
+        # 文档引擎：插件里是函数内惰性 import，静态分析收集不到（同上一类坑）
+        'docx', 'docx.oxml', 'docx.opc',
+        'reportlab', 'reportlab.platypus', 'reportlab.lib',
+        'reportlab.pdfbase', 'reportlab.pdfbase.cidfonts', 'reportlab.pdfbase.ttfonts',
+        'PIL',
         # 统一能力模型 + 生态市场（多处函数内动态 import，PyInstaller 静态分析
         # 收集不到，必须显式列出，否则 sidecar.exe 运行时报 ModuleNotFoundError）
         'capability_registry', 'discovery', 'adapters',

@@ -556,7 +556,17 @@ def _retrieve_relevant_learnings(query: str, limit: int = MAX_LEARNINGS_INJECT,
 
 
 def _store_learning(session_id: str, topic: str, content: str, confidence: float = 0.5, source_type: str = "extracted"):
-    """Store a new learning. If a similar topic already exists, update confidence."""
+    """Store a new learning. If a similar topic already exists, update confidence.
+
+    入库前统一脱敏（P2）：高置信度学习会被注入后续会话，密钥不能进记忆库。
+    """
+    try:
+        from cmd_safety import redact_secrets
+        topic = redact_secrets(str(topic or ""))[:200]
+        content = redact_secrets(str(content or ""))[:4000]
+    except Exception:
+        topic = str(topic or "")[:200]
+        content = str(content or "")[:4000]
     _mark_tfidf_dirty()
     try:
         conn = _get_db()
@@ -629,6 +639,20 @@ def _resolve_preference_key(matched_text: str) -> str:
 
 
 def _store_preference(key: str, value: str, confidence: float = 0.5):
+    try:
+        from cmd_safety import redact_secrets
+        key = redact_secrets(str(key or ""))[:120]
+        value = redact_secrets(str(value or ""))[:500]
+    except Exception:
+        key = str(key or "")[:120]
+        value = str(value or "")[:500]
+    try:
+        from cmd_safety import redact_secrets
+        key = redact_secrets(str(key or ""))[:120]
+        value = redact_secrets(str(value or ""))[:500]
+    except Exception:
+        key = str(key or "")[:120]
+        value = str(value or "")[:500]
     """Store a learned user preference. Boosts confidence if already exists."""
     try:
         conn = _get_db()

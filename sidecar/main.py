@@ -489,7 +489,6 @@ app.add_middleware(
 )
 
 TAVILY_API_URL = os.environ.get("TAVILY_API_URL", "https://api.tavily.com/search")
-MAX_UPLOAD_SIZE = 50 * 1024 * 1024  # 50 MB
 
 # ═══════════════════════════════════════════════════════
 #  Harness: 工具权限分级 + 状态持久化

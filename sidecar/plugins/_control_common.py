@@ -80,10 +80,15 @@ def kill_by_name(pattern: str) -> str:
     try:
         if is_windows():
             rows = tasklist_table(pattern)
-            targets = [r for r in rows if pattern.lower() in r.lower() and "pid=" in r]
+            pat = (pattern or "").strip().lower()
+            # removesuffix 不是 rstrip：rstrip 按**字符集**剥，会把 "latex.exe" 剥成 "lat"
+            targets = [r for r in rows
+                       if os.path.basename(r.lower()).removesuffix(".exe") == pat
+                       or r.lower().endswith(pat + ".exe")]
             if not targets:
                 return f"没有找到名为 {pattern!r} 的进程"
             return f"Windows 建议按 pid 精确终止；匹配 {len(targets)} 个进程请用 pid"
+        pat = (pattern or "").strip().lower()
         r = subprocess.run(["ps", "-axo", "pid=,comm="], capture_output=True, text=True, timeout=15)
         targets = []
         for line in r.stdout.splitlines():
@@ -91,13 +96,18 @@ def kill_by_name(pattern: str) -> str:
             if len(parts) != 2:
                 continue
             p, comm = parts[0], parts[1]
-            if pattern.lower() in comm.lower() or os.path.basename(comm).lower() == pattern.lower():
-                if p not in self_pids() and int(p) > 1:
-                    targets.append((p, comm))
+            base = os.path.basename(comm).lower()
+            if base != pat and base != pat + ".exe":
+                continue
+            if p not in self_pids() and int(p) > 1:
+                targets.append((p, comm))
         if not targets:
             return f"没有找到名为 {pattern!r} 的进程"
+        if len(targets) > 3:
+            return (f"⛔ 匹配到 {len(targets)} 个同名进程（{pattern!r}），为防误杀已拒绝。"
+                    f"请用 pid 精确终止：" + ", ".join(p for p, _ in targets[:10]))
         killed = 0
-        for p, comm in targets[:20]:
+        for p, comm in targets:
             try:
                 os.kill(int(p), 15)
                 killed += 1
@@ -111,6 +121,12 @@ def kill_by_name(pattern: str) -> str:
 def launch_bg(command: str) -> str:
     if not command or len(command) > 2000:
         return "❌ command 不能为空且长度 ≤2000"
+    # 安全闸门：与 run_cmd 同源（破坏性/混淆/敏感路径）。此前本入口完全绕过
+    # cmd_safety，control_launch("rm -rf ~") / curl|sh / python3 -c 全放行。
+    from cmd_safety import check_cmd_with_script
+    denied = check_cmd_with_script(command)
+    if denied:
+        return denied
     RUNLOGS.mkdir(parents=True, exist_ok=True)
     tag = f"proc_{int(time.time())}"
     out_path = RUNLOGS / f"{tag}.out"
@@ -120,14 +136,19 @@ def launch_bg(command: str) -> str:
         tokens = shlex.split(command)
         if not tokens:
             return "❌ 命令无法解析"
-        with open(out_path, "w", encoding="utf-8"), open(err_path, "w", encoding="utf-8") as err_f:
+        out_f = open(out_path, "w", encoding="utf-8")
+        err_f = open(err_path, "w", encoding="utf-8")
+        try:
             proc = subprocess.Popen(
                 # ④ 子进程 env 白名单：控制类工具同样不该拿到 LATIAO_AUTH_TOKEN
                 # 与云端 key（此前继承整个 os.environ）
-                tokens, stdout=open(out_path, "w"), stderr=err_f,
+                tokens, stdout=out_f, stderr=err_f,
                 start_new_session=True, stdin=subprocess.DEVNULL,
                 env=child_env(),
             )
+        finally:
+            out_f.close()
+            err_f.close()
         return (
             f"✅ 已启动: pid={proc.pid}（{command}）\n"
             f"输出文件: {out_path}\n错误文件: {err_path}\n"

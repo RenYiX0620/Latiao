@@ -33,8 +33,12 @@ function showErrorOverlay(message: string, stack?: string) {
   overlay.innerHTML = `
     <h1 style="color:#e74c3c">${escapeHtml(t.title)}</h1>
     <pre style="background:#0d0d1a;padding:20px;border-radius:8px;overflow:auto;font-size:13px;line-height:1.6;color:#ff6b6b;white-space:pre-wrap;word-break:break-all">${escapeHtml(message)}\n\n${escapeHtml(stack || '')}</pre>
-    <button style="margin-top:20px;padding:10px 24px;font-size:14px;background:#e74c3c;color:#fff;border:none;border-radius:6px;cursor:pointer" onclick="document.getElementById('global-error-overlay')?.remove();location.reload()">${escapeHtml(t.reload)}</button>
+    <button style="margin-top:20px;padding:10px 24px;font-size:14px;background:#e74c3c;color:#fff;border:none;border-radius:6px;cursor:pointer" id="global-error-reload" type="button">${escapeHtml(t.reload)}</button>
   `
+  overlay.querySelector('#global-error-reload')?.addEventListener('click', () => {
+    overlay.remove()
+    location.reload()
+  })
   document.body.appendChild(overlay)
 }
 

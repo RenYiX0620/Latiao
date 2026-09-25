@@ -267,6 +267,22 @@ def _extract_and_validate(zip_bytes: bytes, tmp: Path) -> tuple[Path | None, dic
     has_content = any((pkg_root / f).exists() for f in ("plugin.py", "skills", "agents"))
     if not has_content:
         return None, {}, {"status": "error", "message": "扩展包没有任何内容（plugin.py/skills/agents）"}
+    # 安装前 AST 静态审查（P0）：plugin.py 落盘后会被 tool_system.exec_module 加载执行。
+    # 只拦**安全类**问题（禁调用/语法错误）；NAME/DEFINITION/PERMISSION 缺失是风格约定。
+    plugin_py = pkg_root / "plugin.py"
+    if plugin_py.exists():
+        try:
+            from plugin_creator import validate_plugin_code
+            v = validate_plugin_code(plugin_py.read_text("utf-8", errors="ignore"))
+            sec_errors = [e for e in (v.get("errors") or [])
+                          if ("禁止的调用" in e) or ("语法错误" in e)]
+            if sec_errors:
+                return None, {}, {
+                    "status": "error",
+                    "message": "扩展包 plugin.py 未通过静态安全审查: " + "; ".join(sec_errors),
+                }
+        except Exception as e:
+            return None, {}, {"status": "error", "message": f"扩展包代码审查失败: {e}"}
     return pkg_root, {**manifest, "name": name, "version": version, "permissions": perms}, None
 
 

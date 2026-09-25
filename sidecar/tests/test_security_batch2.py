@@ -73,12 +73,18 @@ def test_run_cmd_passes_whitelisted_env(monkeypatch):
 
 
 def test_all_four_spawn_sites_use_whitelist():
-    """四处子进程（run_cmd 两处 / 控制工具 / MCP / 引擎）都得过白名单。"""
+    """子进程（run_cmd 两处 / 控制工具 / MCP / 三后端引擎）都得过白名单。
+
+    引擎启动点已拆到 local_llm_launch_{llamacpp,native,mlx}.py，锁到实际 spawn 处。
+    """
     checks = {
         "plugins/run_cmd.py": 2,
         "plugins/_control_common.py": 1,
         "mcp_client.py": 1,
-        "local_llm.py": 3,
+        "local_llm_launch_llamacpp.py": 1,
+        "local_llm_launch_native.py": 1,
+        "local_llm_launch_mlx.py": 1,
+        "local_llm_download.py": 0,
     }
     for rel, expected in checks.items():
         src = (SIDECAR / rel).read_text("utf-8")

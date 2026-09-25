@@ -5,6 +5,22 @@ import { authFetch } from "../utils/api";
 import type { HFModelResult, DownloadState, SetupIssue, LLMStatus } from "../types";
 
 /** A locally-downloaded model file discovered by the sidecar. */
+interface BenchPrefill { chars: number; seconds: number; tps: number; }
+
+interface BenchResult {
+  ts: number;
+  model: string;
+  backend?: string;
+  context_limit?: number;
+  gen_tps?: number;
+  ttft_s?: number;
+  prefill?: BenchPrefill[];
+  rss_gb?: number;
+  total_ram_gb?: number;
+  advice?: string[];
+  [key: string]: unknown;
+}
+
 interface LocalModelInfo {
   id: string;
   name: string;
@@ -133,8 +149,8 @@ export default function LocalModelsTab(props: Props) {
   const isRunning = localLLMStatus?.status === "running";
   const isStarting = localLLMStatus?.status === "starting";
   const [benchRunning, setBenchRunning] = useState(false);
-  const [benchLatest, setBenchLatest] = useState<any>(null);
-  const [benchHistory, setBenchHistory] = useState<any[]>([]);
+  const [benchLatest, setBenchLatest] = useState<BenchResult | null>(null);
+  const [benchHistory, setBenchHistory] = useState<BenchResult[]>([]);
   const [showSearch, setShowSearch] = useState(false);
   const [searchFilter, setSearchFilter] = useState("");
   const [detailModelId, setDetailModelId] = useState("");
@@ -178,9 +194,9 @@ export default function LocalModelsTab(props: Props) {
     } finally {
       setBenchRunning(false);
     }
-  }, [benchRunning, showToast, loadBenchmarks]);
+  }, [benchRunning, showToast, loadBenchmarks, t, lang]);
 
-  useEffect(() => { void loadBenchmarks(); }, [loadBenchmarks]);
+  useEffect(() => { void Promise.resolve().then(() => loadBenchmarks()); }, [loadBenchmarks]);
 
   const fetchLocalModels = useCallback(() => {
     authFetch("/v1/local-llm/models")
@@ -279,8 +295,8 @@ export default function LocalModelsTab(props: Props) {
               <>
                 <div style={{ fontFamily: "var(--font-mono)", fontSize: 12, lineHeight: 1.9 }}>
                   <div>{t("local.bench_model", { model: `${benchLatest.model}${benchLatest.backend ? ` · ${benchLatest.backend}` : ""}` })}</div>
-                  <div>{t("local.bench_gen", { tps: benchLatest.gen_tps, ttft: benchLatest.ttft_s, ctx: Number(benchLatest.context_limit || 0).toLocaleString() })}</div>
-                  {(benchLatest.prefill || []).map((pf: any, i: number) => (
+                  <div>{t("local.bench_gen", { tps: benchLatest.gen_tps ?? "?", ttft: benchLatest.ttft_s ?? "?", ctx: Number(benchLatest.context_limit || 0).toLocaleString() })}</div>
+                  {(benchLatest.prefill || []).map((pf: BenchPrefill, i: number) => (
                     <div key={i}>{t("local.bench_prefill", { k: (pf.chars / 1000).toFixed(1), sec: pf.seconds, tps: pf.tps })}</div>
                   ))}
                   <div>{t("local.bench_mem", { used: benchLatest.rss_gb ?? "?", total: benchLatest.total_ram_gb ?? "?" })}</div>
@@ -295,8 +311,8 @@ export default function LocalModelsTab(props: Props) {
             {benchHistory.length > 1 && (
               <div style={{ marginTop: 10, fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--text-secondary)" }}>
                 <div style={{ marginBottom: 4 }}>{t("local.bench_history")}</div>
-                {benchHistory.slice(1, 6).map((h: any, i: number) => (
-                  <div key={i}>{t("local.bench_history_row", { ts: new Date(h.ts * 1000).toLocaleString(), model: h.model, tps: h.gen_tps, ttft: h.ttft_s, rss: h.rss_gb })}</div>
+                {benchHistory.slice(1, 6).map((h: BenchResult, i: number) => (
+                  <div key={i}>{t("local.bench_history_row", { ts: new Date(h.ts * 1000).toLocaleString(), model: h.model, tps: h.gen_tps ?? "?", ttft: h.ttft_s ?? "?", rss: h.rss_gb ?? "?" })}</div>
                 ))}
               </div>
             )}

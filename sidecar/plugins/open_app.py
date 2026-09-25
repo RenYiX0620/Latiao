@@ -43,7 +43,7 @@ _APP_ALIASES = {
 
 
 def execute(args: dict) -> str:
-    name = args["name"]
+    name = str(args.get("name") or args.get("app") or "")
     resolved = _APP_ALIASES.get(name, name)
     if IS_WINDOWS:
         # Windows 那条走 cmd /c start：cmd.exe 会二次解释命令行，应用名里的

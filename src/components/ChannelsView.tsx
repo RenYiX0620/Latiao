@@ -17,48 +17,45 @@ const CHANNELS = [
 
 export default function ChannelsView() {
   const { t } = useTranslation();
-  const [configs, setConfigs] = useState<Record<string, string>>({});
-  const [loaded, setLoaded] = useState(false);
+  const [configs, setConfigs] = useState<Record<string, boolean>>({});
+  // 编辑框明文只在打字期间存在，保存后立刻清空
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [activeChannel, setActiveChannel] = useState<string | null>(null);
 
-  // Load channel tokens from OS keychain on mount
+  // 只查「是否已配置」，不把明文 token 读进 webview（密钥代理化）
   useEffect(() => {
     (async () => {
       try {
-        const saved = await invoke("get_secret", { key: CHANNEL_KEYCHAIN_KEY }).catch(() => null) as string | null;
-        if (saved) setConfigs(JSON.parse(saved));
-      } catch (e) { console.warn("Failed to load channel tokens from keychain", e); }
-      setLoaded(true);
+        // 旧版整包键 channel_tokens → 新版 channel_tokens:<channel>
+        await invoke("migrate_channel_tokens").catch(() => 0);
+        const map: Record<string, boolean> = {};
+        for (const ch of CHANNELS) {
+          const ok = await invoke("has_secret", { key: CHANNEL_KEYCHAIN_KEY + ":" + ch.key }).catch(() => false) as boolean;
+          if (ok) map[ch.key] = true;
+        }
+        setConfigs(map);
+      } catch (e) { console.warn("Failed to load channel secret flags", e); }
     })();
   }, []);
 
-  // Persist to keychain (debounced)
-  useEffect(() => {
-    if (!loaded) return;
-    const timer = setTimeout(async () => {
-      try {
-        if (Object.keys(configs).length > 0) {
-          await invoke("store_secret", { key: CHANNEL_KEYCHAIN_KEY, value: JSON.stringify(configs) });
-        }
-      } catch (e) { console.warn("Failed to persist channel tokens to keychain", e); }
-    }, 1000);
-    return () => clearTimeout(timer);
-  }, [configs, loaded]);
-
-  const saveConfig = (key: string, value: string) => {
-    setConfigs(prev => ({ ...prev, [key]: value }));
+  const saveConfig = async (key: string) => {
+    const value = (drafts[key] || "").trim();
+    if (!value) return;
+    try {
+      await invoke("store_secret", { key: CHANNEL_KEYCHAIN_KEY + ":" + key, value });
+      setConfigs(prev => ({ ...prev, [key]: true }));
+      setDrafts(prev => ({ ...prev, [key]: "" }));
+      setActiveChannel(null);
+    } catch (e) { console.warn("Failed to store channel token", e); }
   };
 
-  const clearConfig = (key: string) => {
-    setConfigs(prev => {
-      const next = { ...prev };
-      delete next[key];
-      // If all configs cleared, delete from keychain
-      if (Object.keys(next).length === 0) {
-        invoke("delete_secret", { key: CHANNEL_KEYCHAIN_KEY }).catch((e) => console.warn("Failed to delete channel tokens from keychain", e));
-      }
-      return next;
-    });
+  const clearConfig = async (key: string) => {
+    try {
+      await invoke("delete_secret", { key: CHANNEL_KEYCHAIN_KEY + ":" + key });
+      setConfigs(prev => { const n = { ...prev }; delete n[key]; return n; });
+      setDrafts(prev => ({ ...prev, [key]: "" }));
+      setActiveChannel(null);
+    } catch (e) { console.warn("Failed to delete channel token", e); }
   };
 
   return (
@@ -84,12 +81,12 @@ export default function ChannelsView() {
                     className="form-input"
                     style={{ margin: 0, fontSize: 11, padding: "6px 10px", fontFamily: "var(--font-mono)" }}
                     placeholder={ch.placeholder}
-                    value={configs[ch.key] || ""}
-                    onChange={(e) => saveConfig(ch.key, e.target.value)}
+                    value={drafts[ch.key] || ""}
+                    onChange={(e) => setDrafts(prev => ({ ...prev, [ch.key]: e.target.value }))}
                   />
                   <div style={{ display: "flex", gap: 6 }}>
                     <button className="btn btn-sm btn-primary" style={{ flex: 1 }}
-                      onClick={() => setActiveChannel(null)}>
+                      onClick={() => saveConfig(ch.key)}>
                       {t("channels.done")}
                     </button>
                     {isConfigured && (

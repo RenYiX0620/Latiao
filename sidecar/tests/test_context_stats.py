@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import agent.tool_exec as TE  # noqa: E402  （工具执行簇 2026-09-23 拆出：patch 面在此）
 
 import context_stats as cs
+import local_llm_probe
 
 
 class TestEstimateTokens(unittest.TestCase):
@@ -622,7 +623,9 @@ class TestCustomEngine(unittest.TestCase):
         import local_llm
         self._ll = local_llm
         self._old_cfg_fn = local_llm._config_file
+        self._old_cfg_fn_probe = local_llm_probe._config_file
         local_llm._config_file = lambda: self.cfg
+        local_llm_probe._config_file = lambda: self.cfg
         self._env = dict(os.environ)
         for k in ("LATIAO_CUSTOM_ENGINE", "LATIAO_CUSTOM_ENGINE_BIN",
                   "LATIAO_CUSTOM_ENGINE_ARGS"):
@@ -631,6 +634,7 @@ class TestCustomEngine(unittest.TestCase):
     def tearDown(self):
         import os
         self._ll._config_file = self._old_cfg_fn
+        local_llm_probe._config_file = self._old_cfg_fn_probe
         os.environ.clear(); os.environ.update(self._env)
         self.tmp.cleanup()
 
@@ -890,13 +894,16 @@ class TestMultiCustomEngines(unittest.TestCase):
         import local_llm
         self._ll = local_llm
         self._old = local_llm._config_file
+        self._old_probe = local_llm_probe._config_file
         local_llm._config_file = lambda: self.cfg
+        local_llm_probe._config_file = lambda: self.cfg
         self._env = dict(os.environ)
         os.environ.pop("LATIAO_CUSTOM_ENGINE_BIN", None)
 
     def tearDown(self):
         import os
         self._ll._config_file = self._old
+        local_llm_probe._config_file = self._old_probe
         os.environ.clear(); os.environ.update(self._env)
         self.tmp.cleanup()
 

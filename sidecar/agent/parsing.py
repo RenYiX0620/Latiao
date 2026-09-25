@@ -3,6 +3,7 @@ import json
 import os
 import re
 import tempfile
+import uuid
 import logging
 
 logger = logging.getLogger("latiao-sidecar")
@@ -209,6 +210,11 @@ _PROMPT_TOOL_RE = re.compile(
 # 09-21 收紧（Nous Hermes 立场：工具执行应由模型结构化调用决定，不做散文推断）：
 # 默认关闭；即使开启也只允许只读类工具（可开不可误执行危险性动作）。
 _NL_TOOL_FALLBACK_ENABLED = False
+# 裸 JSON 工具推断（按参数键猜工具名）：默认关。误判面大（正文 JSON → run_cmd）。
+_BARE_JSON_TOOLS_ENABLED = (os.environ.get("LATIAO_BARE_JSON_TOOLS", "0").strip().lower()
+                            in ("1", "on", "true", "yes"))
+_BARE_JSON_READONLY = frozenset({"read_file", "list_dir", "search_files",
+                                 "mx_query", "tavily_search", "headless_read"})
 _NL_TOOL_READONLY = frozenset({"read_file", "list_dir", "search_files", "headless_read",
                                "web_search", "tavily_search", "bing_search"})
 _NL_TOOL_RE = re.compile(
@@ -391,7 +397,7 @@ def _parse_prompt_tool_calls(text: str) -> tuple[str, list[dict]]:
         except json.JSONDecodeError:
             args = _salvage_tool_args(args_str)
         tool_calls.append({
-            "id": f"local_fence_{name}_{idx}",
+            "id": f"local_fence_{name}_{uuid.uuid4().hex[:8]}_{idx}",
             "type": "function",
             "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
         })
@@ -497,7 +503,7 @@ def _parse_prompt_tool_calls(text: str) -> tuple[str, list[dict]]:
             for kv in _TOOLCALL_KV_RE.finditer(xm.group(2)):
                 _xargs[kv.group(1)] = kv.group(2)
             tool_calls.append({
-                "id": f"local_xml_{_xname}_{x_idx}",
+                "id": f"local_xml_{_xname}_{uuid.uuid4().hex[:8]}_{x_idx}",
                 "type": "function",
                 "function": {"name": _xname, "arguments": json.dumps(_xargs, ensure_ascii=False)},
             })
@@ -507,7 +513,11 @@ def _parse_prompt_tool_calls(text: str) -> tuple[str, list[dict]]:
     # "我来查...{"query": "..."}" 的裸 JSON（无 ```tool 栅栏），解析器不认 →
     # JSON 残留在文本里 → 模型复读同样内容 → 复读检测误判循环截断（22:06 事故）。
     # 这里识别"独立 JSON 对象且参数命中文档化工具名"的裸调用，并剥离。
-    if not tool_calls:
+    #
+    # P0：本层按参数键**猜**工具名（cmd→run_cmd），正文/工具结果里解释 JSON 的
+    # 内容会被误造成可执行调用 = 结果反注入。默认关闭；LATIAO_BARE_JSON_TOOLS=1
+    # 可开，且开启后也只允许只读工具。
+    if not tool_calls and _BARE_JSON_TOOLS_ENABLED:
         _bare_json_re = re.compile(r'\{\s*"(?:query|path|cmd|pattern|url|command)"\s*:\s*"[^"]*"\s*[,}]', re.DOTALL)
         for b_idx, m in enumerate(_bare_json_re.finditer(search_text)):
             # 往前看 30 字符是否有"动/查/读/搜"等动作词（避免误判正文 JSON）
@@ -527,8 +537,11 @@ def _parse_prompt_tool_calls(text: str) -> tuple[str, list[dict]]:
                          else "run_cmd" if key == "cmd"
                          else "tavily_search" if key == "url"
                          else "mx_query")
+            # 即便手动开启，也不猜 run_cmd —— 命令执行不走推断
+            if tool_name not in _BARE_JSON_READONLY:
+                continue
             tool_calls.append({
-                "id": f"local_bare_{tool_name}_{b_idx}",
+                "id": f"local_bare_{tool_name}_{uuid.uuid4().hex[:8]}_{b_idx}",
                 "type": "function",
                 "function": {"name": tool_name, "arguments": json.dumps(args, ensure_ascii=False)},
             })
@@ -556,7 +569,7 @@ def _parse_prompt_tool_calls(text: str) -> tuple[str, list[dict]]:
             if not args:
                 continue
             tool_calls.append({
-                "id": f"local_inline_{name}_{idx}",
+                "id": f"local_inline_{name}_{uuid.uuid4().hex[:8]}_{idx}",
                 "type": "function",
                 "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
             })

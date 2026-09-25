@@ -9,6 +9,7 @@ import logging
 
 import asyncio
 import json
+import os
 from agent.context import AUTO_EDIT_TOOLS, _normalize_access
 
 logger = logging.getLogger("latiao-sidecar")   # 与 agent_loop 同名：日志格式不变
@@ -35,14 +36,15 @@ async def _wait_tool_confirmation(call_id: str, tool_name: str,
     保持暂停；停止/取消可中断（生成器取消 → finally 清理 pending）。
     09-21 用户反馈："确认超时 30 秒，改成不限时间，我点了再操作下一步"。
     """
+    if timeout == 0 and _DEFAULT_CONFIRM_TIMEOUT > 0:
+        timeout = _DEFAULT_CONFIRM_TIMEOUT
     events = []
     try:
         if timeout and timeout > 0:
             await asyncio.wait_for(event_obj.wait(), timeout=timeout)
         else:
             await event_obj.wait()
-        async with _pending_lock:
-            approved = _pending_confirmations.get(call_id, {}).get("approved", False)
+        approved = _pending_confirmations.get(call_id, {}).get("approved", False)
         logger.info("tool confirmation resolved: %s approved=%s", call_id, approved)
     except asyncio.TimeoutError:
         approved = False
@@ -53,8 +55,7 @@ async def _wait_tool_confirmation(call_id: str, tool_name: str,
             ),
         })
     finally:
-        async with _pending_lock:
-            _pending_confirmations.pop(call_id, None)
+        _pending_confirmations.pop(call_id, None)
     return approved, events
 
 async def _await_tool_confirmation(call_id: str, tool_name: str, args: dict) -> tuple[bool, list[dict]]:
@@ -63,12 +64,18 @@ async def _await_tool_confirmation(call_id: str, tool_name: str, args: dict) -> 
     approved, events = await _wait_tool_confirmation(call_id, tool_name, started["event_obj"])
     return approved, [started["event"]] + events
 
+# full 档下**仍需用户确认**的高危工具（任意命令执行/杀进程）。
+_FULL_ALWAYS_CONFIRM = frozenset({
+    "run_cmd", "control_launch", "control_kill_process",
+})
+
+
 def _confirm_bypassed(tool_name: str, access_mode: str) -> bool:
-    """confirm 级工具是否免确认（full 档全免；auto_edit 档文件类免确认）。
+    """confirm 级工具是否免确认（full 档免，但高危命令类仍确认；auto_edit 档文件类免确认）。
     供 _handle_tool_execution 与 SSE 调用方（提前发确认事件）共用，避免判定漂移。"""
     _access = _normalize_access(access_mode)
     if _access == "full":
-        return True
+        return tool_name not in _FULL_ALWAYS_CONFIRM
     if _access == "auto_edit" and tool_name in AUTO_EDIT_TOOLS:
         try:
             from main import _custom_permissions
@@ -96,14 +103,15 @@ async def _wait_plan_confirmation(plan_id: str, event_obj: asyncio.Event,
     → 一旦真传了 timeout 就会 NameError 把友好提示变成报错。`lang` 由调用方传入
     （原来是靠 `lang_of(msgs)` 猜，而 msgs 在这里根本没有）。
     """
+    if timeout == 0 and _DEFAULT_CONFIRM_TIMEOUT > 0:
+        timeout = _DEFAULT_CONFIRM_TIMEOUT
     events = []
     try:
         if timeout and timeout > 0:
             await asyncio.wait_for(event_obj.wait(), timeout=timeout)
         else:
             await event_obj.wait()
-        async with _pending_lock:
-            approved = _pending_confirmations.get(plan_id, {}).get("approved", False)
+        approved = _pending_confirmations.get(plan_id, {}).get("approved", False)
         logger.info("plan confirmation resolved: %s approved=%s", plan_id, approved)
     except asyncio.TimeoutError:
         approved = False
@@ -112,8 +120,7 @@ async def _wait_plan_confirmation(plan_id: str, event_obj: asyncio.Event,
             "content": "\n\n" + _msg("plan_timeout", lang or "zh"),
         })
     finally:
-        async with _pending_lock:
-            _pending_confirmations.pop(plan_id, None)
+        _pending_confirmations.pop(plan_id, None)
     return approved, events
 
 def _count_successful_duplicates(current_msgs: list, tool_name: str, args: dict) -> int:
@@ -171,7 +178,18 @@ def _check_pre_hooks(tool_name: str, args: dict) -> tuple[bool, list[dict], str]
         logger.warning(f"Pre-tool hook failed for {tool_name}", exc_info=True)  # don't block execution
     return False, [], ""
 
-# Pending confirmations: call_id → asyncio.Event (approve) or None (deny)
-_pending_confirmations: dict[str, dict] = {}
+# Pending confirmations: call_id → {"event": asyncio.Event, "approved": bool}
+# 不用模块级 asyncio.Lock：跨测试事件循环会绑死；单键 dict 读写在协作式单线程下原子。
+class _NullLock:
+    async def __aenter__(self):
+        return self
 
-_pending_lock = asyncio.Lock()
+    async def __aexit__(self, *exc):
+        return False
+
+
+_pending_confirmations: dict[str, dict] = {}
+_pending_lock = _NullLock()
+
+# 兜底超时（秒）。默认 0=不限时（09-21 用户反馈）；可设 LATIAO_CONFIRM_TIMEOUT_SEC 防 SSE 断流挂死。
+_DEFAULT_CONFIRM_TIMEOUT = float(os.environ.get("LATIAO_CONFIRM_TIMEOUT_SEC", "0") or "0")

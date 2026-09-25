@@ -258,6 +258,21 @@ def _match_forbidden(inv: Invocation, rules: dict[str, Any]) -> str | None:
         if pattern is None and inv.name in table:
             return f"禁止命令: {inv.name}"
         if pattern is not None and inv.args and _any_arg_match(inv.args, pattern):
+            # 解释器内联（python -c / node -e …）：2026-09-24 误杀修复——
+            # 改为审查内联源码（与脚本文件同一黑名单），干净则放行。
+            # bash/sh/zsh/fish 的 -c 仍是完整 shell，继续禁。
+            if table_key == "forbidden_commands_any_arg" and re.match(
+                    r"^(python|python3|node|nodejs|deno|bun|perl|ruby|php|lua|nu|pwsh|powershell)\d*",
+                    inv.name, re.I):
+                code = inv.args[1] if len(inv.args) > 1 else ""
+                try:
+                    from cmd_safety import check_inline_code
+                    denied = check_inline_code(code)
+                except Exception as e:
+                    return f"禁止用法: {inv.name} {inv.args[0]}（审查失败: {e}）"
+                if denied:
+                    return denied
+                return None
             return f"禁止用法: {inv.name} {inv.args[0]}"
     # 敏感读（保留正则层同款对齐；语义层提前拦）
     if inv.name in rules.get("sensitive_readers", ()):

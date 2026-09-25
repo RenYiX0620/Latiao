@@ -51,6 +51,12 @@ def _request_session_cancel(session_id: str) -> None:
     """置位会话取消标记（/v1/chat/cancel 调用）。"""
     if session_id:
         _session_cancelled.add(session_id)
+        # 子智能体同步收口：否则后台子任务注册表停在 running，前端一直「执行中」
+        try:
+            from agent.subagent import cancel_subtasks_for_session
+            cancel_subtasks_for_session(session_id)
+        except Exception:
+            logger.warning("failed to cancel subtasks for %s", session_id, exc_info=True)
         # 相位状态机镜像（阶段 2a，与事件日志同源）：stopping 相位 + 先行原因
         try:
             turn_state_for(session_id).request_stop("user", "button")

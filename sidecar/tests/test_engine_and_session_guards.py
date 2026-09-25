@@ -16,10 +16,9 @@ import api_routes  # noqa: E402
 
 @pytest.fixture(autouse=True)
 def _auth_token():
-    """全量套件下 main 可能已被别的测试模块先导入（AUTH_TOKEN 为空）→ 补上。"""
+    """全量套件下别的测试模块可能已把 AUTH_TOKEN 设成自己的值——钉回 e2e-token。"""
     import main
-    if not main.AUTH_TOKEN:
-        main.AUTH_TOKEN = os.environ.get("LATIAO_AUTH_TOKEN", "e2e-token")
+    main.AUTH_TOKEN = "e2e-token"
     yield
 
 
@@ -83,11 +82,11 @@ def test_stop_allowed_when_idle_and_on_empty_body(client, monkeypatch):
 
 
 def test_busy_helper_defaults_to_zero_on_broken_snapshot(monkeypatch):
-    monkeypatch.setattr(api_routes, "_busy_local_turns", api_routes._busy_local_turns, raising=False)
+    import api_routes_cron_local as local_routes
     import agent.transport as transport
     monkeypatch.setattr(transport, "stream_gate_snapshot",
                         lambda: (_ for _ in ()).throw(RuntimeError("boom")))
-    assert api_routes._busy_local_turns() == 0
+    assert local_routes._busy_local_turns() == 0
 
 
 def test_subagents_endpoint_filters_by_session(monkeypatch):

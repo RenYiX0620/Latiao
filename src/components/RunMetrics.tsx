@@ -42,7 +42,7 @@ export default function RunMetrics({ sessionId, refreshKey, fallbackTurns, fallb
     }
   }, [sessionId]);
 
-  useEffect(() => { void load(); }, [load, refreshKey]);
+  useEffect(() => { void Promise.resolve().then(() => load()); }, [load, refreshKey]);
 
   const turns = stats?.turns || fallbackTurns;
   const steps = stats?.steps ?? 0;

@@ -17,7 +17,7 @@ export async function getAppVersion(): Promise<string> {
   try {
     return await getVersion();
   } catch {
-    return "0.3.17";
+    return "0.0.0";
   }
 }
 

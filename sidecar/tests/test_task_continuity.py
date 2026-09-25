@@ -70,7 +70,7 @@ class TestIdleEngineFastDispose(unittest.TestCase):
 
     def test_idle_engine_disposed_fast(self):
         import time
-        from local_llm import LocalLLMEngine
+        from local_llm_engine import EngineProcess as LocalLLMEngine  # 拆分后引擎类
         eng = LocalLLMEngine.__new__(LocalLLMEngine)
         eng.server_port = 1235
         eng.current_model_id = "m1"
@@ -102,7 +102,7 @@ class TestIdleEngineFastDispose(unittest.TestCase):
     def test_loading_engine_not_disposed(self):
         """加载中的引擎探活失败（模型未就绪 404）是常态：不处置、不误杀
         （14:38 事故回归——误杀正在加载的引擎会再拉一轮重载）。"""
-        from local_llm import LocalLLMEngine
+        from local_llm_engine import EngineProcess as LocalLLMEngine  # 拆分后引擎类
         eng = LocalLLMEngine.__new__(LocalLLMEngine)
         eng.server_port = 1235
         eng.current_model_id = "m1"
@@ -124,7 +124,7 @@ class TestIdleEngineFastDispose(unittest.TestCase):
 
     def test_busy_engine_keeps_slow_window(self):
         """忙引擎：首次失败仍走 60s 慢窗口，不立即处置（防误杀长生成）。"""
-        from local_llm import LocalLLMEngine
+        from local_llm_engine import EngineProcess as LocalLLMEngine  # 拆分后引擎类
         eng = LocalLLMEngine.__new__(LocalLLMEngine)
         eng.server_port = 1235
         eng._health_ok = False
@@ -260,7 +260,7 @@ class TestDeadProcessKeepsModel(unittest.TestCase):
     不得清空 current_model_id（否则排队中的请求因"无模型"被秒死）。"""
 
     def _eng(self):
-        from local_llm import LocalLLMEngine
+        from local_llm_engine import EngineProcess as LocalLLMEngine  # 拆分后引擎类
         eng = LocalLLMEngine.__new__(LocalLLMEngine)
         eng._process = type("_DeadProc", (), {"returncode": -9, "poll": lambda s: -9})()
         eng.server_status = "running"
@@ -270,7 +270,7 @@ class TestDeadProcessKeepsModel(unittest.TestCase):
         return eng
 
     def test_dead_process_keeps_model_and_reloads(self):
-        from local_llm import LocalLLMEngine
+        from local_llm_engine import EngineProcess as LocalLLMEngine  # 拆分后引擎类
         eng = self._eng()
         reloads = []
         eng._request_reload = lambda mid: reloads.append(mid)
@@ -279,7 +279,7 @@ class TestDeadProcessKeepsModel(unittest.TestCase):
         self.assertEqual(eng.current_model_id, "m1")   # 模型记录保留
 
     def test_dead_process_no_model_no_reload(self):
-        from local_llm import LocalLLMEngine
+        from local_llm_engine import EngineProcess as LocalLLMEngine  # 拆分后引擎类
         eng = self._eng()
         eng.current_model_id = ""
         reloads = []
@@ -296,7 +296,7 @@ class TestHealthProbeUsesRealModel(unittest.TestCase):
     def test_probe_sends_real_model_id(self):
         import json
         import urllib.request
-        from local_llm import LocalLLMEngine
+        from local_llm_engine import EngineProcess as LocalLLMEngine  # 拆分后引擎类
         eng = LocalLLMEngine.__new__(LocalLLMEngine)
         eng.server_port = 1235
         eng.current_model_id = "/models/real-gguf"
@@ -335,7 +335,7 @@ class TestAutoReloadClearsExplicitStop(unittest.TestCase):
     否则排队请求收到误导性的"已被手动停止"（14:41 事故回归）。"""
 
     def test_auto_reload_failure_resets_explicit_stop(self):
-        from local_llm import LocalLLMEngine
+        from local_llm_engine import EngineProcess as LocalLLMEngine  # 拆分后引擎类
         eng = LocalLLMEngine.__new__(LocalLLMEngine)
         eng._explicit_stop = False
         eng._auto_reloading = True
@@ -565,7 +565,7 @@ class TestGetApiUrlNeverEmpty(unittest.TestCase):
     """修复 1：端口活但引擎不健康时，get_api_url 不得返回空串。"""
 
     def _eng(self):
-        from local_llm import LocalLLMEngine
+        from local_llm_engine import EngineProcess as LocalLLMEngine  # 拆分后引擎类
         eng = LocalLLMEngine.__new__(LocalLLMEngine)
         eng.server_port = 1235
         eng._external_engine = ""
@@ -574,7 +574,7 @@ class TestGetApiUrlNeverEmpty(unittest.TestCase):
         return eng
 
     def test_unhealthy_engine_returns_url(self):
-        from local_llm import LocalLLMEngine
+        from local_llm_engine import EngineProcess as LocalLLMEngine  # 拆分后引擎类
         eng = self._eng()
         eng._probe_port = lambda port, timeout=1: True
         eng.ensure_engine_healthy = lambda force=False: False  # 已处置完（内部已杀+重载）
@@ -583,7 +583,7 @@ class TestGetApiUrlNeverEmpty(unittest.TestCase):
         self.assertTrue(url.startswith("http://"))  # 有协议，不再 UnsupportedProtocol
 
     def test_healthy_engine_returns_url(self):
-        from local_llm import LocalLLMEngine
+        from local_llm_engine import EngineProcess as LocalLLMEngine  # 拆分后引擎类
         eng = self._eng()
         eng._probe_port = lambda port, timeout=1: True
         eng.ensure_engine_healthy = lambda force=False: True
@@ -599,14 +599,14 @@ class TestEngineStateRestoreValidation(unittest.TestCase):
 
     def setUp(self):
         import tempfile
-        from local_llm import LocalLLMEngine
+        from local_llm_engine import EngineProcess as LocalLLMEngine  # 拆分后引擎类
         self._tmp = tempfile.TemporaryDirectory()
         LocalLLMEngine._engine_state_file = (
             __import__("pathlib").Path(self._tmp.name) / ".engine_state.json")
         self.addCleanup(self._tmp.cleanup)
 
     def _eng(self):
-        from local_llm import LocalLLMEngine
+        from local_llm_engine import EngineProcess as LocalLLMEngine  # 拆分后引擎类
         eng = LocalLLMEngine.__new__(LocalLLMEngine)
         eng.current_model_id = ""
         eng.current_model_name = ""
@@ -615,7 +615,7 @@ class TestEngineStateRestoreValidation(unittest.TestCase):
         return eng
 
     def test_fake_slash_path_discarded(self):
-        from local_llm import LocalLLMEngine
+        from local_llm_engine import EngineProcess as LocalLLMEngine  # 拆分后引擎类
         eng = self._eng()
         eng.current_model_id = "/models/test-35b"
         eng.current_model_name = "test"
@@ -629,7 +629,7 @@ class TestEngineStateRestoreValidation(unittest.TestCase):
 
     def test_real_path_restored(self):
         import os
-        from local_llm import LocalLLMEngine
+        from local_llm_engine import EngineProcess as LocalLLMEngine  # 拆分后引擎类
         real = os.path.join(self._tmp.name, "m.gguf")
         open(real, "w").close()
         eng = self._eng()

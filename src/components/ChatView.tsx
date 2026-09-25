@@ -4,6 +4,8 @@ import { useTranslation } from "../i18n";
 import { loadedMismatch } from "../utils/modelSelection";
 import RunMetrics from "./RunMetrics";
 import ToolCallBubble from "./ToolCallBubble";
+import { FileEditCard, ToolActivityCard, SubagentRow } from "./TurnCards";
+import type { PreviewItem } from "./PreviewPanel";
 import ToolbarSelect from "./ToolbarSelect";
 import {
   Eye, ShieldCheck, PencilRuler, ListChecks, Zap, CircleOff, Circle, Brain, BrainCircuit,
@@ -57,18 +59,19 @@ const SyntaxHighlighter = lazy(async () => {
   ]);
   // 主题按 <html data-theme> 切换：深色用 oneDark、浅色用 oneLight，
   // 统一做扁平化（去面板背景/圆角/内边距，仅保留语法颜色）
-  const flatten = (src: Record<string, any>): Record<string, any> => {
-    const out = Object.fromEntries(
-      Object.entries(src).map(([k, v]) => [k, { ...(v as object), background: "transparent" }])
+  type PrismStyleMap = Record<string, import("react").CSSProperties>;
+  const flatten = (src: PrismStyleMap): PrismStyleMap => {
+    const out: PrismStyleMap = Object.fromEntries(
+      Object.entries(src).map(([k, v]) => [k, { ...v, background: "transparent" }])
     );
     out['pre[class*="language-"]'] = {
       ...(out['pre[class*="language-"]'] as object),
       background: "transparent", margin: 0, padding: 0, boxShadow: "none",
-    } as any;
+    };
     out['code[class*="language-"]'] = {
       ...(out['code[class*="language-"]'] as object),
       background: "transparent", boxShadow: "none", textShadow: "none",
-    } as any;
+    };
     return out;
   };
   const darkFlat = flatten(themes.oneDark);
@@ -117,7 +120,8 @@ interface ChatViewProps {
   sendMessage: () => void;
   handleFileSelect: (e: React.ChangeEvent<HTMLInputElement>) => void;
   startRecording: () => void;
-  confirmTool: (callId: string, approved: boolean) => void;
+  confirmTool: (callId: string, approved: boolean, always?: boolean) => void;
+  onPreview?: (item: PreviewItem) => void;
   /** 朗读一条回复（同一个 id 再点＝停止）。文本的 Markdown 剥离在 App 里统一做。 */
   onSpeak?: (text: string, id?: string) => void;
   speakingId?: string | null;
@@ -150,7 +154,7 @@ export default memo(function ChatView({
   messages, isProcessing, pendingFile, setPendingFile,
   prompt, setPrompt,
   fileInputRef, mediaRecorderRef, isRecording,
-  sendMessage, onStop, handleFileSelect, startRecording, confirmTool,
+  sendMessage, onStop, handleFileSelect, startRecording, confirmTool, onPreview,
   onSpeak, speakingId,
   chatEndRef, handleDrop, onPasteImage,
   cloudModels, selectedModel, onSelectModelAndLoad, engineStatus, sessionId,
@@ -263,11 +267,14 @@ export default memo(function ChatView({
   // 任务头部"已工作 X 分 X 秒"计时（isProcessing / 工具执行期间显示）
   const [elapsed, setElapsed] = useState(0);
   useEffect(() => {
-    if (!taskStartAt || (!isProcessing && !activeTask)) { setElapsed(0); return; }
+    if (!taskStartAt || (!isProcessing && !activeTask)) {
+      const id = setTimeout(() => setElapsed(0), 0);
+      return () => clearTimeout(id);
+    }
     const tick = () => setElapsed(Date.now() - taskStartAt);
-    tick();
     const iv = setInterval(tick, 1000);
-    return () => clearInterval(iv);
+    const id = setTimeout(tick, 0);
+    return () => { clearInterval(iv); clearTimeout(id); };
   }, [taskStartAt, isProcessing, activeTask]);
 
   // 时长格式化：<3s 显示"几秒"，长于 60s 显示"X 分 X 秒"
@@ -284,19 +291,7 @@ export default memo(function ChatView({
     const flat = line.replace(/\s+/g, " ").trim();
     return flat.length > 80 ? flat.slice(0, 80) + "…" : flat;
   };
-  // 工具行摘要：run_cmd→command/description，搜索→query/pattern/url，文件→path，其他→args 前 60 字
-  const toolSummary = (m: Message) => {
-    const a = (m.toolArgs || {}) as Record<string, unknown>;
-    const pick = (k: string) => (typeof a[k] === "string" || typeof a[k] === "number") ? String(a[k]) : "";
-    let s = "";
-    if (m.toolName === "run_cmd" || m.toolName === "control_launch") s = pick("command") || pick("description");
-    else if (["web_search", "bing_search", "tavily_search", "search_files"].includes(m.toolName || "")) s = pick("query") || pick("pattern") || pick("url");
-    else if (["read_file", "write_file", "list_dir", "open_folder", "open_app", "control_process_log"].includes(m.toolName || "")) s = pick("path") || pick("directory") || pick("app") || pick("pattern");
-    else if (m.toolName === "mx_query" || m.toolName === "ak_finance") s = pick("query") || pick("index");
-    if (!s) s = JSON.stringify(a || {}).slice(0, 60);
-    s = s.replace(/\s+/g, " ").trim();
-    return s.length > 80 ? s.slice(0, 80) + "…" : s;
-  };
+  // 工具行摘要（TurnCards.argSummary 已覆盖；保留 toolSummary 会 unused —— 已删）
 
   // ── 对话分段（ZCode 式：一次对话 = 一张卡片，头部显示耗时）──
   // 每轮顺序固定为 [user, tool…, assistant]（App.tsx 已保证插入位置）；
@@ -511,7 +506,10 @@ export default memo(function ChatView({
             <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
               <span style={{ fontWeight: 700, fontSize: 14 }}>{subagentDetail.agent === "explore" ? "🔍" : "🤖"} {t("chat.subagent_detail")}</span>
               <span style={{ fontSize: 11, color: subagentDetail.status === "error" ? "var(--danger)" : subagentDetail.status === "done" ? "var(--success)" : "var(--warning)", marginLeft: "auto" }}>
-                {subagentDetail.status === "running" ? t("chat.status_running") : subagentDetail.status === "done" ? t("chat.status_done") : t("chat.status_failed")}
+                {subagentDetail.status === "running" ? t("chat.status_running")
+                  : subagentDetail.status === "done" ? t("chat.status_done")
+                  : String(subagentDetail.summary || "").includes("中断") ? t("chat.status_stopped")
+                  : t("chat.status_failed")}
               </span>
               {subagentDetail.status !== "running" && (
                 <button className="btn btn-sm btn-ghost" style={{ color: "var(--danger)", padding: "2px 8px" }}
@@ -668,33 +666,35 @@ export default memo(function ChatView({
                 </details>
               )}
               {!collapsed && planMsgs.map((m, i) => renderMsg(m, i))}
-              {!collapsed && catGroups.map((g, gi) => {
-                const Icon = g.icon;
-                // 执行中/待确认的调用必须直接露出卡片（旋转指示/确认按钮），不折叠
-                const needsDirect = g.msgs.some((m) => m.toolStatus === "running" || m.toolStatus === "confirming");
-                if (needsDirect) {
-                  return (
-                    <div key={`cg${gi}`} style={{ margin: "2px 0" }}>
-                      {g.msgs.map((m) => <ToolCallBubble key={m.id} msg={m} onConfirm={confirmTool} />)}
-                    </div>
-                  );
-                }
-                const gSummary = toolSummary(g.msgs[0]);
+              {!collapsed && (() => {
+                const doneTools = toolMsgs.filter((m) => m.toolStatus === "done");
+                const activeTools = toolMsgs.filter((m) => m.toolStatus === "running" || m.toolStatus === "confirming" || m.toolStatus === "error");
+                const editMsgs = doneTools.filter((m) => m.toolName === "write_file");
+                const delegates = toolMsgs.filter((m) => m.toolName === "delegate_task");
+                const activityMsgs = doneTools.filter((m) => m.toolName !== "write_file" && m.toolName !== "delegate_task");
                 return (
-                  <details key={`cg${gi}`} className="tool-group-row">
-                    <summary className="tool-group-row-head">
-                      <span className="tool-call-icon"><Icon size={14} /></span>
-                      <span className="tool-call-name">{g.verb}</span>
-                      <span className="tool-group-row-meta">· {g.msgs.length} {t(g.noun)}</span>
-                      {gSummary && <span className="tool-group-row-summary">· {gSummary}</span>}
-                      <span className="tool-group-row-chevron"><ChevronDown size={12} /></span>
-                    </summary>
-                    <div className="tool-group-row-body">
-                      {g.msgs.map((m) => <ToolCallBubble key={m.id} msg={m} onConfirm={confirmTool} />)}
-                    </div>
-                  </details>
+                  <>
+                    {delegates.map((m) => {
+                      const a = (m.toolArgs || {}) as Record<string, unknown>;
+                      return (
+                        <SubagentRow
+                          key={m.id || String(a.task)}
+                          agent={String(a.agent || "explore")}
+                          task={String(a.task || "")}
+                          status={m.toolStatus === "done" ? "done" : m.toolStatus === "error" ? "error" : "running"}
+                        />
+                      );
+                    })}
+                    {editMsgs.length > 0 && (
+                      <FileEditCard msgs={editMsgs} onPreview={onPreview} onUndo={() => showToast(t("cards.undo_hint"), "warn")} />
+                    )}
+                    {activityMsgs.length > 0 && <ToolActivityCard msgs={activityMsgs} />}
+                    {activeTools.map((m) => (
+                      <ToolCallBubble key={m.id} msg={m} sessionId={sessionId} onConfirm={confirmTool} />
+                    ))}
+                  </>
                 );
-              })}
+              })()}
               {!collapsed && answerMsgs.map((m, i) => renderMsg(m, i))}
             </div>
           );

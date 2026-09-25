@@ -2,18 +2,21 @@ import { useState, useRef, useEffect, useCallback } from "react";
 import { fetch } from "@tauri-apps/plugin-http";
 import { invoke } from "@tauri-apps/api/core";
 import logoUrl from "./assets/logo.png";
-import type { Message, PendingFile, SessionInfo, ViewId, CloudModel, DownloadState, HFModelResult, LLMStatus } from "./types";
-import { parseSSEDataLine } from "./utils/sse";
-import { resolveStopTarget } from "./utils/sessionTarget";
+import type { Message, PendingFile, SessionInfo, ViewId, CloudModel } from "./types";
 import { saveSessionsWithFallback } from "./utils/storage";
 import { needsEngineLoad } from "./utils/modelSelection";
-import { localVoicesForLang, pickVoice, speechSupported, splitSentences, stripForSpeech, voicesForLang } from "./utils/speech";
+import { localVoicesForLang, speechSupported, voicesForLang } from "./utils/speech";
 // API keys stored in OS keychain via Rust commands (store_secret/get_secret/delete_secret)
 import { useSessions } from "./hooks/useSessions";
+import { useLocalLlm } from "./hooks/useLocalLlm";
+import { useChatStream } from "./hooks/useChatStream";
+import { useTts } from "./hooks/useTts";
 import { sidecarFetch, waitForSidecar, authFetch, uploadSidecarFile, uploadLocalPath } from "./utils/api";
 import { useTranslation } from "./i18n";
 import { useCronJobs } from "./hooks/useCronJobs";
 import ChatView from "./components/ChatView";
+import PreviewPanel from "./components/PreviewPanel";
+import type { PreviewItem } from "./components/PreviewPanel";
 import ModelsView from "./components/ModelsView";
 import ToolsView from "./components/ToolsView";
 import CronView from "./components/CronView";
@@ -170,7 +173,6 @@ const [timeFilter, setTimeFilter] = useState("all");
   );
 
   const localVoicesShown = localVoicesForLang(ttsLocalVoices, ttsLocalVoiceLangs, lang, ttsLocalVoice);
-  const [speakingId, setSpeakingId] = useState<string | null>(null);
 
   // 权限模式五档（从保守到放手）：read_only / confirm / auto_edit / plan / full
   // 思考强度三档（🧠 选择器）：off / high(默认) / max
@@ -211,9 +213,6 @@ const [timeFilter, setTimeFilter] = useState("all");
   const [streamingThink, setStreamingThink] = useState<string>("");
   // 任务栈与中止控制器**按会话**存：A 在跑时切到 B，B 的工具栈/停止键不能
   // 受 A 影响，A 的流也不能被 B 的停止键打断（此前都是全局单值）
-  const taskStacksRef = useRef<Record<string, string[]>>({});
-  const taskStartsRef = useRef<Record<string, number>>({});
-  const abortControllersRef = useRef<Record<string, AbortController | null>>({});
   // 回合令牌（每个会话一个自增值）：旧流收尾时校验自己是否仍是该会话的当前回合，
   // 不是就不动状态（打断后立刻重发/两会话并发的状态互相踩）
   const turnSeqRef = useRef(0);
@@ -228,21 +227,31 @@ const [timeFilter, setTimeFilter] = useState("all");
   const setActiveViewRef = useRef(setActiveView);
   setActiveViewRef.current = setActiveView;
   const [pendingFile, setPendingFile] = useState<PendingFile | null>(null);
+  const [previewItem, setPreviewItem] = useState<PreviewItem | null>(null);
   const [isRecording, setIsRecording] = useState(false);
   const [cloudModels, setCloudModels] = useState<CloudModel[]>([]);
   const [cloudModelsLoaded, setCloudModelsLoaded] = useState(false);
 
-  // Load cloud models from OS keychain
+  // Load cloud models from sidecar config（密钥代理化：只回 has_key，明文不进 webview）
+  // 必须拿到一次成功 GET 才置 loaded——否则冷启动 GET 失败 → 空表落盘 effect
+  // 会把 config.json 里的云端模型连 key 整表清掉（2026-09-24 审计 P0-1）。
   useEffect(() => {
+    let alive = true;
     (async () => {
       try {
-        const fromKeychain = await invoke("get_secret", { key: "cloud_models" }).catch(() => null) as string | null;
-        if (fromKeychain) {
-          setCloudModels(JSON.parse(fromKeychain));
+        const { sidecarFetchWithRetry } = await import("./utils/api");
+        const data = await sidecarFetchWithRetry("/v1/settings/cloud-models", "GET", undefined, 5);
+        if (!alive) return;
+        if (data?.status === "ok" && Array.isArray(data.models)) {
+          setCloudModels((data.models as { name: string; endpoint: string; protocol?: string; has_key?: boolean; max_tokens?: number }[]).map((m) => ({
+            name: m.name, endpoint: m.endpoint, protocol: m.protocol || "openai",
+            has_key: !!m.has_key, key: "", max_tokens: m.max_tokens || 32768,
+          })));
+          setCloudModelsLoaded(true);
         }
-      } catch { /* ignore */ }
-      setCloudModelsLoaded(true);
+      } catch { /* 未成功加载则保持 loaded=false，禁止空表回写 */ }
     })();
+    return () => { alive = false; };
   }, []);
   const [newCloudModel, setNewCloudModel] = useState<CloudModel>({ name: "", key: "", endpoint: "", protocol: "openai", max_tokens: 32768 });
   const [showAdvanced, setShowAdvanced] = useState(false);
@@ -288,7 +297,6 @@ const [timeFilter, setTimeFilter] = useState("all");
   const [routeInfo, setRouteInfo] = useState<{ engine: string; declaredModel: string } | null>(null);
   const [activeAgent, setActiveAgent] = useState<string>("latiao");
   const [capabilities, setCapabilities] = useState<Capability[]>([]);
-  const [localLLMStatus, setLocalLLMStatus] = useState<LLMStatus>({ backend: "", status: "checking", model_id: "", model_name: "", port: 1235, message: "", has_image_support: false, token_limit: 32768 });
 
   // Sync theme to document.documentElement so CSS variables cascade correctly
   useEffect(() => {
@@ -304,8 +312,6 @@ const [timeFilter, setTimeFilter] = useState("all");
   const isRecordingRef = useRef(false);
   const transcribingRef = useRef(false);
   // 朗读：正在朗读的消息 id（再点一次＝停）+ 本地语音服务返回的音频元素
-  const speakingIdRef = useRef<string | null>(null);
-  const ttsAudioRef = useRef<HTMLAudioElement | null>(null);
   /* ── Persistence: debounce during SSE streaming, immediate otherwise ── */
   // 同步镜像（state 更新滞后于渲染，同 tick 的双击/回车必须靠 ref 判断）
   const processingRef = useRef<Record<string, boolean>>({});
@@ -368,20 +374,22 @@ const [timeFilter, setTimeFilter] = useState("all");
       chatEndRef.current?.scrollIntoView({ behavior: "auto", block: "end" });
     }, 60);
     return () => clearTimeout(timer);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentIdx, session.id]);
   // Persist cloud models to OS keychain (debounced to avoid writes on every keystroke)
   useEffect(() => {
     if (!cloudModelsLoaded) return;
+    // 防空表误清空：只有加载成功后的用户改动才落盘。空表 + 从未成功加载 = 禁止。
     const timer = setTimeout(async () => {
       try {
-        await invoke("store_secret", { key: "cloud_models", value: JSON.stringify(cloudModels) });
-        // 同步一份到 sidecar config.json：cron 定时任务/自动路由在后台运行，
-        // 拿不到每次请求携带的 cloud_config，必须从持久化配置读取。
-        // sidecar 冷启动可能尚未就绪 -> waitForSidecar 等待后重试
+        // 只写 sidecar config（空 key 由服务端沿用已存密钥）。不再整包写 keychain，
+        // 避免把全部 API key 以可读 JSON 再复制一份给 get_secret 回读。
         const { sidecarFetchWithRetry } = await import("./utils/api");
-        await sidecarFetchWithRetry("/v1/settings/cloud-models", "POST", { models: cloudModels }, 3);
-      } catch (e) { console.warn("Failed to persist cloud models to keychain", e); }
+        // 空表 = 用户删光了模型，必须显式 clear（后端拒绝无 clear 的整表清空）
+        await sidecarFetchWithRetry("/v1/settings/cloud-models", "POST", {
+          models: cloudModels,
+          clear: cloudModels.length === 0,
+        }, 3);
+      } catch (e) { console.warn("Failed to persist cloud models", e); }
     }, 1000);
     return () => clearTimeout(timer);
   }, [cloudModels, cloudModelsLoaded]);
@@ -432,13 +440,15 @@ const [timeFilter, setTimeFilter] = useState("all");
           setFetchDiag(d => `${d}, capabilities=${data.capabilities?.length || 0}`);
         }
         return; // success
-      } catch (e: any) {
+      } catch (e: unknown) {
         if (attempt === maxRetries - 1) {
-          setFetchDiag(t("app.sidecar_caps_error", { msg: String(e?.message || e), n: maxRetries }));
+          setFetchDiag(t("app.sidecar_caps_error", { msg: (e instanceof Error ? e.message : String(e)), n: maxRetries }));
         }
       }
     }
   };
+  // 启动拉一次能力表即可；t 随语言变化不值得重拉
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => { fetchCapabilities(); }, []);
 
   // Fetch recent logs (supplier for recovery panel)
@@ -469,12 +479,53 @@ const [timeFilter, setTimeFilter] = useState("all");
         } catch { /* still starting */ }
       }
       showToast(t("app.sidecar_restart_dead"));
-    } catch (e: any) {
-      showToast(t("app.sidecar_restart_fail", { msg: String(e?.message || e) }));
+    } catch (e: unknown) {
+      showToast(t("app.sidecar_restart_fail", { msg: (e instanceof Error ? e.message : String(e)) }));
     } finally {
       setRestartingSidecar(false);
     }
   };
+
+  // Fetch context estimate
+  const switchSession = (idx: number) => {
+    setCurrentIdx(idx);
+    setPendingFile(null);
+    setActiveView("chat");
+    // 活动栏/任务条先清空：下一个心跳会填回**该会话**自己的子任务
+    setSubagents([]);
+    // 切回会话时恢复**它自己**的阶段/任务显示（09-23 按会话隔离）：
+    // A 在后台跑、切到 B 再切回 A，顶部状态条要还是 A 的进度而不是 B 的残留
+    const target = sessions[idx];
+    if (target) {
+      const stack = taskStacksRef.current[target.id] || [];
+      setActiveTask(stack[stack.length - 1] || null);
+      setTaskStartAt(taskStartsRef.current[target.id] || null);
+      setStreamingThink("");
+      setAgentPhase(processingRef.current[target.id] ? t("agent.phase_analyze") : "");
+    }
+  };
+  const deleteSession = (idx: number) => {
+    // 复用 hook 的 newSession()（crypto.randomUUID）：此前这里另起一套
+    // Math.random().substring(7) 低熵 id（约 20-30 bit）——会话 id 是消息写入、
+    // 取消请求、进度文件的定位键，碰撞即跨会话串话（审计 A2）
+    setSessions((prev) => {
+      const next = prev.filter((_, i) => i !== idx);
+      if (next.length === 0) return [newSession()];
+      return next;
+    });
+    // 删掉的是正在查看的会话时，把查看位置挪到存在的会话上
+    if (currentIdx >= idx) setCurrentIdx((c) => Math.max(0, c - 1));
+  };
+  /* ── Toast ── */
+  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showToast = useCallback((msg: string, type?: string) => {
+    setToast(msg);
+    setToastType(type || "info");
+    // Clear any previous auto-dismiss timer so a new toast isn't cut short
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    toastTimerRef.current = setTimeout(() => setToast(null), 2200);
+  }, []);
+
 
   // Unified heartbeat: sidecar status + downloads + learnings
   useEffect(() => {
@@ -539,268 +590,36 @@ const [timeFilter, setTimeFilter] = useState("all");
     tick();
     const interval = setInterval(tick, 5000);
     return () => clearInterval(interval);
+    // 5s 心跳只挂一次：t/showToast 等变化不重置 interval（会漏检/双跑）
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const [localModelId, setLocalModelId] = useState("");
-  const [setupCheck, setSetupCheck] = useState<{ready: boolean; ok: {item: string; status: string}[]; issues: {item: string; status: string; fix: string}[]} | null>(null);
-  const [hfSearch, setHfSearch] = useState("");
-  const [hfResults, setHfResults] = useState<HFModelResult[]>([]);
-  const [searching, setSearching] = useState(false);
-  const [downloadProgress, setDownloadProgress] = useState<Record<string, DownloadState>>({});
-  // Mirror for the poll loop: lets the interval check current progress without
-  // re-subscribing on every state change.
-  const downloadProgressRef = useRef(downloadProgress);
-  downloadProgressRef.current = downloadProgress;
-  const [fixing, setFixing] = useState("");
-  const [contextLimit, setContextLimit] = useState(8192);
-  const [contextEstimate, setContextEstimate] = useState<{max_context: number; recommended_context: number; ram_available_gb: number; memory_for_context_gb: number} | null>(null);
+  const {
+    localModelId, setLocalModelId, setupCheck, fixing, runFix,
+    hfSearch, setHfSearch, hfResults, searching, searchHF,
+    downloadProgress, downloadModel, pauseDownload, resumeDownload, cancelDownload,
+    contextLimit, contextEstimate, fetchContextEstimate, updateContextLimit,
+    localLLMStatus, setLocalLLMStatus, startLocalLLM, stopLocalLLM,
+  } = useLocalLlm({ showToast, t, setSelectedModel });
 
-  // Fetch context estimate
-  const fetchContextEstimate = async (modelPath?: string) => {
-    try {
-      const params = modelPath ? `?model_path=${encodeURIComponent(modelPath)}` : "";
-      const resp = await authFetch("/v1/local-llm/estimate-context" + params);
-      const data = await resp.json();
-      if (data.max_context) setContextEstimate(data);
-      if (data.current_context) {
-        setContextLimit(data.current_context);
-        contextLimitCommittedRef.current = data.current_context;
-      }
-    } catch { /* ignore */ }
-  };
-  useEffect(() => { fetchContextEstimate(); }, []);
-
-  // Set context limit — local state updates immediately (smooth slider), the
-  // POST is debounced 300ms, and a failed POST rolls back to the last value the
-  // server actually accepted.
-  const contextLimitCommittedRef = useRef(contextLimit);
-  const contextLimitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const updateContextLimit = (limit: number) => {
-    setContextLimit(limit);
-    if (contextLimitTimerRef.current) clearTimeout(contextLimitTimerRef.current);
-    contextLimitTimerRef.current = setTimeout(async () => {
-      try {
-        const resp = await authFetch("/v1/local-llm/context-limit", {
-          method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ limit }),
-        });
-        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-        contextLimitCommittedRef.current = limit;
-      } catch {
-        setContextLimit(contextLimitCommittedRef.current);
-      }
-    }, 300);
-  };
-  useEffect(() => () => { if (contextLimitTimerRef.current) clearTimeout(contextLimitTimerRef.current); }, []);
-
-  // Fetch setup check on mount
-  const fetchSetup = () => {
-    authFetch("/v1/local-llm/setup").then(r => r.json()).then(d => setSetupCheck(d)).catch((e) => console.warn("Setup check failed", e));
-  };
-  useEffect(() => { fetchSetup(); }, []);
-
-  const runFix = async (fixType: string, fixPkg: string) => {
-    setFixing(fixPkg);
-    try {
-      const resp = await authFetch("/v1/local-llm/fix", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ fix_type: fixType, fix_pkg: fixPkg }),
-      });
-      const data = await resp.json();
-      showToast(data.status === "ok" ? t("toast.fix_ok") : (data.message || t("toast.fix_fail")));
-      // Re-run setup check after fix
-      setTimeout(fetchSetup, 2000);
-    } catch (e) { console.error(e); showToast(t("toast.fix_req_fail")); }
-    setFixing("");
-  };
-
-  // ── Download progress polling (like LM Studio) ──
-  // Single writer for downloadProgress. Always fetches once on mount; the 2s
-  // interval only keeps polling while at least one download is in progress.
-  useEffect(() => {
-    const poll = async () => {
-      try {
-        const resp = await authFetch("/v1/local-llm/downloads", { signal: AbortSignal.timeout(5000) });
-        const data = await resp.json();
-        if (data.status === "ok" && Array.isArray(data.downloads)) {
-          const progress: Record<string, DownloadState> = {};
-          for (const dl of data.downloads as (DownloadState & { name?: string })[]) {
-            const key = dl.model_id || dl.name || JSON.stringify(dl).slice(0, 40);
-            if (key) progress[key] = dl;
-          }
-          setDownloadProgress(progress);
-        }
-      } catch { /* ignore poll errors */ }
-    };
-    poll();
-    const interval = setInterval(() => {
-      const active = Object.values(downloadProgressRef.current).some((d) => d.status === "downloading");
-      if (active) poll();
-    }, 2000);
-    return () => clearInterval(interval);
-  }, []);
-
-  // Monotonic request id so only the latest search response is applied
-  const searchReqRef = useRef(0);
-  const searchHF = useCallback(async (query?: string, library?: string) => {
-    const q = query ?? hfSearch;
-    const reqId = ++searchReqRef.current;
-    setSearching(true);
-    try {
-      const libParam = library ? `&library=${encodeURIComponent(library)}` : "";
-      const resp = await authFetch(`/v1/local-llm/search?q=${encodeURIComponent(q)}&limit=30${libParam}`, { signal: AbortSignal.timeout(5000) });
-      const data = await resp.json();
-      if (reqId === searchReqRef.current && data.status === "ok") setHfResults(data.results);
-    } catch (e) { console.error(e) }
-    if (reqId === searchReqRef.current) setSearching(false);
-  }, [hfSearch]);
-
-  // Auto-search with debounce as user types
-  useEffect(() => {
-    if (!hfSearch.trim()) { setHfResults([]); return; }
-    const timer = setTimeout(() => searchHF(hfSearch), 400);
-    return () => clearTimeout(timer);
-  }, [hfSearch, searchHF]);
-
-  const downloadModel = async (modelId: string) => {
-    showToast(t("toast.dl_start", { name: modelId.split("/").pop() || modelId }));
-    try {
-      const resp = await authFetch("/v1/local-llm/download", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model_id: modelId }),
-      });
-      const data = await resp.json();
-      if (data.status === "ok") {
-        // Immediately fetch downloads to show UI feedback
-        const dlResp = await authFetch("/v1/local-llm/downloads");
-        const dlData = await dlResp.json();
-        if (dlData.status === "ok" && Array.isArray(dlData.downloads)) {
-          const progress: Record<string, DownloadState> = {};
-          for (const dl of dlData.downloads as (DownloadState & { name?: string })[]) {
-            const key = dl.model_id || dl.name || JSON.stringify(dl).slice(0, 40);
-            if (key) progress[key] = dl;
-          }
-          setDownloadProgress(prev => ({ ...prev, ...progress }));
-        }
-      } else {
-        showToast(t("toast.dl_fail") + ": " + (data.message || ""));
-      }
-    } catch (e) { console.error(e); showToast(t("toast.dl_fail")); }
-  };
-
-  const pauseDownload = async (modelId: string) => {
-    try {
-      await authFetch("/v1/local-llm/download/pause", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model_id: modelId }),
-      });
-    } catch { showToast(t("app.backend_no_reply"), "warn"); }
-  };
-
-  const resumeDownload = async (modelId: string) => {
-    try {
-      await authFetch("/v1/local-llm/download/resume", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model_id: modelId }),
-      });
-    } catch { showToast(t("app.backend_no_reply"), "warn"); }
-  };
-
-  const cancelDownload = async (modelId: string) => {
-    try {
-      await authFetch("/v1/local-llm/download/cancel", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model_id: modelId }),
-      });
-    } catch { showToast(t("app.backend_no_reply"), "warn"); }
-  };
-
-  // 注意：selectModelAndLoad 依赖它，声明顺序保持在前面
-  const startLocalLLM = async (modelId?: string) => {
-    const mid = (modelId || localModelId).trim();
-    if (!mid) { showToast(t("toast.need_model_id")); return; }
-    if (modelId) setLocalModelId(modelId);
-    try {
-      setLocalLLMStatus(prev => ({ ...prev, status: "starting", message: t("toast.starting") }));
-      const resp = await authFetch("/v1/local-llm/start", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model_id: mid }),
-      });
-      const data = await resp.json();
-      // 引擎忙（别的会话正在用本地模型）：不动状态卡，只提示——切换会让那些会话断流
-      if (data.code === "engine_busy") {
-        showToast(String(data.message || t("toast.start_fail", { msg: "" })), "warn");
-        return;
-      }
-      setLocalLLMStatus(data);
-      if (data.status === "running") {
-        showToast(t("toast.started", { model: data.model_name }));
-        setSelectedModel(mid);
-      } else showToast(t("toast.start_fail", { msg: data.message }));
-    } catch (e) { console.error(e); showToast(t("toast.conn_fail")); }
-  };
-
-  const stopLocalLLM = async () => {
-    try {
-      const resp = await authFetch("/v1/local-llm/stop", { method: "POST" });
-      const data = await resp.json();
-      // 引擎忙：后端拒绝停止（有回合正在用），照实提示，别谎报"已停止"
-      if (data.code === "engine_busy") {
-        showToast(String(data.message || ""), "warn");
-        return;
-      }
-      setLocalLLMStatus(data);
-      // Restore the default UI after unloading: clear the model-id input and
-      // drop the local model selection in chat so the next message routes
-      // through auto-routing/cloud instead of a stopped local server.
-      if (data.status !== "running") {
-        setLocalModelId("");
-        setSelectedModel("");
-      }
-      showToast(t("toast.stopped"));
-    } catch (e) { console.error(e) }
-  };
+  const {
+    streamChat, confirmTool, stopGeneration,
+    taskStacksRef, taskStartsRef, abortControllersRef,
+  } = useChatStream({
+    t, showToast, cloudModels, session, sessionIdRef,
+    setMessages, setMessagesFor, setStreamingThink, setAgentPhase,
+    setActiveTask, setTaskStartAt, setRouteInfo, setProcessing, processingRef,
+    reflectionMode, accessMode, thinkingLevel,
+  });
 
 
 
-  /* ── Session Management ── */
-  const switchSession = (idx: number) => {
-    setCurrentIdx(idx);
-    setPendingFile(null);
-    setActiveView("chat");
-    // 活动栏/任务条先清空：下一个心跳会填回**该会话**自己的子任务
-    setSubagents([]);
-    // 切回会话时恢复**它自己**的阶段/任务显示（09-23 按会话隔离）：
-    // A 在后台跑、切到 B 再切回 A，顶部状态条要还是 A 的进度而不是 B 的残留
-    const target = sessions[idx];
-    if (target) {
-      const stack = taskStacksRef.current[target.id] || [];
-      setActiveTask(stack[stack.length - 1] || null);
-      setTaskStartAt(taskStartsRef.current[target.id] || null);
-      setStreamingThink("");
-      setAgentPhase(processingRef.current[target.id] ? t("agent.phase_analyze") : "");
-    }
-  };
-  const deleteSession = (idx: number) => {
-    // 复用 hook 的 newSession()（crypto.randomUUID）：此前这里另起一套
-    // Math.random().substring(7) 低熵 id（约 20-30 bit）——会话 id 是消息写入、
-    // 取消请求、进度文件的定位键，碰撞即跨会话串话（审计 A2）
-    setSessions((prev) => {
-      const next = prev.filter((_, i) => i !== idx);
-      if (next.length === 0) return [newSession()];
-      return next;
-    });
-    // 删掉的是正在查看的会话时，把查看位置挪到存在的会话上
-    if (currentIdx >= idx) setCurrentIdx((c) => Math.max(0, c - 1));
-  };
-  /* ── Toast ── */
-  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const showToast = useCallback((msg: string, type?: string) => {
-    setToast(msg);
-    setToastType(type || "info");
-    // Clear any previous auto-dismiss timer so a new toast isn't cut short
-    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
-    toastTimerRef.current = setTimeout(() => setToast(null), 2200);
-  }, []);
+  const { speakingId, speak } = useTts({
+    showToast, t, ttsEnabled, ttsRate, ttsVoice, ttsTimeoutMs,
+    ttsLocalVoices, ttsLocalVoice, ttsPitch, ttsEmotion, ttsVoices, lang, session,
+  });
+
+
 
   // 选模型 = 顺带加载（2026-09-23 用户要求）：下拉选中的与会话标签是两回事，
   // 只改标签不切换引擎 → 实际还是旧模型在回答（"对话框显示的模型和引擎里装的不一样"）。
@@ -828,12 +647,13 @@ const [timeFilter, setTimeFilter] = useState("all");
     const res = await checkForUpdates((key, params) => showToast(t(key, params)), !silent);
     setCheckingUpdate(false);
     if (!silent && res === "none") showToast(t("update.uptodate"));
-  }, [checkingUpdate, showToast]);
+  }, [checkingUpdate, showToast, t]);
   useEffect(() => {
     import("./utils/updater").then(({ getAppVersion }) => {
-      getAppVersion().then(setAppVersion).catch(() => setAppVersion("0.3.17"));
-    }).catch(() => setAppVersion("0.3.17"));
+      getAppVersion().then(setAppVersion).catch(() => setAppVersion("…"));
+    }).catch(() => setAppVersion("…"));
     if (autoCheckUpdate) runUpdateCheck(true);
+    // 挂载时查一次版本/更新；runUpdateCheck 内部自管 checkingUpdate
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -841,442 +661,6 @@ const [timeFilter, setTimeFilter] = useState("all");
   const { cronJobs, newCron, setNewCron, addCronJob, toggleCronJob, deleteCronJob, runCronJob } = useCronJobs(showToast);
 
   /* ── Stream Chat (preserved from original) ── */
-  const streamChat = async (
-    messages: Record<string, unknown>[],
-    opts?: { model?: string; agent?: string; cloudConfig?: Record<string, unknown>; skipTools?: boolean; sessionId?: string },
-    signal?: AbortSignal,
-  ): Promise<string> => {
-    // 本轮流的目标会话在**发起时**固化（09-23 并发隔离）：用户中途切到别的
-    // 会话时，消息写入仍落到本会话；显示类状态（思考/阶段/任务条）只在
-    // "正在看的就是本会话"时更新，避免 A 的流在 B 的界面上闪现（混会话）。
-    const targetId = opts?.sessionId || session.id;
-    const viewed = () => sessionIdRef.current === targetId;
-    const writeMessages = (fn: (prev: Message[]) => Message[]) =>
-      (opts?.sessionId ? setMessagesFor(targetId, fn) : setMessages(fn));
-    const showThink = (v: string) => { if (viewed()) setStreamingThink(v); };
-    const showPhase = (v: string) => { if (viewed()) setAgentPhase(v); };
-    const myStack = () => {
-      if (!taskStacksRef.current[targetId]) taskStacksRef.current[targetId] = [];
-      return taskStacksRef.current[targetId];
-    };
-    const showStackTop = () => {
-      if (viewed()) setActiveTask(taskStacksRef.current[targetId]?.slice(-1)[0] || null);
-    };
-
-    const body: Record<string, unknown> = { messages, stream: true, reflection_mode: reflectionMode, access_mode: accessMode, thinking_level: thinkingLevel };
-    // 传 session_id：后端记忆/停滞检测按会话归档（P0-2）
-    if (opts?.sessionId) body.session_id = opts.sessionId;
-    if (opts?.model) body.model = opts.model;
-    if (opts?.agent) body.agent = opts.agent;
-    if (opts?.cloudConfig) body.cloud_config = opts.cloudConfig;
-    if (opts?.skipTools) body.skip_tools = true;
-
-    let response: Response;
-    try {
-      response = await authFetch("/v1/chat/completions", {
-        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal,
-      });
-    } catch (e) {
-      throw new Error(t("app.sidecar_unreachable", { err: String(e) }), { cause: e });
-    }
-    if (!response.ok || !response.body) throw new Error(`HTTP ${response.status}`);
-
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "", full = "";
-
-    // 流式渲染节流：内容/思考按 120ms 批量落盘。每条 token 都 setMessages 会
-    // 让长会话（大量 ReactMarkdown）全量重渲染占满主线程——停止按钮点击排队
-    // 等不到主线程，"停止没反应"的根因。
-    let flushTimer: ReturnType<typeof setTimeout> | null = null;
-    let pendingThinking = "";
-    // 思考起始时间戳：流式期间只攒不发（防"思考闪现多次"），[DONE] 定稿时
-    // 一次性附着到助手消息并结算耗时（09-21 用户反馈：思考应只在折叠栏里）。
-    let thinkingStartedAt = 0;
-    // reflection_revised 已把最终文本写入消息；此后 [DONE]/finally 的 flushStream
-    // 若再跑，prefix 检查不匹配会把 revised 文本重复 push 一条（M1 复发）。
-    let streamFinalized = false;
-    // 定稿后允许最后一次 flush（附着思考），此后不再跑（M1 防重复保护）
-    let thinkingAttached = false;
-    // 流式期思考实时预览节流（09-21 22:48：本地慢生成前端完全静默——每 ≥10s
-    // 写一次"前 120 字…"，既让用户看到"在思考"，又不"闪现内容不同"）
-    let lastThinkingFlush = 0;
-    let lastThinkPropFlush = 0;
-    // 当前 agent 轮次（round_start 事件；09-05 23:52：多轮拉锯黑盒化）
-    let currentRound = 0;
-    const flushStream = () => {
-      if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
-      if (streamFinalized && thinkingAttached) return;
-      const text = full;
-      // 定稿后才附着思考：流式期间正文照常更新，思考攒着不闪现
-      const th = streamFinalized ? pendingThinking : "";
-      if (streamFinalized) pendingThinking = "";
-      // 运行中 Think 行实时摘要（独立轻量 state，800ms 节流——只重渲染
-      // 活动行，不打全量消息列表；定稿后清空，行数据交回消息 thinking 字段）
-      if (!streamFinalized && pendingThinking) {
-        if (Date.now() - lastThinkPropFlush >= 800) {
-          lastThinkPropFlush = Date.now();
-          showThink(pendingThinking);
-        }
-      } else if (streamFinalized) {
-        showThink("");
-      }
-      // 非定稿 + 有思考 + 未到节流窗口：跳过空写（避免每 120ms 重渲染）
-      const livePreview = !streamFinalized && pendingThinking !== ""
-        && Date.now() - lastThinkingFlush >= 10_000;
-      if (!text && !th && !livePreview) return;
-      writeMessages((prev) => {
-        const msgs = [...prev];
-        const last = msgs[msgs.length - 1];
-        if (last?.role === "assistant") {
-          if (text && last.content && !text.startsWith(last.content)) {
-            // 已有内容的 assistant（如 📋 执行计划）：正文另起新消息，不覆盖
-            msgs.push({ id: msgId(), role: "assistant", content: text, thinking: th || undefined, round: currentRound || undefined, ts: Date.now() });
-          } else {
-            const updated: Message = { ...last };
-            updated.round = currentRound || undefined;
-            if (th) {
-              updated.thinking = (last.thinking || "") + th;
-              // 思考耗时按真实起止结算（附着发生在定稿时）
-              updated.thinkingDuration = thinkingStartedAt
-                ? Math.max(0, Date.now() - thinkingStartedAt) : undefined;
-              thinkingStartedAt = 0;
-                        } else if (livePreview) {
-              // 09-20 修复：流式期**不再**把预览写进消息的 thinking 字段——
-              // 实时行（streamingThink）已经在显示同一段预览，双写会让用户看到
-              // 两条一模一样的"前 120 字 + …"（实测截图确认）。这里只更新计时。
-              lastThinkingFlush = Date.now();
-            }
-            if (text) updated.content = text;
-            msgs[msgs.length - 1] = updated;
-          }
-        } else if (text || th || livePreview) {
-          // 思考预览也创建消息（正文未到时可先占位；09-21 22:48：仅预览时
-          // 无 assistant 消息 → 预览无处挂载，前端 3 分钟无反应）
-          msgs.push({
-            id: msgId(), role: "assistant", content: text,
-            thinking: th || undefined,   // 09-20：预览不再双写（见上）
-            round: currentRound || undefined,
-            ts: Date.now(),
-          });
-        }
-        return msgs;
-      });
-    };
-    const scheduleFlush = () => {
-      if (!flushTimer) flushTimer = setTimeout(flushStream, 0);
-    };
-
-
-    // Inactivity watchdog: if the stream goes silent for too long (e.g. the
-    // local model server hangs on an unsupported request, or a tool call blocks
-    // without emitting events), abort so isProcessing always resets instead of
-    // leaving the red Stop button stuck forever. Reset on every received chunk.
-    const WATCHDOG_MS = 180_000;  // 本地模型 prefill 可能 60-100s 无数据，90s 会误断流
-    let watchdog: ReturnType<typeof setTimeout> | null = null;
-    let watchdogFired = false;
-    const armWatchdog = () => {
-      if (watchdog) clearTimeout(watchdog);
-      watchdog = setTimeout(() => {
-        watchdogFired = true;
-        try { reader.cancel("watchdog-timeout").catch(() => {}); } catch { /* noop */ }
-      }, WATCHDOG_MS);
-    };
-    const disarmWatchdog = () => { if (watchdog) { clearTimeout(watchdog); watchdog = null; } };
-    armWatchdog();
-
-    try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) {
-        // watchdog 触发的 cancel 会让 read() 以 done:true 正常结束——
-        // 若不当报错，截断的回答看起来像"自然结束"，用户无从分辨
-        if (watchdogFired) throw new Error(t("app.stream_timeout"));
-        break;
-      }
-      armWatchdog();
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop() || "";
-      for (const line of lines) {
-        {
-          const sse = parseSSEDataLine(line);
-          if (sse.kind === "skip") continue;
-          if (sse.kind === "done") { streamFinalized = true; flushStream(); thinkingAttached = true; return full; }
-          if (sse.kind === "error") throw new Error(sse.message);
-          try {
-            const parsed = sse.parsed;
-            try {
-              if (parsed.event === "engine_route") {
-                // P0 路由透明化：如实告知用户本请求实际落地的引擎，
-                // 避免"选了云端模型名却静默跑本地最慢路径"的误导。
-                const declared = String(parsed.declared_model || "");
-                const ended = parsed.engine === "cloud" ? "cloud" : "local";   // 稳定枚举，渲染处再翻译
-                const isLocalEngine = parsed.engine === "local";
-                // sendMessage 里云配置已由 opts.cloudConfig 传递；模型名虽被选择但
-                // 未匹配到云端配置 → 实际跑本地，正是要提醒用户的情形
-                const cloudCfgPre = opts?.model
-                  ? cloudModels.find((m) => m.name === opts.model)
-                  : undefined;
-                showPhase(t("agent.phase_analyze"));
-                if (isLocalEngine && declared && !cloudCfgPre) {
-                  // 本地模型选择是常态，不再弹窗打扰（09-04 用户反馈）——
-                  // 路由信息保留在日志/routeInfo 中以便排查
-                  console.info(`[route] 模型「${declared}」未在云端配置，实际运行在本地引擎`);
-                }
-                setRouteInfo({ engine: ended, declaredModel: declared });
-                continue;
-              }
-              if (parsed.event === "route_fallback") {
-                // 429 降级切换引擎（09-06：静默切换让用户以为还在用本地模型）
-                const fbLocal = Boolean(parsed.is_local);
-                const fbModel = String(parsed.declared_model || "");
-                setRouteInfo({ engine: fbLocal ? "local" : "cloud", declaredModel: fbModel });
-                showToast(String(parsed.message || t("app.model_switched")) + (fbModel ? ` (${fbModel})` : ""), "warn");
-                continue;
-              }
-              if (parsed.event === "engine_wait") {
-                // 多会话并行：本轮排在别的会话后面（后端闸门等待）。只在"正看这个
-                // 会话"时改状态，避免 A 的等待提示画到 B 的界面上。
-                showPhase(t("agent.phase_engine_wait"));
-                continue;
-              }
-              if (parsed.event === "round_start") {
-                // 轮次透明化（09-05 23:52：本地慢生成多轮拉锯时前端黑盒）
-                currentRound = Number(parsed.iteration) || currentRound;
-                flushStream();
-                continue;
-              }
-              if (parsed.event === "tool_confirm") {
-                flushStream();
-                showPhase(t("agent.phase_confirm", { tool: parsed.tool || "" }));
-                showToast(t("tool.confirm_toast", { tool: parsed.tool || "" }), "warn");
-                // 等待用户确认可能超过看门狗时限——确认期间暂停看门狗，
-                // 用户点允许/拒绝后 tool_start/tool_end 数据到达即自动恢复
-                disarmWatchdog();
-                writeMessages((prev) => {
-                  const msgs = [...prev];
-                  // 工具消息插到用户问题之后、思考/回答之前（保持 [user, tool, assistant] 顺序）
-                  const last = msgs[msgs.length - 1];
-                  const idx = last?.role === "assistant" ? msgs.length - 1 : msgs.length;
-                  msgs.splice(idx, 0, {
-                    id: msgId(), role: "tool", type: "tool_call", content: "",
-                    callId: parsed.call_id, toolName: parsed.tool, toolArgs: parsed.args, toolStatus: "confirming",
-                  });
-                  return msgs;
-                });
-              } else if (parsed.event === "agent_plan") {
-                flushStream();
-                // 规划模式：执行计划显示为一条消息
-                const plan = String(parsed.content ?? "");
-                if (plan.trim()) {
-                  writeMessages((prev) => [...prev, {
-                    id: msgId(), role: "assistant",
-                    content: `${t("app.plan_title")}\n\n${plan}`,
-                  }]);
-                }
-              } else if (parsed.event === "plan_confirm") {
-                // 计划确认门控：批准后才开始执行（后端在等这个 call_id 的决定）
-                flushStream();
-                disarmWatchdog();
-                showToast(t("tool.confirm_toast", { tool: t("app.plan_tool") }), "warn");
-                showPhase(t("agent.phase_confirm", { tool: t("app.plan_tool") }));
-                writeMessages((prev) => [...prev, {
-                  id: msgId(), role: "tool", type: "tool_call", content: "",
-                  callId: parsed.call_id, toolName: t("app.plan_tool"),
-                  toolArgs: parsed.args, toolStatus: "confirming",
-                }]);
-              } else if (parsed.event === "reflection_revised") {
-                flushStream();
-                // 输出反思修正：把最后一条 assistant 消息替换为修正版。
-                // 同步 full = revised，防止 [DONE] 时最终 flush 把修正前原文
-                // 又以新气泡重复显示（M1 复盘 bug）。
-                const revised = String(parsed.content ?? "");
-                if (revised.trim()) {
-                  full = revised;
-                  streamFinalized = true;
-                  thinkingAttached = true;
-                  thinkingAttached = true; // 后续 flush 不再跑（否则 revised 被重复 push）
-                  writeMessages((prev) => {
-                    const msgs = [...prev];
-                    for (let i = msgs.length - 1; i >= 0; i--) {
-                      if (msgs[i].role === "assistant" && msgs[i].content && msgs[i].content.trim()) {
-                        msgs[i] = { ...msgs[i], content: revised + "\n\n" + t("app.self_reviewed") };
-                        break;
-                      }
-                    }
-                    return msgs;
-                  });
-                }
-              } else if (parsed.event === "content_revised") {
-                // 追问续写轮：把最后一条 assistant 消息替换为当前累积文本。
-                // 与 reflection_revised 的区别：不加"已自查修正"角标。
-                flushStream();
-                const revised = String(parsed.content ?? "");
-                if (revised.trim()) {
-                  full = revised;
-                  streamFinalized = true;
-                  // 注意：不置 thinkingAttached——定稿时最后一次 flush 仍需附着思考
-                  writeMessages((prev) => {
-                    const msgs = [...prev];
-                    for (let i = msgs.length - 1; i >= 0; i--) {
-                      if (msgs[i].role === "assistant" && msgs[i].content && msgs[i].content.trim()) {
-                        msgs[i] = { ...msgs[i], content: revised };
-                        break;
-                      }
-                    }
-                    return msgs;
-                  });
-                }
-              } else if (parsed.event === "tool_start") {
-                flushStream();
-                // 工具执行期静默可超 180s（长命令/重载）：暂停看门狗，tool_end 再续（P0-4）
-                disarmWatchdog();
-                myStack().push(`${parsed.tool || ""} ${JSON.stringify(parsed.args || {}).slice(0, 60)}`);
-                showStackTop();
-                const startTs = Number(parsed.ts) || Date.now();
-                writeMessages((prev) => {
-                  const msgs = [...prev];
-                  const idx = msgs.findIndex((m) => m.callId === parsed.call_id && m.toolStatus === "confirming");
-                  if (idx !== -1) { msgs[idx] = { ...msgs[idx], toolStatus: "running", ts: startTs }; }
-                  else {
-                    const last = msgs[msgs.length - 1];
-                    const pos = last?.role === "assistant" ? msgs.length - 1 : msgs.length;
-                    msgs.splice(pos, 0, {
-                      id: msgId(), role: "tool", type: "tool_call", content: "",
-                      callId: parsed.call_id, toolName: parsed.tool, toolArgs: parsed.args, toolStatus: "running",
-                      ts: startTs,
-                    });
-                  }
-                  return msgs;
-                });
-              } else if (parsed.event === "tool_end") {
-                flushStream();
-                armWatchdog();  // 工具执行结束，恢复看门狗（P0-4）
-                myStack().pop();
-                showStackTop();
-                const rawResult = String(parsed.result ?? "");
-                const toolResult = rawResult.length > 10000
-                  ? rawResult.slice(0, 10000) + "\n\n" + t("app.truncated")
-                  : rawResult;
-                const isError = rawResult.startsWith("Error") || rawResult.startsWith("⛔");
-                const endTs = Number(parsed.ts) || Date.now();
-                writeMessages((prev) => {
-                  const msgs = [...prev];
-                  const idx = msgs.findIndex((m) => m.callId === parsed.call_id && (m.toolStatus === "running" || m.toolStatus === "confirming"));
-                  if (idx !== -1) {
-                    const base = msgs[idx];
-                    msgs[idx] = {
-                      ...base, toolResult, toolStatus: isError ? "error" : "done", content: toolResult,
-                      duration: base.ts ? Math.max(0, endTs - base.ts) : undefined,
-                    };
-                  }
-                  return msgs;
-                });
-              } else if (parsed.reasoning) {
-                // 思考内容：流式期间只攒不发（[DONE] 定稿时一次性附着，防闪现）
-                if (!thinkingStartedAt) thinkingStartedAt = Date.now();
-                pendingThinking += String(parsed.reasoning);
-                scheduleFlush();
-              } else if (parsed.content) {
-                // 追问轮（content_revised）之后若又出现新一轮正常内容
-                // （如工具调用后的新回答）：重置累积，另起新气泡，
-                // 不再把替换文本与新内容拼在一起
-                if (streamFinalized) { full = ""; streamFinalized = false; }
-                full += parsed.content;
-                scheduleFlush();
-              }
-            } catch (e) { console.warn("Skipping malformed stream event", e); }
-          } catch (e) { if (e instanceof SyntaxError) continue; throw e; }
-        }
-      }
-    }
-    return full;
-    } finally {
-      flushStream();
-      disarmWatchdog();
-      // Proactively release the stream: plugin-http holds the response body as a
-      // Tauri resource (rid). If we just walk away, the plugin's later teardown
-      // races with connection close and rejects "The resource id ... is invalid"
-      // as an unhandled promise rejection -> fullscreen crash overlay.
-      try { await reader.cancel("stream-done"); } catch { /* already closed */ }
-      try { reader.releaseLock(); } catch { /* noop */ }
-    }
-  };
-
-  const confirmInFlightRef = useRef<Set<string>>(new Set());
-  const confirmTool = useCallback(async (callId: string, approved: boolean) => {
-    // 双击/重复点击去重：同 callId 在途只发一次（09-21 实测：双击触发误报过期）
-    if (confirmInFlightRef.current.has(callId)) return;
-    confirmInFlightRef.current.add(callId);
-    try {
-      const resp = await authFetch("/v1/confirm_tool", {
-        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ call_id: callId, approved }),
-      });
-      const data = await resp.json();
-      if (data.status === "already") {
-        // 服务端幂等：已处理（本卡已批准/拒绝）——收尾卡片状态，避免永远 confirming
-        setMessagesFor(session.id, prev => prev.map(m => m.callId === callId && m.toolStatus === "confirming"
-          ? { ...m, toolStatus: "done" as const } : m));
-        return;
-      }
-      if (data.status === "not_found") {
-        showToast(t("toast.timeout"));
-        setMessagesFor(session.id, prev => prev.map(m => m.callId === callId && m.toolStatus === "confirming" ? { ...m, toolStatus: "error" as const, toolResult: t("toast.timeout_detail") } : m));
-      }
-    } catch (e) {
-      console.error(e);
-      // 服务端若已处理（21:01 实证：客户端失败但 approve 已生效）→ 重试一次再判定
-      try {
-        await new Promise(r => setTimeout(r, 300));
-        const resp2 = await authFetch("/v1/confirm_tool", {
-          method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ call_id: callId, approved }),
-        });
-        const d2 = await resp2.json();
-        if (d2.status === "ok" || d2.status === "already") {
-          setMessagesFor(session.id, prev => prev.map(m => m.callId === callId && m.toolStatus === "confirming"
-            ? { ...m, toolStatus: "done" as const } : m));
-          return;
-        }
-      } catch (e2) { console.error("confirm retry failed", e2); }
-      showToast(t("toast.confirm_fail"));
-    }
-    finally { confirmInFlightRef.current.delete(callId); }
-  }, [showToast, setMessages, t]);
-
-  // 停止**指定会话**（默认=当前查看的会话）的回合：控制器/取消请求/显示状态
-  // 全部按会话定位（09-23）。此前用跟随视图的 sessionIdRef + 单一控制器，
-  // 切走再点停止会停错会话。
-  // ⚠️ 入参类型是 unknown 而不是 string：这个函数**同时**被当作按钮处理器用
-  // （onStop={stopGeneration} → 子组件 onClick={onStop}），React 会把点击事件对象
-  // 塞进来。事件对象带 DOM 引用（循环结构）→ 之后 JSON.stringify 直接抛
-  // TypeError，真机 2026-09-23 崩过一次。所以这里只认非空字符串，其余回落到
-  // sessionIdRef。类型写成 unknown 是刻意的：让将来再想直接挂它也躲不过检查。
-  const stopGeneration = useCallback((targetSession?: unknown) => {
-    const sid = resolveStopTarget(targetSession, sessionIdRef.current);
-    const ctl = abortControllersRef.current[sid];
-    if (ctl) ctl.abort();
-    abortControllersRef.current[sid] = null;
-    // 服务端取消：仅断前端流时 agent 循环会继续烧 GPU/执行工具/扣云端
-    // 费用（P0）。置位 sidecar 会话级取消标记，循环在每轮迭代/工具执行前
-    // 检查并中止。
-    authFetch("/v1/chat/cancel", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ session_id: sid }),
-    }).catch(() => { /* sidecar 不可达时仅靠 abort 兜底 */ });
-    taskStacksRef.current[sid] = [];
-    delete taskStartsRef.current[sid];
-    delete processingRef.current[sid];          // 同步镜像（state 更新滞后一拍）
-    setProcessing((p) => { const n = { ...p }; delete n[sid]; return n; });
-    if (sessionIdRef.current === sid) {
-      setActiveTask(null);
-      setTaskStartAt(null);
-      setAgentPhase("");
-    }
-  }, []);
-
-  /* ── Send Message ── */
   const sendMessage = async () => {
     const text = prompt;
     if (!text.trim() && !pendingFile) return;
@@ -1480,6 +864,8 @@ const [timeFilter, setTimeFilter] = useState("all");
         showToast(t("app.file_upload_fail"), "warn");
       }
     }
+    // 拖放 handler 挂一次即可；t/processImageFile 变化不重绑
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Tauri 原生拖放（macOS 稳定路径）：onDragDropEvent 拿到文件路径，sidecar 读盘
@@ -1560,6 +946,8 @@ const [timeFilter, setTimeFilter] = useState("all");
       }
     })();
     return () => { unlisten?.(); };
+    // 双通道原生监听挂一次；t 变化不重绑（否则每次切语言都 unlisten/relisten）
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [showToast]);
 
   const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -1680,6 +1068,7 @@ const [timeFilter, setTimeFilter] = useState("all");
   // 前端不用改代码；服务不可用由 sidecar 的探测先挡掉，所以放长不会白等。
   // 顺带取本地语音服务的音色表：设置页那份是**系统语音**的名字，本地服务不认，
   // 拿它去合成会 500（audio.cpp: unknown voice id）→ 对不上就不发，让服务用默认音色。
+  const onSettingsPage = activeView === "settings";
   useEffect(() => {
     if (!ttsEnabled) return;
     let alive = true;
@@ -1720,7 +1109,7 @@ const [timeFilter, setTimeFilter] = useState("all");
     // 依赖里带上「是否停在设置页」：音色列表原来只在开启朗读那一刻抓一次，
     // 若那次服务恰好没起来（比如刚开机、服务正在重启），列表会一直空着 ——
     // 用户看到的就是"音色没了"。现在每次打开设置页都会重抓一次。
-  }, [ttsEnabled, activeView === "settings"]);
+  }, [ttsEnabled, onSettingsPage]);
 
   // 抓空了就过几秒自己再试一次（服务刚起来/正在重启时最有用），最多试 3 轮
   useEffect(() => {
@@ -1749,100 +1138,13 @@ const [timeFilter, setTimeFilter] = useState("all");
     return () => clearInterval(timer);
   }, [ttsEnabled, ttsLocalVoices.length]);
 
-  const stopSpeaking = useCallback(() => {
-    try { window.speechSynthesis?.cancel(); } catch { /* ignore */ }
-    const audio = ttsAudioRef.current;
-    if (audio) {
-      try { audio.pause(); } catch { /* ignore */ }
-      ttsAudioRef.current = null;
-    }
-    speakingIdRef.current = null;
-    setSpeakingId(null);
-  }, []);
-
-  const systemSpeak = useCallback((text: string) => {
-    const chunks = splitSentences(text);
-    if (!chunks.length) { speakingIdRef.current = null; setSpeakingId(null); return; }
-    const voice = pickVoice(ttsVoices, lang);
-    chunks.forEach((chunk, idx) => {
-      const utter = new SpeechSynthesisUtterance(chunk);
-      if (voice) utter.voice = voice;
-      utter.rate = ttsRate;
-      // 系统语音也支持音高（0~2，默认 1）：本地服务不可用时回退到这里，
-      // 音高滑杆不该跟着失效 —— 变调方向与本地路径一致（1.15 = 升 15%）
-      utter.pitch = Math.min(2, Math.max(0.1, ttsPitch));
-      utter.lang = voice?.lang || lang;
-      if (idx === chunks.length - 1) {
-        utter.onend = () => {
-          if (speakingIdRef.current) { speakingIdRef.current = null; setSpeakingId(null); }
-        };
-      }
-      window.speechSynthesis.speak(utter);
-    });
-  }, [ttsVoices, lang, ttsRate, ttsPitch]);
-
-  /** 朗读一条回复。同一个消息再点一次＝停止。 */
-  const speak = useCallback(async (raw: string, id?: string) => {
-    if (!ttsEnabled) return;
-    const key = id ?? "";
-    if (speakingIdRef.current !== null && speakingIdRef.current === key) { stopSpeaking(); return; }
-    stopSpeaking();
-    const text = stripForSpeech(raw);
-    if (!text) return;
-    speakingIdRef.current = key;
-    setSpeakingId(key);
-    // ① 本地语音服务（装好之前这里会失败 → 直接落 ②，用户无感）
-    try {
-      const resp = await authFetch("/v1/synthesize_speech", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          text,
-          // 本地音色优先；系统音色名服务不认，发过去只会 500（见 ttsLocalVoices 的说明）
-          voice: ttsLocalVoices.includes(ttsLocalVoice) ? ttsLocalVoice : undefined,
-          speed: ttsRate,
-          // 音高永远发：滑杆是唯一真相源。之前"等于 1 就不发"会让 config 里的
-          // 旧值（1.15）偷偷生效 —— 滑杆拉回 1.00 却还是变调的，所见非所得。
-          pitch: ttsPitch,
-          emotion: ttsEmotion || undefined,
-        }),
-        signal: AbortSignal.timeout(ttsTimeoutMs),
-      });
-      const ctype = resp.headers.get("content-type") || "";
-      if (resp.ok && !ctype.includes("application/json")) {
-        const url = URL.createObjectURL(await resp.blob());
-        const audio = new Audio(url);
-        ttsAudioRef.current = audio;
-        audio.onended = () => {
-          URL.revokeObjectURL(url);
-          if (speakingIdRef.current === key) { speakingIdRef.current = null; setSpeakingId(null); }
-        };
-        await audio.play();
-        return;
-      }
-    } catch { /* 服务不可用 → 系统语音 */ }
-    // ② 系统语音兜底
-    if (!speechSupported()) {
-      showToast(t("toast.tts_unsupported"));
-      speakingIdRef.current = null;
-      setSpeakingId(null);
-      return;
-    }
-    systemSpeak(text);
-  }, [ttsEnabled, ttsVoice, ttsRate, ttsTimeoutMs, ttsLocalVoices, ttsLocalVoice,
-      ttsPitch, ttsEmotion, stopSpeaking, systemSpeak, showToast, t]);
-
-  // 切会话/新会话时停掉上一轮的朗读，别让它在后台继续念
-  useEffect(() => { stopSpeaking(); }, [session.id, stopSpeaking]);
-
-  /* ── API Test ── */
-  const testConnection = async (modelName: string, key: string, endpoint: string, protocol: string) => {
+  const testConnection = async (modelName: string, _key: string | undefined, endpoint: string, protocol: string) => {
     setTestingModel(modelName);
     setTestResult("");
     try {
       const resp = await authFetch("/v1/test_connection", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model: modelName, key, endpoint, protocol }),
+        body: JSON.stringify({ name: modelName, model: modelName, endpoint, protocol }),
       });
       const data = await resp.json();
       setTestResult(data.status === "ok" ? t("app.conn_ok") : t("app.conn_fail", { msg: data.message || t("app.conn_fail_default") }));
@@ -1967,6 +1269,7 @@ const [timeFilter, setTimeFilter] = useState("all");
             />
           </div>
         )}
+        <div className={`view-row${activeView === "chat" && sidecarStatus !== "offline" ? "" : " hidden-row"}`} style={{ display: "flex", flex: 1, minWidth: 0, minHeight: 0 }}>
         <div className={`view-panel${activeView === "chat" ? " active" : ""}`} id="view-chat" style={sidecarStatus === "offline" ? { display: "none" } : undefined}>
           <ChatView
             messages={messages} isProcessing={isProcessing}
@@ -1974,7 +1277,13 @@ const [timeFilter, setTimeFilter] = useState("all");
             prompt={prompt} setPrompt={setPrompt}
             fileInputRef={fileInputRef} mediaRecorderRef={mediaRecorderRef}
             isRecording={isRecording}
-            sendMessage={sendMessage} onStop={() => stopGeneration()} handleFileSelect={handleFileSelect}
+            sendMessage={sendMessage} onStop={() => {
+              stopGeneration();
+              // 立刻把运行中的子智能体收口成「已中断」——后端也会在 /v1/chat/cancel
+              // 时同步置终态，但心跳有间隔，这里先改本地避免详情弹窗仍显示「执行中」
+              setSubagents(prev => prev.map(s => s.status === "running"
+                ? { ...s, status: "error", summary: "已中断（用户停止）" } : s));
+            }} handleFileSelect={handleFileSelect}
             onSelectModelAndLoad={selectModelAndLoad} engineStatus={localLLMStatus}
             startRecording={startRecording} confirmTool={confirmTool}
             onSpeak={speak} speakingId={speakingId}
@@ -1986,6 +1295,7 @@ const [timeFilter, setTimeFilter] = useState("all");
             thinkingLevel={thinkingLevel} setThinkingLevel={setThinkingLevel}
             contextEstimate={contextEstimate}
             sessionId={session.id}
+            onPreview={setPreviewItem}
             showToast={showToast}
             activeTask={activeTask}
             taskStartAt={taskStartAt}
@@ -1995,6 +1305,10 @@ const [timeFilter, setTimeFilter] = useState("all");
             localModelId={localLLMStatus.model_id}
             localModelName={localLLMStatus.model_name}
           />
+        </div>
+          {previewItem && (
+            <PreviewPanel item={previewItem} onClose={() => setPreviewItem(null)} />
+          )}
         </div>
 
         {/* ═══ Models View ═══ */}

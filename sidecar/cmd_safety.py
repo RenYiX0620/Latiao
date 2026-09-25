@@ -11,6 +11,7 @@ import logging
 import os
 import platform
 import re
+from pathlib import Path
 
 logger = logging.getLogger("latiao-sidecar")
 
@@ -63,6 +64,12 @@ OBFUSCATION_PATTERNS = [
     r"\b(python|python3|python3\.\d+[0-9]*|node|nodejs|deno|bun|ruby|perl|php|lua|nu|pwsh|powershell)\s+(-[a-zA-Z]*[ce]\b|--command\b|--eval\b)",
     r"\b(ba|z|k|d)?sh\s+(-[a-zA-Z]*[ce]\b|--command\b)",
     r"\bfish\s+(-c\b|--command\b)",
+    # AppleScript 侧门（实证放行过）：osascript -e 'do shell script "..."' 里是
+    # 完整 shell，黑名单全绕过。同族还有 JXA、open -a Terminal。
+    r"\bosascript\b",
+    r"\bdo\s+shell\s+script\b",
+    r"\bsystem\s+events\b",
+    r"\bopen\s+(-a\s+)?(Terminal|Console)\b",
 ]
 
 _WIN_CMDS = r"|dir|cd|where|ver|type|find|findstr" if platform.system() == "Windows" else ""
@@ -84,6 +91,12 @@ SENSITIVE_READ_RE = re.compile(
 )
 
 _SENSITIVE_READERS = ("cat", "head", "tail", "type", "find", "findstr")
+
+# 辣条数据目录下"改了等于改安全开关"的注册表文件：写一次 permissions.json 就能把
+# run_cmd 降成 safe、确认门被持久关掉；agents.json / skills.json 可植入提示注入。
+# 写入工具路径（sensitive_write_block）与命令路径（_protected_write_target）共用这一份，
+# 避免两处清单各自漂移。
+_APP_REGISTRY_FILES = ("permissions.json", "agents.json", "skills.json")
 
 
 def reject_sensitive_read(cmd: str) -> str | None:
@@ -165,6 +178,25 @@ def sensitive_read_block(path: str) -> str | None:
         if _under or "/.local-ai-os/config.json" in _rp.replace(os.sep, "/"):
             return (f"⛔ 不允许读取辣条自身配置（含 API 密钥）- {_rp}。"
                     "需要改配置请到设置界面操作")
+    return None
+
+
+def sensitive_write_name_block(path: str) -> str | None:
+    """写入路径的**文件名**判定：密钥/凭据名 + `.env` 家族（模板除外）。
+
+    写入侧此前是插件里 5 项的本地拷贝，与 fallback 的 9 项漂移 —— `~/.netrc`、
+    `.git-credentials`、`.env.local` 在插件路径（实际生效的那条）放行。
+    这里与读侧共用同一份清单和同一条 .env 家族规则（2026-09-24 复查修复）。
+    """
+    if not path:
+        return None
+    low = os.path.basename(str(path)).lower()
+    if not low:
+        return None
+    if low in _BLOCKED_FILE_NAMES:
+        return f"⛔ 不允许写入敏感文件（密钥/凭据）- {path}"
+    if _ENV_FAMILY_RE.match(low) and not low.endswith(_ENV_TEMPLATE_SUFFIXES):
+        return f"⛔ 不允许写入 .env 家族文件（可能含密钥）- {path}"
     return None
 
 
@@ -274,6 +306,239 @@ def reject_sensitive_path(cmd: str) -> str | None:
     return None
 
 
+
+
+# ── 引号感知的 shell 操作符检测（2026-09-24：python -c "...;..." 误杀）──
+_SHELL_OPS = ("&&", "||", "$(", ";", "|", ">", "<")
+
+
+
+
+
+
+def shell_op_error(op: str) -> str:
+    return (
+        f"⛔ 不支持 shell 操作符 '{op}'：本工具以 shell=False 直接执行。\n"
+        f"已支持：尾部 `> 文件`、单管道 `A | B`（如 head f | grep x）。\n"
+        f"仍不支持：`&&` `;` `||` `$()` `<`。复合命令请拆成多次调用。\n"
+        f"读文件建议直接用 read_file，不必 head/cat。"
+    )
+
+
+def split_pipeline(cmd: str) -> tuple[str, str] | None:
+    """拆一条**引号外**的单管道 `A | B`；多管道/复杂形态返回 None。
+
+    shell=False 下管道可等价实现为 Popen1.stdout → Popen2.stdin，
+    两侧仍各自 shlex.split，绝不经 shell。
+    """
+    if split_stdout_redirect(cmd):
+        return None  # 管道 + 重定向同时出现：不解析，交给拒绝
+    in_single = in_double = False
+    pipe_at = None
+    i, n = 0, len(cmd)
+    while i < n:
+        c = cmd[i]
+        if c == "\\" and in_double and i + 1 < n:
+            i += 2
+            continue
+        if c == "'" and not in_double:
+            in_single = not in_single
+        elif c == '"' and not in_single:
+            in_double = not in_double
+        elif not (in_single or in_double):
+            if cmd.startswith("||", i):
+                return None
+            if c == "|":
+                if pipe_at is not None:
+                    return None
+                pipe_at = i
+        i += 1
+    if pipe_at is None:
+        return None
+    left, right = cmd[:pipe_at].strip(), cmd[pipe_at + 1:].strip()
+    if not left or not right:
+        return None
+    return left, right
+
+
+def split_stdout_redirect(cmd: str) -> tuple[str, str, bool] | None:
+    """解析**末尾**的 `> path` / `>> path`（引号外、单一目标）。
+
+    shell=False 没有 shell 重定向，但 stdout 写文件可以等价实现，
+    不必整条拒绝。返回 (命令体, 目标路径, append)；无法安全解析则 None。
+    复杂形态（2>&1、多段重定向、带管道的尾部）不解析，仍走拒绝。
+    """
+    in_single = in_double = False
+    hits: list[tuple[int, str]] = []
+    i, n = 0, len(cmd)
+    while i < n:
+        c = cmd[i]
+        if c == "\\" and in_double and i + 1 < n:
+            i += 2
+            continue
+        if c == "'" and not in_double:
+            in_single = not in_single
+        elif c == '"' and not in_single:
+            in_double = not in_double
+        elif not (in_single or in_double):
+            if cmd.startswith(">>", i) or cmd.startswith(">", i):
+                # fd 前缀重定向（2> / 1>> / &>）没有等价实现：只剥掉 `>` 会把前面的
+                # 数字/& 留在命令里 → 命令被静默错执行（实测 `grep x 2>/dev/null`
+                # 解析成 `grep x 2` + 输出进 /dev/null，工具还报"已写入"）。
+                # 只在操作符处判前缀 —— 写成对每个位置判会误伤路径（`…/00000gn/`）。
+                if i > 0 and (cmd[i - 1].isdigit() or cmd[i - 1] == "&"):
+                    return None
+            if cmd.startswith(">>", i):
+                hits.append((i, ">>"))
+                i += 2
+                continue
+            if cmd.startswith(">", i):
+                hits.append((i, ">"))
+                i += 1
+                continue
+        i += 1
+    if len(hits) != 1:
+        return None
+    idx, op = hits[0]
+    head = cmd[:idx].rstrip()
+    target = cmd[idx + len(op):].strip()
+    if not head or not target:
+        return None
+    # 目标必须是单一简单路径（无空白/元字符/引号不配对）
+    if any(ch in target for ch in " \t\n<|;&$`\'\")"):
+        return None
+    if len(target) > 512:
+        return None
+    if head.count('"') % 2 or head.count("'") % 2:
+        return None
+    # 敏感写路径不许经重定向落盘
+    denied = reject_sensitive_write(target)
+    if denied:
+        return None  # 交给上层按「含 >」拒绝，并给出提示
+    return head, target, op == ">>"
+
+
+def unsupported_op_message(op: str) -> str:
+    """不支持的操作符统一文案（插件 / fallback / 内嵌 seed 共用一份）。
+
+    此前两份实现的说法互相矛盾：插件写"重定向和管道都不支持"，fallback 写
+    "尾部 `> 文件` 已支持"——同一个工具、两条路径给模型的指引不同（2026-09-24
+    用户实测撞上）。实际支持面：末尾 `> 文件` / `>> 文件`、单管道 `A | B`、
+    引号内的 ; | >；其余一律拒绝。
+    """
+    return (
+        f"⛔ 不支持 shell 操作符 '{op}'：本工具以 shell=False 直接执行，"
+        f"无法解释 {op}，否则会把它当参数传给程序（静默失败）。\n"
+        "已支持：末尾 `> 文件` / `>> 文件`、单管道 `A | B`、引号内的 ; | > 。\n"
+        "不支持：`2>&1`、`2>/dev/null` 等 fd 重定向、`&&`、`||`、`;`、`<`、多管道。\n"
+        "请拆成多次调用，每次只运行一条命令；需要看错误信息时让命令直接打印到 stdout。"
+    )
+
+
+def find_unsupported_shell_op(cmd: str) -> str | None:
+    """返回引号外的 shell 操作符；引号内（解释器脚本里的 ; | >）不拦。
+
+    shell=False 不解释引号内的元字符——`python3 -c "a; b"` 里的 `;` 是
+    Python 语句分隔符，拦它属于误杀。
+    """
+    # 尾部安全重定向（> file）与单管道（A | B）有等价实现，不在此拒
+    body = cmd
+    try:
+        sp = split_stdout_redirect(cmd)
+        if sp:
+            body = sp[0]
+        elif split_pipeline(cmd):
+            # 管道两侧再各查一次（嵌套的 ; && 等）
+            left, right = split_pipeline(cmd)  # type: ignore
+            for side in (left, right):
+                bad = find_unsupported_shell_op(side)
+                if bad and bad != "|":
+                    return bad
+            return None
+    except Exception:
+        body = cmd
+    in_single = in_double = False
+    i, n = 0, len(body)
+    while i < n:
+        c = body[i]
+        if c == "\\" and in_double and i + 1 < n:
+            i += 2
+            continue
+        if c == "'" and not in_double:
+            in_single = not in_single
+        elif c == '"' and not in_single:
+            in_double = not in_double
+        elif not (in_single or in_double):
+            for op in _SHELL_OPS:
+                if body.startswith(op, i):
+                    return op
+        i += 1
+    return None
+
+
+_INLINE_LANG = (
+    r"(?:python(?:3(?:\.\d+)*)?|node|nodejs|deno|bun|ruby|perl|php|lua|nu"
+    r"|pwsh|powershell|ba(?:sh)?|zsh|ksh|fish)"
+)
+_INTERP_INLINE_PATTERN = (
+    r"\b(python(?:3(?:\.\d+)*)?|node|nodejs|deno|bun|ruby|perl|php|lua|nu"
+    r"|pwsh|powershell)\s+(-[a-zA-Z]*[ce]\b|--command\b|--eval\b)"
+)
+
+
+def extract_inline_code(cmd: str) -> str | None:
+    """取出解释器 -c/-e/--command/--eval 的内联源码；非内联解释器命令返回 None。"""
+    import shlex
+    try:
+        toks = shlex.split(cmd)
+    except ValueError:
+        return None
+    for i, tok in enumerate(toks[:-1]):
+        base = Path(tok).name.lower() if "/" in tok or "\\" in tok else tok.lower()
+        if base not in ("python", "python3", "node", "nodejs", "deno", "bun",
+                        "ruby", "perl", "php", "lua", "nu", "pwsh", "powershell",
+                        "bash", "zsh", "ksh", "sh", "fish"):
+            # python3.11 等
+            if not (base.startswith("python") and base[6:].replace(".", "").isdigit()):
+                continue
+        flag = toks[i + 1]
+        if flag in ("-c", "-e", "--command", "--eval") or (
+            flag.startswith("-") and not flag.startswith("--")
+            and re.fullmatch(r"-[a-zA-Z]*[ce]", flag)
+        ):
+            return toks[i + 2] if i + 2 < len(toks) else ""
+    return None
+
+
+def check_inline_code(code: str) -> str | None:
+    """审查解释器内联源码（与脚本文件同一套黑名单 + Python AST 禁调用）。"""
+    if not code or not code.strip():
+        return "⛔ Blocked: 内联代码为空"
+    if len(code) > 8000:
+        return "⛔ Blocked: 内联代码过长，拒绝执行"
+    low = code.lower()
+    for pattern in DESTRUCTIVE_PATTERNS:
+        if re.search(pattern, low):
+            return "⛔ Blocked: 内联代码命中破坏性模式，拒绝执行"
+    for pattern in OBFUSCATION_PATTERNS:
+        # 「解释器 -c」自身那条不对内联体生效（否则永远拦自己）
+        if "python" in pattern and "[ce]" in pattern:
+            continue
+        if re.search(pattern, low):
+            return "⛔ Blocked: 内联代码命中危险模式，拒绝执行"
+    # 看起来像 Python 时过 AST 禁调用（与 plugin_creator 同一份）
+    if re.search(r"\b(import |def |print\(|from \w+ import)", code):
+        try:
+            from plugin_creator import validate_plugin_code
+            v = validate_plugin_code(code)
+            sec = [e for e in (v.get("errors") or []) if "禁止的调用" in e]
+            if sec:
+                return f"⛔ Blocked: 内联代码含禁止调用，拒绝执行: {'; '.join(sec)}"
+        except Exception:
+            return "⛔ Blocked: 内联代码无法静态解析，拒绝执行"
+    return None
+
+
 def check_cmd(cmd: str) -> str | None:
     """整条命令的安全检查（阶段 3 双层）。返回拒绝文案或 None（放行）。
 
@@ -308,6 +573,15 @@ def check_cmd(cmd: str) -> str | None:
             return f"⛔ Blocked destructive command: {cmd}"
     for pattern in OBFUSCATION_PATTERNS:
         if re.search(pattern, low):
+            # 解释器 -c/-e：一刀切会误杀 python3 -c "print(1); print(2)"——
+            # 改为审查内联源码（与脚本文件同一黑名单 + AST 禁调用）
+            if "[ce]" in pattern and "python" in pattern:
+                inl = extract_inline_code(cmd)
+                if inl is not None:
+                    denied = check_inline_code(inl)
+                    if denied:
+                        return denied
+                    continue
             return f"⛔ Blocked potentially unsafe command: {cmd}"
     return (reject_sensitive_read(cmd) or reject_sensitive_write(cmd)
             or reject_process_env_read(cmd) or reject_sensitive_path(cmd))
@@ -329,8 +603,15 @@ def sensitive_write_block(path: str) -> str | None:
             if _rp == d + os.sep + sub or _rp.startswith(_dir + os.sep):
                 return (f"⛔ 不允许写入自动加载目录（{sub}）—— 写进去的代码会在下次启动/"
                         f"热重载时执行: {_rp}")
+    # 权限/代理/技能注册表：写一次 permissions.json 就能把 run_cmd 降成 safe，
+    # 确认门被持久关掉（P0）。agents.json/skills.json 同理可植入提示注入。
+    _base = os.path.basename(_rp).lower()
+    if _base in _APP_REGISTRY_FILES:
+        for d in _app_data_dirs():
+            if _rp.startswith(d + os.sep):
+                return f"⛔ 不允许改写安全配置（{_base}）—— 走设置界面: {_rp}"
     # 应用配置含凭据（云端 key / Tavily key），且改它等于改安全开关；走设置界面
-    if os.path.basename(_rp).lower().startswith("config.json"):
+    if _base.startswith("config.json"):
         for d in _app_data_dirs():
             if _rp.startswith(d + os.sep):
                 return f"⛔ 不允许改写辣条自身配置（含 API 密钥）: {_rp}"
@@ -354,7 +635,7 @@ _READ_ONLY_VERBS = frozenset({
 
 
 def _protected_write_target(tok: str) -> str | None:
-    """单个 argv token 是否是受保护的写入目标（自动加载目录 / config.json）。"""
+    """单个 argv token 是否是受保护的写入目标（自动加载目录 / 注册表文件 / config.json）。"""
     if not tok or tok.startswith("-"):
         return None
     if "=" in tok:                      # dd of=/path、--output=/path、-o=/path
@@ -366,13 +647,18 @@ def _protected_write_target(tok: str) -> str | None:
         for sub in ("extensions", "skills"):
             if rp == f"{d}{os.sep}{sub}" or rp.startswith(f"{d}{os.sep}{sub}{os.sep}"):
                 return rp
-        if os.path.basename(rp).lower().startswith("config.json") and rp.startswith(d + os.sep):
+        _base = os.path.basename(rp).lower()
+        # 注册表文件与 config.json 同级保护：命令路径此前漏了 permissions/agents/skills.json，
+        # `cp` 一次就能把确认门持久关掉（2026-09-24 复查实测 check_cmd 放行）。
+        if _base in _APP_REGISTRY_FILES and rp.startswith(d + os.sep):
+            return rp
+        if _base.startswith("config.json") and rp.startswith(d + os.sep):
             return rp
     return None
 
 
 def reject_sensitive_write(cmd: str) -> str | None:
-    """命令写入自动加载目录/配置时返回拒绝文案，否则 None。"""
+    """命令写入自动加载目录/安全配置时返回拒绝文案，否则 None。"""
     import shlex
     try:
         tokens = shlex.split(cmd)
@@ -423,3 +709,75 @@ def child_env(extra: dict | None = None, allow_prefixes: tuple = ()) -> dict:
     if extra:
         env.update({str(k): str(v) for k, v in extra.items()})
     return env
+
+
+# ── ⑨ 解释器脚本内容审查（堵 write_file → run_cmd 组合逃逸）────────
+# 命令黑名单只看 argv，拦不住 "python3 /tmp/pwn.py"——脚本体可为任意代码。
+# 显式脚本仍放行（合法工作流），但**内容**必须先过同一套混淆/破坏性规则。
+_SCRIPTY_CMD_RE = re.compile(
+    r"^(?:.*/)?(python|python3|python3\.\d+[0-9]*|node|nodejs|deno|bun|ruby|perl|php|lua|nu|pwsh|powershell|ba|z|k|d?sh|bash|zsh|dash|fish)\s+\S+\.(py|js|mjs|cjs|ts|rb|pl|php|lua|ps1|sh|bash|zsh|fish)\b",
+    re.IGNORECASE,
+)
+_SCRIPT_MAX_BYTES = 256 * 1024
+
+
+def check_script_content(script_path: str) -> str | None:
+    """解释器执行外部脚本前的内容审查。返回拒绝文案或 None（放行）。
+
+    只审"会被解释器执行的脚本文件"；大小超限 fail-closed（不放行巨文件赌运气）。
+    """
+    try:
+        rp = os.path.realpath(os.path.expanduser(script_path))
+    except Exception:
+        return "⛔ Blocked: 脚本路径无效"
+    if not os.path.isfile(rp):
+        return None  # 不存在由执行层报错
+    try:
+        if os.path.getsize(rp) > _SCRIPT_MAX_BYTES:
+            return f"⛔ Blocked: 脚本过大，拒绝执行: {rp}"
+        with open(rp, "r", encoding="utf-8", errors="ignore") as f:
+            body = f.read(_SCRIPT_MAX_BYTES)
+    except Exception as e:
+        return f"⛔ Blocked: 无法读取脚本内容，拒绝执行: {e}"
+    # 逐行/全文过混淆与破坏性规则（与命令侧同一份黑名单）
+    low = body.lower()
+    for pattern in OBFUSCATION_PATTERNS:
+        if re.search(pattern, low):
+            return f"⛔ Blocked: 脚本内容命中危险模式，拒绝执行: {rp}"
+    for pattern in DESTRUCTIVE_PATTERNS:
+        if re.search(pattern, low):
+            return f"⛔ Blocked: 脚本内容命中破坏性模式，拒绝执行: {rp}"
+    # Python 脚本再过 AST 禁调用（eval/exec/os.system 等）
+    if rp.endswith(".py"):
+        try:
+            from plugin_creator import validate_plugin_code
+            v = validate_plugin_code(body)
+            sec = [e for e in (v.get("errors") or []) if "禁止的调用" in e]
+            if sec:
+                return f"⛔ Blocked: 脚本含禁止调用，拒绝执行: {'; '.join(sec)}"
+        except Exception:
+            # AST 不可用/语法失败 → fail-closed（内容审查是唯一防线时不能放行）
+            return f"⛔ Blocked: 脚本无法静态解析，拒绝执行: {rp}"
+    return None
+
+
+def check_cmd_with_script(cmd: str) -> str | None:
+    """命令规则 + 解释器脚本内容审查（run_cmd / launch_bg 共用）。"""
+    denied = check_cmd(cmd)
+    if denied:
+        return denied
+    m = _SCRIPTY_CMD_RE.match(cmd.strip())
+    if not m:
+        return None
+    # 取脚本参数（第一个以脚本扩展名结尾的 token）
+    import shlex
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        return None
+    for tok in tokens[1:]:
+        if tok.startswith("-"):
+            continue
+        if re.search(r"\.(py|js|mjs|cjs|ts|rb|pl|php|lua|ps1|sh|bash|zsh|fish)$", tok, re.I):
+            return check_script_content(tok)
+    return None

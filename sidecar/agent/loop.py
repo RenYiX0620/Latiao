@@ -730,6 +730,15 @@ class ThinAgentLoop:
         msgs = _merge_system_messages(_sanitize_tool_messages(list(self.current_msgs)))
         if self._narrow_search or self._search_used:
             msgs = _append_tail_note(msgs, self._search_reminder())
+        # 识图轮：本地引擎同时收 image_url + tools 会被模板拒（400）甚至拖垮进程
+        # （2026-09-24 Hermes APEX+mmproj 实测）。发图时本地关掉原生 tools。
+        _has_image = any(
+            isinstance(m.get("content"), list)
+            and any(isinstance(p, dict) and p.get("type") == "image_url"
+                    for p in (m.get("content") or []))
+            for m in msgs)
+        if _has_image and self.is_local:
+            self.native_tools = False
         body = {
             "model": engine_model,
             "messages": msgs,
@@ -856,25 +865,56 @@ class ThinAgentLoop:
             return
         async with _local_llm_stream(client, self.api_url, body, self.headers,
                                      wait_info=wait_info) as r:
-            aiter = r.aiter_lines()
+            # 用"泵 + 队列"读流，**不能**用 asyncio.wait_for(anext(aiter))：
+            # wait_for 超时会取消内部的 anext，而异步生成器一旦被取消就永久结束
+            # ——下一次 anext 直接 StopAsyncIteration，被当成"流正常结束"：
+            # 静默超过一个心跳节拍后，剩下的输出会被**静默丢弃**（2026-09-24
+            # 写复现测试时发现；此前"等引擎期间发心跳继续等"因此完全无效）。
+            q: asyncio.Queue = asyncio.Queue()
+            _END = object()
+
+            async def _pump():
+                try:
+                    async for ln in r.aiter_lines():
+                        await q.put(ln)
+                    q.put_nowait(_END)
+                except asyncio.CancelledError:
+                    raise
+                except BaseException as e:   # noqa: BLE001 — 传输层异常交给消费者抛
+                    q.put_nowait(e)
+
+            pump = asyncio.create_task(_pump())
             silent = 0
             any_out = False
-            while True:
-                try:
-                    line = await asyncio.wait_for(anext(aiter), timeout=HEARTBEAT)
+            try:
+                while True:
+                    try:
+                        item = await asyncio.wait_for(q.get(), timeout=HEARTBEAT)
+                    except asyncio.TimeoutError:
+                        # 正在等引擎（排队 / 自动重载）**不算"输出停滞"**：35B 重载要几分钟，
+                        # 撞上 90s/180s 停滞阈值 = 后端掐掉自己的恢复（2026-09-24 实测：
+                        # 引擎中途死亡 → 自动重载开始 → 停滞检测与前端的 180s 看门狗同时开火，
+                        # 后端"愿意等 600s"形同虚设）。等引擎期间只发心跳、继续等。
+                        if isinstance(wait_info, dict) and wait_info.get("phase"):
+                            yield ": keepalive\n\n"
+                            continue
+                        silent += HEARTBEAT
+                        stall = STALL_FIRST if not any_out else STALL_AFTER
+                        if silent < stall:
+                            yield ": keepalive\n\n"
+                            continue
+                        raise TimeoutError(f"模型输出停滞超 {stall}s")
+                    if item is _END:
+                        return
+                    if isinstance(item, BaseException):
+                        raise item
+                    line = item
                     silent = 0
-                except asyncio.TimeoutError:
-                    silent += HEARTBEAT
-                    stall = STALL_FIRST if not any_out else STALL_AFTER
-                    if silent < stall:
-                        yield ": keepalive\n\n"
-                        continue
-                    raise TimeoutError(f"模型输出停滞超 {stall}s")
-                except StopAsyncIteration:
-                    return
-                if line and not line.startswith(": ") and "keepalive" not in line[:30]:
-                    any_out = any_out or '"delta"' in line or '"reasoning"' in line
-                yield line
+                    if line and not line.startswith(": ") and "keepalive" not in line[:30]:
+                        any_out = any_out or '"delta"' in line or '"reasoning"' in line
+                    yield line
+            finally:
+                pump.cancel()
 
     # ── 单 step：流式采样（实时流出 reasoning/content），结果经
     # __result__ 终端事件回传（消费者吞掉，不下发前端）──
@@ -887,6 +927,8 @@ class ThinAgentLoop:
         # 等引擎放行的时长：多会话并行时这一轮可能排在别的会话后面（见 transport 闸门）
         _wait: dict = {}
         _wait_reported = False
+        _wait_started = 0.0   # 首次"等引擎/静默"心跳的时刻（进度事件按此算已等秒数）
+        _recovering = False   # 是否已向前端报过"等引擎/静默"（数据恢复时发 engine_recovered 收尾）
         # ── 语言漂移早退（2026-09-23）：首段攒着不下发，判完再放行 ──
         # 为什么攒：命中漂移时这次生成要被丢掉重来，若已下发，屏幕上会留下
         # "半截英文 + 中文"的拼接。攒 30 字只让首字延迟约 1 秒，换来丢弃时零残留。
@@ -901,7 +943,21 @@ class ThinAgentLoop:
                 _wait_reported = True
                 yield {"event": "engine_wait", "waited": round(float(_wait["waited"]), 1)}
             if not line.startswith("data: "):
+                # 内部 keepalive（引擎静默期心跳，见 _stream）：转成前端可见的进度事件。
+                # 此前它被就地丢弃 → 前端 180s 收不到任何字节就掐断整轮，而后端此刻
+                # 正合法地等引擎重载（2026-09-24 实测：⏱ 流式响应超时）。
+                if "keepalive" in line[:30]:
+                    if not _wait_started:
+                        _wait_started = time.monotonic()
+                    _recovering = True
+                    yield {"event": "engine_recovering",
+                           "phase": str(_wait.get("phase") or "silent"),
+                           "waited": round(time.monotonic() - _wait_started, 1)}
                 continue
+            if _recovering:
+                # 数据回来了：告诉前端清掉"等待引擎/静默"相位，别让它挂在屏幕上
+                _recovering = False
+                yield {"event": "engine_recovered"}
             if '"usage"' in line or '"timings"' in line:
                 # 上下文统计：真实输入 token 数与缓存命中（云端 usage / llama.cpp timings）
                 _record_engine_usage(self.session_id, line)
@@ -1452,9 +1508,33 @@ class ThinAgentLoop:
                                      (e.response.text or "")[:500])
                     except Exception:
                         pass
+                    _body = ""
+                    try:
+                        _body = (e.response.text or "").lower()
+                    except Exception:
+                        pass
+                    # 识图 400 优先判定（mmproj 未挂/不支持 image_url）——
+                    # 不能落进下面的「tools 参数被拒」回退，否则重跑一遍仍然 400
+                    _img_in_msgs = any(
+                        isinstance(m.get("content"), list)
+                        and any(isinstance(p, dict) and p.get("type") == "image_url"
+                                for p in m.get("content") or [])
+                        for m in (self.current_msgs or []))
+                    if status == 400 and _img_in_msgs and (self.native_fallback_used or not self.native_tools) and (
+                            any(k in _body for k in ("image", "vision", "multimodal", "mmproj", "clip", "mtmd", "media"))
+                            or not any(k in _body for k in ("tool", "function"))):
+                        yield {"content": (
+                            "\n\n⚠️ 模型服务拒绝了图片请求（HTTP 400）。常见原因：\n"
+                            "① 当前引擎是**识图支持加入前**启动的——请到「模型」页点"
+                            "**重新加载模型**（会自动挂上旁边的 mmproj-*.gguf）；\n"
+                            "② 目录里没有 `mmproj-*.gguf`，请把它下到与主模型同一目录；\n"
+                            "③ mmproj 与 GGUF 不配套（不同 Hermes 版本不要混用）。")}
+                        return
                     if (self.native_tools and not self.native_fallback_used
                             and status == 400):
-                        # 引擎不支持 tools 参数（模板无工具能力）→ 回退围栏格式重跑本步
+                        # 引擎不支持 tools 参数（模板无工具能力）→ 回退围栏格式重跑本步。
+                        # 带图时同样要回退：image_url+tools 一起会被拒，去掉 tools 重试
+                        # 通常就能过；仍失败才走下面的识图提示。
                         self.native_fallback_used = True
                         self.native_tools = False
                         self.steps -= 1
@@ -1462,11 +1542,6 @@ class ThinAgentLoop:
                         continue
                     # 超长上下文特判：给出可执行指引（09-12：13.7 万字符 PDF 撞 400
                     # 只看到"模型服务返回错误"，用户无从下手）
-                    _body = ""
-                    try:
-                        _body = (e.response.text or "").lower()
-                    except Exception:
-                        pass
                     if status == 400 and any(k in _body for k in (
                             "context", "too long", "length", "exceed", "maximum")):
                         try:
@@ -1654,7 +1729,10 @@ class ThinAgentLoop:
                     self._step_log("重复叙述抑制", f"{len(_narr_text)}字 近重复")
                 else:
                     asst = {"role": "assistant", "content": clean_text or ""}
-                if self.native_tools:
+                # 无论 native/fence，解析出的 tool_calls 都要入史：
+                # 只写 native 路径时 _count_successful_duplicates 扫不到
+                # m["tool_calls"]，同参重复护栏在本地 prompt 工具调用下完全失效（P0）。
+                if tool_calls:
                     asst["tool_calls"] = tool_calls
                 self.current_msgs.append(asst)
 

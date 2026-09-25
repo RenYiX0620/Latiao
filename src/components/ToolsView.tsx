@@ -30,6 +30,53 @@ interface Capability {
   usage_count: number;
 }
 
+interface MarketPlugin {
+  name?: string;
+  display_name?: string;
+  version?: string;
+  source_url?: string;
+  sha256?: string;
+  permissions?: string[];
+  source_kind?: string;
+  market_source?: string;
+  repo?: string;
+  skill_path?: string;
+  description?: string;
+  author?: { name?: string } | string;
+  category?: string;
+  stars?: number;
+  external_deps?: string[] | boolean;
+  installed?: boolean;
+  update_available?: boolean;
+}
+
+interface MarketSource {
+  id?: string;
+  url: string;
+  name?: string;
+  kind?: string;
+  description?: string;
+  builtin?: boolean;
+  removed?: boolean;
+  repo?: string;
+}
+
+interface DiscoverState {
+  last_scan_ts?: number;
+  repos?: number;
+  entries?: number;
+}
+
+interface InstallPreview {
+  name?: string;
+  version?: string;
+  file_count?: number;
+  permissions?: string[];
+  digest?: string;
+}
+
+type MarketCat = "all" | "official" | "openclaw" | "claude" | "discovered";
+
 interface ToolsViewProps {
   capabilities: Capability[];
   setCapabilities: React.Dispatch<React.SetStateAction<Capability[]>>;
@@ -58,21 +105,21 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
   const [extensions, setExtensions] = useState<ExtensionInfo[]>([]);
   const [installSrc, setInstallSrc] = useState("");
   const [installing, setInstalling] = useState(false);
-  const [confirming, setConfirming] = useState<{ source: string; sha256: string; permissions: string[]; githubItem?: any; isGitHubItem?: boolean } | null>(null);
+  const [confirming, setConfirming] = useState<{ source: string; sha256: string; permissions: string[]; githubItem?: MarketPlugin; isGitHubItem?: boolean } | null>(null);
   // ⑦ 服务端预览：stage 之后的待确认安装（pending_id + 预览），用户点"确认安装"才落盘
-  const [staged, setStaged] = useState<{ pendingId: string; preview: any; source: string } | null>(null);
+  const [staged, setStaged] = useState<{ pendingId: string; preview: InstallPreview; source: string } | null>(null);
   // ── 市场 ──
   const [marketTab, setMarketTab] = useState<"market" | "installed">("market");
-  const [marketPlugins, setMarketPlugins] = useState<any[]>([]);
+  const [marketPlugins, setMarketPlugins] = useState<MarketPlugin[]>([]);
   const [marketLoading, setMarketLoading] = useState(false);
   const [marketErr, setMarketErr] = useState("");
   // ── 多市场源（Phase 1） ──
-  const [marketSources, setMarketSources] = useState<any[]>([]);
+  const [marketSources, setMarketSources] = useState<MarketSource[]>([]);
   const [blockedSources, setBlockedSources] = useState<string[]>([]);
   const [newSourceUrl, setNewSourceUrl] = useState("");
   const [showSourceForm, setShowSourceForm] = useState(false);
   // ── GitHub 自动发现（Discovery Engine） ──
-  const [discoverState, setDiscoverState] = useState<any>({ last_scan_ts: 0, repos: 0, entries: 0 });
+  const [discoverState, setDiscoverState] = useState<DiscoverState>({ last_scan_ts: 0, repos: 0, entries: 0 });
   const [discoverRefreshing, setDiscoverRefreshing] = useState(false);
   // ── 市场列表折叠（默认收起，890 条太长） ──
   const [marketCollapsed, setMarketCollapsed] = useState(false);
@@ -112,7 +159,7 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
       }
     }
     setMarketLoading(false);
-  }, []);
+  }, [t]);
 
   const refreshSources = useCallback(async () => {
     try {
@@ -148,7 +195,11 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
     } catch (e) { console.error(e); showToast(t("tools.refresh_fail"), "warn"); setDiscoverRefreshing(false); }
   };
 
-  useEffect(() => { refreshMarket(); refreshSources(); refreshDiscover(); }, [refreshMarket, refreshSources, refreshDiscover]);
+  useEffect(() => {
+    void Promise.resolve().then(() => refreshMarket());
+    void Promise.resolve().then(() => refreshSources());
+    void Promise.resolve().then(() => refreshDiscover());
+  }, [refreshMarket, refreshSources, refreshDiscover]);
 
   const refreshExtensions = useCallback(async () => {
     try {
@@ -158,7 +209,7 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
     } catch { /* 静默：扩展页不可用不影响能力列表 */ }
   }, []);
 
-  useEffect(() => { refreshExtensions(); }, [refreshExtensions]);
+  useEffect(() => { void Promise.resolve().then(() => refreshExtensions()); }, [refreshExtensions]);
 
   // 扩展安装/卸载后，能力表也变了 → 同步刷新统一列表
   const refreshCapabilities = useCallback(async () => {
@@ -186,15 +237,15 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
     setInstalling(true);
     try {
       // 生态源条目：download+pack 后取预览（install-github）；否则走本地/URL install
-      const isGitHub = !!confirming?.isGitHubItem && confirming?.githubItem;
-      const resp = isGitHub
+      const ghItem = confirming?.isGitHubItem ? confirming.githubItem : undefined;
+      const resp = ghItem
         ? await authFetch("/v1/extensions/install-github", {
             method: "POST", headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-              repo: confirming.githubItem.repo || confirming.githubItem.source_url,
-              skill_path: confirming.githubItem.skill_path || "",
-              kind: confirming.githubItem.source_kind || "openclaw-skill",
-              sha256: confirming.githubItem.sha256 || "",
+              repo: ghItem.repo || ghItem.source_url,
+              skill_path: ghItem.skill_path || "",
+              kind: ghItem.source_kind || "openclaw-skill",
+              sha256: ghItem.sha256 || "",
             }),
           })
         : await authFetch("/v1/extensions/install", {
@@ -240,7 +291,7 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
     setConfirming({ source: source.trim(), sha256: "", permissions: [] });
   };
 
-  const installFromMarket = async (item: any) => {
+  const installFromMarket = async (item: MarketPlugin) => {
     setConfirming({ source: item.source_url || "", sha256: item.sha256 || "", permissions: [] });
   };
 
@@ -258,7 +309,7 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
     } catch (e) { console.error(e); showToast(t("tools.add_fail"), "warn"); }
   };
 
-  const removeSource = async (src: any) => {
+  const removeSource = async (src: MarketSource) => {
     if (src.builtin && src.removed === false) { showToast(t("tools.builtin_undeletable"), "warn"); return; }
     try {
       const resp = await authFetch("/v1/marketplace/sources", {
@@ -273,7 +324,7 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
 
   // 生态条目安装：走 install-github（下载→打包→安装），复用确认流
   // 封锁/解封来源（最小治理：安装前由后端拦截）
-  const toggleSourceBlocked = async (src: any) => {
+  const toggleSourceBlocked = async (src: MarketSource) => {
     const key = (src.repo || src.url || "").toLowerCase();
     const isBlocked = blockedSources.some(b => b === key || key.endsWith("/" + b) || b === src.url?.toLowerCase());
     try {
@@ -287,9 +338,9 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
     } catch (e) { console.error(e); showToast(t("tools.op_fail"), "warn"); }
   };
 
-  const installGitHubItem = async (item: any) => {
+  const installGitHubItem = async (item: MarketPlugin) => {
     setConfirming({
-      source: t("tools.source_eco", { repo: item.repo || item.source_url }),
+      source: t("tools.source_eco", { repo: item.repo || item.source_url || "" }),
       sha256: item.sha256 || "",
       permissions: item.permissions || [],
       githubItem: item,
@@ -416,7 +467,7 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
 
   // 市场搜索：按名称/描述/来源过滤（890 条纯前端，零压力）
   const q = marketQuery.trim().toLowerCase();
-  const catOf = (p: any): string => {
+  const catOf = (p: MarketPlugin): MarketCat => {
     if (p.source_kind === "claude-plugin") return "claude";
     if (p.source_kind === "openclaw-skill" || p.source_kind === "generic-skill") {
       // 手动源 vs 发现源：靠 market_source 区分
@@ -566,7 +617,7 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
               ["discovered", t("tools.tab_discover")],
             ] as [string, string][]).map(([k, label]) => (
               <button key={k} className={`btn btn-xs ${marketCat === k ? "btn-primary" : "btn-ghost"}`}
-                onClick={() => setMarketCat(k as any)}>{label}</button>
+                onClick={() => setMarketCat(k as MarketCat)}>{label}</button>
             ))}
           </div>
           <div className="card-desc" style={{ marginBottom: 6, fontSize: 11 }}>
@@ -583,7 +634,7 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
             const onClick = isEco
               ? () => installGitHubItem(item)
               : () => (item.installed && item.update_available
-                  ? setConfirming({ source: item.source_url, sha256: item.sha256, permissions: [] })
+                  ? setConfirming({ source: item.source_url || "", sha256: item.sha256 || "", permissions: [] })
                   : installFromMarket(item));
             return (
             <div key={`${item.repo || item.source_url || ""}:${item.skill_path || item.name}`} style={{

@@ -55,7 +55,10 @@ export type ViewId = "chat" | "models" | "tools" | "skills" | "cron" | "channels
 
 export interface CloudModel {
   name: string;
-  key: string;
+  /** 仅在用户刚输入、尚未保存时短暂存在；列表加载后不应持有明文 key */
+  key?: string;
+  /** 服务端是否已存 key（UI 用「已保存/未设置」展示，不回读明文） */
+  has_key?: boolean;
   endpoint: string;
   protocol?: string;
   max_tokens?: number;

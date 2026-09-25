@@ -14,7 +14,7 @@ interface ModelsViewProps {
   setShowAdvanced: (v: boolean) => void;
   testingModel: string | null;
   testResult: string;
-  testConnection: (modelName: string, key: string, endpoint: string, protocol: string) => void;
+  testConnection: (modelName: string, key: string | undefined, endpoint: string, protocol: string) => void;
   recentLearnings: { topic: string; content: string; confidence: number }[];
   localLLMStatus: LLMStatus;
   localModelId: string;

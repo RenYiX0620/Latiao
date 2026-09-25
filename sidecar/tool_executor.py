@@ -17,7 +17,7 @@ import httpx
 
 # 命令安全不变量单点定义（审计 P0）：插件、本 fallback、插件 seed 共用，
 # 消除三处漂移——fallback 此前缺解释器内联拦截（python3 -c / node -e）。
-from cmd_safety import check_cmd, child_env, reject_sensitive_read
+from cmd_safety import child_env, reject_sensitive_read
 
 logger = logging.getLogger("latiao-sidecar")
 
@@ -161,11 +161,37 @@ def write_file(path: str, content: str) -> str:
         return "⛔ Blocked: path traversal not allowed"
     if len(content) > 10 * 1024 * 1024:  # 10 MB limit
         return f"⛔ File too large ({len(content)} bytes, max 10 MB)"
+    # 与插件版 write_file.py 同级封印（P0）：此前 fallback 只查 `..`，
+    # 插件目录被删/seed 前走本路径时可写 extensions/*/plugin.py → 下次启动
+    # exec_module 即 RCE。系统目录/敏感目录/敏感文件名/自动加载目录全拒。
     try:
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
+        _rp = os.path.realpath(os.path.expanduser(path))
+    except Exception:
+        return "⛔ Blocked: 路径无效"
+    _blocked_dirs = ("/etc", "/System", "/usr", "/bin", "/sbin", "/var", "/private/etc")
+    if any(_rp == d or _rp.startswith(d + os.sep) for d in _blocked_dirs):
+        return f"⛔ Blocked: 不允许写入系统目录 - {_rp}"
+    # 敏感目录/文件名清单统一走 cmd_safety 单点（此前这里是另一份内联拷贝，
+    # 与插件侧的 5 项清单漂移 —— 2026-09-24 复查修复）
+    from cmd_safety import (
+        _BLOCKED_DIR_SUBSTRINGS, sensitive_write_block, sensitive_write_name_block,
+    )
+    if any(s in _rp for s in _BLOCKED_DIR_SUBSTRINGS):
+        return f"⛔ Blocked: 不允许访问敏感目录 - {_rp}"
+    _fn_block = sensitive_write_name_block(_rp)
+    if _fn_block:
+        return _fn_block
+    try:
+        _blk = sensitive_write_block(_rp)
+        if _blk:
+            return _blk
+    except Exception:
+        return "⛔ Blocked: 写入封印不可用，已拒绝"
+    try:
+        os.makedirs(os.path.dirname(_rp) or ".", exist_ok=True)
+        with open(_rp, "w", encoding="utf-8") as f:
             f.write(content)
-        return f"✅ 已写入：{path}（{len(content)} 字符）"
+        return f"✅ 已写入：{_rp}（{len(content)} 字符）"
     except Exception as e:
         return f"错误：{e}"
 
@@ -183,22 +209,54 @@ def list_dir(path: str) -> str:
         return f"错误：{e}"
 
 
+def _run_pipeline(left: str, right: str, timeout: int) -> str:
+    import shlex as _shlex
+    import subprocess as _sp
+    from cmd_safety import child_env
+    p1 = _sp.Popen(_shlex.split(left), shell=False, stdout=_sp.PIPE, stderr=_sp.PIPE,
+                   text=True, env=child_env())
+    p2 = _sp.Popen(_shlex.split(right), shell=False, stdin=p1.stdout, stdout=_sp.PIPE,
+                   stderr=_sp.PIPE, text=True, env=child_env())
+    if p1.stdout:
+        p1.stdout.close()
+    try:
+        out, err = p2.communicate(timeout=timeout)
+    except _sp.TimeoutExpired:
+        p1.kill()
+        p2.kill()
+        return "超时"
+    p1.wait(timeout=5)
+    body = (out or "").strip()
+    if p2.returncode != 0:
+        body += f"\n(退出码: {p2.returncode})"
+        if err and err.strip():
+            body += f"\n{err.strip()}"
+    return body or "(无输出)"
+
+
 def run_cmd(cmd: str) -> str:
     # Strip shell comment lines (models sometimes prepend "# comment\n")
     cmd = "\n".join(line for line in cmd.split("\n") if not line.strip().startswith("#")).strip()
     if not cmd:
         return "错误：命令为空（可能只包含注释行）"
-    # Reject unsupported shell operators — with shell=False they are passed as
-    # literal args and the command silently misbehaves (only the 1st runs).
-    m = re.search(r"(&&|\|\||\||;|\$\(|>|<)", cmd)
-    if m:
-        return (
-            f"⛔ 不支持 shell 操作符 '{m.group(1)}'：本工具以 shell=False 执行，"
-            "复合命令会静默失败。请拆成多次调用，每次只运行一条命令"
-            "（不要用 && | ; > < 等）。"
-        )
-    # 统一安全检查（cmd_safety 单点定义——插件/fallback/seed 共用）
-    denied = check_cmd(cmd)
+    # 引号外的 shell 操作符才拦（引号内是脚本内容，shell=False 不会解释）
+    from cmd_safety import (
+        find_unsupported_shell_op, split_pipeline, split_stdout_redirect,
+        unsupported_op_message,
+    )
+    _redir = split_stdout_redirect(cmd)
+    if _redir:
+        cmd, _target, _append = _redir
+    _pipe = None if _redir else split_pipeline(cmd)
+    if _pipe:
+        op = find_unsupported_shell_op(cmd)  # 两侧已查
+    else:
+        op = find_unsupported_shell_op(cmd)
+    if op:
+        return unsupported_op_message(op)
+    # 统一安全检查（cmd_safety 单点定义——插件/fallback/seed 共用，含脚本内容审查）
+    from cmd_safety import check_cmd_with_script
+    denied = check_cmd_with_script(cmd)
     if denied:
         return denied
     if len(cmd) > 1000:
@@ -212,12 +270,14 @@ def run_cmd(cmd: str) -> str:
             "  web_search({query: \"你的搜索词\"})\n"
             "对于文件操作，使用 read_file、list_dir、write_file 等工具。"
         )
+    if _pipe:
+        return _run_pipeline(_pipe[0], _pipe[1], 300)
     try:
         try:
             tokens = shlex.split(cmd)
         except ValueError as e:
             return f"命令格式错误: {e}"
-        r = subprocess.run(tokens, shell=False, capture_output=True, text=True, timeout=30,
+        r = subprocess.run(tokens, shell=False, capture_output=True, text=True, timeout=300,
                            # ④ 兜底执行器同样过白名单：命令由模型给出，子进程不该拿到
                            # sidecar token 与云模型密钥（审查时靠 test_spawn_env_guard 抓到）
                            env=child_env())
@@ -226,6 +286,13 @@ def run_cmd(cmd: str) -> str:
             out += f"\n(退出码: {r.returncode})"
             if r.stderr.strip():
                 out += f"\n{r.stderr.strip()}"
+        if _redir:
+            body = r.stdout or ""
+            with open(_target, "a" if _append else "w", encoding="utf-8") as _f:
+                _f.write(body)
+            return (f"已写入 {_target}（{len(body)} 字符）"
+                    + (f"\n退出码: {r.returncode}" if r.returncode else "")
+                    + (f"\n{r.stderr.strip()}" if r.stderr and r.stderr.strip() else ""))
         return out or "(无输出)"
     except subprocess.TimeoutExpired:
         return f"超时: {cmd}"

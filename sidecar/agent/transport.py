@@ -138,6 +138,39 @@ class EngineQueueTimeout(RuntimeError):
     """在闸门队列里等到超过上限仍未轮到（引擎被长时间占用/流泄漏）。"""
 
 
+def _set_wait_phase(wait_info: dict | None, phase: str | None) -> None:
+    """回填"正在等引擎"的相位：``queue``=排队等槽位，``reload``=等自动重载。
+
+    调用方（`agent/loop._sample`）据此在**静默期**定期向前端补发进度事件，喂住
+    流式看门狗——否则"后端愿意等 900s、前端 180s 就掐断"（2026-09-24 实测：
+    引擎自动重载期间前端报"流式响应超时"）。传 None 表示等待结束。
+    """
+    if isinstance(wait_info, dict):
+        if phase is None:
+            wait_info.pop("phase", None)
+        else:
+            wait_info["phase"] = phase
+
+
+def _log_engine_death(engine, exc: Exception) -> None:
+    """流中断时记下"引擎为什么死"：退出码 + stderr 尾部 + 当时槽位/上下文。
+
+    此前只抛一句"引擎死亡或连接断开"，日志里查不到原因（引擎 stderr 只留在内存
+    deque 里、成功加载后无人读、也不落盘）——2026-09-24 排查时无法回答"为什么"。
+    """
+    try:
+        proc = getattr(engine, "_process", None)
+        code = proc.poll() if proc is not None else None
+        tail = "".join(list(getattr(engine, "_stderr_tail", []) or [])[-12:])
+        logger.error(
+            "本地引擎流中断诊断：exit_code=%s slots=%s ctx=%s exc=%s；引擎 stderr 尾部:\n%s",
+            code, _engine_slots(), getattr(engine, "model_token_limit", "?"),
+            type(exc).__name__, tail or "(空)",
+        )
+    except Exception:
+        logger.warning("引擎死亡诊断记录失败", exc_info=True)
+
+
 @asynccontextmanager
 async def _local_llm_serialized(api_url: str | None, wait_info: dict | None = None):
     """本地请求按引擎槽位放行（容量 = --parallel N）；云端不设限。
@@ -149,6 +182,7 @@ async def _local_llm_serialized(api_url: str | None, wait_info: dict | None = No
     if _local:
         sem = _stream_lock()
         _t0 = time.monotonic()
+        _set_wait_phase(wait_info, "queue")   # 排队中（前端据此报"等待引擎"进度）
         _gate_stats["waiting"] = _gate_stats.get("waiting", 0) + 1
         try:
             await asyncio.wait_for(sem.acquire(), timeout=_queue_wait_max())
@@ -162,6 +196,7 @@ async def _local_llm_serialized(api_url: str | None, wait_info: dict | None = No
         finally:
             # 放行或超时都要把"排队计数"退掉（只在这里退一次，避免双退）
             _gate_stats["waiting"] = max(0, _gate_stats.get("waiting", 0) - 1)
+            _set_wait_phase(wait_info, None)  # 已放行/已超时：不再报"排队中"
         waited = time.monotonic() - _t0
         if isinstance(wait_info, dict):
             wait_info["waited"] = waited
@@ -272,6 +307,7 @@ async def _local_llm_stream(client, api_url: str, body: dict, headers: dict,
                 try:
                     async with client.stream("POST", api_url, json=body, headers=headers) as r:
                         r.raise_for_status()  # httpx 不自动抛 4xx/5xx，必须显式检查
+                        _set_wait_phase(wait_info, None)  # 连接已建立：等待结束
                         _yielded = True
                         try:
                             yield r
@@ -318,6 +354,7 @@ async def _local_llm_stream(client, api_url: str, body: dict, headers: dict,
                             except Exception:
                                 pass
                             _request_recovery_reload()
+                        _set_wait_phase(wait_info, "reload")  # 等待自动重载（前端据此报进度）
                         await asyncio.sleep(5)  # 5s × 72 = 最大约 6 分钟等待
                         continue
                     raise
@@ -328,6 +365,7 @@ async def _local_llm_stream(client, api_url: str, body: dict, headers: dict,
                     if _yielded:
                         # 流中途断裂（引擎被杀/系统压力/网络断）：生成器内不能重发，
                         # 抛出明确语义的异常，由 agent 循环的零交付重试接管
+                        _log_engine_death(engine, e)
                         raise httpx.RemoteProtocolError(
                             "本地模型流中断（引擎死亡或连接断开）。"
                             "若本轮尚无输出，任务将自动等待引擎恢复并重试。"
@@ -382,12 +420,14 @@ async def _local_llm_stream(client, api_url: str, body: dict, headers: dict,
                     # 等待重试（自动重载完成即恢复）
                     if _attempt < 71:
                         last_err = e
+                        _set_wait_phase(wait_info, "reload")  # 等待自动重载（前端据此报进度）
                         await asyncio.sleep(5)
                         continue
                     raise
             if last_err is not None:
                 raise last_err
         finally:
+            _set_wait_phase(wait_info, None)  # 无论怎么退出都清掉"等待中"相位
             if _local:
                 engine.mark_stream_exit()
                 engine.mark_engine_idle()

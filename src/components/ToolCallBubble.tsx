@@ -50,12 +50,23 @@ function fmtDur(ms: number, t: (k: string, p?: Record<string, string | number>) 
   return t("time.minutes", { m: Math.floor(s / 60), s: s % 60 });
 }
 
-const ToolCallBubble = memo(function ToolCallBubble({ msg, onConfirm }: {
+const ToolCallBubble = memo(function ToolCallBubble({ msg, onConfirm, sessionId }: {
   msg: Message;
-  onConfirm?: (callId: string, approved: boolean) => void;
+  sessionId?: string;
+  onConfirm?: (callId: string, approved: boolean, always?: boolean, toolName?: string, sessionId?: string) => void;
 }) {
   const { t } = useTranslation();
   const [expanded, setExpanded] = useState(false);
+  const alwaysAllowed = (() => {
+    try {
+      const keys = Object.keys(localStorage).filter((k) => k.startsWith("latiao_always_allow"));
+      for (const k of keys) {
+        const arr: string[] = JSON.parse(localStorage.getItem(k) || "[]");
+        if (msg.toolName && arr.includes(msg.toolName)) return true;
+      }
+      return false;
+    } catch { return false; }
+  })();
   const [fullExpanded, setFullExpanded] = useState(false);
   const statusClass = msg.toolStatus === "confirming" ? "confirming" : msg.toolStatus === "running" ? "running" : msg.toolStatus === "error" ? "error" : "done";
   const iconColor = msg.toolStatus === "confirming" ? "var(--warning)" : msg.toolStatus === "running" ? "var(--accent)" : msg.toolStatus === "error" ? "var(--danger)" : "var(--success)";
@@ -145,9 +156,32 @@ const ToolCallBubble = memo(function ToolCallBubble({ msg, onConfirm }: {
       </div>
       {msg.toolStatus === "confirming" && onConfirm && (
         <div className="tool-call-confirm">
-          <span className="tool-call-confirm-text">{t("tool.confirm_text")}</span>
+          <div className="tool-call-confirm-left">
+            <span className="tool-call-confirm-badge">?</span>
+            <div className="tool-call-confirm-copy">
+              <div className="tool-call-confirm-title">{t("tool.confirm_title", { tool: msg.toolName || "tool" })}</div>
+              <div className="tool-call-confirm-sub">{formatToolArgs(msg.toolArgs) || t("tool.confirm_text")}</div>
+              {alwaysAllowed && (
+                <button
+                  type="button"
+                  className="tool-call-confirm-warn"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    try {
+                      for (const k of Object.keys(localStorage).filter((k) => k.startsWith("latiao_always_allow"))) {
+                        const arr: string[] = JSON.parse(localStorage.getItem(k) || "[]");
+                        const next = arr.filter((n) => n !== msg.toolName);
+                        if (next.length !== arr.length) localStorage.setItem(k, JSON.stringify(next));
+                      }
+                    } catch { /* ignore */ }
+                  }}
+                >{t("tool.will_auto_allow")}</button>
+              )}
+            </div>
+          </div>
           <div className="tool-call-confirm-actions">
-            <button className="btn-allow" onClick={(e) => { e.stopPropagation(); onConfirm(msg.callId!, true); }}>{t("tool.allow")}</button>
+            <button className="btn-allow" onClick={(e) => { e.stopPropagation(); onConfirm(msg.callId!, true); }}>{t("tool.allow_once")}</button>
+            <button className="btn-always" onClick={(e) => { e.stopPropagation(); onConfirm(msg.callId!, true, true, msg.toolName, sessionId); }}>{t("tool.allow_always")}</button>
             <button className="btn-deny" onClick={(e) => { e.stopPropagation(); onConfirm(msg.callId!, false); }}>{t("tool.deny")}</button>
           </div>
         </div>

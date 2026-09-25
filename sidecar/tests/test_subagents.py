@@ -69,7 +69,10 @@ class TestSubtaskRegistry(unittest.TestCase):
         self.assertIn("steps", entry)
         self.assertIn("activity", entry)
         self.assertIn("last_activity", entry)
-        self.assertEqual(entry["status"], "running")
+        # 上面的收尾会 cancel 遗留协程 → 注册表必须落终态（09-24：此前永远
+        # running，用户点停止后子任务详情仍显示「执行中」）
+        self.assertEqual(entry["status"], "error")
+        self.assertIn("中断", entry.get("summary") or "")
 
 
 if __name__ == "__main__":

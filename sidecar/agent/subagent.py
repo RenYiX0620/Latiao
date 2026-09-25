@@ -7,6 +7,7 @@
   白名单恒排除 delegate_task；registry 保留 depth 字段为将来递归预留）。
 - UI 契约不变：_SUBTASKS/_SUBTASK_EVENTS/前台返回文本，与旧实现逐字段兼容。
 """
+import asyncio
 import logging
 import time as _time
 import uuid
@@ -70,6 +71,34 @@ _SUBTASKS: dict[str, dict] = {}
 _SUBTASK_EVENTS: list[dict] = []
 _SUBTASK_SEQ = 0
 _SUBTASK_TASKS: set = set()
+# task_id → 后台 asyncio.Task：用户停止时要真的 cancel 协程，
+# 否则卡在长 HTTP 里的子代理会一直跑到超时（09-24「点了结束还在执行」）
+_SUBTASK_CANCEL_HANDLES: dict[str, "asyncio.Task"] = {}
+
+
+def cancel_subtasks_for_session(session_id: str) -> None:
+    """父会话被停止：该会话派生的 running 子任务立刻落终态并 cancel 协程。
+
+    此前 /v1/chat/cancel 只置会话标记，子代理要等下一轮 step 边界才看见，
+    注册表还停在 running —— 前端子任务详情就一直显示「执行中」。
+    """
+    if not session_id:
+        return
+    for tid, s in list(_SUBTASKS.items()):
+        if s.get("status") != "running":
+            continue
+        sid = str(s.get("session") or "")
+        # 本会话发起的，或是 "父:sub_xxx" 形态的子会话
+        if not (sid == session_id or sid.startswith(session_id + ":") or session_id.startswith(sid + ":")):
+            continue
+        s["status"] = "error"
+        s["result"] = "[Sub-agent] 已中断（用户停止）"
+        s["updated_at"] = _time.time()
+        _SUBTASK_EVENTS.append({"id": tid, "status": "error", "summary": "已中断（用户停止）"})
+        t = _SUBTASK_CANCEL_HANDLES.get(tid)
+        if t is not None and not t.done():
+            t.cancel()
+        logger.info("subtask %s cancelled with session %s", tid, session_id)
 
 
 def _prune_subtasks(max_keep: int = 40) -> None:
@@ -227,9 +256,22 @@ async def _delegate_task(agent_type: str, task: str, task_id: str | None = None,
         # 只看首行是否带错误标记：正文引用工具报错（含"错误"二字）不应判失败
         _first = result.split("\n")[0]
         failed = _first.startswith("[Sub-agent") and ("错误" in _first or "HTTP" in _first)
-        s["status"] = "error" if failed else "done"
-        s["updated_at"] = _time.time()
-        _SUBTASK_EVENTS.append({"id": task_id, "status": s["status"], "summary": result[:120]})
+        # 用户停止 → 中断终态（不能记 done，前端会显示已完成）
+        from agent.session_events import _session_cancel_requested
+        interrupted = _session_cancel_requested(parent_session) or _session_cancel_requested(
+            f"{parent_session or 'root'}:{task_id}") or "已停止" in result or "task_stopped" in result
+        if interrupted and s.get("status") == "running":
+            s["status"] = "error"
+            s["result"] = s.get("result") or "[Sub-agent] 已中断（用户停止）"
+            if "已中断" not in s["result"]:
+                s["result"] = "[Sub-agent] 已中断（用户停止）"
+            s["updated_at"] = _time.time()
+            _SUBTASK_EVENTS.append({"id": task_id, "status": "error",
+                                    "summary": "已中断（用户停止）"})
+        else:
+            s["status"] = "error" if failed else "done"
+            s["updated_at"] = _time.time()
+            _SUBTASK_EVENTS.append({"id": task_id, "status": s["status"], "summary": result[:120]})
     return result
 
 
@@ -287,12 +329,14 @@ async def _delegate_task_bg(agent_type: str, task: str, parent_session: str = ""
     _SUBTASK_EVENTS.append({"id": task_id, "status": "started", "summary": task[:80]})
     try:
         from agent_loop import _spawn
-        _spawn(_run_subtask_bg(task_id, agent_type, task, parent_session))
+        _t = _spawn(_run_subtask_bg(task_id, agent_type, task, parent_session))
+        _SUBTASK_CANCEL_HANDLES[task_id] = _t
     except ImportError:
         import asyncio as _asyncio
         t = _asyncio.get_running_loop().create_task(_run_subtask_bg(task_id, agent_type, task, parent_session))
         _SUBTASK_TASKS.add(t)
         t.add_done_callback(_SUBTASK_TASKS.discard)
+        _SUBTASK_CANCEL_HANDLES[task_id] = t
     return (f"[Sub-agent {agent_type} 后台任务已启动] task_id={task_id}\n"
             "主对话可继续；结果将自动出现在子智能体面板，也可用 task_id 查询。")
 
@@ -338,19 +382,29 @@ async def _run_subtask_bg(task_id: str, agent_type: str, task: str, parent_sessi
     try:
         s["status"] = "running"
         s["updated_at"] = _time.time()
-        result = await _delegate_task(agent_type, task, task_id=task_id)
-        s["result"] = result
-        # 只看首行是否带错误标记：正文引用工具报错（含"错误"二字）不应判失败
-        _first = result.split("\n")[0]
-        failed = _first.startswith("[Sub-agent") and ("错误" in _first or "HTTP" in _first)
-        s["status"] = "error" if failed else "done"
-        s["updated_at"] = _time.time()
-        _SUBTASK_EVENTS.append({"id": task_id, "status": s["status"], "summary": result[:120]})
+        result = await _delegate_task(agent_type, task, task_id=task_id,
+                                      parent_session=parent_session)
+        if s.get("status") == "running":  # _delegate_task 已写终态则不覆盖
+            s["result"] = result
+            _first = result.split("\n")[0]
+            failed = _first.startswith("[Sub-agent") and ("错误" in _first or "HTTP" in _first)
+            s["status"] = "error" if failed else "done"
+            s["updated_at"] = _time.time()
+            _SUBTASK_EVENTS.append({"id": task_id, "status": s["status"], "summary": result[:120]})
         # 结果回流父会话（派发时捕获的 parent_session——不能用 contextvar，
         # 子代理 run() 会把它覆盖成子会话 id）
-        if not failed:
-            push_bg_result(parent_session, agent_type, task, result)
-    except Exception as e:
-        s["result"] = f"[Sub-agent: {agent_type}] 错误: {e}"
-        s["status"] = "error"
-        s["updated_at"] = _time.time()
+        if s.get("status") == "done":
+            push_bg_result(parent_session, agent_type, task, s.get("result") or result)
+    except BaseException as e:
+        # 含 CancelledError（用户停止会 cancel 本协程）——必须落终态
+        if s.get("status") == "running":
+            if isinstance(e, (asyncio.CancelledError, GeneratorExit)):
+                msg = "[Sub-agent] 已中断（用户停止）"
+            else:
+                msg = f"[Sub-agent: {agent_type}] 错误: {e}"
+            s["result"] = msg
+            s["status"] = "error"
+            s["updated_at"] = _time.time()
+            _SUBTASK_EVENTS.append({"id": task_id, "status": "error", "summary": msg[:80]})
+        if isinstance(e, (asyncio.CancelledError, GeneratorExit)):
+            return

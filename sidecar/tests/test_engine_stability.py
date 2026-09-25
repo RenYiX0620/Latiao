@@ -9,7 +9,7 @@ import unittest
 
 class TestRequestReloadGuard(unittest.TestCase):
     def test_second_request_skipped(self):
-        from local_llm import LocalLLMEngine
+        from local_llm_engine import EngineProcess as LocalLLMEngine  # 拆分后为 EngineProcess
         eng = LocalLLMEngine.__new__(LocalLLMEngine)  # 不跑 __init__（避免拉起下载等）
         eng._auto_reloading = True  # 模拟已有重载进行中
         eng.current_model_id = "test-model"
@@ -19,7 +19,7 @@ class TestRequestReloadGuard(unittest.TestCase):
 
     def test_first_request_starts_thread(self):
         import threading
-        from local_llm import LocalLLMEngine
+        from local_llm_engine import EngineProcess as LocalLLMEngine  # 拆分后为 EngineProcess
         eng = LocalLLMEngine.__new__(LocalLLMEngine)
         eng._auto_reloading = False
         started = threading.Event()
@@ -37,7 +37,7 @@ class TestRequestReloadGuard(unittest.TestCase):
 class TestEngineStatePersistence(unittest.TestCase):
     def setUp(self):
         import tempfile
-        from local_llm import LocalLLMEngine
+        from local_llm_engine import EngineProcess as LocalLLMEngine  # 拆分后为 EngineProcess
         # 关键：重定向到临时目录。曾发生测试把测试数据写进生产
         # ~/.local-ai-os/.engine_state.json，被运行中的 sidecar 恢复。
         self._tmp = tempfile.TemporaryDirectory()
@@ -47,7 +47,7 @@ class TestEngineStatePersistence(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
 
     def _eng(self):
-        from local_llm import LocalLLMEngine
+        from local_llm_engine import EngineProcess as LocalLLMEngine  # 拆分后为 EngineProcess
         eng = LocalLLMEngine.__new__(LocalLLMEngine)
         eng.current_model_id = ""
         eng.current_model_name = ""
@@ -57,7 +57,7 @@ class TestEngineStatePersistence(unittest.TestCase):
 
     def test_save_and_restore_roundtrip(self):
         import os
-        from local_llm import LocalLLMEngine
+        from local_llm_engine import EngineProcess as LocalLLMEngine  # 拆分后为 EngineProcess
         eng = self._eng()
         # 用真实存在的文件路径（restore 会校验路径存在性，防假 id 污染）
         real = os.path.join(self._tmp.name, "models", "test-35b")
@@ -79,7 +79,7 @@ class TestEngineStatePersistence(unittest.TestCase):
     def test_fake_path_discarded_on_restore(self):
         """防污染回归：状态文件里的假路径（如测试写入的 /models/test-35b）
         必须被丢弃，不得恢复——否则 sidecar 对着不存在的模型反复重载。"""
-        from local_llm import LocalLLMEngine
+        from local_llm_engine import EngineProcess as LocalLLMEngine  # 拆分后为 EngineProcess
         eng = self._eng()
         eng.current_model_id = "/models/test-35b"
         eng.current_model_name = "test-35b"
@@ -93,18 +93,18 @@ class TestEngineStatePersistence(unittest.TestCase):
             LocalLLMEngine._clear_engine_state(eng)
 
     def test_clear_removes_file(self):
-        from local_llm import LocalLLMEngine
+        from local_llm_engine import EngineProcess as LocalLLMEngine  # 拆分后为 EngineProcess
         eng = self._eng()
         eng.current_model_id = "m"
         LocalLLMEngine._save_engine_state(eng)
         LocalLLMEngine._clear_engine_state(eng)
-        from local_llm import LocalLLMEngine as L
-        self.assertFalse(L._engine_state_file.exists())
+        from local_llm_engine import EngineProcess as LocalLLMEngine  # 拆分后为 EngineProcess as L
+        self.assertFalse(LocalLLMEngine._engine_state_file.exists())
 
 
 class TestBusyEngineProtection(unittest.TestCase):
     def test_busy_flag_blocks_and_expires(self):
-        from local_llm import LocalLLMEngine
+        from local_llm_engine import EngineProcess as LocalLLMEngine  # 拆分后为 EngineProcess
         eng = LocalLLMEngine.__new__(LocalLLMEngine)
         LocalLLMEngine._engine_busy_until = 0.0
 
@@ -116,7 +116,7 @@ class TestBusyEngineProtection(unittest.TestCase):
         self.assertFalse(eng._engine_busy())
 
     def test_idle_clears_flag(self):
-        from local_llm import LocalLLMEngine
+        from local_llm_engine import EngineProcess as LocalLLMEngine  # 拆分后为 EngineProcess
         eng = LocalLLMEngine.__new__(LocalLLMEngine)
         eng.mark_engine_busy(grace_sec=60)
         eng.mark_engine_idle()

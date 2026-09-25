@@ -42,9 +42,20 @@ export async function sidecarFetch(path: string, method: "GET" | "POST" | "DELET
     body: body ? JSON.stringify(body) : null,
     token,
   }) as Promise<string>;
-  const timeout = new Promise<never>((_, reject) => setTimeout(() => reject(new Error("sidecar_proxy timeout (30s)")), 30_000));
-  const raw = await Promise.race([request, timeout]);
-  return JSON.parse(raw) as SidecarData;
+  // 超时后底层 invoke 仍可能完成：给它挂 noop catch，避免迟到 reject 变成
+  // unhandled rejection；同时用 AbortSignal.timeout 语义无法取消 invoke，
+  // 这里只保证调用方按时拿到错误。
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  request.catch(() => { /* 迟到失败已由 timeout 分支上报 */ });
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error("sidecar_proxy timeout (30s)")), 30_000);
+  });
+  try {
+    const raw = await Promise.race([request, timeout]);
+    return JSON.parse(raw) as SidecarData;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 /**

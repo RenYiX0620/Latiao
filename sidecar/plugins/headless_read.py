@@ -92,11 +92,56 @@ def _extract_text(html: str) -> str:
     return text.strip()
 
 
+def _url_block_reason(url: str) -> str | None:
+    """URL 是否指向本机/私网/保留地址；允许时返回 None。
+
+    抽成函数是为了**重定向与子请求复用同一道闸门**：只校验初始 URL 时，
+    `http://attacker/302 → http://169.254.169.254/` 的正文照样会被读回来
+    （2026-09-24 复查发现），必须在请求层逐个校验真正要连的目标。
+    """
+    try:
+        from urllib.parse import urlparse
+        import ipaddress
+        import socket
+        if urlparse(url).scheme not in ("http", "https"):
+            return None                      # data:/blob:/about: 不上网
+        host = urlparse(url).hostname or ""
+        if not host:
+            return f"⛔ Blocked: URL 缺少主机名 {url[:80]}"
+        if host in ("localhost", "localhost.localdomain") or host.endswith(".local"):
+            return "⛔ Blocked: 不允许访问本机/局域网地址"
+        if host.replace(".", "").isdigit() and not host.count(".") == 3:
+            return f"⛔ Blocked: 非法 IP 写法 {host}"
+        # 八进制/十六进制 IP（http://0177.0.0.1/ 等）：Chromium 按八进制连 127.0.0.1，
+        # getaddrinfo 却可能解析成别的地址 —— 闸门与浏览器解释不一致，直接拒。
+        if any(part.startswith("0") and len(part) > 1 and part.isdigit() for part in host.split(".")):
+            return f"⛔ Blocked: 不允许八进制 IP 写法 {host}"
+        if host.lower().startswith("0x"):
+            return f"⛔ Blocked: 不允许十六进制 IP 写法 {host}"
+        try:
+            infos = socket.getaddrinfo(host, None)
+        except OSError:
+            return f"Error: 无法解析主机 {host}"
+        for info in infos:
+            ip = ipaddress.ip_address(info[4][0])
+            if (ip.is_private or ip.is_loopback or ip.is_link_local
+                    or ip.is_reserved or ip.is_multicast):
+                return f"⛔ Blocked: 目标解析到私网/保留地址 {ip}"
+        return None
+    except Exception as e:
+        return f"⛔ Blocked: URL 安全检查失败: {e}"
+
+
 def execute(args: dict) -> str:
     url = (args.get("url", "") or "").strip()
     if not url.startswith(("http://", "https://")):
         return "Error: url 参数必须是完整的 http(s) 链接"
+    # SSRF 收口（P1）：禁私网/link-local/云 metadata；八进制/十进制 IP 一律拒绝
+    _deny = _url_block_reason(url)
+    if _deny:
+        return _deny
     wait_ms = max(0, min(int(args.get("wait_ms") or 3000), 15000))
+    _blocked: list[str] = []
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -107,6 +152,23 @@ def execute(args: dict) -> str:
             browser = p.chromium.launch(headless=True)
             try:
                 page = browser.new_page(user_agent=_UA)
+                # 请求层逐个校验：重定向与子请求都要过同一道闸门
+                # （只查初始 URL 时 302 可绕过 —— 2026-09-24 复查发现）
+                def _guard(route_obj):
+                    _r = _url_block_reason(route_obj.request.url)
+                    if _r:
+                        _blocked.append(_r)
+                        try:
+                            route_obj.abort()
+                        except Exception:
+                            pass
+                    else:
+                        try:
+                            route_obj.continue_()
+                        except Exception:
+                            pass
+
+                page.route("**/*", _guard)
                 page.goto(url, timeout=30000, wait_until="domcontentloaded")
                 page.wait_for_timeout(wait_ms)
                 html = page.content()
@@ -120,6 +182,10 @@ def execute(args: dict) -> str:
             # 不再甩生涩英文报错（09-08 17:13：模型见到原生 Playwright 报错）
             return f"Error: 无头浏览器未安装。\n{_NOT_INSTALLED}"
         return f"Error: 无头浏览器读取失败（{msg}）。可加大 wait_ms 重试，或改用 dokobot_read/tavily_search。"
+
+    if _blocked:
+        return (f"{_blocked[0]}（重定向或子请求指向本机/私网，已在请求层拦截，"
+                f"未读取页面内容）")
 
     if not html or len(html) < 200:
         return "Error: 页面内容为空（可能被反爬拦截）。改用 dokobot_read 或 tavily_search。"

@@ -24,6 +24,10 @@ CONFIG_FILE = PROGRESS_DIR / "config.json"
 # 默认 umask 决定，实测是 0644 —— 同机任何用户/进程都能读到明文密钥。
 CONFIG_MODE = 0o600
 
+# 上传体积上限（从 main 收敛到 config：媒体路由要用，而 main 是枢纽、
+# 不能被路由模块模块级 import）
+MAX_UPLOAD_SIZE = 50 * 1024 * 1024  # 50 MB
+
 
 def save_config(cfg: dict, path: Path | None = None) -> Path:
     """写 config.json：临时文件 + os.replace（不出现半截文件），并强制 0600。
