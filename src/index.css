@@ -70,3 +70,18 @@ html, body, #root {
 html.platform-windows[data-theme="light"] body {
   background: var(--bg-root);
 }
+
+/* ── Windows（窗口不透明）下的侧栏自给自足 ─────────────────────────────
+   macOS 的侧栏靠窗口磨砂（vibrancy）透出，不需要自己的底色；Windows 关掉透明后
+   侧栏必须自己给实底并保证文字对比度，否则浅色模式下几乎看不清（2026-09-25 实测）。
+   注意：这条只在 .platform-windows 下生效，macOS 不受影响。 */
+.platform-windows .sidebar {
+  background: var(--bg-surface);
+}
+html.platform-windows[data-theme="light"] .sidebar {
+  background: #ffffff;
+}
+html.platform-windows[data-theme="light"] .sidebar,
+html.platform-windows[data-theme="light"] .sidebar * {
+  color: var(--text-primary);
+}
