@@ -1,0 +1,444 @@
+import { lazy, Suspense, useState, useEffect, useCallback, useRef } from "react";
+import { ask } from "@tauri-apps/plugin-dialog";
+import { useTranslation } from "../i18n";
+import { authFetch } from "../utils/api";
+import type { HFModelResult, DownloadState, SetupIssue, LLMStatus } from "../types";
+
+/** A locally-downloaded model file discovered by the sidecar. */
+interface BenchPrefill { chars: number; seconds: number; tps: number; }
+
+interface BenchResult {
+  ts: number;
+  model: string;
+  backend?: string;
+  context_limit?: number;
+  gen_tps?: number;
+  ttft_s?: number;
+  prefill?: BenchPrefill[];
+  rss_gb?: number;
+  total_ram_gb?: number;
+  advice?: string[];
+  [key: string]: unknown;
+}
+
+interface LocalModelInfo {
+  id: string;
+  name: string;
+  path: string;
+  size: string;
+  format: string;
+}
+
+const ReactMarkdown = lazy(() => import("react-markdown"));
+
+function ModelDetailPanel({ modelId, detailData, detailLoading, downloadProgress, downloadModel, pauseDownload, cancelDownload, resumeDownload, startLocalLLM, deleteModelFile, fetchModelDetail, onClose }: {
+  modelId: string; detailData: Record<string, unknown> | null; detailLoading: boolean;
+  downloadProgress: Record<string, DownloadState>; downloadModel: (id: string) => void;
+  pauseDownload: (id: string) => void; cancelDownload: (id: string) => void;
+  resumeDownload: (id: string) => void;
+  startLocalLLM: (id?: string) => void; deleteModelFile: (id: string) => void; fetchModelDetail: (id: string) => void; onClose: () => void;
+}) {
+  const { t } = useTranslation();
+  if (!modelId) return (
+    <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", color: "#d1d5db", fontSize: 13, padding: 40, textAlign: "center" }}>
+      <div><div style={{ fontSize: 40, marginBottom: 12 }}>📦</div>{t("local.select_model_first")}<div style={{ fontSize: 10, marginTop: 4, color: "#e5e7eb" }}>{t("local.view_details")}</div></div>
+    </div>
+  );
+  if (detailLoading) return (
+    <div style={{ textAlign: "center", padding: 60 }}>
+      <div style={{ width: 24, height: 24, border: "3px solid #e5e7eb", borderTopColor: "#7c3aed", borderRadius: "50%", animation: "spin 0.8s linear infinite", margin: "0 auto 10px" }} />
+      <span style={{ color: "#9ca3af", fontSize: 12 }}>{t("local.loading")}</span>
+    </div>
+  );
+  if (!detailData || detailData.status === "error") return (
+    <div style={{ textAlign: "center", padding: 40, color: "#ef4444", fontSize: 12 }}>
+      {t("local.load_fail")} — <button className="btn btn-sm btn-ghost" onClick={() => fetchModelDetail(modelId)}>{t("local.retry")}</button>
+    </div>
+  );
+
+  const tags = (detailData.tags as string[]) || [];
+  const allLower = tags.map((t: string) => t.toLowerCase());
+  const caps: Array<[string, string, string, string]> = [];
+  if (allLower.some((t: string) => t.includes("vision") || t.includes("image"))) caps.push(["👁", "Vision", "#92400e", "#fef3c7"]);
+  if (allLower.some((t: string) => t.includes("tool") || t.includes("function-calling") || t.includes("agent"))) caps.push(["🔧", "Tool Use", "#1e40af", "#dbeafe"]);
+  if (allLower.some((t: string) => t.includes("reasoning") || t.includes("think") || t.includes("r1"))) caps.push(["🧠", "Reasoning", "#065f46", "#d1fae5"]);
+  if (allLower.some((t: string) => t.includes("gguf"))) caps.push(["📦", "GGUF", "#3b82f6", "#dbeafe"]);
+
+  const specs: Array<[string, string, boolean?]> = [];
+  const seenLabels = new Set<string>();
+  const pm = modelId.match(/(\d+)[bB]/);
+  if (pm) { specs.push(["Params", pm[1] + "B"]); seenLabels.add("Params"); }
+  for (const t of tags) { const l = t.toLowerCase(); if (l.includes("gguf") && !seenLabels.has("Format")) { specs.push(["Format", "GGUF", true]); seenLabels.add("Format"); } else if (!seenLabels.has("Domain") && ["llm","nlp","code","vision"].includes(l)) { specs.push(["Domain", t]); seenLabels.add("Domain"); } else if (!seenLabels.has("Arch") && ["gemma","llama","qwen","mistral","phi","deepseek"].some(a => l.includes(a))) { specs.push(["Arch", t]); seenLabels.add("Arch"); } }
+
+  // Estimate file size from quantization level when HF returns 0 (LFS files)
+  const quantOrder: Record<string, number> = {F16:0,Q8_0:1,Q6_K:2,Q6_K_L:3,Q5_K_M:4,Q5_K_L:5,Q5_K_S:6,Q5_0:7,Q4_K_M:8,Q4_K_L:9,Q4_K_S:10,Q4_0:11,Q4_1:12,Q3_K_XL:13,Q3_K_L:14,Q3_K_M:15,Q3_K_S:16,Q2_K_L:17,Q2_K:18,IQ4_NL:19,IQ4_XS:20,IQ3_M:21,IQ3_XS:22,IQ3_XXS:23,IQ2_M:24,IQ2_S:25,IQ1_M:26,IQ1_S:27};
+  // Bits-per-weight estimates for common quantization levels (used when HF reports 0 bytes for LFS files)
+  const quantBpw: Record<string, number> = {F16:16,Q8_0:8.5,Q6_K:6.6,Q6_K_L:6.6,Q5_K_M:5.5,Q5_K_L:5.5,Q5_K_S:5.5,Q5_0:5.5,Q4_K_M:4.8,Q4_K_L:4.8,Q4_K_S:4.8,Q4_0:4.5,Q4_1:4.5,Q3_K_XL:3.5,Q3_K_L:3.5,Q3_K_M:3.5,Q3_K_S:3.5,Q2_K_L:2.7,Q2_K:2.6,IQ4_NL:4.5,IQ4_XS:4.2,IQ3_M:3.4,IQ3_XS:3.3,IQ3_XXS:3.1,IQ2_M:2.5,IQ2_S:2.4,IQ1_M:1.7,IQ1_S:1.6};
+  // Extract parameter count from modelId (e.g. "Qwen2.5-7B-Instruct" → 7)
+  const paramMatch = modelId.match(/(\d+)[bB]/);
+  const paramB = paramMatch ? parseFloat(paramMatch[1]) : 0;
+  const estimateSize = (sizeBytes: number, quant: string): string => {
+    if (sizeBytes > 0) return (sizeBytes / (1024**3)).toFixed(1) + " GB";
+    if (paramB > 0 && quantBpw[quant]) {
+      const estimatedGB = (paramB * quantBpw[quant]) / 8;
+      return "≈" + estimatedGB.toFixed(1) + " GB";
+    }
+    return "";
+  };
+  // Deduplicate split files (00001-of-00003) into single entries
+  const rawFiles = ((detailData.siblings as Array<{filename:string;size:string;quant:string;size_bytes:number}>) || [])
+    .filter(s => s.filename.endsWith(".gguf") && !s.filename.includes("mmproj") && !s.filename.includes("/mmproj"));
+  const merged = new Map<string, {filename:string;size_bytes:number;quant:string;parts:number}>();
+  for (const f of rawFiles) {
+    const base = f.filename.replace(/-\d{5}-of-\d{5}/, "").replace(/\.gguf$/, "");
+    const existing = merged.get(base);
+    if (existing) {
+      existing.size_bytes += f.size_bytes;
+      existing.parts += 1;
+      if (f.filename.length < existing.filename.length) existing.filename = f.filename;
+    } else {
+      merged.set(base, {filename: f.filename, size_bytes: f.size_bytes, quant: f.quant, parts: 1});
+    }
+  }
+  const ggufFiles = Array.from(merged.values())
+    .sort((a,b) => (quantOrder[a.quant] ?? 99) - (quantOrder[b.quant] ?? 99));
+
+  return (
+    <>
+      <div style={{ padding: "14px 18px", borderBottom: "1px solid #e8eaed", position: "sticky", top: 0, background: "#fafbfc", zIndex: 2 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ fontSize: 15, fontWeight: 700, color: "#1a1a2e" }}>{modelId.split("/").pop()?.replace(/-/g, " ").replace(/_/g, " ") || modelId}</div>
+            <div style={{ fontSize: 10, color: "#9ca3af", fontFamily: "var(--font-mono)", marginTop: 1 }}>{modelId}</div>
+          </div>
+          <button onClick={onClose} style={{ width: 28, height: 28, borderRadius: 6, border: "none", background: "transparent", cursor: "pointer", color: "#9ca3af", fontSize: 16 }}>✕</button>
+        </div>
+      </div>
+      <div style={{ padding: "14px 18px" }}>
+        <div style={{ display: "flex", gap: 12, marginBottom: 12, fontSize: 11, color: "#6b7280" }}>
+          <span>⬇ {(detailData.downloads as number)?.toLocaleString() || 0}</span>
+          <span>❤️ {(detailData.likes as number) || 0}</span>
+          {((detailData.downloads as number) > 100000 || (detailData.likes as number) > 50) && <span style={{ marginLeft: "auto", padding: "2px 8px", borderRadius: 5, background: "#f5f3ff", color: "#7c3aed", fontSize: 9, fontWeight: 600 }}>✨ Staff Pick</span>}
+        </div>
+        {caps.length > 0 && (<div style={{ marginBottom: 12 }}><div style={{ fontSize: 10, color: "#9ca3af", marginBottom: 4 }}>Capabilities:</div><div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>{caps.map(([icon, label, color, bg]) => (<span key={label} style={{ padding: "3px 8px", borderRadius: 12, fontSize: 10, fontWeight: 600, background: bg, color, border: `1px solid ${color}20`, display: "flex", alignItems: "center", gap: 3 }}>{icon} {label}</span>))}</div></div>)}
+        {specs.length > 0 && (<div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "4px 12px", marginBottom: 14 }}>{specs.slice(0,4).map(([label, value, accent]) => (<div key={label} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11 }}><span style={{ color: "#9ca3af", minWidth: 44 }}>{label}</span><span style={{ padding: "1px 6px", borderRadius: 4, fontSize: 10, fontFamily: "var(--font-mono)", fontWeight: 600, background: accent ? "#dbeafe" : "#f3f4f6", color: accent ? "#2563eb" : "#4b5563" }}>{value}</span></div>))}</div>)}
+        {ggufFiles.length > 0 && (<div style={{ marginBottom: 14 }}><div style={{ fontSize: 11, fontWeight: 700, color: "#1f2937", marginBottom: 6 }}>{t("local.download_options", { count: ggufFiles.length })}</div>{ggufFiles.map(sib => { const fullModelId = modelId + "/" + sib.filename; const dp = downloadProgress[sib.filename] || downloadProgress[fullModelId]; const sizeDisplay = estimateSize(sib.size_bytes, sib.quant); const label = sib.filename.split("/").pop()?.replace(/-\d{5}-of-\d{5}\.gguf$/, ".gguf") || sib.filename; return (<div key={sib.filename} style={{ display: "flex", alignItems: "center", gap: 6, padding: "6px 10px", background: dp?.status==="done"?"#ecfdf5":"#fff", borderRadius: 8, marginBottom: 4, border: `1px solid ${dp?.status==="done"?"#10b981":"#e5e7eb"}` }}><span style={{ fontSize: 9, fontWeight: 700, fontFamily: "var(--font-mono)", padding: "2px 6px", borderRadius: 4, background: "#ede9fe", color: "#7c3aed", minWidth: 52, textAlign: "center" }}>{sib.quant||"Weight"}</span><div style={{ flex: 1, minWidth: 0 }}><div style={{ fontSize: 9, fontFamily: "var(--font-mono)", color: "#4b5563", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{label}</div><div style={{ fontSize: 9, color: "#9ca3af" }}>{sizeDisplay}{sib.parts > 1 ? t("local.shards", { n: sib.parts }) : ""}</div></div>{dp?.status==="done"?<div style={{ display:"flex", alignItems:"center", gap:4, flexShrink:0 }}><button className="btn btn-sm btn-primary" style={{ padding: "4px 10px", fontSize: 10, borderRadius: 6 }} onClick={() => startLocalLLM(fullModelId)}>🚀</button><button className="btn btn-sm" style={{ padding:"2px 6px", fontSize:9, borderRadius:4, background:"transparent", color:"#ef4444", border:"1px solid #fecaca" }} onClick={async (e) => { e.stopPropagation(); const ok = await ask(t("local.delete_confirm_label", { label })); if (ok) deleteModelFile(fullModelId); }} title={t("local.delete_model_file")}>🗑</button></div>:dp?.status==="downloading"?<div style={{ display:"flex", alignItems:"center", gap:4, flexShrink:0 }}><div style={{ width:40, height:4, borderRadius:2, background:"#e5e7eb", overflow:"hidden" }}><div style={{ width:dp?.progress+"%", height:"100%", borderRadius:2, background:"#7c3aed", transition:"width 0.5s" }} /></div><span style={{ fontSize:9, color:"#7c3aed", fontWeight:600, minWidth:24, textAlign:"right" }}>{dp?.progress||0}%</span><span style={{ fontSize:8, color:"#9ca3af", minWidth:44, textAlign:"right" }}>{(dp?.speed_bps||0)>0?((dp?.speed_bps||0)/(1024**2)).toFixed(1)+" MB/s":""}</span><span style={{ fontSize:8, color:"#d1d5db" }}>{(dp?.eta_seconds||0)>0?((dp?.eta_seconds||0)>3600?Math.floor((dp?.eta_seconds||0)/3600)+"h":(dp?.eta_seconds||0)>60?Math.floor((dp?.eta_seconds||0)/60)+"m":(dp?.eta_seconds||0)+"s"):""}</span><button className="btn btn-sm" style={{ padding:"2px 6px", fontSize:9, borderRadius:4, background:"#f59e0b", color:"#fff", border:"none" }} onClick={() => pauseDownload(fullModelId)} title={t("local.pause")}>⏸</button><button className="btn btn-sm" style={{ padding:"2px 6px", fontSize:9, borderRadius:4, background:"#ef4444", color:"#fff", border:"none" }} onClick={() => cancelDownload(fullModelId)} title={t("common.cancel")}>✕</button></div>:dp?.status==="error"||dp?.status==="cancelled"?<div style={{ display:"flex", alignItems:"center", gap:4 }}><span style={{ fontSize:8, color:"#ef4444", maxWidth:100, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }} title={dp?.message||""}>{dp?.status==="cancelled"?t("local.cancelled"):t("local.failed")}</span><button className="btn btn-sm" style={{ padding:"2px 6px", fontSize:9, borderRadius:4, background:"#ef4444", color:"#fff", border:"none" }} onClick={() => cancelDownload(fullModelId)} title={t("local.delete_record")}>🗑</button><button className="btn btn-sm" style={{ padding:"4px 10px", fontSize:10, borderRadius:6, background:"#7c3aed", color:"#fff", border:"none", fontWeight:600 }} onClick={() => downloadModel(fullModelId)}>↻</button></div>:dp?.status==="paused"?<div style={{ display:"flex", alignItems:"center", gap:4 }}><span style={{ fontSize:8, color:"#f59e0b" }}>{t("local.paused")}</span><button className="btn btn-sm" style={{ padding:"2px 6px", fontSize:9, borderRadius:4, background:"#ef4444", color:"#fff", border:"none" }} onClick={() => cancelDownload(fullModelId)} title={t("common.cancel")}>✕</button><button className="btn btn-sm" style={{ padding:"4px 10px", fontSize:10, borderRadius:6, background:"#f59e0b", color:"#fff", border:"none", fontWeight:600 }} onClick={() => resumeDownload(fullModelId)}>{t("local.resume")}</button></div>:<button className="btn btn-sm" style={{ padding: "4px 10px", fontSize: 10, borderRadius: 6, background: "#7c3aed", color: "#fff", border: "none", fontWeight: 600 }} onClick={() => downloadModel(fullModelId)}>⬇</button>}</div>); })}</div>)}
+        {detailData.readme ? <details open><summary style={{ fontSize: 11, fontWeight: 700, color: "#1f2937", cursor: "pointer", marginBottom: 6 }}>📖 README</summary><div style={{ fontSize: 10, lineHeight: 1.6, color: "#374151", maxHeight: 300, overflowY:"auto", padding: "10px 12px", background: "#fff", borderRadius: 8, border: "1px solid #e5e7eb" }}><Suspense fallback={<div>{String(detailData.readme).slice(0, 500)}</div>}><ReactMarkdown>{String(detailData.readme).slice(0, 3000)}</ReactMarkdown></Suspense></div></details> : null}
+      </div>
+    </>
+  );
+}
+
+interface Props {
+  localLLMStatus: LLMStatus; localModelId: string; setLocalModelId: (id: string) => void;
+  setupCheck: { ready: boolean; ok: { item: string; status: string }[]; issues: SetupIssue[] } | null;
+  hfSearch: string; setHfSearch: (s: string) => void; hfResults: HFModelResult[]; searching: boolean; searchHF: (query?: string, library?: string) => void;
+  downloadProgress: Record<string, DownloadState>; downloadModel: (modelId: string) => void;
+  pauseDownload: (modelId: string) => void; cancelDownload: (modelId: string) => void;
+  resumeDownload: (modelId: string) => void;
+  startLocalLLM: (modelId?: string) => void; stopLocalLLM: () => void;
+  fixing: string; runFix: (fixType: string, fixPkg: string) => void; showToast: (msg: string, type?: string) => void;
+  contextLimit: number; setContextLimit: (limit: number) => void;
+  contextEstimate: { max_context: number; recommended_context: number; ram_available_gb: number; memory_for_context_gb: number } | null;
+  fetchContextEstimate: (modelPath?: string) => void;
+}
+
+export default function LocalModelsTab(props: Props) {
+  const { localLLMStatus, localModelId, setLocalModelId, setupCheck, hfSearch, setHfSearch, hfResults, searching, searchHF, downloadProgress, downloadModel, pauseDownload, cancelDownload, resumeDownload, startLocalLLM, stopLocalLLM, fixing, runFix, showToast, contextLimit, setContextLimit, contextEstimate, fetchContextEstimate } = props;
+  const { t, lang } = useTranslation();
+  const isRunning = localLLMStatus?.status === "running";
+  const isStarting = localLLMStatus?.status === "starting";
+  const [benchRunning, setBenchRunning] = useState(false);
+  const [benchLatest, setBenchLatest] = useState<BenchResult | null>(null);
+  const [benchHistory, setBenchHistory] = useState<BenchResult[]>([]);
+  const [showSearch, setShowSearch] = useState(false);
+  const [searchFilter, setSearchFilter] = useState("");
+  const [detailModelId, setDetailModelId] = useState("");
+  const [detailData, setDetailData] = useState<Record<string, unknown> | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [localModels, setLocalModels] = useState<LocalModelInfo[]>([]);
+
+  // ── 基准测试：一键测生成速度/首字延迟/预填充/内存，并给可执行建议（09-13）──
+  const loadBenchmarks = useCallback(async () => {
+    try {
+      const resp = await authFetch("/v1/local-llm/benchmarks");
+      const data = await resp.json();
+      if (data.status === "ok") {
+        setBenchHistory(data.items || []);
+        setBenchLatest((data.items || [])[0] || null);
+      }
+    } catch { /* 基准历史不可用不影响页面 */ }
+  }, []);
+
+  const runBenchmark = useCallback(async () => {
+    if (benchRunning) return;
+    setBenchRunning(true);
+    showToast(t("local.bench_started"), "info");
+    try {
+      const resp = await authFetch("/v1/local-llm/benchmark", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        // 建议文案由后端生成 → 把界面语言一起发过去（large: 跑大档预填充）
+        body: JSON.stringify({ large: true, lang }),
+      });
+      const data = await resp.json();
+      if (data.status === "ok") {
+        setBenchLatest(data);
+        showToast(t("local.bench_done", { tps: data.gen_tps, ttft: data.ttft_s, rss: data.rss_gb }));
+        void loadBenchmarks();
+      } else {
+        showToast(data.message || t("local.bench_failed"), "warn");
+      }
+    } catch (e) {
+      console.error(e);
+      showToast(t("local.bench_request_failed"), "warn");
+    } finally {
+      setBenchRunning(false);
+    }
+  }, [benchRunning, showToast, loadBenchmarks, t, lang]);
+
+  useEffect(() => { void Promise.resolve().then(() => loadBenchmarks()); }, [loadBenchmarks]);
+
+  const fetchLocalModels = useCallback(() => {
+    authFetch("/v1/local-llm/models")
+      .then(resp => resp.json())
+      .then((data) => {
+        if (data.status === "ok" && Array.isArray(data.models)) {
+          setLocalModels(data.models as LocalModelInfo[]);
+        }
+      })
+      .catch(() => { /* sidecar not ready yet - silently skip */ });
+  }, []);
+
+  // Refresh the local model list on mount and whenever a model finishes
+  // starting/stopping (so a freshly downloaded model shows up).
+  useEffect(() => { fetchLocalModels(); }, [fetchLocalModels, localLLMStatus.status]);
+
+  const filteredResults = searchFilter ? hfResults.filter(m => m.tags?.some(t => t.toLowerCase().includes(searchFilter))) : hfResults;
+
+  const openSearch = () => { setShowSearch(true); setHfSearch(""); setDetailModelId(""); setDetailData(null); searchHF(""); };
+  // Monotonic request id so a slow detail response can't clobber a newer selection
+  const detailReqRef = useRef(0);
+  const fetchModelDetail = async (modelId: string) => { const reqId = ++detailReqRef.current; setDetailModelId(modelId); setDetailData(null); setDetailLoading(true); try { const resp = await authFetch("/v1/local-llm/model-detail?model_id=" + encodeURIComponent(modelId)); const data = await resp.json(); if (reqId === detailReqRef.current) setDetailData(data); } catch { if (reqId === detailReqRef.current) setDetailData({ status: "error", message: t("local.load_fail") }); } if (reqId === detailReqRef.current) setDetailLoading(false); };
+  const deleteModelFile = async (modelId: string) => { try { const resp = await authFetch("/v1/local-llm/delete-model", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model_id: modelId }) }); const data = await resp.json(); showToast(data.message || t("local.deleted")); if (data.status === "ok" && detailModelId) fetchModelDetail(detailModelId); } catch(e) { console.error(e); showToast(t("local.delete_fail")); } };
+
+  // 应用内目录选择器：点文件夹进入、点"选择"直接选中该目录——
+  // 绕开 macOS 原生目录面板t("local.dblclick_enter")的歧义
+  const [showDirPicker, setShowDirPicker] = useState(false);
+  const [browse, setBrowse] = useState<{ path: string; parent: string | null; roots: { path: string; label: string }[]; entries: { name: string; path: string; is_dir: boolean; size: number }[] } | null>(null);
+  const fetchBrowse = async (path?: string) => { try { const q = path ? "?path=" + encodeURIComponent(path) : ""; const resp = await authFetch("/v1/files/browse" + q); const data = await resp.json(); if (data.status === "ok") setBrowse(data); else showToast(data.detail || t("local.dir_fail")); } catch { showToast(t("local.dir_fail")); } };
+  const openDirPicker = () => { setShowDirPicker(true); fetchBrowse(); };
+  const pickDir = (path: string) => { setShowDirPicker(false); setLocalModelId(path); startLocalLLM(path); };
+
+  return (
+    <div style={{ position: "relative" }}>
+      {setupCheck && setupCheck.issues.length > 0 && (
+        <div className="settings-group" style={{ marginBottom: 16, borderColor: "var(--warning)" }}>
+          <div className="settings-group-header" style={{ color: "var(--warning)" }}>⚠ {t("local.env_check")}</div>
+          {setupCheck.issues.map((iss, i) => (
+            <div key={i} className="settings-row" style={{ background: iss.status === "missing" ? "var(--warning-soft)" : "transparent" }}>
+              <div style={{ flex: 1 }}><div className="settings-row-label">{iss.item}</div><div className="settings-row-desc" style={{ fontFamily: "var(--font-mono)", fontSize: 10 }}>{iss.fix}</div></div>
+              {iss.fix_type === "pip" ? <button className="btn btn-sm btn-primary" style={{ flexShrink: 0 }} onClick={() => runFix(iss.fix_type || "", iss.fix_pkg || "")} disabled={fixing === (iss.fix_pkg || "")}>{fixing === (iss.fix_pkg || "") ? t("local.fixing") : t("local.fix_btn")}</button>
+              : <button className="btn btn-sm btn-ghost" style={{ flexShrink: 0 }} onClick={() => showToast(t("local.manual_fix") + ": " + iss.fix)}>{t("local.manual_fix")}</button>}
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div className="settings-group" style={{ marginBottom: 16 }}>
+        <div className="settings-group-header">{t("local.engine_title")}<span style={{ marginLeft: 8, fontSize: 11, fontWeight: 400, color: "var(--text-secondary)" }}>{localLLMStatus.backend || t("local.engine_detecting")}{localLLMStatus.platform && <> · {localLLMStatus.platform}</>}</span></div>
+        <div style={{ padding: "14px 16px", display: "flex", alignItems: "center", gap: 16 }}>
+          <div style={{ width: 40, height: 40, borderRadius: "50%", background: isRunning ? "linear-gradient(135deg, var(--success), #10b981)" : isStarting ? "linear-gradient(135deg, var(--warning), #f59e0b)" : "rgba(255,255,255,0.05)", border: isRunning || isStarting ? "1px solid rgba(255,255,255,0.14)" : "1px solid var(--border-strong)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: isRunning || isStarting ? 15 : 10, flexShrink: 0, boxShadow: isRunning ? "0 0 18px rgba(52,211,153,0.35)" : isStarting ? "0 0 18px rgba(251,191,36,0.3)" : "none", transition: "all 0.5s ease" }}>{isRunning ? "⚡" : isStarting ? "⏳" : "\u23F9\uFE0E"}</div>
+          <div style={{ flex: 1 }}>
+            <div style={{ fontSize: 16, fontWeight: 600, color: "var(--text-primary)" }}>{isRunning ? t("local.status_running") : isStarting ? t("local.status_starting") : t("local.status_stopped")}</div>
+            <div style={{ fontSize: 12, color: "var(--text-secondary)", marginTop: 2 }}>{localLLMStatus.message || t("local.ready")}</div>
+            {isRunning && <>
+              <div style={{ fontSize: 12, color: "var(--text-primary)", marginTop: 6, fontFamily: "var(--font-mono)", display: "flex", gap: 16, flexWrap: "wrap" }}><span>🖥 {localLLMStatus.model_name || localLLMStatus.model_id}</span><span>🔌 :{localLLMStatus.port}</span><span>📐 {(localLLMStatus.token_limit ?? 0).toLocaleString()} tokens</span>{localLLMStatus.gpu_layers !== undefined && <span>🧮 {localLLMStatus.gpu_layers === -1 ? "Auto GPU" : `${localLLMStatus.gpu_layers} layers`}</span>}</div>
+              <div style={{ marginTop: 8, display: "flex", gap: 8 }}><button className="btn btn-sm btn-primary" onClick={stopLocalLLM} style={{ padding: "6px 16px" }}>⏹ {t("local.stop_btn")}</button><button className="btn btn-sm btn-ghost" style={{ padding: "6px 16px", color: "var(--danger)" }} onClick={async () => { const mid = localLLMStatus.model_id; if (!mid) return; const ok = await ask(t("local.delete_model_confirm") + "\n" + mid); if (!ok) return; try { await stopLocalLLM(); const resp = await authFetch("/v1/local-llm/delete-model", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model_id: mid }) }); const data = await resp.json(); showToast(data.message || t("local.deleted")); } catch(e) { console.error(e); showToast(t("local.delete_fail")); } }}>{t("local.delete_model_btn")}</button></div>
+            </>}
+          </div>
+        </div>
+      </div>
+
+      <div className="settings-group" style={{ marginBottom: 16 }}>
+        <div className="settings-group-header">{t("local.ctx_length")}{contextEstimate && <span style={{ marginLeft: 8, fontSize: 11, fontWeight: 400, color: "var(--text-secondary)" }}>{t("local.ram_hint", { gb: contextEstimate.ram_available_gb, rec: contextEstimate.recommended_context.toLocaleString() })}</span>}</div>
+        <div style={{ padding: "12px 16px" }}>
+          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+            <input type="range" min={2048} max={131072} step={2048} value={contextLimit} onChange={e => setContextLimit(parseInt(e.target.value))} style={{ flex: 1, minWidth: 200 }} />
+            <select className="form-input" style={{ width: 120, margin: 0, fontSize: 12, padding: "6px 8px", fontFamily: "var(--font-mono)" }} value={contextLimit} onChange={e => setContextLimit(parseInt(e.target.value))}>
+              {[2048, 4096, 8192, 16384, 32768, 49152, 65536, 98304, 131072].map(v => <option key={v} value={v}>{v.toLocaleString()}</option>)}
+            </select>
+            <span style={{ fontSize: 11, fontFamily: "var(--font-mono)", color: "var(--accent)", minWidth: 80, textAlign: "right" }}>{contextLimit.toLocaleString()} tokens</span>
+          </div>
+          <div style={{ display: "flex", gap: 8, marginTop: 8, fontSize: 10, color: "var(--text-muted)", alignItems: "center" }}>
+            <button className="btn btn-sm btn-ghost" style={{ fontSize: 10, padding: "2px 8px" }} onClick={() => fetchContextEstimate(localModelId || undefined)}>{t("local.redetect")}</button>
+            <button className="btn btn-sm btn-ghost" style={{ fontSize: 10, padding: "2px 8px" }} onClick={() => startLocalLLM()} disabled={!localLLMStatus.model_id}>{t("local.reload_model")}</button>
+            <button className="btn btn-sm btn-ghost" style={{ fontSize: 10, padding: "2px 8px" }}
+              onClick={() => void runBenchmark()} disabled={benchRunning || !localLLMStatus.model_id}>
+              {benchRunning ? t("local.bench_running") : t("local.bench_run")}
+            </button>
+            {contextEstimate && <><span>| {t("local.max_safe")}: {contextEstimate.max_context.toLocaleString()} tokens</span><span>| {t("local.restart_effect")}</span></>}
+          </div>
+          {contextEstimate && contextLimit > contextEstimate.max_context && <div style={{ marginTop: 8, fontSize: 10, color: "var(--danger)" }}>{t("local.context_warning", { limit: contextEstimate.max_context.toLocaleString() })}</div>}
+        </div>
+      </div>
+
+      {/* 基准测试结果（一键实测：生成速度/首字延迟/预填充/内存 + 建议） */}
+      {(benchLatest || benchHistory.length > 0) && (
+        <div className="settings-group" style={{ marginBottom: 16 }}>
+          <div className="settings-group-header">{t("local.bench_results")}
+            <span style={{ marginLeft: 8, fontSize: 11, fontWeight: 400, color: "var(--text-secondary)" }}>
+              {t("local.bench_recent", { count: benchHistory.length })}
+            </span>
+          </div>
+          <div style={{ padding: "12px 16px", fontSize: 12 }}>
+            {benchLatest && (
+              <>
+                <div style={{ fontFamily: "var(--font-mono)", fontSize: 12, lineHeight: 1.9 }}>
+                  <div>{t("local.bench_model", { model: `${benchLatest.model}${benchLatest.backend ? ` · ${benchLatest.backend}` : ""}` })}</div>
+                  <div>{t("local.bench_gen", { tps: benchLatest.gen_tps ?? "?", ttft: benchLatest.ttft_s ?? "?", ctx: Number(benchLatest.context_limit || 0).toLocaleString() })}</div>
+                  {(benchLatest.prefill || []).map((pf: BenchPrefill, i: number) => (
+                    <div key={i}>{t("local.bench_prefill", { k: (pf.chars / 1000).toFixed(1), sec: pf.seconds, tps: pf.tps })}</div>
+                  ))}
+                  <div>{t("local.bench_mem", { used: benchLatest.rss_gb ?? "?", total: benchLatest.total_ram_gb ?? "?" })}</div>
+                </div>
+                {(benchLatest.advice || []).length > 0 && (
+                  <div style={{ marginTop: 8, padding: "8px 10px", background: "var(--bg-tool-call)", borderRadius: "var(--radius-sm)", lineHeight: 1.7 }}>
+                    {(benchLatest.advice || []).map((a: string, i: number) => <div key={i}>· {a}</div>)}
+                  </div>
+                )}
+              </>
+            )}
+            {benchHistory.length > 1 && (
+              <div style={{ marginTop: 10, fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--text-secondary)" }}>
+                <div style={{ marginBottom: 4 }}>{t("local.bench_history")}</div>
+                {benchHistory.slice(1, 6).map((h: BenchResult, i: number) => (
+                  <div key={i}>{t("local.bench_history_row", { ts: new Date(h.ts * 1000).toLocaleString(), model: h.model, tps: h.gen_tps ?? "?", ttft: h.ttft_s ?? "?", rss: h.rss_gb ?? "?" })}</div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      <div className="settings-group" style={{ marginBottom: 16 }}>
+        <div className="settings-group-header">{t("local.hf_search")}</div>
+        <div style={{ padding: "12px 16px" }}>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button className="btn btn-md btn-primary" onClick={openSearch} style={{ flex: 1, padding: "10px 16px", fontSize: 13 }}>🔍 {t("local.search_btn")}</button>
+          </div>
+          <div style={{ fontSize: 10, color: "var(--text-muted)", marginTop: 6 }}>{t("local.browse_hint")}</div>
+        </div>
+      </div>
+
+      {!isRunning && (
+        <div className="settings-group" style={{ marginBottom: 16 }}>
+          <div className="settings-group-header">{t("local.start_model")}</div>
+          <div style={{ padding: "12px 16px" }}>
+            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              <input className="form-input" style={{ flex: 1, margin: 0, fontSize: 12, padding: "8px 12px", fontFamily: "var(--font-mono)" }} placeholder={t("local.model_id_placeholder")} value={localModelId} onChange={e => setLocalModelId(e.target.value)} onKeyDown={e => { if (e.key === "Enter") startLocalLLM(); }} />
+              <button className="btn btn-sm" onClick={openDirPicker} title={t("local.pick_dir_hint")} style={{ minWidth: 100, padding: "8px 16px" }}>📂 {t("local.pick_model")}</button>
+              <button className="btn btn-md btn-primary" style={{ minWidth: 100, padding: "8px 16px" }} onClick={() => startLocalLLM()} disabled={isStarting}>{isStarting ? "⏳ " + t("local.starting") : "🚀 " + t("local.start")}</button>
+            </div>
+            <div style={{ fontSize: 10, color: "var(--text-muted)", marginTop: 8 }}>{t("local.start_hint")} {localLLMStatus.backend === "mlx" ? t("local.mlx") : t("local.llamacpp")}</div>
+            {localModels.length > 0 && (
+              <div style={{ marginTop: 12 }}>
+                <div style={{ fontSize: 11, fontWeight: 700, color: "var(--text-secondary)", marginBottom: 6, display: "flex", alignItems: "center", gap: 6 }}>
+                  📥 {t("local.downloaded_models")}
+                  <button className="btn btn-sm btn-ghost" style={{ fontSize: 9, padding: "1px 6px" }} onClick={fetchLocalModels} title={t("local.refresh")}>↻</button>
+                </div>
+                <div style={{ maxHeight: 220, overflowY: "auto" }} className="custom-scrollbar">
+                  {localModels.map(m => (
+                    <div key={m.path} style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 10px", borderRadius: 8, marginBottom: 4, background: "var(--bg-input)", border: "1px solid var(--border-default)" }}>
+                      <span style={{ fontSize: 9, fontWeight: 700, fontFamily: "var(--font-mono)", padding: "2px 6px", borderRadius: 4, background: m.format === "gguf" ? "var(--accent-soft)" : "rgba(99,102,241,0.12)", color: m.format === "gguf" ? "var(--accent)" : "#6366f1", minWidth: 38, textAlign: "center", textTransform: "uppercase" }}>{m.format}</span>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontSize: 11, fontWeight: 500, color: "var(--text-primary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{m.name}</div>
+                        <div style={{ fontSize: 9, color: "var(--text-muted)" }}>{m.size}</div>
+                      </div>
+                      <button className="btn btn-sm btn-primary" style={{ padding: "4px 12px", fontSize: 10, flexShrink: 0 }} onClick={() => startLocalLLM(m.id)} disabled={isStarting}>🚀 {t("local.load")}</button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {showDirPicker && browse && (
+        <>
+          <div onClick={() => setShowDirPicker(false)} style={{ position: "absolute", inset: 0, background: "rgba(0,0,0,0.3)", backdropFilter: "blur(2px)", WebkitBackdropFilter: "blur(2px)", zIndex: 199 }} />
+          <div style={{ position: "absolute", top: 40, left: "50%", transform: "translateX(-50%)", width: 560, maxWidth: "94%", maxHeight: "72vh", background: "var(--bg-card)", borderRadius: 14, boxShadow: "0 20px 60px rgba(0,0,0,0.25)", zIndex: 200, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+            <div style={{ padding: "12px 16px", borderBottom: "1px solid var(--border-default)", display: "flex", alignItems: "center", gap: 8 }}>
+              <span style={{ fontWeight: 700, fontSize: 14 }}>{t("local.pick_title")}</span>
+              <button className="btn btn-sm btn-primary" style={{ marginLeft: "auto" }} onClick={() => pickDir(browse.path)}>✅ {t("local.pick_current")}</button>
+              <button className="btn btn-sm btn-ghost" onClick={() => setShowDirPicker(false)}>✕</button>
+            </div>
+            <div style={{ padding: "8px 16px", borderBottom: "1px solid var(--border-default)", display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+              {browse.roots.map(r => <button key={r.path} className="btn btn-sm btn-ghost" style={{ fontSize: 10, padding: "2px 8px" }} onClick={() => fetchBrowse(r.path)}>🏠 {r.label}</button>)}
+              {browse.parent && <button className="btn btn-sm btn-ghost" style={{ fontSize: 10, padding: "2px 8px" }} onClick={() => fetchBrowse(browse.parent!)}>⬆ {t("local.parent_dir")}</button>}
+              <span style={{ fontSize: 10, fontFamily: "var(--font-mono)", color: "var(--text-muted)", wordBreak: "break-all", width: "100%" }}>{browse.path}</span>
+            </div>
+            <div style={{ flex: 1, overflowY: "auto", padding: "8px 12px" }} className="custom-scrollbar">
+              {browse.entries.length === 0 && <div style={{ fontSize: 12, color: "var(--text-muted)", padding: 24, textAlign: "center" }}>{t("local.empty_dir")}</div>}
+              {browse.entries.map(e => {
+                const isGgufFile = !e.is_dir && e.name.toLowerCase().endsWith(".gguf");
+                return (
+                <div key={e.path} style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 10px", borderRadius: 8, borderBottom: "1px solid var(--border-default)", cursor: e.is_dir ? "pointer" : "default" }}>
+                  <span style={{ fontSize: 14 }}>{e.is_dir ? "📁" : isGgufFile ? "🧠" : "📄"}</span>
+                  <span style={{ flex: 1, fontSize: 12, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: e.is_dir || isGgufFile ? "var(--text-primary)" : "var(--text-muted)" }} onClick={() => e.is_dir && fetchBrowse(e.path)}>{e.name}</span>
+                  {!isGgufFile && e.size > 0 && <span style={{ fontSize: 9, color: "var(--text-muted)", flexShrink: 0 }}>{(e.size / 1073741824).toFixed(1)}GB</span>}
+                  {isGgufFile && <span style={{ fontSize: 9, color: "var(--accent)", flexShrink: 0 }}>{(e.size / 1073741824).toFixed(1)}GB</span>}
+                  {e.is_dir && <button className="btn btn-sm btn-primary" style={{ fontSize: 10, padding: "2px 10px", flexShrink: 0 }} onClick={() => pickDir(e.path)}>{t("local.choose")}</button>}
+                  {isGgufFile && <button className="btn btn-sm btn-primary" style={{ fontSize: 10, padding: "2px 10px", flexShrink: 0 }} onClick={() => pickDir(e.path)}>{t("local.load")}</button>}
+                </div>
+                );
+              })}
+            </div>
+          </div>
+        </>
+      )}
+
+      {showSearch && (
+        <>
+          <div onClick={() => setShowSearch(false)} style={{ position: "absolute", inset: 0, background: "rgba(0,0,0,0.3)", backdropFilter: "blur(2px)", WebkitBackdropFilter: "blur(2px)", zIndex: 199 }} />
+          <div style={{ position: "absolute", top: 16, left: 16, right: 16, bottom: 16, background: "var(--bg-card)", borderRadius: 14, boxShadow: "0 20px 60px rgba(0,0,0,0.25)", zIndex: 200, display: "flex", overflow: "hidden" }}>
+            <div style={{ width: 340, minWidth: 280, flexShrink: 0, borderRight: "1px solid var(--border-default)", display: "flex", flexDirection: "column", overflow: "hidden" }}>
+              <div style={{ padding: "14px 16px", borderBottom: "1px solid var(--border-default)", display: "flex", gap: 8 }}>
+                <input className="form-input" style={{ flex: 1, margin: 0, fontSize: 13, padding: "8px 12px" }} placeholder={t("local.search_placeholder")} value={hfSearch} onChange={e => setHfSearch(e.target.value)} onKeyDown={e => { if (e.key === "Enter") searchHF(); }} autoFocus />
+                <button className="btn btn-sm btn-primary" onClick={() => searchHF()} disabled={searching} style={{ padding: "8px 14px", fontSize: 12, whiteSpace: "nowrap" }}>{searching ? "..." : "🔍"}</button>
+                <button className="btn btn-sm btn-ghost" onClick={() => { setShowSearch(false); setDetailModelId(""); }} style={{ fontSize: 18, padding: "4px 8px" }}>✕</button>
+              </div>
+              <div style={{ padding: "6px 12px", display: "flex", gap: 6, borderBottom: "1px solid #f0f0f0", flexWrap: "wrap" }}>
+                {[{ label: t("local.all"), value: "" }, { label: "GGUF", value: "gguf" }, { label: "MLX", value: "mlx" }].map(f => (
+                  <button key={f.label} onClick={() => { setSearchFilter(f.value); if (f.value) searchHF(hfSearch || f.value, f.value); else searchHF(hfSearch); }} style={{ padding: "4px 10px", borderRadius: 14, fontSize: 10, fontWeight: 500, cursor: "pointer", border: `1px solid ${searchFilter === f.value ? "#7c3aed" : "#e5e7eb"}`, background: searchFilter === f.value ? "#f5f3ff" : "#fff", color: searchFilter === f.value ? "#7c3aed" : "#6b7280" }}>{f.label}</button>
+                ))}
+              </div>
+              <div className="custom-scrollbar" style={{ flex: 1, overflowY: "auto", padding: "8px 12px" }}>
+                {searching && <div style={{ textAlign: "center", padding: 40, color: "#9ca3af", fontSize: 12 }}>{t("local.searching")}</div>}
+                {!searching && filteredResults.length === 0 && <div style={{ textAlign: "center", padding: 40, color: "#9ca3af", fontSize: 12 }}>{hfSearch ? t("local.no_results") : t("local.trending")}</div>}
+                {filteredResults.map((m: HFModelResult) => (
+                  <div key={m.id} onClick={() => fetchModelDetail(m.id)} style={{ padding: "10px 12px", borderRadius: 8, marginBottom: 4, cursor: "pointer", background: detailModelId === m.id ? "#f5f3ff" : "transparent", border: detailModelId === m.id ? "1px solid #ddd6fe" : "1px solid transparent", transition: "all 0.15s" }}
+                    onMouseEnter={e => { if (detailModelId !== m.id) (e.currentTarget as HTMLElement).style.background = "#f9fafb"; }} onMouseLeave={e => { if (detailModelId !== m.id) (e.currentTarget as HTMLElement).style.background = "transparent"; }}>
+                    <div style={{ display: "flex", alignItems: "flex-start", gap: 8 }}>
+                      <div style={{ width: 28, height: 28, borderRadius: 6, background: "linear-gradient(135deg, #667eea, #764ba2)", display: "flex", alignItems: "center", justifyContent: "center", color: "#fff", fontSize: 12, flexShrink: 0 }}>🧩</div>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontSize: 12, fontWeight: 600, color: "#1f2937", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{m.id.split("/").pop()?.replace(/-/g, " ").replace(/_/g, " ") || m.id}</div>
+                        <div style={{ fontSize: 10, color: "#9ca3af", fontFamily: "var(--font-mono)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{m.id.split("/")[0]}</div>
+                        <div style={{ fontSize: 9, color: "#d1d5db", marginTop: 2 }}>⬇ {m.downloads?.toLocaleString() || 0} · ❤️ {m.likes || 0}</div>
+                      </div>
+                      {downloadProgress[m.id]?.status === "downloading" && <span style={{ fontSize: 9, color: "#7c3aed", fontWeight: 600 }}>{downloadProgress[m.id].progress}%</span>}
+                      {downloadProgress[m.id]?.status === "done" && <span style={{ fontSize: 12 }}>✅</span>}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div className="custom-scrollbar" style={{ flex: 1, overflowY: "auto", background: "#fafbfc" }}>
+              <ModelDetailPanel modelId={detailModelId} detailData={detailData} detailLoading={detailLoading} downloadProgress={downloadProgress} downloadModel={downloadModel} pauseDownload={pauseDownload} cancelDownload={cancelDownload} resumeDownload={resumeDownload} startLocalLLM={startLocalLLM} deleteModelFile={deleteModelFile} fetchModelDetail={fetchModelDetail} onClose={() => setDetailModelId("")} />
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}

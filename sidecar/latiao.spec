@@ -1,0 +1,62 @@
+# -*- mode: python -*-
+# 文档引擎（python-docx）自带数据文件必须显式收集：
+from PyInstaller.utils.hooks import collect_data_files
+a = Analysis(
+    ['main.py'],
+    pathex=['plugins'],
+    binaries=[],
+    datas=[
+        ('agents/*.txt', 'agents'),
+        ('skills/', 'skills'),
+        ('plugins/', 'plugins'),
+        # 随包 OFL 中文字体（PDF 排版用；reportlab 直接读文件）
+        ('assets/fonts', 'assets/fonts'),
+        # python-docx 自带 templates/default.docx：不收集 → Document() 报 PackageNotFoundError
+        *collect_data_files('docx'),
+        # 注意：不要把 .env 打进 exe（含密钥）
+    ],
+    hiddenimports=[
+        'uvicorn.logging', 'uvicorn.loops', 'uvicorn.protocols',
+        'fastapi', 'httpx', 'certifi',
+        'sqlite3', 'asyncio',
+        'yaml',
+        # 文档引擎：插件里是函数内惰性 import，静态分析收集不到（同上一类坑）
+        'docx', 'docx.oxml', 'docx.opc',
+        'reportlab', 'reportlab.platypus', 'reportlab.lib',
+        'reportlab.pdfbase', 'reportlab.pdfbase.cidfonts', 'reportlab.pdfbase.ttfonts',
+        'PIL',
+        # 统一能力模型 + 生态市场（多处函数内动态 import，PyInstaller 静态分析
+        # 收集不到，必须显式列出，否则 sidecar.exe 运行时报 ModuleNotFoundError）
+        'capability_registry', 'discovery', 'adapters',
+        'mcp_client', 'extension_manager',
+        'cron', 'identity', 'memory', 'local_llm', 'db', 'config',
+        'tool_system', 'tool_executor',
+        # Stage 1-5 拆分：agent/ 包（薄循环/Scope 容器/传输/解析/上下文/闸门/子代理），
+        # 多处函数内 from agent.* import ——静态扫描可能漏，显式列出保 Windows 不炸
+        'agent', 'agent.loop', 'agent.core', 'agent.transport', 'agent.parsing',
+        'agent.text_quality', 'agent.context', 'agent.gates', 'agent.subagent',
+        'agent.plugins', 'agent.plugins.builtin',
+        'uuid',
+        # mx_query 金融工具：--mx-query 模式下需要 import（目录已改为合法包名 mx_data）
+        'skills', 'skills.mx_data', 'skills.mx_data.mx_data',
+        # 控制类插件（plugins/ 下由 tool_system 动态加载，需随包）
+        '_control_common', '_control_mouse_common',
+        # Windows 端运行时被动态 import（fastapi optional extra 路径），环境已装但
+        # 静态分析扫不到，必须显式收集，否则 sidecar.exe 启动即 ModuleNotFoundError
+        'pydantic_settings', 'tzdata',
+    ],
+    hookspath=[],
+    runtime_hooks=[],
+    excludes=['llama_cpp', 'mlx_lm', 'torch', 'tensorflow'],
+)
+pyz = PYZ(a.pure, a.zipped_data)
+exe = EXE(
+    pyz,
+    a.scripts,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    name='sidecar',
+    console=False,
+    debug=False,
+)

@@ -1,0 +1,68 @@
+"""Open an application by name. macOS native, Windows via start."""
+import platform
+import re as _re
+import subprocess
+
+IS_WINDOWS = platform.system() == "Windows"
+
+NAME = "open_app"
+PERMISSION = "confirm"
+
+DEFINITION = {
+    "type": "function",
+    "function": {
+        "name": "open_app",
+        "description": "Open a macOS application by name. Use this when the user asks to open an app. Supports both English names (Photos, Safari, Mail) and Chinese names (照片/相册, 浏览器, 邮件).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "App name in English or Chinese (e.g., 'Photos', 'Safari', '照片', '浏览器')."}
+            },
+            "required": ["name"]
+        }
+    }
+}
+
+_APP_ALIASES = {
+    "照片": "Photos", "相册": "Photos", "photo": "Photos",
+    "音乐": "Music", "music": "Music",
+    "浏览器": "Safari", "safari": "Safari",
+    "邮件": "Mail", "mail": "Mail",
+    "日历": "Calendar", "calendar": "Calendar",
+    "备忘录": "Notes", "notes": "Notes",
+    "提醒": "Reminders", "reminders": "Reminders",
+    "计算器": "Calculator", "calculator": "Calculator",
+    "终端": "Terminal", "terminal": "Terminal",
+    "设置": "System Settings", "系统设置": "System Settings", "偏好设置": "System Settings",
+    "App Store": "App Store", "app store": "App Store",
+    "地图": "Maps", "maps": "Maps",
+    "天气": "Weather", "weather": "Weather",
+    "时钟": "Clock", "clock": "Clock",
+    "查找": "Find My", "find my": "Find My",
+}
+
+
+def execute(args: dict) -> str:
+    name = str(args.get("name") or args.get("app") or "")
+    resolved = _APP_ALIASES.get(name, name)
+    if IS_WINDOWS:
+        # Windows 那条走 cmd /c start：cmd.exe 会二次解释命令行，应用名里的
+        # & | ^ < > " % 会被当命令分隔符/转义（模型可以塞 "x & del ..."）。
+        # 应用名不需要这些字符，直接拒绝（审查 2026-09-23）。
+        if _re.search(r'[&|^<>"%\r\n\t]', resolved):
+            return f"⛔ 应用名含不允许的字符：{resolved}"
+        try:
+            subprocess.Popen(["cmd", "/c", "start", "", resolved])
+            return f"✅ 已打开：{resolved}"
+        except Exception as e:
+            return f"无法打开 {resolved}: {e}"
+    try:
+        r = subprocess.run(["open", "-a", resolved], capture_output=True, text=True, timeout=5)
+        if r.returncode != 0:
+            err = r.stderr.strip() or "应用不存在或无法打开"
+            return f"❌ 无法打开 {resolved}: {err}"
+        return f"✅ 已打开应用：{resolved}"
+    except subprocess.TimeoutExpired:
+        return f"❌ 打开 {resolved} 超时"
+    except Exception as e:
+        return f"无法打开应用 {resolved}: {e}"

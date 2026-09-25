@@ -1,0 +1,46 @@
+node_modules/
+dist/
+# Build output
+Latiao.app/
+src-tauri/target/
+sidecar/venv/
+sidecar/python/
+sidecar/__pycache__/
+sidecar/plugins/__pycache__/
+__pycache__/
+*.pyc
+.ruff_cache/
+.DS_Store
+.env
+.env.local
+# OpenClaw skills folder (not part of Latiao) — root only, NOT sidecar/skills/
+/skills/
+# Runtime-generated plugin seed manifest
+sidecar/plugins/.seed_manifest.json
+# IDE
+.codegraph/
+.mcp.json
+sidecar/main.py.deploy
+tauri-key
+tauri-key.pub
+tauri-key
+tauri-key.pub
+outputs/
+
+# Windows 构建产物（不应入库）
+sidecar/sidecar.exe
+sidecar/llama-server.exe
+sidecar/llama-upstream/
+sidecar/*.dll
+sidecar/build/
+sidecar/dist/
+scripts/build-win.sh.bak
+# Local test venv / pytest cache（不入库）
+.venv*/
+.pytest_cache/
+
+# Spark 专用 llama.cpp（XHToken fork）本地构建产物（~100MB，不入库）
+sidecar/llama-server
+sidecar/libllama*.dylib
+sidecar/libggml*.dylib
+sidecar/libmtmd*.dylib

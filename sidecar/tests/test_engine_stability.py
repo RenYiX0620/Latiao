@@ -1,0 +1,154 @@
+"""引擎稳定性回归测试：重载防重入 / 状态持久化 / 忙引擎保护。
+
+背景：内存 95% 尖峰 = ensure_engine_healthy 的重载线程不带守卫，与
+get_api_url 的自动重载并发 → 双 start_model 串行执行，第二个杀掉第一个
+刚加载完的 26GB 再加载一遍。
+"""
+import unittest
+
+
+class TestRequestReloadGuard(unittest.TestCase):
+    def test_second_request_skipped(self):
+        from local_llm_engine import EngineProcess as LocalLLMEngine  # 拆分后为 EngineProcess
+        eng = LocalLLMEngine.__new__(LocalLLMEngine)  # 不跑 __init__（避免拉起下载等）
+        eng._auto_reloading = True  # 模拟已有重载进行中
+        eng.current_model_id = "test-model"
+        # 直接调用内部请求逻辑应返回 False（跳过）
+        ok = LocalLLMEngine._request_reload(eng, "test-model")
+        self.assertFalse(ok)
+
+    def test_first_request_starts_thread(self):
+        import threading
+        from local_llm_engine import EngineProcess as LocalLLMEngine  # 拆分后为 EngineProcess
+        eng = LocalLLMEngine.__new__(LocalLLMEngine)
+        eng._auto_reloading = False
+        started = threading.Event()
+
+        def fake_reload(mid):
+            started.set()
+            eng._auto_reloading = False
+
+        eng._auto_reload = fake_reload
+        ok = LocalLLMEngine._request_reload(eng, "test-model")
+        self.assertTrue(ok)
+        self.assertTrue(started.wait(timeout=2))
+
+
+class TestEngineStatePersistence(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        from local_llm_engine import EngineProcess as LocalLLMEngine  # 拆分后为 EngineProcess
+        # 关键：重定向到临时目录。曾发生测试把测试数据写进生产
+        # ~/.local-ai-os/.engine_state.json，被运行中的 sidecar 恢复。
+        self._tmp = tempfile.TemporaryDirectory()
+        LocalLLMEngine._engine_state_file = (
+            __import__("pathlib").Path(self._tmp.name) / ".engine_state.json"
+        )
+        self.addCleanup(self._tmp.cleanup)
+
+    def _eng(self):
+        from local_llm_engine import EngineProcess as LocalLLMEngine  # 拆分后为 EngineProcess
+        eng = LocalLLMEngine.__new__(LocalLLMEngine)
+        eng.current_model_id = ""
+        eng.current_model_name = ""
+        eng._active_backend = ""
+        eng.server_port = 1235
+        return eng
+
+    def test_save_and_restore_roundtrip(self):
+        import os
+        from local_llm_engine import EngineProcess as LocalLLMEngine  # 拆分后为 EngineProcess
+        eng = self._eng()
+        # 用真实存在的文件路径（restore 会校验路径存在性，防假 id 污染）
+        real = os.path.join(self._tmp.name, "models", "test-35b")
+        os.makedirs(os.path.dirname(real), exist_ok=True)
+        open(real, "w").close()
+        eng.current_model_id = real
+        eng.current_model_name = "test-35b"
+        eng._active_backend = "mlx"
+        LocalLLMEngine._save_engine_state(eng)
+        try:
+            eng2 = self._eng()
+            LocalLLMEngine._restore_engine_state(eng2)
+            self.assertEqual(eng2.current_model_id, real)
+            self.assertEqual(eng2.current_model_name, "test-35b")
+            self.assertEqual(eng2._active_backend, "mlx")
+        finally:
+            LocalLLMEngine._clear_engine_state(eng)
+
+    def test_fake_path_discarded_on_restore(self):
+        """防污染回归：状态文件里的假路径（如测试写入的 /models/test-35b）
+        必须被丢弃，不得恢复——否则 sidecar 对着不存在的模型反复重载。"""
+        from local_llm_engine import EngineProcess as LocalLLMEngine  # 拆分后为 EngineProcess
+        eng = self._eng()
+        eng.current_model_id = "/models/test-35b"
+        eng.current_model_name = "test-35b"
+        eng._active_backend = "mlx"
+        LocalLLMEngine._save_engine_state(eng)
+        try:
+            eng2 = self._eng()
+            LocalLLMEngine._restore_engine_state(eng2)
+            self.assertEqual(eng2.current_model_id, "")
+        finally:
+            LocalLLMEngine._clear_engine_state(eng)
+
+    def test_clear_removes_file(self):
+        from local_llm_engine import EngineProcess as LocalLLMEngine  # 拆分后为 EngineProcess
+        eng = self._eng()
+        eng.current_model_id = "m"
+        LocalLLMEngine._save_engine_state(eng)
+        LocalLLMEngine._clear_engine_state(eng)
+        from local_llm_engine import EngineProcess as LocalLLMEngine  # 拆分后为 EngineProcess as L
+        self.assertFalse(LocalLLMEngine._engine_state_file.exists())
+
+
+class TestBusyEngineProtection(unittest.TestCase):
+    def test_busy_flag_blocks_and_expires(self):
+        from local_llm_engine import EngineProcess as LocalLLMEngine  # 拆分后为 EngineProcess
+        eng = LocalLLMEngine.__new__(LocalLLMEngine)
+        LocalLLMEngine._engine_busy_until = 0.0
+
+        eng.mark_engine_busy(grace_sec=5)
+        self.assertTrue(eng._engine_busy())
+
+        # 到期后自动失效
+        LocalLLMEngine._engine_busy_until = 0.0
+        self.assertFalse(eng._engine_busy())
+
+    def test_idle_clears_flag(self):
+        from local_llm_engine import EngineProcess as LocalLLMEngine  # 拆分后为 EngineProcess
+        eng = LocalLLMEngine.__new__(LocalLLMEngine)
+        eng.mark_engine_busy(grace_sec=60)
+        eng.mark_engine_idle()
+        self.assertFalse(eng._engine_busy())
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+
+
+class TestLoopDetection(unittest.TestCase):
+    """复读循环检测：本地小模型长生成偶发两三句话无限重复。"""
+
+    def test_detects_sentence_loop(self):
+        from agent_loop import _detect_text_loop
+        loop = "沪指涨0.5%，报3400点。深成指涨0.8%。" * 10
+        self.assertTrue(_detect_text_loop(loop))
+
+    def test_normal_text_not_flagged(self):
+        from agent_loop import _detect_text_loop
+        normal = ("今天大盘上涨1.2%，成交量明显放大。科技板块领涨，半导体涨超3%。"
+                  "北向资金净流入50亿元，市场情绪回暖。券商板块午后异动。"
+                  "展望后市，分析师认为短期仍有震荡整固需求。") * 2
+        self.assertFalse(_detect_text_loop(normal))
+
+    def test_short_text_ignored(self):
+        from agent_loop import _detect_text_loop
+        self.assertFalse(_detect_text_loop("好的，"))
+
+    def test_high_freq_short_fragment(self):
+        from agent_loop import _detect_text_loop
+        # ≥120 字符才会进入检测（防短消息误判），50 次 = 150 字符
+        self.assertTrue(_detect_text_loop("好的，" * 50))
+        # 90 字符（30 次）低于最短长度守卫 → 不判（防误报）
+        self.assertFalse(_detect_text_loop("好的，" * 30))

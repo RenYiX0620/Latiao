@@ -1,0 +1,20 @@
+# 命令安全规则覆盖（阶段 3）——本文件是"用户可审可改"层，叠加在内置默认规则之上。
+#
+# 键与内置默认（safety/rules.py _DEFAULT_RULES）对应：
+#   forbidden_commands        命令名 → 参数正则（None = 无条件禁止）
+#   forbidden_commands_any_arg 同上（匹配任意一个参数）
+#   pipe_shell_lhs / pipe_shell_rhs  管道投毒（lhs|rhs）
+#   sensitive_read            敏感路径正则列表
+#   sensitive_readers         读取型命令名列表
+#   allow_commands            白名单命令名
+#   allow_word_shape          白名单词形状（选项/路径形态）
+#
+# 注意：{...} 合并覆盖、[...] 整体替换。解析失败将 fail-loud 回退内置默认
+# 规则（见 safety/rules.py load_rules 的注释约定）。
+#
+# 示例（取消注释即生效）：
+# forbidden_commands:
+#   curl: "^-o /tmp/evil$"
+# allow_commands:
+#   - ls
+#   - pwd

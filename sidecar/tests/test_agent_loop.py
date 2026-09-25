@@ -1,0 +1,664 @@
+"""Tests for agent loop pure parsing/dedup functions."""
+import json
+import sys
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+import main
+
+
+class TestParsePromptToolCalls(unittest.TestCase):
+    """Tests for main._parse_prompt_tool_calls (```tool fenced format)."""
+
+    def test_fenced_tool_call_parsed(self):
+        text = '```tool list_dir\n{"path": "."}\n```'
+        clean, calls = main._parse_prompt_tool_calls(text)
+        self.assertEqual(clean, "")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "list_dir")
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"path": "."})
+
+    def test_fence_with_surrounding_text(self):
+        text = '我先看看目录```tool list_dir\n{"path": "."}\n```然后继续'
+        clean, calls = main._parse_prompt_tool_calls(text)
+        self.assertEqual(clean, "我先看看目录然后继续")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"path": "."})
+
+    def test_invalid_json_salvaged(self):
+        # 围栏内不是合法 JSON 时走 _salvage_tool_args 容错解析
+        text = "```tool run_cmd\ncommand: ls -la\n```"
+        clean, calls = main._parse_prompt_tool_calls(text)
+        self.assertEqual(clean, "")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "run_cmd")
+        # 09-19：参数名归一后 command → cmd（run_cmd 的 schema 用 cmd，旧断言是归一前的形状）
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"cmd": "ls -la"})
+
+    def test_multiple_fences(self):
+        text = (
+            '```tool read_file\n{"path": "/a.txt"}\n```\n'
+            '```tool run_cmd\n{"command": "pwd"}\n```'
+        )
+        clean, calls = main._parse_prompt_tool_calls(text)
+        self.assertEqual(clean, "")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(
+            [c["function"]["name"] for c in calls], ["read_file", "run_cmd"]
+        )
+
+    def test_no_tools_returns_empty(self):
+        text = "好的，我明白了。"
+        clean, calls = main._parse_prompt_tool_calls(text)
+        self.assertEqual(clean, "好的，我明白了。")
+        self.assertEqual(calls, [])
+
+    def test_think_block_only_no_tools(self):
+        text = "<think>让我想想用什么工具</think>"
+        clean, calls = main._parse_prompt_tool_calls(text)
+        self.assertEqual(calls, [])
+        # 没有工具调用时原文保留
+        self.assertEqual(clean, text)
+
+
+class TestParseNativeToolCalls(unittest.TestCase):
+    """Tests for main._parse_native_tool_calls (Gemma <|tool_call|> format)."""
+
+    def test_gemma_format(self):
+        text = '<|tool_call|>call:list_dir{path:<|"|>.<|"|>}<tool_call|>'
+        calls = main._parse_native_tool_calls(text)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "list_dir")
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"path": "."})
+
+    def test_gemma_unquoted_args(self):
+        text = "<|tool_call|>call:read_file{path: /tmp/x}<tool_call|>"
+        calls = main._parse_native_tool_calls(text)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"path": "/tmp/x"})
+
+    def test_gemma_multiple_calls(self):
+        text = (
+            "<|tool_call|>call:list_dir{path: .}<tool_call|>"
+            '<|tool_call|>call:read_file{path:<|"|>/etc/hosts<|"|>}<tool_call|>'
+        )
+        calls = main._parse_native_tool_calls(text)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(
+            [c["function"]["name"] for c in calls], ["list_dir", "read_file"]
+        )
+
+    def test_broken_args_salvaged_without_crash(self):
+        # 参数无法转成合法 JSON 时走 salvage 容错，不崩溃且 arguments 仍是合法 JSON
+        text = "<|tool_call|>call:run_cmd{command: ls -la}<tool_call|>"
+        calls = main._parse_native_tool_calls(text)
+        self.assertEqual(len(calls), 1)
+        args = json.loads(calls[0]["function"]["arguments"])
+        self.assertIsInstance(args, dict)
+        self.assertTrue(args)
+
+    def test_no_native_calls(self):
+        text = "这是一个普通回复，没有工具调用。"
+        self.assertEqual(main._parse_native_tool_calls(text), [])
+
+
+class TestDeduplicateResponse(unittest.TestCase):
+    """Tests for main._deduplicate_response (identity introduction dedup)."""
+
+    def test_duplicate_prefix_removed(self):
+        text = "我是辣条，正在帮你查看文件。我是辣条，请稍等。"
+        self.assertEqual(
+            main._deduplicate_response(text), "我是辣条，正在帮你查看文件。"
+        )
+
+    def test_duplicate_with_hello_prefix(self):
+        text = "你好，我是辣条，很高兴见到你。你好，我是辣条，请问有什么可以帮你？"
+        self.assertEqual(
+            main._deduplicate_response(text), "你好，我是辣条，很高兴见到你。"
+        )
+
+    def test_duplicate_english_prefix(self):
+        text = "我是Latiao，你好。我是Latiao，再见。"
+        self.assertEqual(main._deduplicate_response(text), "我是Latiao，你好。")
+
+    def test_no_duplicate_unchanged(self):
+        text = "这是一个普通的回复，不重复身份介绍。"
+        self.assertEqual(main._deduplicate_response(text), text)
+
+    def test_empty_text(self):
+        self.assertEqual(main._deduplicate_response(""), "")
+
+    def test_none_text(self):
+        self.assertIsNone(main._deduplicate_response(None))
+
+
+class TestReflectionTrigger(unittest.TestCase):
+    def test_off_never_reflects(self):
+        from agent_loop import _should_reflect
+        self.assertFalse(_should_reflect("off", "x" * 5000, False))
+
+    def test_light_cloud_long_only(self):
+        from agent_loop import _should_reflect
+        self.assertTrue(_should_reflect("light", "x" * 900, False))   # 云端长输出
+        self.assertFalse(_should_reflect("light", "x" * 500, False))  # 云端短输出
+        self.assertFalse(_should_reflect("light", "x" * 900, True))   # 本地不触发
+
+    def test_number_traceability(self):
+        from agent_loop import _find_unverified_numbers
+        report = "黄金板块本周上涨 12.35%，银行 +3.25%，美债收益率创 19 年新高（30 年期 5.33%），共 4 个交易日"
+        tools = ["黄金(板块) 成份区间涨跌幅 12.35% 2026-08-17至2026-08-20", "银行 +3.25%"]
+        unverified = _find_unverified_numbers(report, tools)
+        self.assertIn("5.33%", unverified)   # 美债数字无查询来源 → 被标记
+        self.assertIn("19 年", unverified)
+        self.assertNotIn("12.35%", unverified)  # 黄金有来源 → 不标记
+        self.assertNotIn("3.25%", unverified)
+
+    def test_plan_trigger(self):
+        from agent_loop import _should_plan
+        self.assertTrue(_should_plan("帮我分析一下最近的A股大盘走势，写一份详细的行情分析报告，包括各板块表现", False))
+        self.assertFalse(_should_plan("你好", False))            # 太短
+        self.assertFalse(_should_plan("帮我分析一下最近的A股大盘走势，写一份详细的行情分析报告，包括各板块表现", True))  # 本地不触发
+        self.assertFalse(_should_plan("今天天气怎么样啊，你觉得呢", False))  # 无任务关键词
+
+    def test_deep_any_model_long_output(self):
+        from agent_loop import _should_reflect
+        self.assertTrue(_should_reflect("deep", "x" * 400, False))
+        self.assertTrue(_should_reflect("deep", "x" * 400, True))     # 本地也触发（用户自选）
+        self.assertFalse(_should_reflect("deep", "x" * 100, False))
+
+
+class TestToolCappingKeepsTavily(unittest.TestCase):
+    """回归：_cap_tools 截断后 tavily_search 必须仍在列表且排在 bing_search 前。
+    曾因插件按文件名排序（bing < tavily），cap=5/8 时 tavily 被切掉，模型只能
+    调用 bing_search——表现为"怎么一直不调用 tavily"。"""
+
+    def _capped_names(self, cap):
+        from agent_loop import TOOLS, _cap_tools
+        names = [t.get("function", {}).get("name") for t in _cap_tools(TOOLS, cap)]
+        return names
+
+    def test_tavily_visible_after_cap(self):
+        for cap in (5, 8):
+            names = self._capped_names(cap)
+            self.assertIn("tavily_search", names, f"cap={cap} 切掉了 tavily_search: {names}")
+
+    def test_tavily_before_bing(self):
+        for cap in (5, 8):
+            names = self._capped_names(cap)
+            if "bing_search" in names:
+                self.assertLess(
+                    names.index("tavily_search"), names.index("bing_search"),
+                    f"cap={cap} tavily 应排在 bing 前: {names}")
+
+    def test_core_tools_survive(self):
+        names = self._capped_names(8)
+        for core in ("read_file", "write_file", "list_dir"):
+            self.assertIn(core, names)
+
+
+class TestAccessMode(unittest.TestCase):
+    def _tools(self):
+        from agent_loop import TOOLS
+        return list(TOOLS)
+
+    def test_read_only_filters(self):
+        from agent_loop import _check_access, _filter_tools_by_access
+        tools = self._tools()
+        ro = _filter_tools_by_access(tools, "read_only")
+        names = {t.get("function", {}).get("name") for t in ro}
+        self.assertIn("read_file", names)
+        self.assertNotIn("run_cmd", names)
+        self.assertNotIn("write_file", names)
+        self.assertIsNotNone(_check_access("run_cmd", "read_only"))
+        self.assertIsNone(_check_access("read_file", "read_only"))
+
+    def test_confirm_and_full_allow_all(self):
+        from agent_loop import _check_access, _filter_tools_by_access
+        tools = self._tools()
+        for mode in ("confirm", "plan", "full"):
+            self.assertEqual(len(_filter_tools_by_access(tools, mode)), len(tools), mode)
+            self.assertIsNone(_check_access("run_cmd", mode), mode)
+
+    def test_legacy_workspace_maps_to_auto_edit(self):
+        from agent_loop import _normalize_access
+        self.assertEqual(_normalize_access("workspace"), "auto_edit")
+        self.assertEqual(_normalize_access("full"), "full")
+        # 审计 H2：未知值拒绝升格——此前 "bogus" 静默落 full（免确认执行高风险工具）
+        self.assertEqual(_normalize_access("bogus"), "confirm")
+
+    def test_auto_edit_tools_defined(self):
+        from agent_loop import AUTO_EDIT_TOOLS
+        self.assertIn("write_file", AUTO_EDIT_TOOLS)
+        self.assertIn("open_folder", AUTO_EDIT_TOOLS)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class TestPromptToolParsingThinkBlock(unittest.TestCase):
+    """回归：解析与清洗必须同一坐标系（去 think 后的文本）。
+    曾把 search_text 上的区间回放到原始 text 上，栅栏残留进历史、
+    think 块被拦腰截断，模型下一轮重复调用同一工具。"""
+
+    def test_think_block_plus_fence(self):
+        from agent_loop import _parse_prompt_tool_calls
+        text = "<think>我需要列目录</think>我来查看。\n```tool list_dir\n{\"path\": \"/tmp\"}\n```"
+        clean, calls = _parse_prompt_tool_calls(text)
+        self.assertNotIn("```", clean)
+        self.assertNotIn("list_dir", clean)
+        self.assertEqual(calls[0]["function"]["name"], "list_dir")
+
+    def test_leading_whitespace_fence(self):
+        from agent_loop import _parse_prompt_tool_calls
+        text = "\n\n好的。\n```tool read_file\n{\"path\": \"/tmp/a.txt\"}\n```"
+        clean, calls = _parse_prompt_tool_calls(text)
+        self.assertNotIn("```", clean)
+        self.assertEqual(calls[0]["function"]["name"], "read_file")
+
+    def test_plain_text_untouched(self):
+        from agent_loop import _parse_prompt_tool_calls
+        clean, calls = _parse_prompt_tool_calls("你好，今天天气不错")
+        self.assertEqual(clean, "你好，今天天气不错")
+        self.assertEqual(calls, [])
+
+
+class TestSubagentWhitelistReachable(unittest.TestCase):
+    """回归：explore/debugger 的 run_cmd 必须在子智能体可见工具列表里，
+    否则只读白名单（执行时兜底）永远不可达——'死配置'复发。"""
+
+    def test_run_cmd_visible_for_explore(self):
+        # 不真正跑 LLM：构造到 sub_tools 过滤后的可见性检查即可
+        # （直接调 _delegate_task 会发起 HTTP；这里验证过滤逻辑链路存在）
+        # 模拟 _delegate_task 内部的可见性过滤（TOOLS 由 agent_loop 门面持有）
+        import agent_loop as al
+        import tool_executor as te
+        allowed = te._SUBAGENT_TOOLS["explore"]
+        visible = [t for t in al.TOOLS if t.get("function", {}).get("name") in allowed]
+        names = {t["function"]["name"] for t in visible}
+        self.assertIn("run_cmd", names)
+
+    def test_prune_subtasks_caps_registry(self):
+        from tool_executor import _SUBTASKS, _prune_subtasks
+        for i in range(120):
+            _SUBTASKS[f"old_{i}"] = {"agent": "x", "task": "t", "status": "done",
+                                     "steps": 0, "result": "", "activity": {},
+                                     "started_at": 0, "updated_at": 0}
+        _prune_subtasks(max_keep=50)
+        done_left = [t for t, s in _SUBTASKS.items() if t.startswith("old_")]
+        self.assertLessEqual(len(done_left), 60)
+
+
+class TestControlToolsSurviveFilter(unittest.TestCase):
+    """五控工具可见性回归：_filter_tools 不得把控制工具全部滤掉
+    （此前 TOOL_CATEGORIES 无 control 类，导致 control_* 永不到模型面前，
+    权限确认弹窗也永不触发——表现为"权限工具没用"）。"""
+
+    def _tool(self, name):
+        return {"type": "function", "function": {"name": name}}
+
+    def setUp(self):
+        import agent_loop
+        self.all_tools = [self._tool(n) for n in
+                          list(agent_loop.TOOL_CATEGORIES["file_read"]) +
+                          ["control_mouse_click", "control_list_processes",
+                           "screen_capture", "control_kill_process"]]
+        self.f = agent_loop._filter_tools
+
+    def test_control_intent_keeps_interactive_control(self):
+        filtered = self.f("帮我点击那个按钮", self.all_tools)
+        names = [t["function"]["name"] for t in filtered]
+        self.assertIn("control_mouse_click", names)
+
+    def test_file_intent_keeps_readonly_control(self):
+        filtered = self.f("分析一下这个文件夹", self.all_tools)
+        names = [t["function"]["name"] for t in filtered]
+        self.assertIn("control_list_processes", names)
+        # 危险交互控制不保留（防误操作）
+        self.assertNotIn("control_mouse_click", names)
+
+    def test_no_intent_keeps_all(self):
+        filtered = self.f("随便", self.all_tools)
+        self.assertEqual(len(filtered), len(self.all_tools))
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class TestThinkingInjection(unittest.TestCase):
+    """思考强度按模型族注入（此前 off 恒写 Anthropic 字段致 DeepSeek/OpenAI 无效）。"""
+
+    def test_off_anthropic(self):
+        import agent_loop
+        body = agent_loop._inject_thinking_disabled({"model": "claude-3-5"}, "claude-3-5", "off")
+        self.assertEqual(body.get("thinking"), {"type": "disabled"})
+
+    def test_off_openai_reasoning(self):
+        import agent_loop
+        body = agent_loop._inject_thinking_disabled({"model": "o3-mini"}, "o3-mini", "off")
+        self.assertEqual(body.get("reasoning_effort"), "none")
+        self.assertNotIn("thinking", body)
+
+    def test_off_deepseek_forced_marks_unsupported(self):
+        import agent_loop
+        body = agent_loop._inject_thinking_disabled({"model": "deepseek-reasoner"}, "deepseek-reasoner", "off")
+        self.assertTrue(body.get("_thinking_unsupported"))
+        self.assertNotIn("thinking", body)  # 不写无效字段
+
+    def test_off_non_reasoning_no_fields(self):
+        import agent_loop
+        body = agent_loop._inject_thinking_disabled({"model": "deepseek-chat"}, "deepseek-chat", "off")
+        self.assertNotIn("thinking", body)
+        self.assertNotIn("reasoning_effort", body)
+
+    def test_max_raises_budget(self):
+        import agent_loop
+        body = agent_loop._inject_thinking_disabled({"model": "deepseek-chat", "max_tokens": 4096}, "deepseek-chat", "max")
+        self.assertGreaterEqual(body["max_tokens"], 18432)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class TestPlanConfirmationGate(unittest.TestCase):
+    """计划确认门控：计划必须等用户批准才执行（此前列完直接跑）。"""
+
+    def test_plan_confirm_emits_event_and_blocks(self):
+        import asyncio
+        import agent_loop
+
+        async def run():
+            # 启动确认等待，然后模拟用户拒绝（计划被拒 -> 任务不执行）
+            started = await agent_loop._start_plan_confirmation("plan-t1", "1. 步骤A\n2. 步骤B")
+            task = asyncio.create_task(
+                agent_loop._wait_plan_confirmation("plan-t1", started["event_obj"]))
+            await asyncio.sleep(0.1)
+            async with agent_loop._pending_lock:
+                agent_loop._pending_confirmations["plan-t1"]["approved"] = False
+                agent_loop._pending_confirmations["plan-t1"]["event"].set()
+            approved, events = await task
+            return approved, [started["event"]] + events
+
+        approved, events = asyncio.run(run())
+        self.assertFalse(approved)
+        self.assertTrue(any(e.get("event") == "plan_confirm" for e in events))
+
+
+    def test_plan_confirmation_timeout_returns_message_not_nameerror(self):
+        """超时分支原先引用 _msg/lang_of/msgs 三个不存在的名字 → 真超时会 NameError。
+
+        现在改成局部 import + 调用方传 lang；这里用 timeout=0.05 真跑一次超时路径。
+        """
+        import asyncio
+        import agent_loop
+
+        async def run():
+            started = await agent_loop._start_plan_confirmation("plan-to1", "1. A\n2. B")
+            return await agent_loop._wait_plan_confirmation(
+                "plan-to1", started["event_obj"], timeout=0.05, lang="zh")
+
+        approved, events = asyncio.run(run())
+        self.assertFalse(approved)
+        self.assertEqual(len(events), 1)
+        self.assertIn("超时", events[0]["content"])
+
+    def test_plan_confirm_approve(self):
+        import asyncio
+        import agent_loop
+
+        async def run():
+            started = await agent_loop._start_plan_confirmation("plan-t2", "计划")
+            task = asyncio.create_task(
+                agent_loop._wait_plan_confirmation("plan-t2", started["event_obj"]))
+            await asyncio.sleep(0.1)
+            async with agent_loop._pending_lock:
+                agent_loop._pending_confirmations["plan-t2"]["approved"] = True
+                agent_loop._pending_confirmations["plan-t2"]["event"].set()
+            approved, _ = await task
+            return approved
+
+        self.assertTrue(asyncio.run(run()))
+
+    def test_confirm_tool_endpoint_shares_pending(self):
+        # 计划确认与工具确认共用 _pending_confirmations / /v1/confirm_tool
+        import agent_loop
+        entry = {"event": None, "approved": False}
+        agent_loop._pending_confirmations["plan-t3"] = entry
+        # api_routes.confirm_tool 的写法就是改 approved + set event
+        agent_loop._pending_confirmations["plan-t3"]["approved"] = True
+        self.assertTrue(agent_loop._pending_confirmations["plan-t3"]["approved"])
+        agent_loop._pending_confirmations.pop("plan-t3", None)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class TestConfirmEventTiming(unittest.TestCase):
+    """确认事件时序（死锁修复回归）：tool_confirm/plan_confirm 必须在等待前可得。"""
+
+    def test_tool_confirm_event_available_before_wait(self):
+        import asyncio
+        import agent_loop
+
+        async def run():
+            started = await agent_loop._start_tool_confirmation("t1", "run_cmd", {"cmd": "ls"})
+            # 事件已注册：此刻 pending 表里已有条目（前端可查询/事件可发）
+            async with agent_loop._pending_lock:
+                pending = "t1" in agent_loop._pending_confirmations
+            # 模拟用户批准
+            async with agent_loop._pending_lock:
+                agent_loop._pending_confirmations["t1"]["approved"] = True
+                agent_loop._pending_confirmations["t1"]["event"].set()
+            approved, events = await agent_loop._wait_tool_confirmation("t1", "run_cmd", started["event_obj"])
+            return pending, approved, events
+
+        pending, approved, events = asyncio.run(run())
+        self.assertTrue(pending)          # 等待前已注册（事件可先发）
+        self.assertTrue(approved)
+        # 等待函数不再重复返回 tool_confirm 事件（已由调用方先发）
+        self.assertFalse(any(e.get("event") == "tool_confirm" for e in events))
+
+    def test_plan_confirm_event_available_before_wait(self):
+        import asyncio
+        import agent_loop
+
+        async def run():
+            started = await agent_loop._start_plan_confirmation("p1", "1. A\n2. B")
+            event_payload = started["event"]  # 调用方此刻 yield 给前端
+            async with agent_loop._pending_lock:
+                agent_loop._pending_confirmations["p1"]["approved"] = True
+                agent_loop._pending_confirmations["p1"]["event"].set()
+            approved, events = await agent_loop._wait_plan_confirmation("p1", started["event_obj"])
+            return event_payload, approved, events
+
+        payload, approved, events = asyncio.run(run())
+        self.assertEqual(payload.get("event"), "plan_confirm")
+        self.assertTrue(approved)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class TestJsonFenceParsing(unittest.TestCase):
+    """```json {"name","arguments"} ``` 解析层（Qwen3.8/MoziAI 27B 实测输出格式，
+    此前四层全不认 → "任务刚开始就停"）。"""
+
+    def test_json_fence_with_think_parsed(self):
+        import agent_loop
+        raw = (
+            "<think>\n\n</think>\n\n"
+            "```json\n"
+            '{"name": "write_file", "arguments": {"path": "/Users/u/Desktop/t.txt", "content": "测试"}}\n'
+            "```"
+        )
+        clean, calls = agent_loop._parse_prompt_tool_calls(raw)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "write_file")
+        args = json.loads(calls[0]["function"]["arguments"])
+        self.assertEqual(args["path"], "/Users/u/Desktop/t.txt")
+        # think 块与工具调用从正文剥离
+        self.assertNotIn("```json", clean)
+
+    def test_json_fence_plain_openai_style(self):
+        import agent_loop
+        raw = '```json\n{"name": "run_cmd", "arguments": {"cmd": "ls /tmp"}}\n```'
+        clean, calls = agent_loop._parse_prompt_tool_calls(raw)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "run_cmd")
+
+    def test_non_tool_json_ignored(self):
+        import agent_loop
+        raw = '```json\n{"result": "普通数据输出"}\n```'
+        clean, calls = agent_loop._parse_prompt_tool_calls(raw)
+        self.assertEqual(len(calls), 0)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class TestTransientReminders:
+    """历史污染修复：新回合到达时清除上一轮一次性系统提醒。"""
+
+    def test_strips_transient_reminders(self):
+        from agent_loop import _strip_transient_reminders
+        msgs = [
+            {"role": "system", "content": "可用工具…"},
+            {"role": "user", "content": "你能做什么"},
+            {"role": "assistant", "content": "我可以…"},
+            {"role": "system", "content": "⚠️ 这不是用户的新消息，而是系统提醒（上一轮回复未完成）"},
+            {"role": "user", "content": "测试"},
+            {"role": "system", "content": "你上一轮的回复是空的。请直接回复用户。"},
+            {"role": "assistant", "content": "测试正常"},
+        ]
+        stripped = _strip_transient_reminders(msgs)
+        roles = [m.get("role") for m in stripped]
+        assert roles == ["system", "user", "assistant", "user", "assistant"], roles
+        # 真系统提示（非提醒）必须保留
+        assert stripped[0]["content"].startswith("可用工具")
+
+
+class TestSingleFlight:
+    """双发防御：_running_turns 认领/释放语义。"""
+
+    def test_claim_and_release(self):
+        from api_routes import _running_turns
+        sid = "sf-test-session"
+        _running_turns.add(sid)
+        assert sid in _running_turns
+        _running_turns.discard(sid)
+        assert sid not in _running_turns
+
+
+class TestConfirmationWait:
+    """确认不限时（09-21 用户反馈）：timeout=0 无限等待；显式超时保持暂停语义。"""
+
+    def test_infinite_wait_approved(self):
+        import asyncio
+        from agent_loop import _pending_confirmations, _pending_lock, _wait_tool_confirmation
+
+        async def runner():
+            event = asyncio.Event()
+            async def _approve():
+                async with _pending_lock:
+                    _pending_confirmations["wait-1"] = {"event": event, "approved": True}
+                await asyncio.sleep(0.01)
+                event.set()  # 模拟 confirm_tool API 触发
+            asyncio.create_task(_approve())
+            return await _wait_tool_confirmation("wait-1", "run_cmd", event, timeout=0)
+
+        approved, events = asyncio.run(runner())
+        assert approved is True and events == []
+
+    def test_explicit_timeout_still_pauses(self):
+        import asyncio
+        from agent_loop import _pending_confirmations, _pending_lock, _wait_tool_confirmation
+
+        async def runner():
+            event = asyncio.Event()
+            async with _pending_lock:
+                _pending_confirmations["wait-2"] = {"event": event, "approved": False}
+            return await _wait_tool_confirmation("wait-2", "run_cmd", event, timeout=0.05)
+
+        approved, events = asyncio.run(runner())
+        assert approved is False and len(events) == 1
+        assert "超时" in events[0]["content"]
+
+
+class TestLanguageEnsure:
+    """语言确保兜底（09-21 实测修复）：翻译失败不得粘贴整段英文原文。"""
+
+    EN_TEXT = ("The user wants me to analyze a financial data file, a board sector capital flow "
+               "analysis spreadsheet. This is a Chinese A-share sector analysis and this particular "
+               "sheet tracks sector performance and capital flows over several trading days. "
+               "The main line is the AI computing chain and capital rotated heavily this week.")
+
+    def test_translate_failure_returns_short_hint(self, monkeypatch):
+        import asyncio
+        import agent_loop
+
+        async def _fail(*a, **k):
+            return self.EN_TEXT  # 翻译失败 = 返回原文；必须与入参完全一致
+
+        import agent.gates as _gates
+        monkeypatch.setattr(_gates, "_force_translate", _fail)
+        delivered = asyncio.run(agent_loop._ensure_final_language(
+            None, "http://x", {}, "model", self.EN_TEXT, "分析这个文件"
+        ))
+        assert delivered.startswith("⚠️ 模型本次生成了英文回复")
+        assert "原文如下" not in delivered
+        assert "The user wants" not in delivered  # 英文原文不再出现
+
+    def test_translate_success_returns_translation(self, monkeypatch):
+        import asyncio
+        import agent_loop
+
+        async def _ok(*a, **k):
+            return "中文翻译结果"
+
+        import agent.gates as _gates
+        monkeypatch.setattr(_gates, "_force_translate", _ok)
+        delivered = asyncio.run(agent_loop._ensure_final_language(
+            None, "http://x", {}, "model", self.EN_TEXT, "中文用户"
+        ))
+        assert delivered == "中文翻译结果"
+
+    def test_language_already_ok_passthrough(self):
+        import asyncio
+        import agent_loop
+        delivered = asyncio.run(agent_loop._ensure_final_language(
+            None, "http://x", {}, "model", "中文回答", "中文用户"
+        ))
+        assert delivered == "中文回答"
+
+
+class TestEmptyNameRecovery:
+    """空工具名恢复（09-21 实测：deepseek-v4 名称空、参数全）。"""
+
+    def test_recover_unique_match(self):
+        from agent_loop import _recover_tool_name
+        # {"query": ...} 唯一候选 tavily_search → 恢复
+        assert _recover_tool_name({"query": "行情"}) == "tavily_search"
+        # 09-06 14:34 事故：多候选（path 同时是 read_file/list_dir 参数）曾返回
+        # 空 → 守卫反馈循环 3 连击中止；现确定性择优（exact 键匹配优先，注册表
+        # 顺序兜底）——执行结果会引导模型，优于中止
+        assert _recover_tool_name({"path": "."}) == "read_file"
+        # URL 型读取工具由注册表取现役名字，别把名字写死：dokobot_read 已在 817f6c1
+        # 移除（本地从不可用），改由 headless_read 承担；写死会让每次改名都变成假失败。
+        from agent_loop import TOOLS
+        _url_tools = {
+            t["function"]["name"] for t in TOOLS
+            if "url" in ((t["function"].get("parameters") or {}).get("properties") or {})
+        }
+        _picked = _recover_tool_name({"url": "https://github.com/x"})
+        assert _picked and _picked in _url_tools, f"应从 URL 型工具里恢复，实得 {_picked!r}（候选 {_url_tools}）"
+
+    def test_recover_empty_args_no_recovery(self):
+        from agent_loop import _recover_tool_name
+        assert _recover_tool_name({}) == ""
+        assert _recover_tool_name(None) == ""

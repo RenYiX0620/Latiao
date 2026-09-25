@@ -1,0 +1,270 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  release-macos:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: dtolnay/rust-toolchain@stable
+
+      - run: npm install
+
+      - name: "Prepare portable Python (sidecar 运行时)"
+        run: |
+          bash scripts/setup-portable-python.sh
+
+      - name: "Clean sidecar build artifacts before bundling"
+        run: |
+          # bundle.resources 把整个 sidecar 目录打进安装包：PyInstaller 产物、
+          # __pycache__、pip 缓存会白胖上百 MB（09-14：Windows 包 98→224MB）
+          rm -rf sidecar/dist sidecar/build sidecar/__pycache__ 2>/dev/null || true
+          find sidecar -name "__pycache__" -type d -prune -exec rm -rf {} + 2>/dev/null || true
+          find sidecar -name "*.pyc" -delete 2>/dev/null || true
+          rm -rf sidecar/.pytest_cache sidecar/.mypy_cache 2>/dev/null || true
+          du -sh sidecar || true
+
+      - name: "Build Spark fork engine (XHToken llama.cpp)"
+        run: |
+          # 09-15 事故：fork 二进制在 .gitignore 里（不入库），CI 从干净仓库构建
+          # → 打出的 macOS 包从来没有 sidecar/llama-server → Spark 类模型
+          # “启动失败: Failed to load model”（python 引擎不支持其架构，而回退
+          # 引擎缺失）。此步骤在 CI 内现编，并在编译失败时立刻终止发版。
+          command -v cmake >/dev/null 2>&1 || brew install cmake
+          bash scripts/build-spark-llama.sh
+          test -x sidecar/llama-server || { echo "::error::Spark fork 未产出 sidecar/llama-server"; exit 1; }
+          echo "Spark fork engine:"; ./sidecar/llama-server --version | head -2
+
+      - name: "Fetch upstream llama.cpp engine (dual-engine dispatch)"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 09-15：macOS 内置双引擎——sidecar/llama-server 是 Spark 专用 fork，
+          # 上游引擎由本步骤抓预编译包到 sidecar/llama-upstream/（普通模型走上游）
+          bash scripts/fetch-upstream-llama.sh
+
+      - name: "Guard: signing key configured?"
+        run: |
+          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo "::error::TAURI_PRIVATE_KEY secret not configured - aborting release job to avoid unsigned artifacts overwriting latest.json"
+            exit 1
+          fi
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+
+      - name: Build (updater 插件自动产出签名更新包)
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+        run: |
+          npm run tauri build
+
+      - name: Prepare updater archive (fallback 手动打包+签名)
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+        run: |
+          BUNDLE="src-tauri/target/release/bundle"
+          VERSION="${GITHUB_REF_NAME#v}"
+          case "$(uname -m)" in arm64) ARCH="aarch64" ;; *) ARCH="x86_64" ;; esac
+          ARCHIVE="$BUNDLE/macos/Latiao_${VERSION}_${ARCH}.app.tar.gz"
+          if [ ! -f "$ARCHIVE" ]; then
+            APP=$(ls -d "$BUNDLE"/macos/*.app | head -1)
+            cd "$BUNDLE/macos" && tar czf "$(basename "$ARCHIVE")" "$(basename "$APP")" && cd -
+            npx @tauri-apps/cli signer sign --password "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" "$ARCHIVE"
+          fi
+          ls -la "$BUNDLE/macos"
+
+      - name: "Verify bundled engines (fork + upstream)"
+        run: |
+          # 硬性校验：包里必须同时有 Spark fork 与上游引擎，否则失败而不是静默发布
+          APP=$(ls -d src-tauri/target/release/bundle/macos/*.app | head -1)
+          RES="$APP/Contents/Resources/sidecar"
+          for e in "$RES/llama-server" "$RES/llama-upstream/llama-server"; do
+            if [ ! -x "$e" ]; then echo "::error::缺少引擎: $e"; exit 1; fi
+            "$e" --version | head -1
+          done
+
+      - name: Generate latest.json (darwin 条目)
+        run: |
+          BUNDLE="src-tauri/target/release/bundle"
+          VERSION="${GITHUB_REF_NAME#v}"
+          case "$(uname -m)" in arm64) ARCH="aarch64" ;; *) ARCH="x86_64" ;; esac
+          ARCHIVE="$BUNDLE/macos/Latiao_${VERSION}_${ARCH}.app.tar.gz"
+          SIG=$(cat "$ARCHIVE.sig" | tr -d '\n')
+          cat > latest.json <<EOF
+          {
+            "version": "$VERSION",
+            "notes": "Latiao v$VERSION",
+            "pub_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "platforms": {
+              "darwin-$ARCH": {
+                "signature": "$SIG",
+                "url": "https://github.com/RenYiX0620/Latiao/releases/download/${GITHUB_REF_NAME}/Latiao_${VERSION}_${ARCH}.app.tar.gz"
+              }
+            }
+          }
+          EOF
+          echo "Manifest: $(cat latest.json)"
+
+      - name: Upload release (macOS)
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            src-tauri/target/release/bundle/macos/*.app.tar.gz
+            src-tauri/target/release/bundle/macos/*.app.tar.gz.sig
+            src-tauri/target/release/bundle/dmg/*.dmg
+            latest.json
+          draft: false
+          generate_release_notes: true
+          overwrite_files: true
+
+  release-windows:
+    runs-on: windows-latest
+    needs: release-macos
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: dtolnay/rust-toolchain@stable
+
+      - run: npm install
+
+      - name: "Guard: signing key configured?"
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrEmpty($env:TAURI_SIGNING_PRIVATE_KEY)) {
+            Write-Host "::error::TAURI_PRIVATE_KEY secret not configured - aborting release job to avoid unsigned artifacts overwriting latest.json"
+            exit 1
+          }
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+
+      - name: Build sidecar (PyInstaller)
+        run: |
+          cd sidecar
+          # Windows 侧依赖：requirements-win.txt（不含 Mac 专属 mlx/mlx-lm/mlx-metal），
+          # 缺失 httpx 等会导致 sidecar.exe 启动即 ModuleNotFoundError
+          python -m pip install -r requirements-win.txt
+          python -m pip install "pyinstaller==6.*"
+          python -m PyInstaller latiao.spec
+          Copy-Item dist/sidecar.exe -Destination . -Force
+
+      - name: Download llama-server.exe
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $headers = @{ "User-Agent" = "Latiao-CI"; "Authorization" = "Bearer $env:GH_TOKEN" }
+          # releases/latest 可能只是无二进制的占位 release（如 v0.3.0 仅含 nightly-tag.txt），
+          # 因此扫描最近 release，取第一个带 win-cpu x64 zip 的；用 GITHUB_TOKEN 认证避免共享 runner IP 的匿名限额
+          $asset = $null
+          try {
+            $releases = Invoke-RestMethod -Uri "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=10" -Headers $headers
+            foreach ($rel in $releases) {
+              $asset = $rel.assets | Where-Object { $_.name -like "*bin-win-cpu-x64*.zip" } | Select-Object -First 1
+              if (-not $asset) {
+                $asset = $rel.assets | Where-Object { $_.name -like "*bin-win-x64*.zip" } | Select-Object -First 1
+              }
+              if ($asset) { Write-Host "Matched release: $($rel.tag_name)"; break }
+            }
+          } catch {
+            Write-Host "API 查询失败（$($_.Exception.Message)），回退固定版本"
+          }
+          if (-not $asset) {
+            $asset = @{ name = "llama-b10689-bin-win-cpu-x64.zip"; browser_download_url = "https://github.com/ggml-org/llama.cpp/releases/download/b10689/llama-b10689-bin-win-cpu-x64.zip" }
+          }
+          Write-Host "Downloading: $($asset.name)"
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile "$env:RUNNER_TEMP\llama.zip"
+          Expand-Archive -Path "$env:RUNNER_TEMP\llama.zip" -DestinationPath "$env:RUNNER_TEMP\llama" -Force
+          $exe = Get-ChildItem -Path "$env:RUNNER_TEMP\llama" -Recurse -Filter "llama-server.exe" | Select-Object -First 1
+          if (-not $exe) { Write-Error "zip 内未找到 llama-server.exe"; exit 1 }
+          Copy-Item $exe.FullName -Destination "sidecar\llama-server.exe" -Force
+          Write-Host "llama-server.exe ready: $($exe.FullName)"
+
+      - name: Clean sidecar build artifacts before bundling
+        shell: pwsh
+        run: |
+          # bundle.resources 递归包含 sidecar 目录：PyInstaller 的 dist/build 树
+          # 会被一起打进安装器（09-14 实测 98MB → 224MB 的根因）
+          Remove-Item -Recurse -Force sidecar\dist, sidecar\build -ErrorAction SilentlyContinue
+          Get-ChildItem -Path sidecar -Recurse -Directory -Filter "__pycache__" |
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+          Get-ChildItem -Path sidecar -Recurse -Include *.pyc -File |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+          Write-Host "sidecar size after cleanup:"
+          "{0:N1} MB" -f ((Get-ChildItem sidecar -Recurse -File |
+            Measure-Object Length -Sum).Sum / 1MB)
+
+      - name: Build Tauri (NSIS + MSI，updater 自动签名)
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+        run: npm run tauri build -- --target x86_64-pc-windows-msvc
+
+      - name: Sign NSIS installer (fallback 手动签名)
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+        run: |
+          $BUNDLE = "src-tauri\target\x86_64-pc-windows-msvc\release\bundle"
+          $exe = Get-ChildItem -Path "$BUNDLE\nsis" -Filter "*-setup.exe" | Select-Object -First 1
+          if ($exe -and -not (Test-Path "$($exe.FullName).sig")) {
+            npx @tauri-apps/cli signer sign --password $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD $exe.FullName
+          }
+          Get-ChildItem -Path "$BUNDLE\nsis" | Select-Object Name
+
+      - name: Upload Windows artifacts
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.sig
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
+          draft: false
+          generate_release_notes: true
+          overwrite_files: true
+
+  # 清单合并：macOS 与 Windows 并行产出各自签名，历史实现两边都写 latest.json
+  # → 后完成者覆盖先完成者。v0.3.30 实测：Windows 补的 windows-x86_64 条目
+  # 被随后执行的 macOS 上传覆盖，Windows 用户收不到更新。现在两个 job 都完成
+  # 后由本 job 一次性生成，缺任一平台即失败（不再发布残缺清单）。
+  release-manifest:
+    needs: [release-macos, release-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "Assemble latest.json from both platforms"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p sigs
+          gh release download "$GITHUB_REF_NAME" --pattern "*.sig" --dir sigs --clobber
+          ls -la sigs
+          python3 .github/scripts/assemble_latest_json.py "$VERSION" "$GITHUB_REF_NAME" sigs latest.json
+          gh release upload "$GITHUB_REF_NAME" latest.json --clobber

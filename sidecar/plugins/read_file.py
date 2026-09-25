@@ -1,0 +1,150 @@
+"""Read the contents of a file at the given path. Supports ~ expansion."""
+
+import os
+import re
+
+# 敏感路径判定**与 run_cmd 共享一份**（cmd_safety.sensitive_read_block）：
+# 此前两条路不一致——`cat ~/.local-ai-os/config.json` 被拦，read_file 同一路径
+# 免确认读通，明文 API key 因此进了模型上下文/日志/报告（09-23 真机复现，审计 P1）
+# 兼容导出：旧代码/测试可能引用这两个常量名（实际判定统一走 sensitive_read_block）
+from cmd_safety import _BLOCKED_DIR_SUBSTRINGS as _BLOCKED_SUBSTRINGS  # noqa: F401
+from cmd_safety import _BLOCKED_FILE_NAMES as _BLOCKED_FILE_NAMES  # noqa: F401
+from cmd_safety import sensitive_read_block
+
+MAX_READ_SIZE = 10000  # chars before truncation
+
+NAME = "read_file"
+PERMISSION = "safe"
+
+DEFINITION = {
+    "type": "function",
+    "function": {
+        "name": "read_file",
+        "description": "Read the contents of a file at the given path. Large files are truncated.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Absolute path to the file."}
+            },
+            "required": ["path"]
+        }
+    }
+}
+
+
+def summarize_progress_tail(text: str, limit: int = 10) -> str:
+    """从 PROGRESS.md 尾部提取最近条目，生成中文摘要（可测纯函数）。
+
+    PROGRESS.md 600KB+ 且 2/3 是英文工具日志，直接读会把本地模型带偏成
+    英文（09-03 新会话英文事故）。启动协议只需要"了解最近进度"，摘要即可。
+    """
+    entries = []
+    for ln in text.splitlines():
+        m = re.match(r"^###\s+(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2})\S*\s+(\w+)", ln)
+        if m:
+            entries.append((f"{m.group(1)[5:]} {m.group(2)}", m.group(3)))
+    entries = entries[-limit:]
+    if not entries:
+        return ""
+    out = ["最近工作记录（自动摘要）："]
+    for ts, tool in entries:
+        out.append(f"- {ts} {tool}")
+    return "\n".join(out)
+
+
+def _safe_path(path: str) -> str | None:
+    """返回规范化后的绝对路径；不合法返回 None。"""
+    if not path:
+        return None
+    expanded = os.path.expanduser(path)
+    if not os.path.isabs(expanded):
+        # 相对路径按 sidecar 工作目录解析（模型常发 "." 或相对路径，
+        # 此前直接拒绝并误报"路径穿越"）
+        try:
+            from agent_loop import _safe_cwd
+            base = _safe_cwd()
+            if not base:
+                return None
+            expanded = os.path.join(base, expanded)
+        except Exception:
+            return None
+    # Block path traversal — 两种分隔符都查
+    if ".." in path.split("/") or ".." in path.split("\\"):
+        return None
+    # realpath 解析符号链接，防止经由 symlink 逃出校验
+    return os.path.realpath(expanded)
+
+
+def execute(args: dict) -> str:
+    p = _safe_path(args.get("path") or args.get("file") or "")
+    if p is None:
+        return "⛔ Blocked: 路径无效（空路径或包含 .. 穿越片段）"
+    # 敏感路径（密钥目录/凭据文件/.env 家族/辣条自身 config.json）一律拒绝
+    _blocked = sensitive_read_block(p)
+    if _blocked:
+        return _blocked
+    try:
+        # 先检测是否为二进制文件(xlsx/zip/png 等),避免 utf-8 codec 报错
+        # 让模型困惑。读前 1KB 探测 NUL 字节或已知二进制魔数。
+        _BINARY_EXTS = {".xlsx", ".xls", ".pdf", ".png", ".jpg", ".jpeg", ".gif",
+                        ".bmp", ".webp", ".zip", ".gz", ".tar", ".7z", ".rar",
+                        ".mp3", ".mp4", ".mov", ".avi", ".woff", ".woff2",
+                        ".ttf", ".otf", ".icns", ".ico", ".class", ".so", ".dylib", ".dll", ".exe"}
+        ext = os.path.splitext(p)[1].lower()
+        is_binary = ext in _BINARY_EXTS
+        if not is_binary:
+            # 探测文件内容:前 1024 字节含 NUL -> 二进制
+            with open(p, "rb") as bf:
+                head = bf.read(1024)
+            if b"\x00" in head:
+                is_binary = True
+        if is_binary:
+            return (f"⚠️ 这是二进制文件({ext or '未知格式'}),无法作为文本读取。\n"
+                    f"文件: {p}\n"
+                    f"如需查看数据,请读取对应的文本格式文件(如 _raw.json / _description.txt)。")
+
+        # PROGRESS.md 特例：返回最近条目中文摘要而非原始内容
+        try:
+            from config import PROGRESS_DIR
+            if os.path.realpath(p) == os.path.realpath(str(PROGRESS_DIR / "PROGRESS.md")):
+                with open(p, "rb") as pf:
+                    pf.seek(max(0, os.path.getsize(p) - 8192))
+                    tail = pf.read().decode("utf-8", errors="replace")
+                summary = summarize_progress_tail(tail)
+                if summary:
+                    return (summary
+                            + "\n\n（PROGRESS.md 共 60 万+ 字符，以上即最近进度摘要，"
+                            + "无需再次读取；直接开始执行任务。）")
+        except Exception:
+            pass  # 摘要失败回退到常规读取，不阻断
+
+        with open(p, "r", encoding="utf-8") as f:
+            content = f.read(MAX_READ_SIZE + 1)
+        if len(content) > MAX_READ_SIZE:
+            est_lines = content.count("\n")
+            return (
+                content[:MAX_READ_SIZE]
+                + f"\n\n... (文件过长，已截断。约 {est_lines}+ 行，"
+                + f"仅显示前 {MAX_READ_SIZE} 字符。如需完整内容请分段读取)"
+            )
+        return content
+    except FileNotFoundError:
+        return f"错误：文件不存在 - {p}"
+    except UnicodeDecodeError:
+        # 容错降级：文件混入少量非 UTF-8 字节（如历史轮转切在多字节汉字
+        # 中间留下的残缺字节）时仍读出内容，残缺处用 � 替代——
+        # 比整个拒绝更利于断点续作（22:46 事故）。
+        try:
+            with open(p, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read(MAX_READ_SIZE + 1)
+            if len(content) > MAX_READ_SIZE:
+                est_lines = content.count("\n")
+                return (
+                    content[:MAX_READ_SIZE]
+                    + f"\n\n... (文件过长，已截断。约 {est_lines}+ 行)"
+                )
+            return content
+        except Exception as e2:
+            return f"错误：{e2}"
+    except Exception as e:
+        return f"错误：{e}"

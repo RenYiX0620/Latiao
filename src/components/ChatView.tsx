@@ -1,0 +1,843 @@
+import { memo, lazy, Suspense, useCallback, useState, useMemo, useRef, useEffect } from "react";
+import type { Message, PendingFile } from "../types";
+import { useTranslation } from "../i18n";
+import { loadedMismatch } from "../utils/modelSelection";
+import RunMetrics from "./RunMetrics";
+import ToolCallBubble from "./ToolCallBubble";
+import { FileEditCard, ToolActivityCard, SubagentRow } from "./TurnCards";
+import type { PreviewItem } from "./PreviewPanel";
+import ToolbarSelect from "./ToolbarSelect";
+import {
+  Eye, ShieldCheck, PencilRuler, ListChecks, Zap, CircleOff, Circle, Brain, BrainCircuit,
+  Bot, User, ChevronRight, ChevronDown, Wrench, Search, Database, FileText,
+  FolderOpen, FilePen, Terminal, AppWindow, Users, Clock,
+  MousePointer2, Keyboard, Camera, ListTree, Play, History, ScanLine,
+} from "lucide-react";
+import type { LucideIcon } from "lucide-react";
+import { COMPOSE_GRACE_MS, COMPOSING_BACKSTOP_MS, shouldSendOnEnter } from "../utils/composer";
+
+// 活动类别：工具名 → (类别标签, 数量名词, 图标)。标签英文对齐 DSH/Codex
+// 活动行样式（Think/Bash/Search/Read/Write/Data…），noun 保留中文计数
+const TOOL_CATEGORIES: Record<string, { verb: string; noun: string; icon: LucideIcon }> = {
+  bing_search: { verb: "Search", noun: "tool.noun_search", icon: Search },
+  web_search: { verb: "Search", noun: "tool.noun_search", icon: Search },
+  tavily_search: { verb: "Search", noun: "tool.noun_search", icon: Search },
+  search_files: { verb: "Search", noun: "tool.noun_search", icon: Search },
+  mx_query: { verb: "Data", noun: "tool.noun_query", icon: Database },
+  ak_finance: { verb: "Data", noun: "tool.noun_query", icon: Database },
+  read_file: { verb: "Read", noun: "tool.noun_file", icon: FileText },
+  list_dir: { verb: "Read", noun: "tool.noun_dir", icon: FolderOpen },
+  write_file: { verb: "Write", noun: "tool.noun_file", icon: FilePen },
+  run_cmd: { verb: "Bash", noun: "tool.noun_cmd", icon: Terminal },
+  open_folder: { verb: "Open", noun: "tool.noun_dir", icon: FolderOpen },
+  open_app: { verb: "Open", noun: "tool.noun_app", icon: AppWindow },
+  delegate_task: { verb: "Task", noun: "tool.noun_task", icon: Users },
+  create_cron: { verb: "Task", noun: "tool.noun_task", icon: Clock },
+  // 五控工具
+  screen_capture: { verb: "Capture", noun: "tool.noun_screen", icon: Camera },
+  control_list_processes: { verb: "List", noun: "tool.noun_process", icon: ListTree },
+  control_kill_process: { verb: "Kill", noun: "tool.noun_process", icon: ScanLine },
+  control_launch: { verb: "Launch", noun: "tool.noun_process", icon: Play },
+  control_process_log: { verb: "Read", noun: "tool.noun_log", icon: FileText },
+  control_mouse_move: { verb: "Control", noun: "tool.noun_mouse", icon: MousePointer2 },
+  control_mouse_click: { verb: "Control", noun: "tool.noun_mouse", icon: MousePointer2 },
+  control_keyboard_type: { verb: "Control", noun: "tool.noun_keyboard", icon: Keyboard },
+  control_keyboard_press: { verb: "Control", noun: "tool.noun_keyboard", icon: Keyboard },
+  control_wait: { verb: "Wait", noun: "tool.noun_process", icon: Clock },
+  control_audit: { verb: "Data", noun: "tool.noun_record", icon: History },
+};
+const TOOL_CATEGORY_FALLBACK = { verb: "Tool call", noun: "tool.noun_call", icon: Wrench };
+import ReactMarkdown from "react-markdown";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import remarkGfm from "remark-gfm";
+import type { SyntaxHighlighterProps } from "react-syntax-highlighter";
+
+const SyntaxHighlighter = lazy(async () => {
+  const [{ Prism }, themes] = await Promise.all([
+    import("react-syntax-highlighter"),
+    import("react-syntax-highlighter/dist/esm/styles/prism"),
+  ]);
+  // 主题按 <html data-theme> 切换：深色用 oneDark、浅色用 oneLight，
+  // 统一做扁平化（去面板背景/圆角/内边距，仅保留语法颜色）
+  type PrismStyleMap = Record<string, import("react").CSSProperties>;
+  const flatten = (src: PrismStyleMap): PrismStyleMap => {
+    const out: PrismStyleMap = Object.fromEntries(
+      Object.entries(src).map(([k, v]) => [k, { ...v, background: "transparent" }])
+    );
+    out['pre[class*="language-"]'] = {
+      ...(out['pre[class*="language-"]'] as object),
+      background: "transparent", margin: 0, padding: 0, boxShadow: "none",
+    };
+    out['code[class*="language-"]'] = {
+      ...(out['code[class*="language-"]'] as object),
+      background: "transparent", boxShadow: "none", textShadow: "none",
+    };
+    return out;
+  };
+  const darkFlat = flatten(themes.oneDark);
+  const lightFlat = flatten(themes.oneLight);
+
+  // 必须写成**具名组件**再赋给 default：原来是一个匿名箭头函数直接放在 default 属性里，
+  // React 认不出来这是组件（Fast Refresh 失效），eslint 也会报 rules-of-hooks —— hook 写在
+  // 无名函数里，一旦哪天被当成普通函数调用就会崩。
+  function DarkAwarePrism(props: SyntaxHighlighterProps) {
+    const [theme, setTheme] = useState<string>(
+      () => document.documentElement.getAttribute("data-theme") || "dark"
+    );
+    useEffect(() => {
+      const el = document.documentElement;
+      const apply = () => setTheme(el.getAttribute("data-theme") || "dark");
+      const mo = new MutationObserver(apply);
+      mo.observe(el, { attributes: true, attributeFilter: ["data-theme"] });
+      return () => mo.disconnect();
+    }, []);
+    return <Prism style={theme === "light" ? lightFlat : darkFlat} {...props} />;
+  }
+  return { default: DarkAwarePrism };
+});
+
+function CodeBlock({ language, children }: { language: string; children: string }) {
+  return (
+    <Suspense fallback={<pre><code>{children}</code></pre>}>
+      <SyntaxHighlighter language={language} PreTag="div">
+        {children}
+      </SyntaxHighlighter>
+    </Suspense>
+  );
+}
+
+interface ChatViewProps {
+  messages: Message[];
+  isProcessing: boolean;
+  pendingFile: PendingFile | null;
+  setPendingFile: (f: PendingFile | null) => void;
+  prompt: string;
+  setPrompt: (p: string) => void;
+  fileInputRef: React.RefObject<HTMLInputElement | null>;
+  mediaRecorderRef: React.MutableRefObject<MediaRecorder | null>;
+  isRecording: boolean;
+  onStop: () => void;
+  sendMessage: () => void;
+  handleFileSelect: (e: React.ChangeEvent<HTMLInputElement>) => void;
+  startRecording: () => void;
+  confirmTool: (callId: string, approved: boolean, always?: boolean) => void;
+  onPreview?: (item: PreviewItem) => void;
+  /** 朗读一条回复（同一个 id 再点＝停止）。文本的 Markdown 剥离在 App 里统一做。 */
+  onSpeak?: (text: string, id?: string) => void;
+  speakingId?: string | null;
+  chatEndRef: React.RefObject<HTMLDivElement | null>;
+  handleDrop?: (e: React.DragEvent) => void;
+  onPasteImage?: (file: File) => void;
+  cloudModels: { name: string }[];
+  selectedModel: string;
+  /** 选择模型（本地模型会顺带触发加载）——见 utils/modelSelection 的说明 */
+  onSelectModelAndLoad: (m: string) => void;
+  /** 引擎真实加载的模型（下拉要显示真相：会话选择与实际回答者可能不一致） */
+  engineStatus?: { status?: string; model_id?: string; model_name?: string } | null;
+  accessMode: "read_only" | "confirm" | "auto_edit" | "plan" | "full";
+  setAccessMode: (m: "read_only" | "confirm" | "auto_edit" | "plan" | "full") => void;
+  thinkingLevel: "off" | "low" | "high" | "max";
+  setThinkingLevel: (l: "off" | "low" | "high" | "max") => void;
+  contextEstimate?: { max_context: number; recommended_context: number } | null;
+  sessionId?: string;   // 上下文统计面板按会话取数
+  showToast: (msg: string, type?: string) => void;
+  activeTask: string | null;
+  taskStartAt: number | null;
+  streamingThink?: string;  // 流式中的思考缓冲（运行中 Think 行实时摘要）
+  subagents?: { id: string; agent: string; task: string; status: string; summary?: string }[];
+  routeInfo?: { engine: string; declaredModel: string } | null;  // 实际引擎路由（engine_route/route_fallback）
+  localModelId?: string;    // 已加载的本地模型 id（选择器展示 💻 选项）
+  localModelName?: string;  // 已加载的本地模型名
+}
+
+export default memo(function ChatView({
+  messages, isProcessing, pendingFile, setPendingFile,
+  prompt, setPrompt,
+  fileInputRef, mediaRecorderRef, isRecording,
+  sendMessage, onStop, handleFileSelect, startRecording, confirmTool, onPreview,
+  onSpeak, speakingId,
+  chatEndRef, handleDrop, onPasteImage,
+  cloudModels, selectedModel, onSelectModelAndLoad, engineStatus, sessionId,
+  accessMode, setAccessMode, thinkingLevel, setThinkingLevel,
+  contextEstimate, showToast, activeTask, taskStartAt, streamingThink, subagents,
+  routeInfo, localModelId, localModelName,
+}: ChatViewProps) {
+  const { t } = useTranslation();
+  // WebKit (WKWebView) 下 compositionend 先于最终 keydown 派发，
+  // 仅靠 e.nativeEvent.isComposing 会在按 Enter 确认候选词时已变 false
+  // → 半句话被发送。用 compositionend 时间戳做一小段缓冲（VSCode 同款方案）。
+  // 09-21 修：原来组词开始时把缓冲设成 Number.MAX_SAFE_INTEGER，一旦某次
+  // compositionend 没派发就**永久锁死回车**（症状：回车只换行、点按钮才发送）；
+  // 且 300ms 窗口会连"打完字紧接着按的回车"一起吞掉。判定逻辑见 utils/composer.ts。
+  const composingUntilRef = useRef(0);
+  const handleCompositionStart = useCallback(() => {
+    composingUntilRef.current = Date.now() + COMPOSING_BACKSTOP_MS;
+  }, []);
+  const handleCompositionEnd = useCallback(() => {
+    composingUntilRef.current = Date.now() + COMPOSE_GRACE_MS;
+  }, []);
+  const handleEditableKeyDown = useCallback((e: React.KeyboardEvent) => {
+    // 输入法组词中按 Enter 是确认候选，不是发送（中文输入法高频误发送）
+    const send = shouldSendOnEnter(Date.now(), composingUntilRef.current, isProcessing, {
+      key: e.key,
+      shiftKey: e.shiftKey,
+      isComposing: e.nativeEvent.isComposing,
+      keyCode: e.nativeEvent.keyCode,
+    });
+    if (send) {
+      e.preventDefault();
+      sendMessage();
+    }
+  }, [sendMessage, isProcessing]);
+
+  const handleSend = useCallback(() => {
+    sendMessage();
+  }, [sendMessage]);
+
+  // 点赞/点踩本地反馈状态（localStorage 持久化 + 回流后端 learnings，审计 B12）
+  const [msgFeedback, setMsgFeedback] = useState<Record<string, "up" | "down">>(() => {
+    try { return JSON.parse(localStorage.getItem("latiao_msg_feedback") || "{}"); } catch { return {}; }
+  });
+  const toggleFeedback = (msgId: string, kind: "up" | "down", content?: string) => {
+    const cur = msgFeedback[msgId];
+    const next = cur === kind ? undefined : kind;
+    const m = { ...msgFeedback };
+    if (next) m[msgId] = next; else delete m[msgId];
+    setMsgFeedback(m);
+    try { localStorage.setItem("latiao_msg_feedback", JSON.stringify(m)); } catch { /* ignore */ }
+    // 回流：点赞/点踩写入 learnings（高置信度），影响后续回复
+    if (next && content && content.trim()) {
+      import("../utils/api").then(({ authFetch }) => {
+        authFetch("/v1/feedback", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          // session_id：后端据此把该会话最近一条记忆注入记录标成 used 标签
+          body: JSON.stringify({ content: content.slice(0, 500), kind: next, session_id: sessionId || "" }),
+        }).catch(() => { /* 反馈失败不打扰用户 */ });
+      });
+    }
+  };
+  const fmtTime = (ts?: number) => ts ? new Date(ts).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false }) : "";
+
+  // ── 消息导航缩略图（minimap）：长会话右侧迷你图，点击/拖动跳转 ──
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const [scrollInfo, setScrollInfo] = useState({ top: 0, viewH: 0, totalH: 1 });
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const onScroll = () => setScrollInfo({ top: el.scrollTop, viewH: el.clientHeight, totalH: el.scrollHeight || 1 });
+    onScroll();
+    el.addEventListener("scroll", onScroll, { passive: true });
+    const ro = new ResizeObserver(onScroll);
+    ro.observe(el);
+    return () => { el.removeEventListener("scroll", onScroll); ro.disconnect(); };
+  }, [messages.length]);
+
+  // 每条消息的真实布局测量（offsetTop/height）——Turn Navigator 用它把每轮
+  // 对话映射到真实滚动位置（点击跳转、当前轮高亮）。
+  const [msgMetrics, setMsgMetrics] = useState<{ id: string; top: number; height: number }[]>([]);
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const measure = () => {
+      const elRect = el.getBoundingClientRect();
+      const next: { id: string; top: number; height: number }[] = [];
+      el.querySelectorAll<HTMLElement>("[data-mid]").forEach((n) => {
+        const id = n.dataset.mid;
+        if (!id) return;
+        const r = n.getBoundingClientRect();
+        next.push({ id, top: r.top - elRect.top + el.scrollTop, height: Math.max(4, r.height) });
+      });
+      next.sort((a, b) => a.top - b.top);
+      setMsgMetrics(next);
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    const t = setTimeout(measure, 300);
+    return () => { ro.disconnect(); clearTimeout(t); };
+  }, [messages]);
+
+  // minimap 悬停轮次（Turn Navigator 式：悬停显示该轮问题主题，点击跳转）
+  const [hoverTurn, setHoverTurn] = useState<{ idx: number; topPx: number } | null>(null);
+  // 子任务详情弹窗：点 subagent 行看 task 全文 + 结果摘要（✗ 只是状态标记，
+  // 此前无点击入口，用户误以为 ✗ 是删除按钮）
+  const [subagentDetail, setSubagentDetail] = useState<{ id: string; agent: string; task: string; status: string; summary?: string; started_at?: string; updated_at?: string } | null>(null);
+
+  // 任务头部"已工作 X 分 X 秒"计时（isProcessing / 工具执行期间显示）
+  const [elapsed, setElapsed] = useState(0);
+  useEffect(() => {
+    if (!taskStartAt || (!isProcessing && !activeTask)) {
+      const id = setTimeout(() => setElapsed(0), 0);
+      return () => clearTimeout(id);
+    }
+    const tick = () => setElapsed(Date.now() - taskStartAt);
+    const iv = setInterval(tick, 1000);
+    const id = setTimeout(tick, 0);
+    return () => { clearInterval(iv); clearTimeout(id); };
+  }, [taskStartAt, isProcessing, activeTask]);
+
+  // 时长格式化：<3s 显示"几秒"，长于 60s 显示"X 分 X 秒"
+  const fmtDur = (ms: number) => {
+    const s = Math.max(0, Math.round(ms / 1000));
+    if (s < 60) return t("time.seconds", { n: s });
+    return t("time.minutes", { m: Math.floor(s / 60), s: s % 60 });
+  };
+
+  // 活动行摘要（DSH/Codex 同款：一行可见 = 摘要截断）
+  const thinkSummary = (text: string) => {
+    const m = text.match(/\*\*([^*\n]+)\*\*/);  // 首个 **粗体**（Codex streaming.rs 头部提取）
+    const line = m ? m[1] : (text.split("\n").find((l) => l.trim()) || "");
+    const flat = line.replace(/\s+/g, " ").trim();
+    return flat.length > 80 ? flat.slice(0, 80) + "…" : flat;
+  };
+  // 工具行摘要（TurnCards.argSummary 已覆盖；保留 toolSummary 会 unused —— 已删）
+
+  // ── 对话分段（ZCode 式：一次对话 = 一张卡片，头部显示耗时）──
+  // 每轮顺序固定为 [user, tool…, assistant]（App.tsx 已保证插入位置）；
+  // 兼容历史坏数据：段首工具挪到问题之后；无 user 的孤儿工具段并入下一段
+  const segments = useMemo(() => {
+    const raw: { msgs: Message[] }[] = [];
+    let cur: Message[] = [];
+    const push = () => {
+      if (cur.length === 0) return;
+      raw.push({ msgs: cur });
+      cur = [];
+    };
+    for (const m of messages) {
+      if (m.role === "user" && cur.length > 0) { push(); cur = [m]; }
+      else cur.push(m);
+    }
+    push();
+    // 孤儿段（历史坏顺序的纯工具段）并入相邻段：前面有段并入其末尾，否则挂起并入下一段
+    const merged: { msgs: Message[] }[] = [];
+    let pending: Message[] = [];
+    for (const seg of raw) {
+      const hasUser = seg.msgs.some((m) => m.role === "user");
+      if (!hasUser) {
+        if (merged.length > 0) {
+          const last = merged[merged.length - 1];
+          last.msgs = [...last.msgs, ...seg.msgs];
+        } else {
+          pending = [...pending, ...seg.msgs];
+        }
+      } else {
+        if (pending.length > 0) { seg.msgs = [...pending, ...seg.msgs]; pending = []; }
+        merged.push(seg);
+      }
+    }
+    if (pending.length > 0) {
+      if (merged.length > 0) {
+        const last = merged[merged.length - 1];
+        last.msgs = [...last.msgs, ...pending];
+      } else {
+        merged.push({ msgs: pending });
+      }
+    }
+    // normalize：段首连续工具消息挪到该段 user 消息之后
+    const segs: { startTs?: number; endTs?: number; msgs: Message[] }[] = [];
+    for (const seg of merged) {
+      let msgs = seg.msgs;
+      if (msgs[0]?.role === "tool" || msgs[0]?.type === "tool_call") {
+        let k = 0;
+        while (k < msgs.length && (msgs[k].role === "tool" || msgs[k].type === "tool_call")) k++;
+        if (k < msgs.length) msgs = [msgs[k], ...msgs.slice(0, k), ...msgs.slice(k + 1)];
+      }
+      let st = msgs[0].ts, en = 0;
+      for (const m of msgs) {
+        const t = (m.ts || 0) + (m.duration || 0) + (m.thinkingDuration || 0);
+        if (t > en) en = t;
+        if (m.ts && (!st || m.ts < st)) st = m.ts;
+      }
+      segs.push({ startTs: st, endTs: en, msgs });
+    }
+    return segs;
+  }, [messages]);
+  const [collapsedSegs, setCollapsedSegs] = useState<Record<string, boolean>>({});
+  // 用户消息里内联文件块的展开状态（默认收起：只显示文件名与展开按钮，
+  // 不再把整段文件文本刷屏在气泡里）
+  const [expandedFiles, setExpandedFiles] = useState<Record<string, boolean>>({});
+
+  // 单条消息渲染（段内复用；思考内容由段渲染器提前提取为独立活动行，此处只渲染正文）
+  const renderMsg = (msg: Message, i: number) => {
+          if (msg.role === "assistant") {
+            const localThink = msg.content.match(/^<think>([\s\S]*?)<\/think>\s*/);
+            const bodyText = (localThink ? msg.content.slice(localThink[0].length) : msg.content)
+              // 模型输出 ```think> ... ```think< 围栏：剥掉围栏标记、保留内容为正文，
+              // 否则未闭合的围栏会让 ReactMarkdown 把后续全部渲染成代码块（灰框）
+              .replace(/```{3,}\s*think\s*[<>]/g, "");
+            return (
+              <div key={msg.id || i} data-mid={msg.id} className={`msg-row assistant${msg.type === "file" ? " file" : ""}`}>
+                <div className="avatar-small avatar-bot"><Bot size={19} strokeWidth={2} /></div>
+                <div className="msg-content">
+                  {bodyText && (
+                    <div className="msg-bubble assistant">
+                      <ReactMarkdown remarkPlugins={[remarkGfm]} components={
+                        {
+                          code: ({ inline, className, children, ...props }: { inline?: boolean; className?: string; children?: React.ReactNode }) =>
+                            inline
+                              ? <code className={className} {...props}>{children}</code>
+                              : <CodeBlock language={(className || "").replace("language-", "")}>{String(children)}</CodeBlock>,
+                          a: ({ href, children }: { href?: string; children?: React.ReactNode }) => (
+                            <a href={href} onClick={(e) => { e.preventDefault(); if (href) openUrl(href); }}>{children}</a>
+                          ),
+                        }
+                      }>{bodyText}</ReactMarkdown>
+                    </div>
+                  )}
+                  <div className="msg-actions">
+                    <button className="btn-icon" title={t("chat.copy")} onClick={() => {
+                      navigator.clipboard?.writeText(msg.content).then(() => showToast(t("chat.copied"))).catch(() => showToast(t("chat.copy_fail"), "warn"));
+                    }}>⧉</button>
+                    {onSpeak && (
+                      <button
+                        className={`btn-icon${speakingId && speakingId === msg.id ? " active" : ""}`}
+                        title={speakingId === msg.id ? t("chat.speaking") : t("chat.speak")}
+                        onClick={() => onSpeak(msg.content, msg.id)}
+                      >{speakingId === msg.id ? "⏹" : "🔊"}</button>
+                    )}
+                    <button className={`btn-icon${msgFeedback[msg.id || ""] === "up" ? " active" : ""}`} title={t("chat.like")}
+                      onClick={() => msg.id && toggleFeedback(msg.id, "up", msg.content)}>👍</button>
+                    <button className={`btn-icon${msgFeedback[msg.id || ""] === "down" ? " active" : ""}`} title={t("chat.dislike")}
+                      onClick={() => msg.id && toggleFeedback(msg.id, "down", msg.content)}>👎</button>
+                    {fmtTime(msg.ts) && <span className="msg-time">{fmtTime(msg.ts)}</span>}
+                  </div>
+                </div>
+              </div>
+            );
+          }
+          if (msg.type === "file") {
+            // 拆分"用户输入文本 + 📎 文件…内容如下：```…```"结构：
+            // 文本正常显示，文件内容默认折叠（点击展开）——模型仍收到完整内容，
+            // 气泡不再整段刷屏。
+            const fm = msg.content.match(/^([\s\S]*?)\n*📎 [^\n]{1,80}\n\s*```\n([\s\S]*?)\n```\s*$/);
+            const textPart = fm ? fm[1].trim() : "";
+            const fname = fm ? fm[2] : msg.filename || "";
+            const fbody = fm ? fm[3] : msg.content;
+            const isExpanded = !!expandedFiles[msg.id || ""];
+            return (
+              <div key={msg.id || i} data-mid={msg.id} className={`msg-row user file`}>
+                <div className="avatar-small avatar-user"><User size={19} strokeWidth={2} /></div>
+                <div className="msg-content">
+                  {textPart && <div className="msg-bubble user">{textPart}</div>}
+                  <div className="msg-bubble" style={{ marginTop: textPart ? 6 : 0 }}>
+                    {msg.imagePreview ? (
+                      <img src={msg.imagePreview} alt="" style={{ maxWidth: 240 }} />
+                    ) : (
+                      <span className="file-attach-line" style={{ cursor: "pointer" }}
+                        onClick={() => setExpandedFiles((prev) => ({ ...prev, [msg.id || ""]: !prev[msg.id || ""] }))}>
+                        📄 {fname}
+                        <span className="file-attach-meta" style={{ opacity: 0.65, fontSize: "0.85em" }}>
+                          {isExpanded ? ` · ${t("chat.collapse")}` : ` · ${(fbody.length / 1024).toFixed(1)} KB · ${t("chat.click_expand")}`}
+                        </span>
+                      </span>
+                    )}
+                  </div>
+                  {isExpanded && (
+                    <pre className="msg-bubble file-content" style={{ marginTop: 6, maxHeight: 260, overflow: "auto", whiteSpace: "pre-wrap", wordBreak: "break-all", fontSize: "0.85em" }}>{fbody}</pre>
+                  )}
+                  <div className="msg-actions">
+                    <button className="btn-icon" title={t("chat.copy")} onClick={() => {
+                      navigator.clipboard?.writeText(msg.content).then(() => showToast(t("chat.copied"))).catch(() => showToast(t("chat.copy_fail"), "warn"));
+                    }}>⧉</button>
+                    {fmtTime(msg.ts) && <span className="msg-time">{fmtTime(msg.ts)}</span>}
+                  </div>
+                </div>
+              </div>
+            );
+          }
+          return (
+            <div key={msg.id || i} data-mid={msg.id} className={`msg-row user${msg.type === "image" ? " file" : ""}`}>
+              <div className="avatar-small avatar-user"><User size={19} strokeWidth={2} /></div>
+              <div className="msg-content">
+                <div className="msg-bubble user">{msg.content}</div>
+                <div className="msg-actions">
+                  <button className="btn-icon" title={t("chat.copy")} onClick={() => {
+                    navigator.clipboard?.writeText(msg.content).then(() => showToast(t("chat.copied"))).catch(() => showToast(t("chat.copy_fail"), "warn"));
+                  }}>⧉</button>
+                  {fmtTime(msg.ts) && <span className="msg-time">{fmtTime(msg.ts)}</span>}
+                </div>
+              </div>
+            </div>
+          );
+  };
+
+  // 状态栏数据：轮数（user 消息数）、工具调用数、消息数、token 估算
+  const userTurns = messages.filter(m => m.role === "user").length || 0;
+  const toolCalls = messages.filter(m => m.role === "tool" || m.type === "tool_call").length || 0;
+  const estTokens = Math.round(messages.reduce((s, m) => s + m.content.length, 0) * 0.55); // 中文近似
+
+  return (
+    <>
+      <div className="chat-wrap">
+      {(subagents && subagents.length > 0) && (
+        <div className="subagent-bar">
+          {(subagents as { id: string; agent: string; task: string; status: string; steps?: number; activity?: Record<string, number>; last_activity?: string; summary?: string }[]).map(sa => {
+            const isExplore = sa.agent === "explore";
+            const Icon = isExplore ? Search : Bot;
+            // ZCode 式活动摘要："终端 · 1 个命令""文件 · 3 次读取"
+            // 后端的 activity 分类名是中文（数据），这里映射到 i18n 键再翻译
+            const actLabel: Record<string, string> = {
+              终端: "chat.act_cmd", 文件: "chat.act_file",
+              搜索: "chat.act_search", 委派: "chat.act_delegate",
+            };
+            const parts = Object.entries(sa.activity || {})
+              .filter(([, n]) => n > 0)
+              .map(([cat, n]) => `${cat} · ${n}${actLabel[cat] ? t(actLabel[cat]) : t("chat.act_times")}`);
+            return (
+              <div key={sa.id} className={`subagent-row${sa.status === "running" ? " running" : sa.status === "error" ? " error" : ""}`} title={sa.last_activity || sa.summary || ""} style={{ cursor: "pointer" }} onClick={() => setSubagentDetail(sa as typeof subagentDetail)}>
+                <span className={`subagent-icon${isExplore ? " explore" : ""}`}><Icon size={13} /></span>
+                <span className="subagent-name">{sa.agent}</span>
+                <span className="subagent-task">· {sa.task.slice(0, 40)}</span>
+                {(parts.length > 0 || (sa.steps ?? 0) > 0) && (
+                  <span className="subagent-activity">{parts.join("　") || `· ${t("chat.steps", { n: sa.steps ?? 0 })}`}</span>
+                )}
+                <span className={`subagent-status${sa.status === "running" ? " running" : ""}`}>
+                  {sa.status === "running" ? "●" : sa.status === "done" ? "✓" : sa.status === "stale" ? "⚠" : "✗"}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+      {subagentDetail && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.35)", backdropFilter: "blur(2px)", WebkitBackdropFilter: "blur(2px)", zIndex: 300, display: "flex", alignItems: "center", justifyContent: "center" }} onClick={() => setSubagentDetail(null)}>
+          <div style={{ width: 520, maxWidth: "92%", maxHeight: "70vh", overflowY: "auto", background: "var(--bg-card)", borderRadius: 14, boxShadow: "0 20px 60px rgba(0,0,0,0.3)", padding: "16px 18px" }} onClick={(e) => e.stopPropagation()}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+              <span style={{ fontWeight: 700, fontSize: 14 }}>{subagentDetail.agent === "explore" ? "🔍" : "🤖"} {t("chat.subagent_detail")}</span>
+              <span style={{ fontSize: 11, color: subagentDetail.status === "error" ? "var(--danger)" : subagentDetail.status === "done" ? "var(--success)" : "var(--warning)", marginLeft: "auto" }}>
+                {subagentDetail.status === "running" ? t("chat.status_running")
+                  : subagentDetail.status === "done" ? t("chat.status_done")
+                  : String(subagentDetail.summary || "").includes("中断") ? t("chat.status_stopped")
+                  : t("chat.status_failed")}
+              </span>
+              {subagentDetail.status !== "running" && (
+                <button className="btn btn-sm btn-ghost" style={{ color: "var(--danger)", padding: "2px 8px" }}
+                  onClick={async (e) => {
+                    e.stopPropagation();
+                    try {
+                      const { authFetch } = await import("../utils/api");
+                      const resp = await authFetch(`/v1/subagents/${subagentDetail.id}`, { method: "DELETE" });
+                      const d = await resp.json();
+                      if (d.status === "ok") { showToast(t("chat.clear_done")); setSubagentDetail(null); }
+                      else showToast(d.message || t("chat.clear_fail"), "warn");
+                    } catch { showToast(t("chat.clear_fail"), "warn"); }
+                  }} title={t("chat.clear_title")}>🗑 {t("chat.clear")}</button>
+              )}
+              <button className="btn btn-sm btn-ghost" style={{ padding: "2px 8px" }} onClick={() => setSubagentDetail(null)}>✕</button>
+            </div>
+            <div style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 6 }}>{t("chat.task_content")}</div>
+            <div style={{ fontSize: 12, whiteSpace: "pre-wrap", wordBreak: "break-word", background: "var(--bg-input)", borderRadius: 8, padding: "10px 12px", marginBottom: 10 }}>{subagentDetail.task}</div>
+            {(subagentDetail.summary || "").trim() && <>
+              <div style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 6 }}>{t("chat.task_result")}</div>
+              <div style={{ fontSize: 12, whiteSpace: "pre-wrap", wordBreak: "break-word", background: "var(--bg-input)", borderRadius: 8, padding: "10px 12px" }}>{subagentDetail.summary}</div>
+            </>}
+            {subagentDetail.updated_at && <div style={{ fontSize: 10, color: "var(--text-muted)", marginTop: 10 }}>{t("chat.updated_at", { ts: subagentDetail.updated_at })}</div>}
+          </div>
+        </div>
+      )}
+      {(() => {
+        // ── Turn Navigator（ZCode 式对话轮导航条）──
+        // 每轮对话（一段）一根细横杠：均匀分布、当前轮高亮、运行中脉冲；
+        // 悬停显示该轮主题（问题 2 行 + 回答摘要 3 行），点击平滑跳转。
+        // 此前 per-message 色块 + 滑动窗口预览内容过多且与滚动位置错位，已废。
+        const turns = segments.map((seg, i) => {
+          const q = seg.msgs.find((m) => m.role === "user");
+          const a = [...seg.msgs].reverse().find((m) => m.role === "assistant" && (m.content || "").trim());
+          const top = q ? msgMetrics.find((mm) => mm.id === q.id)?.top : undefined;
+          return { key: seg.msgs[0]?.id || `t${i}`, q, a, top, idx: i };
+        }).filter((t) => t.q);
+        if (turns.length < 3) return null;
+        const live = isProcessing || activeTask !== null;
+        // 当前轮：滚动视口上 35% 位置覆盖的那一轮
+        const center = scrollInfo.top + scrollInfo.viewH * 0.35;
+        let activeIdx = 0;
+        turns.forEach((t, i) => { if (t.top !== undefined && t.top <= center) activeIdx = i; });
+        const hovered = hoverTurn ? turns[hoverTurn.idx] : null;
+        const stripText = (s: string | undefined, n: number) =>
+          (s || "").replace(/```[\s\S]*?```/g, t("chat.code_placeholder")).replace(/[#*|`>-]/g, "").replace(/\s+/g, " ").trim().slice(0, n);
+        return (
+          <>
+          <div className="chat-minimap" onMouseLeave={() => setHoverTurn(null)}>
+            {turns.map((t, i) => (
+              <div key={t.key} className="turn-slot"
+                onMouseEnter={(e) => {
+                  const r = e.currentTarget.getBoundingClientRect();
+                  const p = e.currentTarget.parentElement!.getBoundingClientRect();
+                  setHoverTurn({ idx: i, topPx: r.top - p.top + r.height / 2 });
+                }}
+                onClick={() => {
+                  const el = scrollRef.current;
+                  if (el && t.top !== undefined) el.scrollTo({ top: Math.max(0, t.top - 16), behavior: "smooth" });
+                }}>
+                <span className={`turn-dash${i === activeIdx ? " active" : ""}${live && i === turns.length - 1 ? " running" : ""}`} />
+              </div>
+            ))}
+          </div>
+          {hovered && hovered.q && (
+            <div className="mini-preview" style={{ top: Math.max(34, Math.min(34 + (scrollInfo.viewH - 220), 20 + (hoverTurn!.topPx))) }}>
+              <p className="mini-preview-q">{stripText(hovered.q.content, 140) || t("chat.no_text")}</p>
+              {hovered.a && <p className="mini-preview-a">{stripText(hovered.a.content, 180)}</p>}
+            </div>
+          )}
+          </>
+        );
+      })()}
+      <div className="chat-scroll" ref={scrollRef} onDrop={handleDrop} onDragOver={(e) => { if (handleDrop) e.preventDefault(); }}>
+        {segments.map((seg, si) => {
+          const segKey = seg.msgs[0]?.id || `seg${si}`;
+          const collapsed = collapsedSegs[segKey] === true;
+          const segDur = seg.startTs && seg.endTs ? Math.max(0, seg.endTs - seg.startTs) : 0;
+          const qMsg = seg.msgs.find((m) => m.role === "user");
+          const qText = (qMsg?.content || "").replace(/\s+/g, " ").slice(0, 24);
+          // 进行中的对话段（最后一段）：实时计时 + 当前工具
+          const live = si === segments.length - 1 && taskStartAt !== null && (isProcessing || activeTask !== null);
+          const label = live
+            ? (elapsed >= 15000 ? `Deep diving… ${fmtDur(elapsed)}` : "Deep diving…")
+            : segDur > 0 ? t("chat.worked", { d: fmtDur(segDur) }) : qText || t("chat.chat_label");
+          // 引擎徽标（09-06：429 降级静默换引擎，用户以为还在用本地模型）——
+          // 仅进行中且路由信息可用时显示；本地路径截尾段作短名
+          const badgeModel = routeInfo?.declaredModel
+            ? (routeInfo.declaredModel.includes("/") ? routeInfo.declaredModel.split("/").filter(Boolean).pop() : routeInfo.declaredModel)
+            : "";
+          const badge = live && routeInfo?.engine && badgeModel
+            ? `${routeInfo.engine === "cloud" ? "☁" : "💻"} ${badgeModel.slice(0, 28)}`
+            : "";
+          // ZCode 分区渲染：用户消息 → 思考活动行 → 计划 → 工具聚合行 → 回答正文
+          const userMsgs = seg.msgs.filter((m) => m.role === "user");
+          const asstMsgs = seg.msgs.filter((m) => m.role === "assistant");
+          const toolMsgs = seg.msgs.filter((m) => m.role === "tool" || m.type === "tool_call");
+          const thinkRows: { key: string; text: string; dur?: number; round?: number }[] = [];
+          for (const m of asstMsgs) {
+            const localThink = m.content.match(/^<think>([\s\S]*?)<\/think>\s*/);
+            const thinkText = m.thinking || (localThink ? localThink[1] : null);
+            if (thinkText) thinkRows.push({ key: m.id || `thk${thinkRows.length}`, text: thinkText, dur: m.thinkingDuration, round: m.round });
+          }
+          // 同一对话段的全部思考合并为单一折叠栏：时长求和展示
+          const thinkTotalDur = thinkRows.reduce((acc, r) => acc + (r.dur ?? 0), 0);
+          // 轮次展示（09-05 23:52：多轮拉锯时"第 N 轮"让进度可见）
+          const lastRound = thinkRows.reduce((acc, r) => r.round ?? acc, 0);
+          // 运行中思考行（流式期间消息未定稿，思考还在缓冲里；Codex 同款：提取首个粗体/首行摘要）
+          const liveThink = (live && streamingThink) ? thinkSummary(streamingThink) : null;
+          const planMsgs = asstMsgs.filter((m) => m.content.startsWith("📋"));
+          const answerMsgs = asstMsgs.filter((m) => !m.content.startsWith("📋"));
+          // ZCode 式类别聚合：同类别工具折叠为一行 "Search · N 搜索"（保持首次出现顺序）
+          const catGroups: { verb: string; noun: string; icon: LucideIcon; msgs: Message[] }[] = [];
+          for (const m of toolMsgs) {
+            const cat = TOOL_CATEGORIES[m.toolName || ""] || TOOL_CATEGORY_FALLBACK;
+            const last = catGroups[catGroups.length - 1];
+            if (last && last.verb === cat.verb) last.msgs.push(m);
+            else catGroups.push({ verb: cat.verb, noun: cat.noun, icon: cat.icon, msgs: [m] });
+          }
+          return (
+            <div key={segKey} className={`chat-segment${collapsed ? " collapsed" : ""}${live ? " live-seg" : ""}`}>
+              <button className="chat-segment-head" onClick={() => setCollapsedSegs(p => ({ ...p, [segKey]: !collapsed }))}>
+                <span className="chat-segment-label">{label}{badge && (
+                  <span style={{ fontSize: 10, color: "var(--text-muted)", padding: "1px 6px", borderRadius: "var(--radius-sm)", background: "var(--bg-elevated)", marginLeft: 8, fontWeight: 400 }}>{badge}</span>
+                )}</span>
+                <span className="chat-segment-chevron">{collapsed ? <ChevronRight size={13} /> : <ChevronDown size={13} />}</span>
+              </button>
+              {userMsgs.map((m, i) => renderMsg(m, i))}
+              {!collapsed && liveThink && (
+                <div className="thinking-row live">
+                  <div className="thinking-row-head">
+                    <Brain size={13} />
+                    <span>Think</span>
+                    <span className="thinking-meta">·</span>
+                    <span className="thinking-row-summary">{liveThink}</span>
+                  </div>
+                </div>
+              )}
+              {!collapsed && thinkRows.length > 0 && (
+                <details className="thinking-row">
+                  <summary className="thinking-row-head">
+                    <Brain size={13} />
+                    <span>Think</span>
+                    <span className="thinking-meta">·</span>
+                    <span className="thinking-row-summary">{thinkSummary(thinkRows[0].text)}</span>
+                    {lastRound > 0 && <span className="thinking-meta">{t("chat.round_n", { n: lastRound })}</span>}
+                    {thinkTotalDur > 0 && <span className="thinking-meta">{t("chat.duration", { d: fmtDur(thinkTotalDur) })}</span>}
+                  </summary>
+                  <div className="thinking-row-body">
+                    {thinkRows.map((r, i) => (
+                      <p key={r.key} style={{ margin: i > 0 ? "8px 0 0" : 0 }}>{r.text}</p>
+                    ))}
+                  </div>
+                </details>
+              )}
+              {!collapsed && planMsgs.map((m, i) => renderMsg(m, i))}
+              {!collapsed && (() => {
+                const doneTools = toolMsgs.filter((m) => m.toolStatus === "done");
+                const activeTools = toolMsgs.filter((m) => m.toolStatus === "running" || m.toolStatus === "confirming" || m.toolStatus === "error");
+                const editMsgs = doneTools.filter((m) => m.toolName === "write_file");
+                const delegates = toolMsgs.filter((m) => m.toolName === "delegate_task");
+                const activityMsgs = doneTools.filter((m) => m.toolName !== "write_file" && m.toolName !== "delegate_task");
+                return (
+                  <>
+                    {delegates.map((m) => {
+                      const a = (m.toolArgs || {}) as Record<string, unknown>;
+                      return (
+                        <SubagentRow
+                          key={m.id || String(a.task)}
+                          agent={String(a.agent || "explore")}
+                          task={String(a.task || "")}
+                          status={m.toolStatus === "done" ? "done" : m.toolStatus === "error" ? "error" : "running"}
+                        />
+                      );
+                    })}
+                    {editMsgs.length > 0 && (
+                      <FileEditCard msgs={editMsgs} onPreview={onPreview} onUndo={() => showToast(t("cards.undo_hint"), "warn")} />
+                    )}
+                    {activityMsgs.length > 0 && <ToolActivityCard msgs={activityMsgs} />}
+                    {activeTools.map((m) => (
+                      <ToolCallBubble key={m.id} msg={m} sessionId={sessionId} onConfirm={confirmTool} />
+                    ))}
+                  </>
+                );
+              })()}
+              {!collapsed && answerMsgs.map((m, i) => renderMsg(m, i))}
+            </div>
+          );
+        })}
+        <div ref={chatEndRef}></div>
+      </div>
+      </div>
+
+      <div className="input-area">
+        {pendingFile && (
+          <div className="file-preview">
+            <div className={`file-preview-thumb ${pendingFile.type === "pdf" ? "pdf" : "code"}`}>
+              {pendingFile.type === "image" ? <img src={pendingFile.preview} alt="" style={{ width: 38, height: 38, borderRadius: 4, objectFit: "cover" }} /> : pendingFile.preview === "📄" ? "📄" : "📄"}
+            </div>
+            <span className="file-preview-name">{pendingFile.name}</span>
+            <button className="file-preview-close" onClick={() => setPendingFile(null)}>✕</button>
+          </div>
+        )}
+        <div className="input-row">
+          <textarea
+            className={`chat-input${prompt ? "" : " is-empty"}`}
+            value={prompt}
+            onChange={(e) => setPrompt(e.target.value)}
+            onCompositionStart={handleCompositionStart}
+            onCompositionEnd={handleCompositionEnd}
+            onKeyDown={handleEditableKeyDown}
+            onPaste={async (e) => {
+              if (!onPasteImage) return;
+              const items = e.clipboardData?.items;
+              if (!items) return;
+              for (const item of Array.from(items)) {
+                if (item.type.startsWith("image/")) {
+                  e.preventDefault();
+                  const file = item.getAsFile();
+                  if (file) onPasteImage(file);
+                  return;
+                }
+              }
+            }}
+            placeholder={t("chat.placeholder")}
+            rows={1}
+            style={{ resize: "none", minHeight: 52, maxHeight: 150 }}
+          />
+          <input type="file" ref={fileInputRef} style={{ display: "none" }} onChange={handleFileSelect} />
+          {/* 底部工具栏：左（附件/语音/模式）右（模型/设置/发送） */}
+          <div className="input-toolbar">
+            <div className="toolbar-left">
+              <button className="btn-icon" onClick={() => fileInputRef.current?.click()} title={t("chat.attach")}>＋</button>
+              <button className="btn-icon" onClick={isRecording ? () => mediaRecorderRef.current?.stop() : startRecording}
+                style={isRecording ? { color: "var(--danger)" } : undefined} title={t("chat.voice")}>{isRecording ? "⏹" : "🎙"}</button>
+              <ToolbarSelect value={accessMode}
+                options={[
+                  { value: "read_only", label: t("chat.access_readonly"), icon: <Eye size={15} /> },
+                  { value: "confirm", label: t("chat.access_confirm"), icon: <ShieldCheck size={15} /> },
+                  { value: "auto_edit", label: t("chat.access_auto_edit"), icon: <PencilRuler size={15} /> },
+                  { value: "plan", label: t("chat.access_plan"), icon: <ListChecks size={15} /> },
+                  { value: "full", label: t("chat.access_full"), icon: <Zap size={15} /> },
+                ]}
+                onChange={(v) => setAccessMode(v as "read_only" | "confirm" | "auto_edit" | "plan" | "full")}
+                title={t("chat.access_title")} />
+              <ToolbarSelect value={thinkingLevel}
+                options={[
+                  { value: "off", label: t("chat.thinking_off"), icon: <CircleOff size={15} /> },
+                  { value: "low", label: t("chat.thinking_low"), icon: <Circle size={15} /> },
+                  { value: "high", label: t("chat.thinking_high"), icon: <Brain size={15} /> },
+                  { value: "max", label: t("chat.thinking_max"), icon: <BrainCircuit size={15} /> },
+                ]}
+                onChange={(v) => {
+                  setThinkingLevel(v as "off" | "low" | "high" | "max");
+                  // 强制思考模型（DeepSeek 推理系等）API 层面无法关闭思考——
+                  // 诚实提示，避免用户设了 off 却不见效果以为工具坏了
+                  if (v === "off") {
+                    const m = (selectedModel || "").toLowerCase();
+                    if (m.includes("reasoner") || m.includes("deepseek-r1") || m.includes("o1") || m.includes("o3") || m.includes("gpt-5")) {
+                      showToast(t("chat.thinking_cannot_off"), "warn");
+                    }
+                  }
+                }}
+                title={t("chat.thinking_title")} />
+            </div>
+            <div className="toolbar-right">
+              <select className="form-input" style={{
+                fontSize: 13, padding: "2px 6px", margin: 0, width: "auto", maxWidth: 210,
+                background: "transparent", border: "0", color: "var(--text-secondary)",
+                cursor: "pointer", outline: "none",
+              }}
+                value={selectedModel} onChange={(e) => onSelectModelAndLoad(e.target.value)}
+                title={t("chat.model_select")}>
+                <option value="">{t("sidebar.auto_detect")}</option>
+                {/* 会话选的本地模型不在"已加载"里时也要列出来，否则浏览器没有对应选项可显示、
+                    下拉会显示成别的（用户 2026-09-23 遇到的就是这个错位） */}
+                {selectedModel && selectedModel !== localModelId && !cloudModels.some((m) => m.name === selectedModel) && (
+                  <option key="session-pick" value={selectedModel}>🎯 {selectedModel.split("/").filter(Boolean).pop()}（{t("chat.model_session_pick")}）</option>
+                )}
+                {localModelId && (
+                  <option key="local-loaded" value={localModelId}>💻 {localModelName || localModelId.split("/").filter(Boolean).pop()}（{t("chat.model_loaded_mark")}）</option>
+                )}
+                {cloudModels.map((m) => (
+                  <option key={m.name} value={m.name}>☁️ {m.name}</option>
+                ))}
+              </select>
+              {/* 实际回答者与会话选择不一致时必须说出来——但**按钮行放不下长句**（首版被挤到
+                  换行、连发送键都推挤了，用户当场反馈）。这里只放紧凑徽标，完整说明进状态行。 */}
+              {(() => {
+                const actual = loadedMismatch(selectedModel, engineStatus);
+                if (!actual) return null;
+                const short = actual.length > 16 ? actual.slice(0, 15) + "…" : actual;
+                return (
+                  <span style={{ fontSize: 11, color: "var(--warning, #f59e0b)", marginLeft: 4,
+                                whiteSpace: "nowrap", flexShrink: 0 }}
+                        title={t("chat.model_mismatch_hint", { model: actual })}>
+                    ⚠️ {t("chat.model_answering", { model: short })}
+                  </span>
+                );
+              })()}
+              {isProcessing ? (
+                <button className="btn-send btn-circle" onClick={onStop} title={t("chat.stop")}>⏹</button>
+              ) : (
+                <button className="btn-send btn-circle" onClick={handleSend} title={t("chat.send")}>↑</button>
+              )}
+            </div>
+          </div>
+        </div>
+        {/* 会话状态栏 */}
+        <div className="chat-statusbar">
+          {userTurns > 0 ? (
+            <RunMetrics
+              sessionId={sessionId}
+              refreshKey={messages.length}
+              fallbackTurns={userTurns}
+              fallbackToolCalls={toolCalls}
+              fallbackTokens={estTokens}
+              fallbackLimit={contextEstimate?.max_context ?? null}
+              modelWarning={(() => {
+                const actual = loadedMismatch(selectedModel, engineStatus);
+                return actual ? t("chat.model_mismatch_hint", { model: actual }) : null;
+              })()}
+            />
+          ) : (
+            <span>{t("chat.status_hint")}</span>
+          )}
+        </div>
+      </div>
+    </>
+  );
+});

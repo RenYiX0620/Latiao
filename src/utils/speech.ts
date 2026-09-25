@@ -1,0 +1,177 @@
+/**
+ * 朗读用文本处理与系统语音工具（纯函数，便于单测）。
+ *
+ * 为什么要有这一层：**朗读前必须剥掉 Markdown 与代码块** —— 不剥的话
+ * `**加粗**`、表格、```代码围栏```、裸链接都会被逐字念出来，是听感的分水岭。
+ * 而语音这块此前**零测试**（当年 `_get_whisper_model` 就是因为没测试被误删过一次），
+ * 所以这里只放纯函数、配单测，副作用（speechSynthesis / 音频播放）留在 App 里。
+ */
+
+const _SENTENCE_END = "。！？!?；;";
+
+/** 剥掉 Markdown 与代码块，只留适合朗读的正文。 */
+export function stripForSpeech(markdown: string): string {
+  let t = markdown || "";
+
+  // 围栏代码块整块丢弃（念代码没有意义），含未闭合的流式半截
+  t = t.replace(/```[\s\S]*?```/g, "\n");
+  t = t.replace(/~~~[\s\S]*?~~~/g, "\n");
+  t = t.replace(/```[\s\S]*$/g, "\n");
+
+  // 表格整行丢弃（逐格念毫无意义）；gfm 表格的数据行与分隔行都以 | 开头
+  t = t.split("\n").filter((line) => !/^\s*\|/.test(line)).join("\n");
+
+  // 行内代码保留内容（多为文件名/函数名，用户要听），只去反引号
+  t = t.replace(/`([^`]*)`/g, "$1");
+
+  // 图片 → alt 文本；链接 → 链接文字；裸 URL 去掉（念出来是噪音）
+  t = t.replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1");
+  t = t.replace(/\[([^\]]+)\]\([^)]*\)/g, "$1");
+  t = t.replace(/https?:\/\/\S+/g, " ");
+
+  // HTML 标签
+  t = t.replace(/<[^>]+>/g, " ");
+
+  // 标题 / 引用 / 列表标记 / 分隔线
+  t = t.replace(/^\s{0,3}#{1,6}\s*/gm, "");
+  t = t.replace(/^\s{0,3}>\s?/gm, "");
+  t = t.replace(/^\s{0,3}(?:[-*+]|\d{1,2}[.)])\s+/gm, "");
+  t = t.replace(/^\s*([-*_])\1{2,}\s*$/gm, "\n");
+
+  // 强调符号：只剥"成对包裹"的标记，**绝不能碰标识符里的下划线**
+  // （`read_file` 曾被剥成 `readfile` —— 由单测抓到）
+  t = t.replace(/\*\*([^*]+)\*\*/g, "$1");
+  t = t.replace(/__([^_]+)__/g, "$1");
+  t = t.replace(/\*([^*]+)\*/g, "$1");
+  t = t.replace(/(^|[^A-Za-z0-9_])_([^_]+)_(?!\w)/g, "$1$2");
+  t = t.replace(/~~([^~]+)~~/g, "$1");
+
+  // emoji：多数引擎会念成"表情符号"或读出名字，朗读时去掉
+  t = t.replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2190}-\u{21FF}]/gu, "")
+      .replace(/\uFE0F/g, "");   // 变体选择符单独删：组合字符放进字符类，linter 与引擎都会误解
+
+  // 收尾：去掉只剩空白的行（代码块/分隔线被替换后留下的），再折叠空行
+  return t
+    .replace(/^[ \t]+$/gm, "")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n{2,}/g, "\n")
+    .trim();
+}
+
+/**
+ * 按句切分：一次塞几千字会让引擎卡住，逐句播也更像"在说话"。
+ * 过短的碎片会合并，减少引擎启停次数。
+ */
+export function splitSentences(text: string, maxLen = 110): string[] {
+  const src = (text || "").replace(/\s+/g, " ").trim();
+  if (!src) return [];
+
+  // 手写扫描而不是正则 lookbehind（旧 WebKit 不支持 lookbehind，且会让整个模块解析失败）
+  const parts: string[] = [];
+  let buf = "";
+  for (const ch of src) {
+    buf += ch;
+    if (_SENTENCE_END.includes(ch)) {
+      if (buf.trim()) parts.push(buf.trim());
+      buf = "";
+    }
+  }
+  if (buf.trim()) parts.push(buf.trim());
+
+  const out: string[] = [];
+  for (const part of parts) {
+    if (part.length <= maxLen) {
+      out.push(part);
+      continue;
+    }
+    let rest = part;
+    while (rest.length > maxLen) {
+      const cut = Math.max(
+        rest.lastIndexOf("，", maxLen),
+        rest.lastIndexOf("、", maxLen),
+        rest.lastIndexOf(",", maxLen),
+        rest.lastIndexOf(" ", maxLen),
+      );
+      const at = cut >= Math.floor(maxLen / 2) ? cut : maxLen;
+      out.push(rest.slice(0, at + 1).trim());
+      rest = rest.slice(at + 1).trim();
+    }
+    if (rest) out.push(rest);
+  }
+
+  const merged: string[] = [];
+  for (const s of out) {
+    const last = merged[merged.length - 1];
+    if (last && (last + s).length <= maxLen) merged[merged.length - 1] = last + s;
+    else merged.push(s);
+  }
+  return merged;
+}
+
+/** 从系统音色里挑一个与界面语言匹配的；找不到返回 undefined（交给系统默认音色）。 */
+/** 只挑当前语言的系统语音，给设置页的下拉用。
+ *
+ * 为什么要筛：macOS 的 `getVoices()` 会给 180+ 个语音（英文 18、中文只有 10，还有韩语西语
+ * 葡语……），全塞进下拉既难找也让人以为"怎么全是英文"。筛不到任何匹配时**回落全量**，
+ * 免得用户在下拉里一个都选不到。语言码统一把 `zh_CN` 归一成 `zh-CN` 再比。
+ */
+/** 「本地音色」下拉：只列当前界面语言的音色。
+ *
+ * 本地服务有 157 个音色（中文 113 + 英文 31 + 西/法/印地/意/葡 13），混在一个下拉里
+ * 没法挑；而拿英文音色去念中文不会报错、只会念歪（实测 HTTP 200 但发音是错的），
+ * 所以按语言筛是防错而不只是好看。语言判不出来（""）的照常显示，
+ * 筛完一个不剩就回落全表 —— 不能把音色藏没。
+ */
+export function localVoicesForLang(voices: string[], langs: Record<string, string>,
+                                   lang: string, keep?: string): string[] {
+  const list = voices || [];
+  const want = (lang || "zh").toLowerCase();
+  const norm = (v: string) => (langs?.[v] || "").toLowerCase();
+  const matched = list.filter((v) => !!norm(v) && norm(v).startsWith(want));
+  // 该语言一个音色都没有时不返回只有怪名字的子集，而是回落全表：
+  // 界面切到俄语而本地只有中/英/西/法/印地/意/葡时，给全表比只给一个更合理。
+  // 有该语言的音色时，语言未判定的也一起显示（宁可多给，不可藏没）。
+  let shown = !matched.length ? list : list.filter((v) => !norm(v) || norm(v).startsWith(want));
+  // keep：当前已选音色**必须留在列表里**。否则切界面语言后选中项从下拉里消失，
+  // 下拉显示 A、实际发出去的是 B（状态与显示不一致）。
+  if (keep && list.includes(keep) && !shown.includes(keep)) shown = [keep, ...shown];
+  return shown;
+}
+
+export function voicesForLang<T extends { lang?: string }>(voices: T[] | undefined | null,
+                                                          lang: string): T[] {
+  const list = (voices || []).filter((v) => !!v);
+  const want = (lang || "zh").toLowerCase().replace("_", "-");
+  const short = want.split("-")[0];
+  const norm = (v: { lang?: string }) => (v.lang || "").toLowerCase().replace("_", "-");
+  const hit = list.filter((v) => {
+    const l = norm(v);
+    return l === want || l.startsWith(short + "-") || l === short;
+  });
+  return hit.length ? hit : list;
+}
+
+export function pickVoice(
+  voices: SpeechSynthesisVoice[] | undefined | null,
+  lang: string,
+): SpeechSynthesisVoice | undefined {
+  const want = (lang || "zh").toLowerCase().replace("_", "-");
+  const short = want.split("-")[0];
+  const list = (voices || []).filter((v) => !!v);
+  const norm = (v: SpeechSynthesisVoice) => (v.lang || "").toLowerCase().replace("_", "-");
+  return (
+    list.find((v) => norm(v) === want) ||
+    list.find((v) => norm(v).startsWith(short + "-")) ||
+    list.find((v) => norm(v) === short) ||
+    undefined
+  );
+}
+
+/** 这台设备有没有系统语音能力（没有就完全不显示朗读按钮，而不是点了报错）。 */
+export function speechSupported(): boolean {
+  return (
+    typeof window !== "undefined" &&
+    !!window.speechSynthesis &&
+    typeof window.SpeechSynthesisUtterance === "function"
+  );
+}
