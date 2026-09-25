@@ -4,6 +4,12 @@ import App from './App'
 import { I18nProvider } from './i18n'
 import './index.css'
 
+// Windows 上窗口不透明（见 tauri.windows.conf.json）→ 背景需要实色；
+// 这里按平台打类，macOS 不加（保留透明，让窗口磨砂透出来）。
+if (typeof navigator !== "undefined" && /Windows/i.test(navigator.userAgent)) {
+  document.documentElement.classList.add("platform-windows");
+}
+
 // Global error overlay — catches errors outside React render cycle
 // Reads language from localStorage to show i18n error / reload labels
 const ERROR_TEXTS: Record<string, { title: string; reload: string }> = {
