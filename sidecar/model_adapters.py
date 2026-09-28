@@ -129,11 +129,17 @@ def _append_delta_chunks(delta: dict[str, Any], chunks: list[Chunk]) -> None:
         if not isinstance(tc, dict):
             continue
         fn = tc.get("function", {}) or {}
+        # null ≠ 缺键（2026-09-28 小米 mimo 实测）：其 OpenAI 兼容流在**每个参数
+        # 增量**里都带 "name": null，.get("name","") 对"键存在值为 null"返回的是
+        # None（默认值只在缺键时生效），str() 后变成字面 "None" 被下游 name +=
+        # 拼进工具名 → 未知工具 'mx_queryNoneNoneNone…'。显式把 null 归一成 ""。
+        raw_name = fn.get("name")
+        raw_args = fn.get("arguments")
         chunks.append(Chunk(kind="tool_call", tool_call=ToolCallDelta(
             index=int(tc.get("index", 0) or 0),
             id=str(tc.get("id", "")),
-            name=str(fn.get("name", "")),
-            arguments=str(fn.get("arguments", "")),
+            name="" if raw_name is None else str(raw_name),
+            arguments="" if raw_args is None else str(raw_args),
         )))
 
 
