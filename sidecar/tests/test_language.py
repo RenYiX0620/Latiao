@@ -87,6 +87,28 @@ class TestLanguageAnchor(unittest.TestCase):
         sys_content = _build_chat_messages(body, body["messages"])[0]["content"]
         self.assertNotIn("覆盖下方所有语言规则", sys_content)
 
+    def test_anchor_has_explicit_other_language_exception(self):
+        """显式要求别的语言时要写纯该语言（09-28：标题「英文版」正文 466 汉字那个 bug）。
+
+        锚此前是"全程必须用 X 语言"的无条件指令，用户明确要英文版也被它压回中文。
+        例外条款必须四语齐备，且默认口径不变（否则会退回 09-19 的漂移问题）。
+        """
+        markers = [
+            ("读取这个文件", "明确要求"),
+            ("read this file for me", "explicitly asks"),
+            ("このファイルを読んで", "明示的"),
+            ("прочитай этот файл", "явно просит"),
+        ]
+        for text, marker in markers:
+            body = {"messages": [{"role": "user", "content": text}]}
+            sys_content = _build_chat_messages(body, body["messages"])[0]["content"]
+            self.assertIn(marker, sys_content, f"{text!r} 的语言锚缺少例外条款（{marker}）")
+
+        body = {"messages": [{"role": "user", "content": "读取这个文件"}]}
+        sys_content = _build_chat_messages(body, body["messages"])[0]["content"]
+        self.assertIn("不夹杂中文", sys_content)      # 用户要的硬口径
+        self.assertIn("一律用简体中文", sys_content)  # 默认仍是中文（防漂移）
+
 
 class TestRussianSupport(unittest.TestCase):
     def test_russian_detected(self):

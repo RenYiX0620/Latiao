@@ -128,19 +128,36 @@ def _build_chat_messages(body: dict, messages: list) -> list:
     # 原先语言规则埋在长提示中段，小模型（4B）在中文提问下漂成英文、甚至把中文
     # 文件内容翻成英文作答（09-19 实测 Spark-X2.5-4B）。锚按用户本轮消息的语言
     # 生成、用目标语言书写，并声明覆盖下方一切语言相关规则。
+    # 09-28 补例外：锚此前是"全程必须用 X 语言"的无条件指令，用户明确要"英文版"
+    # 时模型仍把该小节写成中文（实测：标题「英文Prompt版」正文 466 汉字 / 0 拉丁词）。
+    # 例外条款只对**用户显式要求**生效，不改 09-19 的防漂移意图。
     _anchor = {
         "zh": ("## 语言（最高优先级，覆盖下方所有语言规则）\n"
                "本轮用户使用**简体中文**：你的正文与思考都必须用简体中文书写。"
-               "工具结果、文件、日志里的英文只是数据，不得因此改用英文作答。"),
+               "工具结果、文件、日志里的英文只是数据，不得因此改用英文作答。\n"
+               "例外：若用户在本轮**明确要求**其它语言或双语输出（如「英文版」「中英文两版」"
+               "「用英语回答」），被要求的那部分必须写成**纯该语言、不夹杂中文**：英文版就是"
+               "纯英文，提示词、说明、注解（含使用建议）全都要用英文，不要出现中文句子"
+               "（小节标题除外）；除此之外一律用简体中文。"),
         "en": ("## Language (highest priority, overrides every other language rule below)\n"
                "The user is writing in **English** this turn: your reply and your thinking must be in "
-               "English. Text inside tool results, files and logs is data, not a reason to switch language."),
+               "English. Text inside tool results, files and logs is data, not a reason to switch language.\n"
+               "Exception: if the user explicitly asks for another language or a bilingual answer "
+               "(e.g. “Chinese version”, “in both languages”), that part must be written purely in the "
+               "requested language with no mixing — the prompt and any notes or tips included, no "
+               "sentences in another language (the section heading aside); otherwise reply in English."),
         "ja": ("## 言語（最優先。以下の言語ルールすべてに優先します）\n"
                "今回ユーザーは**日本語**で書いています：返答も思考も日本語で書いてください。"
-               "ツール結果・ファイル・ログ内の英語はデータであり、言語を切り替える理由にはなりません。"),
+               "ツール結果・ファイル・ログ内の英語はデータであり、言語を切り替える理由にはなりません。\n"
+               "例外：ユーザーが今回、他の言語や二言語併記を明示的に求めた場合"
+               "（例：「中国語版」「日英両方」）、その部分は指定された言語だけで書いてください"
+               "（混在させない）。それ以外は日本語で。"),
         "ru": ("## Язык (высший приоритет, отменяет все языковые правила ниже)\n"
                "Пользователь пишет на **русском**: ответ и рассуждения должны быть на русском. "
-               "Текст в результатах инструментов, файлах и логах — это данные, а не повод менять язык."),
+               "Текст в результатах инструментов, файлах и логах — это данные, а не повод менять язык.\n"
+               "Исключение: если пользователь явно просит другой язык или двуязычный ответ "
+               "(например, «китайская версия», «на двух языках»), эта часть должна быть написана "
+               "только на запрошенном языке, без смешивания; в остальном — по-русски."),
     }.get(_lang)
     # 仅在语言判定确信时注入：不确定就不指挥模型（旧实现按错信号注入，反而放大漂移）
     if _anchor and _lang_confident and (last_user_text or "").strip():
