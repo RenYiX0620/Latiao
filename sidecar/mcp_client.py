@@ -25,6 +25,17 @@ _CLIENT_INFO = {"name": "latiao-sidecar", "version": "0.2.0"}
 _HEADER_RE = re.compile(rb"([A-Za-z-]+):\s*([^\r\n]*)")
 
 
+def _encode_frame(payload: bytes) -> bytes:
+    """发送帧：同时携带 Content-Length 头与行尾换行（两头兼容）。
+
+    - 旧式 server（Content-Length 制）：读取头帧取 payload，行尾 \\n 被当作
+      帧间垃圾/空行忽略；
+    - 新式 server（按行分隔制，官方 SDK 2026.8.31+）：头行不是 JSON 会被跳过，
+      下一行正好是裸 JSON。
+    """
+    return (f"Content-Length: {len(payload)}\r\n\r\n".encode() + payload + b"\n")
+
+
 class MCPError(Exception):
     pass
 
@@ -121,14 +132,12 @@ class MCPClient:
         payload = json.dumps(msg).encode()
         if self._proc is None:
             return  # http 下 notification 无必要
-        body = f"Content-Length: {len(payload)}\r\n\r\n".encode() + payload
-        self._proc.stdin.write(body)
+        self._proc.stdin.write(_encode_frame(payload))
         await self._proc.stdin.drain()
 
     async def _stdio_request(self, msg: dict, timeout: float) -> dict | None:
         payload = json.dumps(msg).encode()
-        body = f"Content-Length: {len(payload)}\r\n\r\n".encode() + payload
-        self._proc.stdin.write(body)
+        self._proc.stdin.write(_encode_frame(payload))
         try:
             await asyncio.wait_for(self._proc.stdin.drain(), timeout=timeout)
         except asyncio.TimeoutError:
@@ -142,12 +151,20 @@ class MCPClient:
             raise MCPError(f"MCP {self.name}: 响应非 JSON")
 
     async def _read_frame(self, timeout: float) -> bytes | None:
-        """读取一个 Content-Length 帧（循环处理响应的字节流）。"""
+        """读取一帧响应（循环处理响应的字节流）。
+
+        分帧两制并存（2026-09-28 实测）：MCP 规范 2024-11-05 的 stdio 是
+        Content-Length 头帧；官方 SDK 2026.8.31 起改成**按行分隔**（每行一个
+        JSON，serializeMessage = JSON + '\\n'）。新版 server 对 Content-Length
+        帧永不回应（它把帧头当坏行丢弃），旧版 server 对裸行也 parsing error。
+        发送侧用 _encode_frame 两头兼容，读取侧这里同样两制都认。
+        """
         deadline = asyncio.get_event_loop().time() + timeout
         while True:
             remain = deadline - asyncio.get_event_loop().time()
             if remain <= 0:
                 raise MCPError(f"MCP {self.name}: 读取超时")
+            # 制式一：Content-Length 头帧
             idx = self._read_buf.find(b"\r\n\r\n")
             if idx >= 0:
                 header = self._read_buf[:idx].decode(errors="replace")
@@ -157,10 +174,21 @@ class MCPClient:
                     if m and m.group(1).lower() == b"content-length":
                         length = int(m.group(2))
                 body_start = idx + 4
-                if len(self._read_buf) >= body_start + length:
+                if length and len(self._read_buf) >= body_start + length:
                     frame = self._read_buf[body_start:body_start + length]
                     self._read_buf = self._read_buf[body_start + length:]
                     return frame
+            # 制式二：按行分隔（\n 单行 JSON）—— 新版官方 SDK 的形态
+            nl = self._read_buf.find(b"\n")
+            if nl >= 0:
+                line = self._read_buf[:nl].strip()
+                # 只有当它不像帧头（无 Content-Length 冒号前缀）才当 JSON 行
+                if line.startswith(b"{"):
+                    self._read_buf = self._read_buf[nl + 1:]
+                    return line
+                # 是帧头残片或其它非 JSON 行：丢弃这一行，继续等
+                self._read_buf = self._read_buf[nl + 1:]
+                continue
             try:
                 chunk = await asyncio.wait_for(self._proc.stdout.read(65536), timeout=max(0.1, remain))
             except asyncio.TimeoutError:
