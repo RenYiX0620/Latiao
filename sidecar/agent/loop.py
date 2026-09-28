@@ -351,6 +351,23 @@ def _looks_like_plan_only(text: str, has_tools: bool) -> bool:
     return bool(_PLAN_VERB_RE.search(t) and _PLAN_INTENT_RE.search(t))
 
 
+def _finalize_body_is_junk(body_text: str, stripped_tools: bool) -> bool:
+    """终答轮正文是否"不算答案"（2026-09-28）。
+
+    实况：mimo 被剥掉工具调用后，正文只剩一句计划碎片——「最后 1 次检索机会，
+    用来补盘面下跌的新闻面解释。」（25 字）——旧的 <10 字空判定拦不住，被当
+    正式答案交付，用户看到的就是"答了一半就断"。判定两档：
+    - 空：<10 字（原有口径）；
+    - 碎片：本轮仍发了工具调用（剥离过）+ 正文 <80 字 + 含工具动词 →
+      模型还锁在工具模式里，这句只是它的中间自语，不是给用户的答案。
+    不带工具尝试的短正文（如"今日大盘收跌。"）不拦，避免误伤合法短答。
+    """
+    t = (body_text or "").strip()
+    if len(t) < 10:
+        return True
+    return bool(stripped_tools and len(t) < 80 and _PLAN_VERB_RE.search(t))
+
+
 def _note_msg(text: str, label: str = "【系统提示】") -> dict:
     """循环内的临时提示 → **尾部用户消息**（绝不能是 system）。
 
@@ -1630,11 +1647,15 @@ class ThinAgentLoop:
 
                 if self._finalize_round:
                     # 终答轮：只交付正文。模型若仍发围栏工具调用 → 剥离后交付。
+                    _stripped_tools = False
                     if tool_calls:
-                        self._step_log("终答轮", f"剥离 {len(tool_calls)} 个工具调用，直接交付")
+                        self._step_log("终答轮", f"剥离 {len(tool_calls)} 个工具调用，重验正文")
                         tool_calls = []
                         streamed = body_text = _parse_prompt_tool_calls(streamed)[0]
-                    if len(body_text.strip()) < 10:
+                        _stripped_tools = True
+                    if _finalize_body_is_junk(body_text, _stripped_tools):
+                        self._step_log("终答轮",
+                                       f"正文非答案（{len(body_text.strip())} 字）→ 重采/数据兜底")
                         # 终答轮仍空 → 温度抖动重采一次（0.0 温度下模型被
                         # 工具调用形态锁定（09-08 17:43 实况：tools=[] 仍只
                         # 输出 1 个工具调用、正文 0 字））；再空才交付警告。

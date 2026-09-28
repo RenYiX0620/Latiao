@@ -369,3 +369,36 @@ async def test_no_lang_guard_when_language_not_confident():
             local_llm._engine = old
     assert loop.user_lang_confident is False, "前置条件：这条消息的语言判定应为不确定"
     assert len(_gen_requests(engine)) == 1, "语言不确定时不该掐掉重试"
+
+
+class TestFinalizeBodyIsJunk:
+    """终答轮交付闸（2026-09-28）：25 字计划碎片被当答案交付（mimo 实况）。
+
+    「最后 1 次检索机会，用来补盘面下跌的新闻面解释。」——模型仍发工具调用
+    被剥离后，正文只剩这句自语；旧的 <10 字空判定拦不住。
+    """
+
+    def test_short_fragment_with_stripped_tools_is_junk(self):
+        from agent.loop import _finalize_body_is_junk
+        assert _finalize_body_is_junk(
+            "最后 1 次检索机会，用来补盘面下跌的新闻面解释。", True) is True
+
+    def test_tiny_body_always_junk(self):
+        from agent.loop import _finalize_body_is_junk
+        assert _finalize_body_is_junk("好的。", False) is True
+        assert _finalize_body_is_junk("", False) is True
+
+    def test_legit_short_answer_without_tool_attempt_delivers(self):
+        from agent.loop import _finalize_body_is_junk
+        # 没发工具尝试的短正文不是碎片（合法短答）
+        assert _finalize_body_is_junk("今日大盘收跌，跌幅有限。", False) is False
+
+    def test_legit_short_numeric_answer_with_stripped_tools_delivers(self):
+        from agent.loop import _finalize_body_is_junk
+        # 剥离过工具调用，但正文是含数字的短答、无工具动词 → 不拦
+        assert _finalize_body_is_junk("上证 -0.99%，收 3877 点。", True) is False
+
+    def test_long_body_never_junk(self):
+        from agent.loop import _finalize_body_is_junk
+        long_text = "今天大盘全面收跌。" + "主力资金净流出明显。" * 20
+        assert _finalize_body_is_junk(long_text, True) is False
