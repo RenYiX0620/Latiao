@@ -1651,8 +1651,13 @@ class ThinAgentLoop:
                     if tool_calls:
                         self._step_log("终答轮", f"剥离 {len(tool_calls)} 个工具调用，重验正文")
                         tool_calls = []
-                        streamed = body_text = _parse_prompt_tool_calls(streamed)[0]
                         _stripped_tools = True
+                        # 只清洗可见文本里的围栏标记，**body_text 必须保持"仅正文"口径**：
+                        # streamed 是思考+正文的总和（_sample 把两者都累进去），把清洗后的
+                        # streamed 赋回 body_text 会让空/碎片判定被思考字数蒙蔽——
+                        # 2026-09-28 20:11 实况：思考 340 字、正文 0 字，被判成
+                        # "已交付 340 字"直接收尾，用户只看到思考块（答了一半就断）。
+                        streamed, _ = _parse_prompt_tool_calls(streamed)
                     if _finalize_body_is_junk(body_text, _stripped_tools):
                         self._step_log("终答轮",
                                        f"正文非答案（{len(body_text.strip())} 字）→ 重采/数据兜底")

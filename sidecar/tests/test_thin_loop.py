@@ -7,7 +7,7 @@ import time
 
 import pytest
 
-from tests.fake_engine import FakeEngine
+from tests.fake_engine import FakeEngine, _sse
 
 HEADERS = {"Authorization": "Bearer fake"}
 NEUTRAL_TEXT = ("根据刚才的目录输出，这个目录里包含 agents、skills、tests 等目录以及若干 python 文件，"
@@ -402,3 +402,76 @@ class TestFinalizeBodyIsJunk:
         from agent.loop import _finalize_body_is_junk
         long_text = "今天大盘全面收跌。" + "主力资金净流出明显。" * 20
         assert _finalize_body_is_junk(long_text, True) is False
+
+
+
+# 按真实事故的量级构造（思考 340 字 > 80 字碎片闸上限）：若 body_text 被# 思考污染，碎片闸（<80 字）与 <10 字空判定都拦不住，测试必失败。
+THINK_BODY = ("用户要分析今天大盘。按规则先查行情数据，用 mx_query 查指数、板块、资金流向。"
+              "有指数数据、资金流、涨跌家数、支撑压力、布林线。还差板块涨跌（热点板块）。"
+              "我可以并行调用 mx_query 查三个热门板块的涨跌幅与资金流向，再用 tavily_search 补"
+              "今天盘面下跌的新闻面解释。时间：2026-09-28 星期一。注意 identical call 已经被拒绝过，"
+              "需要换参数。预算：还剩 3 次检索机会，最后一次留给新闻面。")
+assert len(THINK_BODY) > 100
+RECOVERED_ANSWER = "今日大盘收跌：上证指数 -0.99%，主力资金净流出 417 亿元。"
+@pytest.mark.asyncio
+async def test_finalize_round_think_only_tool_call_recovers():
+    """终答轮"思考+工具调用、正文 0 字"必须重采出真答案（2026-09-28 20:11 实况）。
+
+    mimo 链路：同参空转触发收口 → 终答轮模型仍发 1 个工具调用 + 思考若干字 +
+    0 字正文 → 旧实现把含思考的 streamed 赋回 body_text，被判"已交付 340 字"
+    直接收尾，用户只看到思考块。修复后：body_text 保持仅正文口径 → 空判定
+    命中 → 温度抖动重采一次 → 真答案交付。
+
+    脚本按请求内容有状态分派：请求带收口指令（"📣 收尾"）= 终答轮（第一次）
+    返回思考+工具调用、正文 0；重采轮（第二次带指令）返回真答案；其余轮返回
+    同参工具调用以触发收口。对收口触发时机不敏感。
+    """
+    import agent.context as agent_context
+    import local_llm
+    from tests.test_loop_scenarios import _StubEngine
+    from agent.loop import ThinAgentLoop
+
+    DIRECTIVE = "📣 收尾"
+    state = {"final_seen": 0}
+
+    # FakeEngine 的脚本一次一弹（每个请求消费一条），所以每轮推一个 callable，
+    # 由共享状态按"请求里是否带收口指令"分派。
+    def _make_round():
+        def _round(body):
+            has_directive = DIRECTIVE in json.dumps(body["messages"], ensure_ascii=False)
+            if has_directive:
+                state["final_seen"] += 1
+                if state["final_seen"] == 1:
+                    # 终答轮：仿 mimo——思考 + 1 个工具调用（finish 同包）、正文 0 字
+                    return [
+                        _sse({"choices": [{"delta": {"reasoning_content": THINK_BODY}, "index": 0}]}),
+                        _sse({"choices": [{"delta": {"tool_calls": [
+                            {"index": 0, "id": "call_final_1", "type": "function",
+                             "function": {"name": "list_dir",
+                                          "arguments": json.dumps({"path": "."})}},
+                        ]}, "finish_reason": "tool_calls", "index": 0}]}),
+                        "data: [DONE]\n\n",
+                    ]
+                # 温度重采轮：给真答案
+                return engine.text_response(RECOVERED_ANSWER)
+            # 常规轮：同参调用（重复会被拒绝器挡回），把循环推向收口
+            return engine.native_tool_response("list_dir", {"path": "."})
+        return _round
+
+    with FakeEngine() as engine:
+        for _ in range(15):
+            engine.push(_make_round())
+        old = local_llm._engine
+        local_llm._engine = _StubEngine()
+        agent_context._LOCAL_NATIVE_TOOLS_OVERRIDE = True
+        try:
+            events = await _collect(ThinAgentLoop(
+                MESSAGES, "fake-model", engine.url, HEADERS,
+                session_id=f"thin-fin-{time.time()}", access_mode="full").run())
+        finally:
+            local_llm._engine = old
+            agent_context._LOCAL_NATIVE_TOOLS_OVERRIDE = None
+        contents = " ".join(str(e.get("content", "")) for e in events if "content" in e)
+        assert state["final_seen"] >= 1, "脚本应观察到终答轮请求"
+        assert RECOVERED_ANSWER in contents, \
+            f"重采出的真答案必须交付；实际 events 末尾：{events[-6:]}"
