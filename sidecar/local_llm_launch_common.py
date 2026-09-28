@@ -80,14 +80,14 @@ def find_llama_server(model_path: str = "") -> Path | None:
     return None
 
 
-def find_mmproj_for(model_path: str) -> Path | None:
-    """找模型配套的多模态投影器（识图）：mmproj*.gguf。
+_MMPROJ_GLOBS = ("mmproj*.gguf", "mmproj*.bin")
+_MMPROJ_DONE_SUFFIX = (".gguf", ".bin")
 
-    查找顺序：模型同目录 → 上级目录 → ~/Models 顶层。Hermes/Qwen-VL 这类
-    GGUF 多模态要把 mmproj 和主模型放在同一目录，启动时自动挂上。
-    """
+
+def _mmproj_dirs(model_path: str) -> list[Path]:
+    """投影器的查找目录（去重后）：模型自身 → 上级 → ~/Models 顶层。"""
     if not model_path:
-        return None
+        return []
     p = Path(model_path)
     dirs: list[Path] = []
     if p.is_file():
@@ -100,6 +100,7 @@ def find_mmproj_for(model_path: str) -> Path | None:
         dirs.append(Path(MODELS_DIR))
     except Exception:
         pass
+    out: list[Path] = []
     seen: set[str] = set()
     for d in dirs:
         try:
@@ -109,10 +110,58 @@ def find_mmproj_for(model_path: str) -> Path | None:
             if key in seen:
                 continue
             seen.add(key)
-            hits = sorted(d.glob("mmproj*.gguf")) + sorted(d.glob("mmproj*.bin"))
+            out.append(d)
+        except OSError:
+            continue
+    return out
+
+
+def _mmproj_files(d: Path) -> list[Path]:
+    hits: list[Path] = []
+    for pat in _MMPROJ_GLOBS:
+        hits += sorted(d.glob(pat))
+    return hits
+
+
+def find_mmproj_for(model_path: str) -> Path | None:
+    """找模型配套的多模态投影器（识图）：mmproj*.gguf。
+
+    查找顺序：模型同目录 → 上级目录 → ~/Models 顶层。Hermes/Qwen-VL 这类
+    GGUF 多模态要把 mmproj 和主模型放在同一目录，启动时自动挂上。
+    """
+    for d in _mmproj_dirs(model_path):
+        try:
+            hits = _mmproj_files(d)
             if hits:
                 logger.info("找到 mmproj 投影器: %s", hits[0])
                 return hits[0]
         except OSError:
             continue
     return None
+
+
+def mmproj_hint(model_path: str) -> str:
+    """模型卡片上的一行提示：有投影器却没挂上时，告诉用户怎么修（2026-09-27）。
+
+    只在这两种**确实有信号**的情况下出声；纯文本模型的目录里没有 mmproj 类文件
+    → 返回空串，不给正常模型添噪音：
+
+    - 目录里已有 mmproj*.gguf/.bin：说明它是引擎**加载之后**才下完的 → 重载即生效
+      （用户实测踩过：模型 21:56 下完、引擎 22:14 加载、mmproj 22:17 才落盘，
+       于是挂不上，界面上只说"不支持图片"，用户以为文件白下了）
+    - 只有下了一半的残件（mmproj*.part/.tmp 等）→ 提示下完再重载
+    """
+    for d in _mmproj_dirs(model_path):
+        try:
+            hits = _mmproj_files(d)
+            if hits:
+                return (f"⚠️ 发现投影器 {hits[0].name}，但当前引擎加载时还没有它——"
+                        "点「重新加载模型」即可识图")
+            partial = [f.name for f in sorted(d.glob("mmproj*"))
+                       if f.is_file() and not f.name.lower().endswith(_MMPROJ_DONE_SUFFIX)]
+            if partial:
+                return (f"⚠️ 投影器 {partial[0]} 似乎还没下完——"
+                        "下完后点「重新加载模型」即可识图")
+        except OSError:
+            continue
+    return ""

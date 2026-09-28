@@ -110,6 +110,8 @@ export interface LLMStatus {
   port: number;
   message: string;
   has_image_support: boolean;
+  /** 识图提示：目录里有 mmproj 却没挂上时后端给的"怎么修"文案（2026-09-27） */
+  mmproj_hint?: string;
   token_limit: number;
   platform?: string;
   gpu_layers?: number;

@@ -608,7 +608,7 @@ const T: Record<string, Record<Lang, string>> = {
   "toast.starting": { zh: "正在启动...", en: "Starting...", ja: "起動中...", ru: "Запуск..." },
   "toast.stopped": { zh: "模型已停止", en: "Model stopped", ja: "モデル停止", ru: "Модель остановлена" },
   "toast.no_mic": { zh: "此环境不支持麦克风访问", en: "Microphone not supported", ja: "マイク非対応", ru: "Микрофон недоступен" },
-  "toast.no_vision": { zh: "当前模型不支持图片，请切换到支持视觉的模型（如 Qwen2.5-VL）或云端多模态模型", en: "Current model doesn't support images. Switch to a vision model (e.g. Qwen2.5-VL) or a multimodal cloud model.", ja: "現在のモデルは画像非対応です。視覚モデルに切り替えてください。", ru: "Модель не поддерживает изображения." },
+  "toast.no_vision": { zh: "当前模型不支持图片。若它本该能识图：把 mmproj-*.gguf 放到与主模型同一目录，再到「模型」页点「重新加载模型」；也可切换到支持视觉的模型或云端多模态模型", en: "This model can't take images. If it should be able to: put mmproj-*.gguf next to the model file, then press Reload on the Models page. Or switch to a vision model / a multimodal cloud model.", ja: "現在のモデルは画像非対応です。本来は対応する場合：mmproj-*.gguf をモデルと同じフォルダに置き、「モデル」ページで再読み込みしてください。", ru: "Модель не поддерживает изображения. Если должна: положите mmproj-*.gguf рядом с файлом модели и нажмите «Перезагрузить» на странице «Модели»." },
   "toast.speech_fail": { zh: "语音识别失败", en: "Speech recognition failed", ja: "音声認識失敗", ru: "Ошибка распознавания" },
   "toast.tts_unsupported": { zh: "这台设备不支持语音朗读", en: "Speech synthesis is not available on this device", ja: "この端末は読み上げに非対応です", ru: "Синтез речи недоступен на этом устройстве" },
   "toast.mic_denied": { zh: "麦克风权限被拒绝", en: "Microphone denied", ja: "マイク拒否", ru: "Доступ к микрофону запрещен" },

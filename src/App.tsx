@@ -693,7 +693,8 @@ const [timeFilter, setTimeFilter] = useState("all");
       : undefined;
     const isLocalTarget = !cloudCfgPre;
     if (pendingFile?.base64 && pendingFile.type === "image" && isLocalTarget && !localLLMStatus?.has_image_support) {
-      showToast(t("toast.no_vision"), "warn");
+      // 后端若已看出"投影器晚到/没下完"，就用它给的修复指引，而不是笼统的"换个模型"
+      showToast(localLLMStatus?.mmproj_hint || t("toast.no_vision"), "warn");
       setPendingFile(null);
       return;
     }

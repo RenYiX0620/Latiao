@@ -176,6 +176,16 @@ class EngineProcess:
             self.status_message = "(reconnected after sidecar restart)"
             if not self._active_backend:
                 self._active_backend = self.backend
+        # 识图提示（2026-09-27）：目录里有 mmproj 却没挂上，多半是它比引擎晚下完。
+        # 外部引擎的 mmproj 不归我们管（挂不挂由对方决定），所以那种模式不出声。
+        _hint = ""
+        if (self.server_status == "running" and self.current_model_id
+                and not self.has_image_support and not self._external_engine):
+            try:
+                from local_llm_launch_common import mmproj_hint
+                _hint = mmproj_hint(str(self.current_model_id))
+            except Exception:
+                _hint = ""
         return {
             "backend": self._active_backend or self.backend,
             "available_backends": self.get_available_backends(),
@@ -183,8 +193,9 @@ class EngineProcess:
             "model_id": self.current_model_id,
             "model_name": self.current_model_name,
             "port": self.server_port,
-            "message": self.status_message,
+            "message": self.status_message + (f"　{_hint}" if _hint else ""),
             "has_image_support": self.has_image_support,
+            "mmproj_hint": _hint,
             "token_limit": self.model_token_limit,
             "platform": platform.system(),
             "gpu_layers": self.n_gpu_layers,
