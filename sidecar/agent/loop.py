@@ -678,7 +678,8 @@ class ThinAgentLoop:
             pass
         # Loop 三缺口（2026-09-29）：预算守卫 / 硬升级 的每轮状态
         self._budget_wrapped = False      # 预算守卫是否已触发过收口
-        self._fail_sigs: dict[str, int] = {}   # "工具|错误摘要" → 连续失败次数
+        self._fail_sigs: dict[str, int] = {}   # "工具|错误摘要" → 连续失败**轮**数
+        self._fail_scan_from = 0               # 失败扫描游标（只看新增的工具消息）
         self._escalated = False           # 硬升级每轮只触发一次
         self._lang_retried = False   # 语言漂移早退：每轮只允许重试一次（2026-09-23）
         self.steps = 0
@@ -1172,27 +1173,52 @@ class ThinAgentLoop:
             return True
         return False
 
-    def _note_tool_failure(self, tool_name: str, result: str) -> dict | None:
-        """同一工具以同一错误连续失败 ≥3 次 → 返回 {n, err}（调用方交回用户）。
+    def _scan_tool_failures(self) -> dict | None:
+        """扫描**上一轮**落进消息流的工具失败；同一错误累计到 3 轮 → 返回交回信息。
 
         2026-09-29 补（硬升级出口）。与 `_stagnation_gate` 分工：那个基于**调用签名**
-        （同参空转，不管成败），这个只看**失败**——参数换着花样但每次都以同样错误
-        撞墙（ak_finance 的东财拒连、mx_query 的额度耗尽）同样是没有进展，而签名
-        一直在变，旧闸门抓不到。错误摘要取前 80 字去噪（数字/时间戳不参与签名）。
+        （同参空转，不管成败），这个只看**失败**——参数换着花样但每次都撞同一堵墙
+        （ak_finance 的东财拒连、mx_query 的额度耗尽）同样没有进展，而签名一直在变，
+        旧闸门抓不到。
+
+        设计要点（第一版踩过的坑，test_saturation_gate 抓到）：
+        - **按轮去重**：一轮里并行发 3 个**不同**查询恰好都失败（密钥缺失/网络断）是
+          合法覆盖查询，不能算三次空转——只有"换着说法反复撞同一堵墙"才升级；
+        - **在轮首扫描**而不是在工具循环里就地判定：那时本轮记账（检索计数/信息增量）
+          已经完成，升级不会吞掉统计；也不依赖并行/顺序两条分支各自的代码路径。
+        错误摘要取前 80 字并抹掉数字（时间戳/计数不参与签名），闸门回复不算失败。
         """
-        if "Error" not in result[:200] and "⛔" not in result[:200]:
+        try:
+            pending = self.current_msgs[self._fail_scan_from:]
+            self._fail_scan_from = len(self.current_msgs)
+        except Exception:
             return None
-        # 闸门回复不算"工具失败"（2026-09-29 实测）：重复调用守卫回的是
-        # 「⛔ 该调用与此前已成功执行的调用完全相同…已拒绝重复执行」。若计入失败，
-        # 正常的"重复被拒 → 模型换路"流程会在第 3 次被误升级打断（场景测试抓到）。
-        if "已拒绝重复执行" in result[:200]:
-            return None
-        err_head = re.sub(r"\d+", "#", result[:80])
-        sig = f"{tool_name}|{err_head}"
-        self._fail_sigs[sig] = self._fail_sigs.get(sig, 0) + 1
-        if self._fail_sigs[sig] >= 3 and not self._escalated:
-            self._escalated = True
-            return {"n": self._fail_sigs[sig], "err": result[:80].split("\n")[0]}
+        # tool_call_id → 工具名（工具消息本身不带名字，回查 assistant 的 tool_calls）
+        id2name: dict[str, str] = {}
+        for m in self.current_msgs:
+            if m.get("role") == "assistant":
+                for tc in (m.get("tool_calls") or []):
+                    tid = str(tc.get("id") or "")
+                    if tid:
+                        id2name[tid] = str((tc.get("function") or {}).get("name") or "")
+        seen: dict[str, str] = {}          # 签名 → 原文（本轮每种错只记一次）
+        for m in pending:
+            if not isinstance(m, dict) or m.get("role") != "tool":
+                continue
+            c = m.get("content")
+            if not isinstance(c, str) or ("Error" not in c[:200] and "⛔" not in c[:200]):
+                continue
+            if "已拒绝重复执行" in c[:200]:      # 闸门回复不是工具失败
+                continue
+            sig = re.sub(r"\d+", "#", c[:80])
+            seen[sig] = str(id2name.get(str(m.get("tool_call_id") or "")) or "")
+        for sig, tool_name in seen.items():
+            key = f"{tool_name}|{sig}"
+            self._fail_sigs[key] = self._fail_sigs.get(key, 0) + 1
+            if self._fail_sigs[key] >= 3 and not self._escalated:
+                self._escalated = True
+                return {"n": self._fail_sigs[key], "tool": tool_name or "(工具)",
+                        "err": sig.split("\n")[0]}
         return None
 
     def _maybe_quota_hint(self, result: str) -> None:
@@ -1526,6 +1552,15 @@ class ThinAgentLoop:
                                    + plan_wait["plan"]})
                     self._plan_injected = True
 
+                # 硬升级：上一轮的工具失败累计到 3 轮同错 → 停手交回用户（记账已完成）
+                _esc = self._scan_tool_failures()
+                if _esc is not None:
+                    self._step_log("硬升级",
+                                   f"{_esc['tool']} 同错失败 {_esc['n']} 轮 → 交回用户")
+                    yield {"content": "\n\n" + _msg(
+                        "stuck_escalation", self.user_lang,
+                        tool=_esc["tool"], n=_esc["n"], err=_esc["err"])}
+                    return
                 engine_model = self._engine_model()
                 # 预算守卫（2026-09-29，Loop 三缺口之二）：本轮累计输入 token 越线 →
                 # 先赶进终答轮（模型自己收口，比硬停体验好）；终答轮后仍越线 → 停手交付。
@@ -2060,16 +2095,9 @@ class ThinAgentLoop:
                                                f"摘要: {_res[:80]!r}")
                     for evt in events:
                         yield evt
-                    # 硬升级（2026-09-29，Loop 三缺口之三）：同一工具以**同一错误**
-                    # 连续失败 ≥3 次 → 不再空转，把"试过什么、卡在哪"交回用户。
-                    # 与重复调用守卫分工：那个管"相同参数成功过还再调"，这个管"反复失败"。
-                    _esc = self._note_tool_failure(tname, _res)
-                    if _esc is not None:
-                        self._step_log("硬升级", f"{tname} 同错失败 {_esc['n']} 次 → 交回用户")
-                        yield {"content": "\n\n" + _msg(
-                            "stuck_escalation", self.user_lang,
-                            tool=tname, n=_esc["n"], err=_esc["err"])}
-                        return
+                    # 同错升级不在这里判定：就地 return 会跳过本轮记账（检索计数/信息
+                    # 增量），且并行与顺序两条分支各要写一份。统一改到**轮首**扫描上一轮
+                    # 的工具结果（见 _scan_tool_failures）：按轮去重、记账已完成。
                     # use_skill 联动：加载技能时，该技能声明的依赖工具并入
                     # 会话集合（技能承诺的能力必须在场——mx-data → mx_query）
                     if tname == "use_skill":

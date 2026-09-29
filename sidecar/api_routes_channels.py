@@ -14,17 +14,11 @@ import logging
 
 from fastapi import APIRouter, Request
 
+from http_json import _json_body  # noqa: E402 — 唯一定义（禁各模块自带副本）
+
 logger = logging.getLogger("latiao-sidecar")
 
 router = APIRouter()
-
-
-async def _json_body(request: Request) -> dict:
-    try:
-        data = await request.json()
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
 
 
 @router.post("/v1/channels/inbound")

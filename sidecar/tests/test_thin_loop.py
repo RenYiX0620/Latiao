@@ -503,35 +503,56 @@ class TestLoopGaps:
         assert _fold_old_tool_results(big, keep_recent=6) == 0, "二次调用必须幂等"
         assert sum(1 for m in big if str(m["content"]).startswith(_FOLD_MARK)) == 2
 
-    # ── 同错硬升级 ──
-    def test_escalates_after_three_same_errors(self):
+    # ── 同错硬升级（按轮去重）──
+    def _loop_with_tool_msgs(self, msgs):
         from agent.loop import ThinAgentLoop
         loop = ThinAgentLoop.__new__(ThinAgentLoop)
+        loop.current_msgs = msgs
         loop._fail_sigs = {}
+        loop._fail_scan_from = 0
         loop._escalated = False
+        return loop
+
+    def _tool_msg(self, content, name="ak_finance", cid="c1"):
+        return [
+            {"role": "assistant", "content": "",
+             "tool_calls": [{"id": cid, "type": "function",
+                             "function": {"name": name, "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": cid, "content": content},
+        ]
+
+    def test_escalates_after_three_rounds_of_same_error(self):
         err = "Error: 金融数据查询失败: ConnectionError: RemoteDisconnected"
-        assert loop._note_tool_failure("ak_finance", err) is None
-        assert loop._note_tool_failure("ak_finance", err) is None
-        out = loop._note_tool_failure("ak_finance", err)
-        assert out and out["n"] == 3 and "ak_finance" not in out["err"]
-        # 只触发一次
-        assert loop._note_tool_failure("ak_finance", err) is None
+        loop = self._loop_with_tool_msgs([])
+        for i in range(2):
+            loop.current_msgs.extend(self._tool_msg(err))
+            assert loop._scan_tool_failures() is None, f"第 {i+1} 轮不应升级"
+        loop.current_msgs.extend(self._tool_msg(err))
+        out = loop._scan_tool_failures()
+        assert out and out["n"] == 3 and out["tool"] == "ak_finance"
+        assert loop._scan_tool_failures() is None, "只升级一次"
 
-    def test_success_and_different_tools_not_counted(self):
-        from agent.loop import ThinAgentLoop
-        loop = ThinAgentLoop.__new__(ThinAgentLoop)
-        loop._fail_sigs = {}
-        loop._escalated = False
-        assert loop._note_tool_failure("mx_query", "查询结果：| date | 上证 |") is None
-        loop._note_tool_failure("ak_finance", "Error: A")
-        loop._note_tool_failure("mx_query", "Error: B")
-        assert not loop._escalated, "不同工具/不同错误不该触发升级"
+    def test_one_round_with_three_distinct_failures_is_not_escalated(self):
+        """一轮里 3 个不同查询同时失败 = 合法覆盖查询（test_saturation_gate 的教训）。"""
+        loop = self._loop_with_tool_msgs([])
+        msgs = []
+        for i in range(3):
+            msgs.extend(self._tool_msg(
+                f"Error: 网络不可用，任务 {i}", name="mx_query", cid=f"c{i}"))
+        loop.current_msgs.extend(msgs)
+        assert loop._scan_tool_failures() is None, "同一轮内的多次失败只记一次"
 
-    def test_varying_numbers_same_error_still_counts(self):
-        from agent.loop import ThinAgentLoop
-        loop = ThinAgentLoop.__new__(ThinAgentLoop)
-        loop._fail_sigs = {}
-        loop._escalated = False
-        for n in (1, 2, 3):
-            out = loop._note_tool_failure("ak_finance", f"Error: HTTP 500 after {n * 3} tries")
-        assert out is not None, "错误里的数字不应破坏签名（时间戳/计数每次都变）"
+    def test_success_and_guard_replies_not_counted(self):
+        loop = self._loop_with_tool_msgs([])
+        loop.current_msgs.extend(self._tool_msg("查询结果：| date | 上证 |", name="mx_query"))
+        loop.current_msgs.extend(self._tool_msg(
+            "⛔ 该调用与此前已成功执行的调用完全相同（mx_query），已拒绝重复执行", name="mx_query"))
+        assert loop._scan_tool_failures() is None
+        assert loop._fail_sigs == {}, "成功与闸门回复都不该进失败计数"
+
+    def test_varying_numbers_same_error_counts_once_per_round(self):
+        loop = self._loop_with_tool_msgs([])
+        for i in (1, 2, 3):
+            loop.current_msgs.extend(self._tool_msg(f"Error: HTTP 500 after {i * 3} tries"))
+            out = loop._scan_tool_failures()
+        assert out is not None, "错误里的数字变化不应破坏签名"
