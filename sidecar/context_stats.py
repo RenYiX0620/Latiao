@@ -173,6 +173,14 @@ def _session(session_id: str) -> dict:
         "gen_tokens": 0,         # 本轮生成的 completion token 数
         "gen_seconds": 0.0,      # 扣除首 token 等待后的生成耗时
         "turn_input_tokens": 0,  # 本轮**累计**输入 token（每步相加，供预算守卫用）
+        # ── 成本可见（gap 第 4 步，2026-09-29）：让"这轮花了多少、花在哪"有数可看 ──
+        "turn_retries": 0,       # 本轮重采次数（空生成/截断/复读/语言漂移/终答重采）
+        "turn_retry_kinds": [],  # 重采原因（面板/日志说明"花在哪"，最多留 8 条）
+        "turn_budget": 0,        # 本轮生效的输入 token 预算（0=关闭）
+        "turn_refine_calls": 0,  # 本轮工具后的"学习提炼"调用次数（隐形烧钱大户）
+        "turn_refine_tokens": 0, # 其中已知的 token 数（引擎不回 usage 时不计）
+        "refine_calls_total": 0, # 会话累计（跨轮看长期开销）
+        "refine_tokens_total": 0,
     })
 
 
@@ -184,7 +192,59 @@ def begin_turn(session_id: str) -> None:
         sess = _session(session_id)
         sess.update(steps=0, llm_seconds=0.0, tool_seconds=0.0,
                     ttft_samples=[], gen_tokens=0, gen_seconds=0.0,
-                    turn_input_tokens=0)
+                    turn_input_tokens=0, turn_retries=0, turn_retry_kinds=[],
+                    turn_refine_calls=0, turn_refine_tokens=0)
+
+
+def record_retry(session_id: str, kind: str = "") -> None:
+    """记一次"重采"（成本可见：重试是隐形烧钱大户，得说得出花在哪）。"""
+    if not session_id:
+        return
+    with _lock:
+        sess = _session(session_id)
+        sess["turn_retries"] = int(sess.get("turn_retries") or 0) + 1
+        kinds = list(sess.get("turn_retry_kinds") or [])
+        kinds.append(str(kind or "retry")[:24])
+        sess["turn_retry_kinds"] = kinds[-8:]
+
+
+def record_budget(session_id: str, budget: int) -> None:
+    """记录本轮生效的输入 token 预算（面板要显示 已用/预算）。"""
+    if not session_id:
+        return
+    try:
+        b = max(0, int(budget))
+    except (TypeError, ValueError):
+        return
+    with _lock:
+        _session(session_id)["turn_budget"] = b
+
+
+def record_refine(session_id: str, usage: dict | None = None, ok: bool = True) -> None:
+    """记录一次工具后的"学习提炼"LLM 调用（fire-and-forget，此前完全不计账）。
+
+    2026-09-29（gap 第 4 步）：每个工具执行后都会额外发一次模型调用（云端优先），
+    9 次工具 = 9 次隐形调用，用户看不到这笔开销。这里只计数（能拿到 usage 时也计
+    token），不改变提炼本身的行为——失败也算一次调用（如实反映"发出去了"）。
+    """
+    if not session_id:
+        return
+    pt = ct = 0
+    if isinstance(usage, dict):
+        try:
+            pt = int(usage.get("prompt_tokens") or 0)
+            ct = int(usage.get("completion_tokens") or 0)
+        except (TypeError, ValueError):
+            pt = ct = 0
+    with _lock:
+        sess = _session(session_id)
+        sess["turn_refine_calls"] = int(sess.get("turn_refine_calls") or 0) + 1
+        sess["refine_calls_total"] = int(sess.get("refine_calls_total") or 0) + 1
+        if pt or ct:
+            sess["turn_refine_tokens"] = int(sess.get("turn_refine_tokens") or 0) + pt + ct
+            sess["refine_tokens_total"] = int(sess.get("refine_tokens_total") or 0) + pt + ct
+    if not ok:
+        logger.debug("学习提炼调用未成功（已计入成本可见）: %s", session_id)
 
 
 def record_step(session_id: str, seconds: float, ttft: float | None = None) -> None:
@@ -445,12 +505,32 @@ def record_usage(session_id: str, usage: dict | None = None, timings: dict | Non
                 del sess["cache_samples"][:-CACHE_SAMPLES]
 
 
+def _turn_cost(sess: dict) -> dict:
+    """本轮的"花了多少、花在哪"（gap 第 4 步）：输入 token / 预算比 / 重采次数与原因 /
+    学习提炼调用。数据源全是已有计数器，不新增埋点。"""
+    used = int(sess.get("turn_input_tokens") or 0)
+    budget = int(sess.get("turn_budget") or 0)
+    return {
+        "input_tokens": used,
+        "gen_tokens": int(sess.get("gen_tokens") or 0),
+        "budget": budget,
+        "budget_percent": (round(used * 100.0 / budget, 1) if budget else None),
+        "retries": int(sess.get("turn_retries") or 0),
+        "retry_kinds": list(sess.get("turn_retry_kinds") or []),
+        "refine_calls": int(sess.get("turn_refine_calls") or 0),
+        "refine_tokens": int(sess.get("turn_refine_tokens") or 0),
+        "refine_calls_total": int(sess.get("refine_calls_total") or 0),
+        "refine_tokens_total": int(sess.get("refine_tokens_total") or 0),
+    }
+
+
 def stats(session_id: str, limit: int = 0, limit_source: str = "") -> dict:
     """面板数据：容量、总量、六类占比、平均缓存命中率。"""
     with _lock:
         sess = _sessions.get(session_id) or {}
         snap = dict(sess.get("snapshot") or {})
         samples = list(sess.get("cache_samples") or [])
+        _turn = _turn_cost(sess)
     if not snap:
         return {
             "status": "ok", "available": False, "session_id": session_id,
@@ -464,6 +544,7 @@ def stats(session_id: str, limit: int = 0, limit_source: str = "") -> dict:
             "ttft_avg": (round(sum(sess.get("ttft_samples") or []) / len(sess["ttft_samples"]), 2)
                          if sess.get("ttft_samples") else None),
             "tps": _safe_tps(sess),
+            "turn": _turn,
         }
     counts = snap.get("counts") or {}
     est_total = int(snap.get("estimated_total") or 0)
@@ -508,6 +589,7 @@ def stats(session_id: str, limit: int = 0, limit_source: str = "") -> dict:
         "ttft_avg": (round(sum(sess.get("ttft_samples") or []) / len(sess["ttft_samples"]), 2)
                      if sess.get("ttft_samples") else None),
         "tps": _safe_tps(sess),
+        "turn": _turn,
         "token_source": snap.get("token_source", "estimated"),
         "model_path": sess.get("model_path", ""),
         "updated_at": snap.get("updated_at"),

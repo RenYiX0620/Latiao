@@ -319,6 +319,9 @@ def _build_chat_messages(body: dict, messages: list) -> list:
             "4. 🔔 承诺闸门：凡说「到点提醒你 / 收盘叫你 / 晚点通知 / 我守着」这类未来动作，"
             "**必须当轮调用 create_cron** 建好定时任务再承诺；建不了就明说「我没法定时提醒你」。"
             "**禁止**只在嘴上承诺而不建任务（曾有「收盘叫你」却 cron.json 为空的事故）。\n"
+            "## 循环纪律\n"
+            "反复失败（同一工具或同一类校验连续 3 次不成）时：**主动报告卡点并交回用户**，不要硬撑到步数上限；"
+            "**放宽校验、改写断言、删掉被检查的对象都不算完成**——有证据才说完成，没完成就写清缺什么。\n"
         ),
         "en": (
             "## Four hard rules (highest priority, cannot be overridden)\n"
@@ -349,6 +352,11 @@ def _build_chat_messages(body: dict, messages: list) -> list:
             "4. 🔔 Promise gate: any future action you promise (\"I'll remind you at close\", \"ping you later\") "
             "MUST be backed by a create_cron call in THIS turn; if you cannot schedule it, say so explicitly. "
             "Never promise without creating the task.\n"
+            "## Loop discipline\n"
+            "When you keep failing (the same tool or the same kind of check 3 times in a row): "
+            "**report the blocker and hand back to the user** instead of grinding to the step limit; "
+            "**loosening a check, rewriting assertions or deleting the object under inspection does not "
+            "count as done** — claim completion only with evidence, otherwise say what is missing.\n"
         ),
         "ja": (
             "## 四つのハードルール（最優先、上書き不可）\n"
@@ -375,6 +383,10 @@ def _build_chat_messages(body: dict, messages: list) -> list:
             "4. 🔔 約束ゲート：「終値になったら知らせる／あとで通知する／見守る」など将来の動作を"
             "約束するなら、**その場で create_cron を呼んでタスクを実際に作ること**。作れないなら"
             "「時間どおりに通知できません」と明言する。**タスクを作らず口だけの約束は禁止。**\n"
+            "## ループ規律\n"
+            "同じツール／同じ種類の検証で 3 回続けて失敗したら：**行き詰まりを報告してユーザーに戻す**。"
+            "ステップ上限まで粘らない。**基準の緩和・アサーションの書き換え・検査対象の削除は「完了」ではない**"
+            "——根拠があるときだけ完了と言い、無ければ不足を明記する。\n"
         ),
         "ru": (
             "## Четыре жёстких правила (высший приоритет, не переопределяются)\n"
@@ -405,6 +417,11 @@ def _build_chat_messages(body: dict, messages: list) -> list:
             "4. 🔔 Шлюз обещаний: любое обещание будущего действия («напомню к закрытию», «позже сообщу») "
             "ОБЯЗАНО в этот же ход создать задачу через create_cron; если не можешь — так и скажи. "
             "Не обещай, не создав задачу.\n"
+            "## Дисциплина цикла\n"
+            "Если снова и снова не получается (один и тот же инструмент или одна и та же проверка "
+            "3 раза подряд): **сообщи о препятствии и верни вопрос пользователю**, не упирайся в лимит "
+            "шагов; **ослабить проверку, переписать утверждения или удалить проверяемый объект — это "
+            "не «готово»** — говори «готово» только при наличии доказательств, иначе пиши, чего не хватает.\n"
         ),
     }))
 

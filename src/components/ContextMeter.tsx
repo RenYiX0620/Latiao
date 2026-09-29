@@ -1,6 +1,7 @@
 import { useCallback, useMemo, useRef, useState } from "react";
 import { useTranslation } from "../i18n";
 import { authFetch } from "../utils/api";
+import { turnCostView, type TurnCostLike } from "../utils/turnCost";
 
 /** 与后端 context_stats.CATEGORIES 一一对应（顺序即展示顺序）。 */
 const ROWS: { key: string; i18n: string; color: string }[] = [
@@ -22,6 +23,8 @@ interface CtxStats {
   cache_hit_rate: number | null;
   cache_samples: number;
   token_source: string;
+  /** 成本可见（gap 第 4 步）：本轮花了多少、花在哪 */
+  turn?: TurnCostLike | null;
 }
 
 /** token 数按语言习惯缩写：中文用「万」，其余用 k/M（对齐同类工具的面板写法）。 */
@@ -81,6 +84,11 @@ export default function ContextMeter({ sessionId, fallbackTokens, fallbackLimit 
   const percent = limit ? Math.round((total * 1000) / limit) / 10 : null;
   const cache = live ? data!.cache_hit_rate : null;
 
+  const turnView = useMemo(
+    () => turnCostView(data?.turn, (n) => fmtTokens(n, lang), t),
+    [data, lang, t],
+  );
+
   const rows = useMemo(() => {
     const byKey: Record<string, number> = {};
     for (const b of data?.breakdown || []) byKey[b.key] = b.percent;
@@ -120,6 +128,23 @@ export default function ContextMeter({ sessionId, fallbackTokens, fallbackLimit 
             </div>
           ) : (
             <div className="ctx-empty">{t("chat.ctx_no_data")}</div>
+          )}
+          {live && turnView && (
+            <div className="ctx-turn">
+              <div className="ctx-row">
+                <span className="ctx-row-label">{t("chat.ctx_turn_input")}</span>
+                <span className="ctx-row-val">{turnView.input}</span>
+              </div>
+              <div className="ctx-row">
+                <span className="ctx-row-label">{t("chat.ctx_turn_cost")}</span>
+                <span className="ctx-row-val">{turnView.cost}</span>
+              </div>
+              {turnView.retryKinds && (
+                <div className="ctx-row-val" style={{ opacity: 0.7 }}>
+                  {turnView.retryKinds}
+                </div>
+              )}
+            </div>
           )}
           <div className="ctx-foot">
             <span>{t("chat.ctx_cache")}</span>

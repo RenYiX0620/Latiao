@@ -1075,6 +1075,11 @@ img.sidebar-logo {
 .ctx-row-label { flex: 1 1 auto; color: var(--text-secondary); }
 .ctx-row-val { color: var(--text-primary); font-variant-numeric: tabular-nums; }
 .ctx-empty { color: var(--text-muted); padding: 6px 0; }
+/* 成本可见（gap 第 4 步）：本轮输入/预算 + 花在哪（生成/重采/知识提炼） */
+.ctx-turn {
+  display: flex; flex-direction: column; gap: 7px;
+  margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border-default);
+}
 .ctx-foot {
   display: flex; align-items: center; justify-content: space-between;
   margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--border-default);

@@ -9,7 +9,6 @@
 3. **绝不跑满 MAX_STEPS**——预算守卫必须比步数上限先到（长回合里它才是先撞的墙）。
 """
 import json
-import os
 import sys
 import time
 from pathlib import Path

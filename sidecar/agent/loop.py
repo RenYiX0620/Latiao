@@ -768,10 +768,16 @@ class ThinAgentLoop:
         # 任务级验证器（gap 清单 P1，2026-09-29）：本轮工具账本 + 等级校验
         # 第一次未达标只提示（重采一次），第二次/作弊才交回用户（两级生效）
         self._task_verify_used = False
+        self._budget_warned = False            # 预算近阈提示（每轮一次，成本可见）
         try:
             task_verify.begin_turn(session_id)
         except Exception:
             logger.debug("task_verify.begin_turn 失败", exc_info=True)
+        try:
+            import context_stats as _cs
+            _cs.record_budget(session_id, _turn_token_budget())   # 面板显示"已用/预算"
+        except Exception:
+            logger.debug("record_budget 失败", exc_info=True)
         self._quota_hint_injected = False      # 当日额度用尽提示（每 turn 一次）
         # 可配置阈值：主循环用默认值，子代理实例化后收紧（09-13 子代理收紧）
         self.max_steps = MAX_STEPS             # 步数上限
@@ -876,6 +882,14 @@ class ThinAgentLoop:
         """终端式每步日志：统一前缀，进 sidecar.log 与 app 实况日志。"""
         logger.info("[THIN][step %s] %s%s", self.steps, phase,
                     f" | {detail}" if detail else "")
+
+    def _note_retry(self, kind: str) -> None:
+        """记一次"重采"进成本可见（gap 第 4 步）：重试是隐形烧钱大户，得能说清花在哪。"""
+        try:
+            import context_stats
+            context_stats.record_retry(self.session_id, kind)
+        except Exception:
+            logger.debug("重试记账失败", exc_info=True)
 
     # ── 请求组装（request waterfall 之前的宿主编排）──────────
     def _build_request(self, engine_model: str) -> dict:
@@ -1199,6 +1213,7 @@ class ThinAgentLoop:
             # 只重试一次——再漂就照常交付，交给交付闸门去翻译（那条兜底仍在）。
             if not getattr(self, "_lang_retried", False):
                 self._lang_retried = True
+                self._note_retry("lang_drift")
                 self._step_log("语言漂移重试", "首段非目标语言，丢弃后重试一次")
                 logger.info("thin loop: 首段语言漂移，丢弃这次生成并重试一次")
                 _append_lang_retry_note(body, self.user_lang)
@@ -1213,6 +1228,7 @@ class ThinAgentLoop:
                     and _looks_like_lang_drift(body_text, self.user_lang)
                     and not getattr(self, "_lang_retried", False)):
                 self._lang_retried = True
+                self._note_retry("lang_drift_short")
                 self._step_log("语言漂移重试", "短回复非目标语言，丢弃后重试一次")
                 _append_lang_retry_note(body, self.user_lang)
                 async for _evt in self._sample(client, body):
@@ -1675,6 +1691,19 @@ class ThinAgentLoop:
                                 "budget_exhausted", self.user_lang,
                                 used=f"{_used:,}", budget=f"{_budget:,}")}
                             return
+                    elif _used > int(_budget * 0.8) and not self._budget_warned:
+                        # 近阈显式提示（gap 第 4 步）：此前是"要么不知道、要么被静默收口"。
+                        # 80% 时同时告诉**用户**（可见文字）与**模型**（尾部提示）——用户
+                        # 知道钱花到哪了，模型知道该收口了（不 continue：本轮照常采样，
+                        # 尾部提示已进本次请求，模型这一轮就能收）。
+                        self._budget_warned = True
+                        _pct = int(_used * 100 / _budget)
+                        self._step_log("预算提醒", f"本轮输入 {_used} 已达预算 {_pct}% → 提示收口")
+                        yield {"content": "\n\n" + _msg("budget_warning", self.user_lang,
+                                                        used=f"{_used:,}",
+                                                        budget=f"{_budget:,}", pct=f"{_pct}")}
+                        self.current_msgs.append(_note_msg(_msg(
+                            "budget_warning_tail", self.user_lang, pct=f"{_pct}")))
                 # 工具输出回收：每轮请求前把较早的大块工具结果折成一行（幂等）
                 _folded_n = _fold_old_tool_results(self.current_msgs)
                 if _folded_n:
@@ -1750,6 +1779,7 @@ class ThinAgentLoop:
                     if _needs_length_retry(finish_reason, bool(native), _empty_body,
                                            self._len_retry_used):
                         self._len_retry_used = True
+                        self._note_retry("length_truncated")
                         self._force_thinking_off_next = True
                         self.steps -= 1
                         if native:
@@ -1778,6 +1808,7 @@ class ThinAgentLoop:
                             self._retry_temp, self._retry_freq = 0.35, 1.0
                         else:
                             self._retry_temp, self._retry_freq = 0.6, 1.5
+                        self._note_retry("generation_loop")
                         self.steps -= 1
                         logger.warning("thin loop: %s —— 重采本轮（temp=%s freq=%s）",
                                        e, self._retry_temp, self._retry_freq)
@@ -1852,6 +1883,7 @@ class ThinAgentLoop:
                         and not reasoning and not native):
                     if not self._empty_gen_retry_used:
                         self._empty_gen_retry_used = True
+                        self._note_retry("empty_generation")
                         self.steps -= 1
                         logger.warning("thin loop: 引擎空生成，重采本轮")
                         yield {"event": "heartbeat"}
@@ -1937,6 +1969,7 @@ class ThinAgentLoop:
                         # 输出 1 个工具调用、正文 0 字））；再空才交付警告。
                         if not self._finalize_retry_used:
                             self._finalize_retry_used = True
+                            self._note_retry("finalize_resample")
                             self._retry_temp, self._retry_freq = 0.6, 1.5
                             if self.steps >= self.max_steps:
                                 self.steps = self.max_steps - 1

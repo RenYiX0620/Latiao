@@ -199,6 +199,13 @@ const T: Record<string, Record<Lang, string>> = {
   "chat.ctx_cache": { zh: "平均缓存命中率", en: "Avg cache hit rate", ja: "平均キャッシュヒット率", ru: "Средний кэш-хит" },
   "chat.ctx_cache_na": { zh: "当前引擎未提供", en: "Not reported by this engine", ja: "このエンジンは未対応", ru: "Движок не сообщает" },
   "chat.ctx_no_data": { zh: "发一条消息后可见各类别占比", en: "Send a message to see the breakdown", ja: "メッセージ送信後に内訳を表示", ru: "Отправьте сообщение для детализации" },
+  // 成本可见（gap 第 4 步）：本轮花了多少、花在哪
+  "chat.ctx_turn_input": { zh: "本轮输入", en: "Turn input", ja: "今回の入力", ru: "Ввод хода" },
+  "chat.ctx_turn_input_val": { zh: "{used} / {budget}（{pct}%）", en: "{used} / {budget} ({pct}%)", ja: "{used} / {budget}（{pct}%）", ru: "{used} / {budget} ({pct}%)" },
+  "chat.ctx_turn_input_nobudget": { zh: "{used} token", en: "{used} tokens", ja: "{used} token", ru: "{used} токенов" },
+  "chat.ctx_turn_cost": { zh: "本轮开销", en: "Turn spend", ja: "今回のコスト", ru: "Расход хода" },
+  "chat.ctx_turn_cost_val": { zh: "生成 {gen} · 重采 {retries} 次 · 知识提炼 {refine} 次（{refineTok}）", en: "gen {gen} · {retries} retries · {refine} refinements ({refineTok})", ja: "生成 {gen} · 再サンプル {retries} 回 · 知識抽出 {refine} 回（{refineTok}）", ru: "ген {gen} · пересэмплов {retries} · извлечений {refine} ({refineTok})" },
+  "chat.ctx_turn_retry_kinds": { zh: "重采原因：{kinds}", en: "retry reasons: {kinds}", ja: "再サンプル理由：{kinds}", ru: "причины пересэмплов: {kinds}" },
   "settings.persona_title": { zh: "人格与称呼", en: "Persona & Address", ja: "ペルソナと呼称", ru: "Персона и обращение" },
   "settings.persona_desc": { zh: "新安装的用户第一次对话时，辣条会先自我介绍，再依次询问称呼、名字和语气；升级版本不会重新询问。", en: "On a fresh install, Latiao introduces itself, then asks how to address you, what to call itself and your preferred tone. Updates never re-ask.", ja: "新規インストールの初回会話で自己紹介し、呼び方・自分の名前・口調を順に確認します。更新時に再確認はしません。", ru: "При первой установке Latiao представится и спросит, как к вам обращаться, как называть себя и какой тон предпочитаете. Обновления не спрашивают повторно." },
   "settings.persona_user": { zh: "对你称呼", en: "Addresses you", ja: "呼び方", ru: "Обращение" },

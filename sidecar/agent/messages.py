@@ -129,6 +129,20 @@ MESSAGES: dict[str, dict[str, str]] = {
         "ja": "⚠️ このターンは「完了」として納品しません：{detail}。以上が今回得られた内容です。次の手順（データ追加／目標の調整／手作業）はご判断ください。",
         "ru": "⚠️ Я не выдаю этот ход как завершённый: {detail}. Выше — то, что получено в этом ходу; решение о следующем шаге (данные / другая цель / вручную) за вами.",
     },
+    # 预算近阈提示（gap 第 4 步，2026-09-29）：显式告诉用户与模型"花到哪了"，
+    # 不再要么静默、要么直接收口。
+    "budget_warning": {
+        "zh": "💸 本轮输入已达预算的 {pct}%（{used}/{budget} token）。已请模型收口，优先给出结论；要继续深挖可以发新消息（新一轮预算重新计算）。",
+        "en": "💸 This turn is at {pct}% of its input budget ({used}/{budget} tokens). I have asked the model to wrap up with conclusions; send a new message to dig deeper (the budget resets each turn).",
+        "ja": "💸 このターンの入力は予算の {pct}%（{used}/{budget} token）に達しました。モデルには結論を優先して締めるよう伝えています。さらに掘る場合は新しいメッセージを送ってください（予算はターンごとにリセット）。",
+        "ru": "💸 Ввод в этом ходу достиг {pct}% бюджета ({used}/{budget} токенов). Модель попросили завершать и дать выводы; чтобы копать дальше — отправьте новое сообщение (бюджет сбрасывается каждый ход).",
+    },
+    "budget_warning_tail": {
+        "zh": "⚠️ 本轮预算已用 {pct}%。请立刻收口：直接给出**结论版**答案（关键数字 + 判断），不要再开新的检索/工具轮；确实还缺的项，在答案里写明缺什么。",
+        "en": "⚠️ {pct}% of this turn's budget is used. Wrap up now: give the **conclusion-grade** answer (key figures + judgement), do not open new search/tool rounds; name anything still missing.",
+        "ja": "⚠️ このターンの予算を {pct}% 使用しました。今すぐ締めてください：**結論版**の回答（重要数値＋判断）を書き、新たな検索／ツールラウンドを始めないでください。不足は明記を。",
+        "ru": "⚠️ Израсходовано {pct}% бюджета хода. Завершайте сейчас: дайте **итоговый** ответ (ключевые цифры + вывод), не начинайте новых поисковых/инструментальных раундов; чего не хватает — укажите.",
+    },
     "max_steps": {
         "zh": "⚠️ 已达安全步数上限（{n}）。请发送新消息继续。",
         "en": "⚠️ Safety step limit reached ({n}). Send a new message to continue.",

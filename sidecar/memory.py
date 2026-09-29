@@ -887,6 +887,21 @@ async def _refine_learnings(tool_name: str, args: dict, result: str, session_id:
                 # 当"知识"存库（09-07 清理出多条 <think> 垃圾，置信度 1.0）
                 "chat_template_kwargs": {"enable_thinking": False},
             }, headers=headers)
+            # 成本可见（gap 第 4 步，2026-09-29）：这次调用此前完全不计账——每个工具
+            # 执行后都会额外发一次（云端优先），用户只看到主循环的开销。只计数、不改行为。
+            # 注意：**先记"发出去了一次"**，再尝试取 usage——响应不是 JSON 时也不能漏记。
+            try:
+                import context_stats as _cs
+                _usage = None
+                if r.status_code == 200:
+                    try:
+                        _usage = r.json().get("usage")
+                    except Exception:
+                        _usage = None
+                _cs.record_refine(session_id, _usage if isinstance(_usage, dict) else None,
+                                  ok=(r.status_code == 200))
+            except Exception:
+                logger.debug("refine 用量记账失败", exc_info=True)
             if r.status_code == 200:
                 data = r.json()
                 summary = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
