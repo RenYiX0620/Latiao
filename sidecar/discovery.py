@@ -37,7 +37,30 @@ _PROGRESS_DIR = Path.home() / ".local-ai-os"
 INDEX_FILE = _PROGRESS_DIR / "discovered_index.json"
 CACHE_FILE = _PROGRESS_DIR / "discovery_cache.json"
 
-_GH_TOKEN = os.environ.get("DISCOVERY_GH_TOKEN", "")  # 可选：提高配额
+def _load_gh_token() -> str:
+    """GitHub token（可选，只为提高 repo search 配额）。
+
+    读取顺序：环境变量 DISCOVERY_GH_TOKEN → config.json 的 `discovery_gh_token`。
+    2026-09-29：sidecar.log 里 "repo search 配额耗尽（匿名 10/分）" 累计 65 次——
+    匿名搜索每分钟 10 次，一次发现扫描就能打满。放 config.json（0600、与
+    mx_api_key 同一处）符合本项目"凭据不进环境"的规矩（环境变量可被 `ps eww` 读到）。
+    """
+    tok = os.environ.get("DISCOVERY_GH_TOKEN", "")
+    if tok:
+        return tok
+    try:
+        import json as _json
+        from config import CONFIG_FILE
+        if CONFIG_FILE.exists():
+            cfg = _json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            if isinstance(cfg, dict):
+                return str(cfg.get("discovery_gh_token") or "")
+    except Exception:
+        pass
+    return ""
+
+
+_GH_TOKEN = _load_gh_token()  # 可选：提高配额
 
 # ── TLS 信任链（本机关键：Watt Toolkit/SteamTools MITM CA 在系统 keychain 但
 #    不在 certifi——从 keychain 导出生成 trust bundle，与 curl 行为一致） ──
