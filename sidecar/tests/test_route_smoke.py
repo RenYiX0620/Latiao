@@ -101,5 +101,8 @@ def test_health_exempt_from_auth(client):
 
 
 def test_auth_required_for_v1(client):
-    resp = client.get("/v1/tools")
+    # 探针用**核心**路由：此前挂在 /v1/tools（快捷调用功能的端点）上，
+    # 该功能 2026-09-29 按用户要求移除后，这里探的是不存在的路径，
+    # 401 变 404 —— 通用鉴权测试不该绑在某个可被删除的功能路由上。
+    resp = client.get("/v1/permissions")
     assert resp.status_code == 401
