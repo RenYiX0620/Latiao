@@ -409,7 +409,12 @@ def record_usage(session_id: str, usage: dict | None = None, timings: dict | Non
         prompt_tokens = int(usage.get("prompt_tokens") or 0)
         completion_tokens = int(usage.get("completion_tokens") or 0)
     elif isinstance(timings, dict):
-        prompt_tokens = int(timings.get("prompt_n") or 0)
+        # llama.cpp 语义**不代表全量输入**（2026-09-29 受控实测查出的 bug）：
+        # prompt_n 只是本次**新评估**的 token，命中的缓存前缀在 cache_n（日志里
+        # "复用 X / 共 Y" 的 Y = cache_n + prompt_n）。旧实现只取 prompt_n →
+        # 预算守卫在本地引擎上按"新增量"累加（实测 6 步仅 6797，真实约 4 万），
+        # 等于永不触发；上下文面板的"真实输入"校准同样偏低。取两者之和 = 全量输入。
+        prompt_tokens = int(timings.get("prompt_n") or 0) + int(timings.get("cache_n") or 0)
         completion_tokens = int(timings.get("predicted_n") or 0)
     rate = _extract_cache_rate(usage, timings)
     with _lock:
