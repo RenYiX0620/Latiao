@@ -940,6 +940,13 @@ class ThinAgentLoop:
         native: dict[int, dict] = {}
         raw = 0
         finish_reason = None
+        # 真·首 token 时刻（2026-09-29）：在**引擎流解析层**打点——第一个
+        # think/content delta 到达即计时，**在语言闸缓冲之前**。此前 TTFT 由消费者
+        # 在首个"下发事件"处测量，而思考期 delta 全被语言闸攒着（_pending），
+        # 纯思考步的第一个下发事件在流末尾 → TTFT≈步长（实测 26.79/26.8s），
+        # gen_seconds≈0 → tps=278001。语言闸必须保留（防漂移残留），计时必须前移。
+        _first_delta_at: float | None = None
+        finish_reason = None
         deadline = time.monotonic() + 900
         # 等引擎放行的时长：多会话并行时这一轮可能排在别的会话后面（见 transport 闸门）
         _wait: dict = {}
@@ -1007,6 +1014,8 @@ class ThinAgentLoop:
                 streamed = _strip_repeat_tail(streamed)
                 raise _GenerationLoopError("输出复读循环，已截断")
             if think:
+                if _first_delta_at is None:
+                    _first_delta_at = time.monotonic()   # 真·首 token：闸前打点
                 reasoning += think
                 streamed += think
                 if _gate_open:
@@ -1014,6 +1023,8 @@ class ThinAgentLoop:
                 else:
                     _pending.append({"reasoning": think, "ts": int(time.time() * 1000)})
             if content:
+                if _first_delta_at is None:
+                    _first_delta_at = time.monotonic()
                 streamed += content
                 body_text += content
                 if _gate_open:
@@ -1057,7 +1068,8 @@ class ThinAgentLoop:
             for _ev in _pending:
                 yield _ev
             _pending.clear()
-        yield {"__result__": (streamed, body_text, reasoning, native, finish_reason)}
+        yield {"__result__": (streamed, body_text, reasoning, native, finish_reason,
+                              _first_delta_at)}
 
     # ── 主循环 ────────────────────────────────────────────
     def _maybe_repeat_reminder(self, tool_calls: list) -> bool:
@@ -1465,7 +1477,10 @@ class ThinAgentLoop:
                         yield {"content": _leftover}
                     if result is None:
                         return
-                    streamed, body_text, reasoning, native, finish_reason = result
+                    streamed, body_text, reasoning, native, finish_reason, _first_delta_at = result
+                    # 真·首 token 优先（闸前打点）；消费者自己的测量（过闸后）只作兜底
+                    if _first_delta_at:
+                        t_first_token = _first_delta_at
                     self._last_round_had_tools = bool(native)   # 围栏路径稍后按 tool_calls 复核
                     # 复读/折叠一律**只看正文**：streamed 是"思考+正文"混合缓冲，
                     # 拿它做基准会把思考当成复读、还会把思考摘要当消息推给用户（09-19 实测）

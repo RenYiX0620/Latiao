@@ -187,6 +187,7 @@ const T: Record<string, Record<Lang, string>> = {
   "chat.run_tool_calls_only": { zh: " 次工具调用", en: " tool calls", ja: " 回のツール呼び出し", ru: " вызовов инструментов" },
   "chat.run_llm_tool": { zh: "LLM {llm}秒 · 工具调用 {tool}秒", en: "LLM {llm}s · tools {tool}s", ja: "LLM {llm}秒 · ツール {tool}秒", ru: "LLM {llm}с · инструменты {tool}с" },
   "chat.run_ttft_tps": { zh: "首 token 平均 {ttft}秒 · {tps} tok/s", en: "first token avg {ttft}s · {tps} tok/s", ja: "初回トークン平均 {ttft}秒 · {tps} tok/s", ru: "первый токен {ttft}с · {tps} ток/с" },
+  "chat.run_ttft_only": { zh: "首 token 平均 {ttft}秒", en: "first token avg {ttft}s", ja: "初回トークン平均 {ttft}秒", ru: "первый токен {ttft}с" },
   "chat.ctx_cache_rate": { zh: "缓存命中 {percent}%", en: "cache hit {percent}%", ja: "キャッシュヒット {percent}%", ru: "кэш-хит {percent}%" },
   "chat.ctx_title": { zh: "上下文容量", en: "Context usage", ja: "コンテキスト容量", ru: "Контекст" },
   "chat.ctx_messages": { zh: "消息", en: "Messages", ja: "メッセージ", ru: "Сообщения" },

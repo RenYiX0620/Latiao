@@ -1403,3 +1403,31 @@ class TestCounterFailureMemory(unittest.TestCase):
                 self.cs.count_tokens("今天", "/tmp/warn.gguf")
         warnings = [r for r in logs.output if "精确计数不可用" in r]
         self.assertEqual(len(warnings), 1, "同一模型的告警只打一次")
+
+
+class TestSafeTps(unittest.TestCase):
+    """tps 地板（2026-09-29 实测 278001 tok/s）：思考型步骤 TTFT≈步长 →
+    gen_seconds≈0.01 → 分母近零除法。低于地板必须显示 None 而不是天文数字。"""
+
+    def _stats(self):
+        sid = f"tps-{time.time()}"
+        cs.begin_turn(sid)
+        return sid, cs._session(sid)
+
+    def test_near_zero_gen_seconds_returns_none(self):
+        sid, sess = self._stats()
+        cs.record_step(sid, 26.8, 26.79)     # TTFT≈步长 → 贡献 0.01s
+        self.assertAlmostEqual(sess["gen_seconds"], 0.01, places=3)
+        self.assertIsNone(cs._safe_tps(sess), "分母近零必须返回 None")
+
+    def test_healthy_generation_returns_tps(self):
+        sid, sess = self._stats()
+        cs.record_step(sid, 106.7, 1.2)      # 真·首 token：闸前打点后的形态
+        sess["gen_tokens"] = 2780
+        self.assertEqual(cs._safe_tps(sess), round(2780 / 105.5))
+
+    def test_get_stats_endpoints_use_floor(self):
+        sid, sess = self._stats()
+        cs.record_step(sid, 26.8, 26.79)
+        d = cs.stats(sid, limit=0)
+        self.assertIsNone(d["tps"], "stats() 也要走地板")

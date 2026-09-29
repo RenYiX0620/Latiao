@@ -70,7 +70,10 @@ export default function RunMetrics({ sessionId, refreshKey, fallbackTurns, fallb
           <span className="statusbar-sep">|</span>
           <span>
             {ttft !== null
-              ? t("chat.run_ttft_tps", { ttft: ttft.toFixed(2), tps: `${tps ?? 0}` })
+              ? (tps !== null
+                  // tps 有地板（gen_seconds 太短不显示）——没有就只给 TTFT，不显示 0
+                  ? t("chat.run_ttft_tps", { ttft: ttft.toFixed(2), tps: `${tps}` })
+                  : t("chat.run_ttft_only", { ttft: ttft.toFixed(2) }))
               : "—"}
           </span>
         </>

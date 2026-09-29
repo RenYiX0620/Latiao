@@ -203,6 +203,20 @@ def record_step(session_id: str, seconds: float, ttft: float | None = None) -> N
             sess["gen_seconds"] += max(0.0, sec - tt)
 
 
+# tps 显示地板（2026-09-29 实测 278001 tok/s）：gen_seconds = Σ(步长−TTFT)。
+# 思考型步骤的 TTFT≈步长（语言闸把 delta 攒到流末才下发时，旧计时点测出的是
+# "过闸时间"）→ 单步贡献≈0 → 分母近零 → 除出天文数字。低于地板不显示，
+# 宁可空着也不给假数。
+_TPS_MIN_GEN_SECONDS = 2.0
+
+
+def _safe_tps(sess: dict) -> float | None:
+    gs = float(sess.get("gen_seconds") or 0.0)
+    if gs < _TPS_MIN_GEN_SECONDS:
+        return None
+    return round(float(sess.get("gen_tokens") or 0) / gs)
+
+
 def record_tool_time(session_id: str, seconds: float) -> None:
     """记录工具执行耗时（并发执行时由调用方传入该批次的墙钟耗时）。"""
     if not session_id:
@@ -438,7 +452,7 @@ def stats(session_id: str, limit: int = 0, limit_source: str = "") -> dict:
             "tool_seconds": round(float(sess.get("tool_seconds") or 0.0), 1),
             "ttft_avg": (round(sum(sess.get("ttft_samples") or []) / len(sess["ttft_samples"]), 2)
                          if sess.get("ttft_samples") else None),
-            "tps": (round(sess["gen_tokens"] / sess["gen_seconds"]) if sess.get("gen_seconds") else None),
+            "tps": _safe_tps(sess),
         }
     counts = snap.get("counts") or {}
     est_total = int(snap.get("estimated_total") or 0)
@@ -482,7 +496,7 @@ def stats(session_id: str, limit: int = 0, limit_source: str = "") -> dict:
         "tool_seconds": round(float(sess.get("tool_seconds") or 0.0), 1),
         "ttft_avg": (round(sum(sess.get("ttft_samples") or []) / len(sess["ttft_samples"]), 2)
                      if sess.get("ttft_samples") else None),
-        "tps": (round(sess["gen_tokens"] / sess["gen_seconds"]) if sess.get("gen_seconds") else None),
+        "tps": _safe_tps(sess),
         "token_source": snap.get("token_source", "estimated"),
         "model_path": sess.get("model_path", ""),
         "updated_at": snap.get("updated_at"),
