@@ -475,3 +475,63 @@ async def test_finalize_round_think_only_tool_call_recovers():
         assert state["final_seen"] >= 1, "脚本应观察到终答轮请求"
         assert RECOVERED_ANSWER in contents, \
             f"重采出的真答案必须交付；实际 events 末尾：{events[-6:]}"
+
+
+class TestLoopGaps:
+    """Loop 三缺口（2026-09-29）：工具输出回收 / 预算守卫 / 同错硬升级。"""
+
+    # ── 工具输出回收 ──
+    def test_fold_old_large_tool_results(self):
+        from agent.loop import _fold_old_tool_results, _FOLD_MARK
+        msgs = [{"role": "user", "content": "q"}]
+        for i in range(9):
+            msgs.append({"role": "tool", "content": f"结果{i}：" + "x" * 2000})
+        n = _fold_old_tool_results(msgs, keep_recent=6)
+        assert n == 3, f"应折 9-6=3 条，实际 {n}"
+        folded = [m for m in msgs if str(m.get("content", "")).startswith(_FOLD_MARK)]
+        assert len(folded) == 3
+        # 最近 6 条保持原样
+        tail_tools = [m for m in msgs if m.get("role") == "tool"][-6:]
+        assert all(not str(m["content"]).startswith(_FOLD_MARK) for m in tail_tools)
+
+    def test_fold_is_idempotent_and_skips_small(self):
+        from agent.loop import _fold_old_tool_results, _FOLD_MARK
+        msgs = [{"role": "tool", "content": "小结果"} for _ in range(8)]
+        assert _fold_old_tool_results(msgs, keep_recent=6) == 0, "小结果不值得折"
+        big = [{"role": "tool", "content": "y" * 3000} for _ in range(8)]
+        assert _fold_old_tool_results(big, keep_recent=6) == 2
+        assert _fold_old_tool_results(big, keep_recent=6) == 0, "二次调用必须幂等"
+        assert sum(1 for m in big if str(m["content"]).startswith(_FOLD_MARK)) == 2
+
+    # ── 同错硬升级 ──
+    def test_escalates_after_three_same_errors(self):
+        from agent.loop import ThinAgentLoop
+        loop = ThinAgentLoop.__new__(ThinAgentLoop)
+        loop._fail_sigs = {}
+        loop._escalated = False
+        err = "Error: 金融数据查询失败: ConnectionError: RemoteDisconnected"
+        assert loop._note_tool_failure("ak_finance", err) is None
+        assert loop._note_tool_failure("ak_finance", err) is None
+        out = loop._note_tool_failure("ak_finance", err)
+        assert out and out["n"] == 3 and "ak_finance" not in out["err"]
+        # 只触发一次
+        assert loop._note_tool_failure("ak_finance", err) is None
+
+    def test_success_and_different_tools_not_counted(self):
+        from agent.loop import ThinAgentLoop
+        loop = ThinAgentLoop.__new__(ThinAgentLoop)
+        loop._fail_sigs = {}
+        loop._escalated = False
+        assert loop._note_tool_failure("mx_query", "查询结果：| date | 上证 |") is None
+        loop._note_tool_failure("ak_finance", "Error: A")
+        loop._note_tool_failure("mx_query", "Error: B")
+        assert not loop._escalated, "不同工具/不同错误不该触发升级"
+
+    def test_varying_numbers_same_error_still_counts(self):
+        from agent.loop import ThinAgentLoop
+        loop = ThinAgentLoop.__new__(ThinAgentLoop)
+        loop._fail_sigs = {}
+        loop._escalated = False
+        for n in (1, 2, 3):
+            out = loop._note_tool_failure("ak_finance", f"Error: HTTP 500 after {n * 3} tries")
+        assert out is not None, "错误里的数字不应破坏签名（时间戳/计数每次都变）"

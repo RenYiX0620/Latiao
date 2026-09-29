@@ -380,6 +380,64 @@ def _note_msg(text: str, label: str = "【系统提示】") -> dict:
     return {"role": "user", "content": label + text}
 
 
+_TOOL_FOLD_KEEP_RECENT = 6      # 最近 N 条工具结果保持原样
+_TURN_TOKEN_BUDGET_DEFAULT = 400_000   # 本轮输入 token 预算（0 = 关闭）
+
+
+def _turn_token_budget() -> int:
+    """本轮输入 token 预算（env LATIAO_TURN_TOKEN_BUDGET，0 关闭）。"""
+    try:
+        return max(0, int(os.environ.get("LATIAO_TURN_TOKEN_BUDGET",
+                                         _TURN_TOKEN_BUDGET_DEFAULT)))
+    except (TypeError, ValueError):
+        return _TURN_TOKEN_BUDGET_DEFAULT
+
+
+def _turn_input_tokens(session_id: str) -> int:
+    """本轮累计输入 token（失败返回 0 —— 预算守卫宁可不动，也不能误伤正常轮）。"""
+    try:
+        import context_stats
+        with context_stats._lock:
+            sess = context_stats._sessions.get(session_id) or {}
+            return int(sess.get("turn_input_tokens") or 0)
+    except Exception:
+        return 0
+_TOOL_FOLD_MIN_CHARS = 1500     # 小于此长度不值得折（收益小、还有丢数字的风险）
+_TOOL_FOLD_HEAD = 400           # 折叠后保留的开头（表格头/结论/日期多在最前）
+_FOLD_MARK = "[已折叠·旧工具结果]"
+
+
+def _fold_old_tool_results(current_msgs: list,
+                           keep_recent: int = _TOOL_FOLD_KEEP_RECENT,
+                           min_chars: int = _TOOL_FOLD_MIN_CHARS) -> int:
+    """把较早的、体积大的 tool 结果折成一行（原地改 current_msgs，返回折叠条数）。
+
+    2026-09-29 补（Loop 三缺口之"工具输出回收"）：长会话里旧工具结果（几千字的
+    表格/文件读回）会一直占窗，只能等整体压缩阈值兜底——而它们的信息早已被模型
+    消化或写进了答案。这里只折 **不在最近 keep_recent 条之内**、且 >= min_chars 的
+    那些；保留开头（表格头/结论行），并注明可重新调用。
+
+    current_msgs 是本轮请求的**副本**（构造时 dict 展开），折叠只影响模型视野；
+    完整结果仍在工具台账与会话记录里。幂等：带折叠标记的跳过。
+    """
+    tool_idx = [i for i, m in enumerate(current_msgs) if m.get("role") == "tool"]
+    if len(tool_idx) <= keep_recent:
+        return 0
+    folded = 0
+    for i in tool_idx[:-keep_recent]:
+        m = current_msgs[i]
+        c = m.get("content")
+        if not isinstance(c, str) or len(c) < min_chars:
+            continue
+        if c.startswith(_FOLD_MARK) or _FOLD_MARK in c[:60]:
+            continue
+        m["content"] = (f"{_FOLD_MARK} 原 {len(c)} 字符，仅保留开头：\n"
+                        f"{c[:_TOOL_FOLD_HEAD]}\n"
+                        "…（其余已被回收以节省上下文；需要完整数据可重新调用该工具）")
+        folded += 1
+    return folded
+
+
 def _collect_finalize_data(current_msgs: list, max_results: int = 6,
                            max_chars: int = 700) -> list:
     """工具结果数据块（去重、仅尾部、限长）——供摘要视图与兜底交付。"""
@@ -420,15 +478,27 @@ def _append_tail_note(msgs: list, text: str) -> list:
     return out
 
 
-def _finalize_tail_directive(lang: str = "zh") -> str:
+def _finalize_tail_directive(lang: str = "zh", tone: str = "") -> str:
     """收口轮的尾部指令（四语）——替代旧的"重建数据摘要视图"。
 
     收口轮旧实现把 messages 整体换成 [收口system, 问题, 数据N..., 追问] 并撤掉
     tools，等于把提示头换成另一份内容：该轮必然 0% 复用，而且会把下一轮的
     缓存也打掉（下一轮的开头与这份陌生提示无公共前缀）。改为在既有请求尾部
     追加指令后，收口轮自身≈全命中，下一轮也仍能命中系统提示+历史。
+
+    2026-09-29 加 tone：表格型长回答（大盘分析）里语气会漂回中性——头部身份块
+    与每轮尾注都盖不到终答轮这条**另一条**尾部指令。有语气时并在同一行下发。
     """
-    return _msg("finalize_tail", lang)
+    _base = _msg("finalize_tail", lang)
+    if not tone:
+        return _base
+    _tone_line = {
+        "zh": f"（本轮语气：{tone}——按 SOUL.md 的语气风格写，别退回中性平铺。）",
+        "en": f"(Tone for this reply: {tone} — keep the SOUL.md voice, don't flatten.)",
+        "ja": f"（今回のトーン：{tone}——SOUL.md の語り口を保つこと。）",
+        "ru": f"(Тон этого ответа: {tone} — держите голос из SOUL.md.)",
+    }.get(lang) or f"（本轮语气：{tone}）"
+    return _base + "\n" + _tone_line
 
 
 def _finalize_directive() -> str:
@@ -599,6 +669,17 @@ class ThinAgentLoop:
             _hist = _hist[:-1]
         self.lang_decision = detect_language_decision(self.last_user_text, _hist)
         self.user_lang, self.user_lang_confident = self.lang_decision
+        # 当前语气（每轮读一次，终答轮指令要用；SOUL.md 很小，避免每次调用重读）
+        self._tone = ""
+        try:
+            from agent.prompt_build import current_tone
+            self._tone = current_tone()
+        except Exception:
+            pass
+        # Loop 三缺口（2026-09-29）：预算守卫 / 硬升级 的每轮状态
+        self._budget_wrapped = False      # 预算守卫是否已触发过收口
+        self._fail_sigs: dict[str, int] = {}   # "工具|错误摘要" → 连续失败次数
+        self._escalated = False           # 硬升级每轮只触发一次
         self._lang_retried = False   # 语言漂移早退：每轮只允许重试一次（2026-09-23）
         self.steps = 0
         self.native_tools = False
@@ -858,7 +939,7 @@ class ThinAgentLoop:
             # 空正文/仍发工具调用的兜底不变：先用尾部提醒重采一次，仍空则退回
             # _collect_finalize_data 直接交付数据（见收口轮交付分支）。
             body["messages"] = _append_tail_note(
-                body["messages"], _finalize_tail_directive(self.user_lang))
+                body["messages"], _finalize_tail_directive(self.user_lang, self._tone))
             body["parallel_tool_calls"] = False
             body["chat_template_kwargs"] = {"enable_thinking": False}
         if _is_custom_engine():
@@ -1090,6 +1171,29 @@ class ThinAgentLoop:
             logger.info("thin loop: 重复同参调用提醒 (%s ×3)", fname)
             return True
         return False
+
+    def _note_tool_failure(self, tool_name: str, result: str) -> dict | None:
+        """同一工具以同一错误连续失败 ≥3 次 → 返回 {n, err}（调用方交回用户）。
+
+        2026-09-29 补（硬升级出口）。与 `_stagnation_gate` 分工：那个基于**调用签名**
+        （同参空转，不管成败），这个只看**失败**——参数换着花样但每次都以同样错误
+        撞墙（ak_finance 的东财拒连、mx_query 的额度耗尽）同样是没有进展，而签名
+        一直在变，旧闸门抓不到。错误摘要取前 80 字去噪（数字/时间戳不参与签名）。
+        """
+        if "Error" not in result[:200] and "⛔" not in result[:200]:
+            return None
+        # 闸门回复不算"工具失败"（2026-09-29 实测）：重复调用守卫回的是
+        # 「⛔ 该调用与此前已成功执行的调用完全相同…已拒绝重复执行」。若计入失败，
+        # 正常的"重复被拒 → 模型换路"流程会在第 3 次被误升级打断（场景测试抓到）。
+        if "已拒绝重复执行" in result[:200]:
+            return None
+        err_head = re.sub(r"\d+", "#", result[:80])
+        sig = f"{tool_name}|{err_head}"
+        self._fail_sigs[sig] = self._fail_sigs.get(sig, 0) + 1
+        if self._fail_sigs[sig] >= 3 and not self._escalated:
+            self._escalated = True
+            return {"n": self._fail_sigs[sig], "err": result[:80].split("\n")[0]}
+        return None
 
     def _maybe_quota_hint(self, result: str) -> None:
         """工具结果命中"当日额度已用尽" → 本轮注入一次提示（每 turn 一次）。
@@ -1423,6 +1527,35 @@ class ThinAgentLoop:
                     self._plan_injected = True
 
                 engine_model = self._engine_model()
+                # 预算守卫（2026-09-29，Loop 三缺口之二）：本轮累计输入 token 越线 →
+                # 先赶进终答轮（模型自己收口，比硬停体验好）；终答轮后仍越线 → 停手交付。
+                # 0 = 关闭（默认 400k，可用 LATIAO_TURN_TOKEN_BUDGET 覆盖；本地长文档
+                # 分析正常量级在 100–200k，云端按调用计费时这个守卫更值钱）。
+                _budget = _turn_token_budget()
+                if _budget:
+                    _used = _turn_input_tokens(self.session_id)
+                    if _used > _budget:
+                        if not self._finalize_round:
+                            self._finalize_round = True
+                            self._budget_wrapped = True
+                            if self.steps >= self.max_steps:
+                                self.steps = self.max_steps - 1
+                            self._step_log("预算守卫",
+                                           f"本轮输入 {_used} > 预算 {_budget} → 强制收口")
+                            self.current_msgs.append(_note_msg(_msg(
+                                "budget_wrap_now", self.user_lang,
+                                used=f"{_used:,}", budget=f"{_budget:,}")))
+                            continue
+                        if self._budget_wrapped:
+                            self._step_log("预算守卫", f"收口后仍越线（{_used}）→ 停手交付")
+                            yield {"content": "\n\n" + _msg(
+                                "budget_exhausted", self.user_lang,
+                                used=f"{_used:,}", budget=f"{_budget:,}")}
+                            return
+                # 工具输出回收：每轮请求前把较早的大块工具结果折成一行（幂等）
+                _folded_n = _fold_old_tool_results(self.current_msgs)
+                if _folded_n:
+                    self._step_log("工具输出回收", f"折叠 {_folded_n} 条旧工具结果")
                 body = self._build_request(engine_model)
                 tools_n = len(body.get("tools") or [])
                 chars = sum(len(str(m.get("content") or "")) for m in body.get("messages", []))
@@ -1687,7 +1820,7 @@ class ThinAgentLoop:
                             # 追加为**尾部用户消息**：system 角色会改提示头 → 缓存全丢
                             self.current_msgs.append({
                                 "role": "user",
-                                "content": _finalize_tail_directive(self.user_lang)})
+                                "content": _finalize_tail_directive(self.user_lang, self._tone)})
                             self._step_log("终答轮", "空生成 → 温度抖动重采（一次）")
                             yield {"event": "heartbeat"}
                             continue
@@ -1927,6 +2060,16 @@ class ThinAgentLoop:
                                                f"摘要: {_res[:80]!r}")
                     for evt in events:
                         yield evt
+                    # 硬升级（2026-09-29，Loop 三缺口之三）：同一工具以**同一错误**
+                    # 连续失败 ≥3 次 → 不再空转，把"试过什么、卡在哪"交回用户。
+                    # 与重复调用守卫分工：那个管"相同参数成功过还再调"，这个管"反复失败"。
+                    _esc = self._note_tool_failure(tname, _res)
+                    if _esc is not None:
+                        self._step_log("硬升级", f"{tname} 同错失败 {_esc['n']} 次 → 交回用户")
+                        yield {"content": "\n\n" + _msg(
+                            "stuck_escalation", self.user_lang,
+                            tool=tname, n=_esc["n"], err=_esc["err"])}
+                        return
                     # use_skill 联动：加载技能时，该技能声明的依赖工具并入
                     # 会话集合（技能承诺的能力必须在场——mx-data → mx_query）
                     if tname == "use_skill":

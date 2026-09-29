@@ -165,6 +165,24 @@ def _append_tail_to_content(content, tail: str):
     return str(content or "") + tail
 
 
+def current_tone() -> str:
+    """当前语气（SOUL.md 的 `- 对话语气：X`）——终答轮指令复用（2026-09-29）。
+
+    动因：表格型长回答（大盘分析）里语气会漂回中性平铺——抽样实测，同模型
+    同一天的两次回答一次带语气一次不带。头部身份块 + 尾部提醒已经做了，但
+    终答轮（收口强制作答）走的是另一条尾部指令，此前没有语气信息。抽成函数
+    供 loop 复用，避免"解析出现在两个地方、口径可能不一致"。
+    """
+    try:
+        for _m in _read_identity():
+            if (_m.get("file") or "") == "SOUL.md":
+                _tm = re.search(r"^-\s*对话语气：\s*(.+?)\s*$", _m.get("content") or "", re.M)
+                return _tm.group(1).strip() if _tm else ""
+    except Exception:
+        pass
+    return ""
+
+
 def _build_chat_messages(body: dict, messages: list) -> list:
     # AGENT_PROFILES 归 agent_loop（枢纽）所有；此处惰性取用，避免复制第二份数据
     from agent_loop import _get_agent_config
@@ -294,7 +312,10 @@ def _build_chat_messages(body: dict, messages: list) -> list:
             "把两者各自的值与时点都写出来，不要混用、不要取平均。"
             "工具结果里的『当前』快照行与『日线/历史』行是两个口径，引用时写明用的是哪一段、不得混用；"
             "查不到的字段必须写「未查询到该日数据」，**禁止填 “—” 或留空**。"
-            "美股点位**禁止**引用新浪 int_ 接口数字（那是冻结快照）；一律用 ak_finance 的日线/gb_ 实时。\n"
+            "美股点位**禁止**引用新浪 int_ 接口数字（那是冻结快照）；一律用 ak_finance 的日线/gb_ 实时。"
+            "**链接必须实测**：给出任何 URL（文章/项目/文档）前，先确认它真的指向你声称的东西——"
+            "标题与内容对不上、或只是在正文里看到过就照抄，都属于编造（实测事故：一篇讲 A 项目的文章"
+            "末尾给出的地址指向完全无关的项目；读者照着走会白忙）。无法确认就写「链接未核实」或干脆不给。\n"
             "4. 🔔 承诺闸门：凡说「到点提醒你 / 收盘叫你 / 晚点通知 / 我守着」这类未来动作，"
             "**必须当轮调用 create_cron** 建好定时任务再承诺；建不了就明说「我没法定时提醒你」。"
             "**禁止**只在嘴上承诺而不建任务（曾有「收盘叫你」却 cron.json 为空的事故）。\n"
@@ -321,7 +342,10 @@ def _build_chat_messages(body: dict, messages: list) -> list:
             "A tool result's \"current\" snapshot row and its daily/history rows are different measures — "
             "never mix them, and say which one you quote. Any field you could not fetch must be written as "
             "\"no data retrieved for that day\" — never as \"—\" or blank. "
-            "Never cite Sina int_* US quotes (frozen snapshot) — use ak_finance daily/gb_ realtime only.\n"
+            "Never cite Sina int_* US quotes (frozen snapshot) — use ak_finance daily/gb_ realtime only. "
+            "**Verify every link you give**: before quoting a URL (article/project/doc), confirm it actually "
+            "points at what you claim — a title that doesn't match, or a URL merely seen in passing, is "
+            "fabrication; if you cannot confirm it, say \"link unverified\" or omit it.\n"
             "4. 🔔 Promise gate: any future action you promise (\"I'll remind you at close\", \"ping you later\") "
             "MUST be backed by a create_cron call in THIS turn; if you cannot schedule it, say so explicitly. "
             "Never promise without creating the task.\n"
@@ -344,7 +368,10 @@ def _build_chat_messages(body: dict, messages: list) -> list:
             "出してはいけません。二つの出典が食い違う場合は、混ぜたり平均したりせず、両方の値と時点を併記してください。"
             "ツール結果の「現在」スナップショット行と「日足/履歴」行は別の口径です——混ぜず、どちらを引用したか明記してください。"
             "取得できなかった項目は「その日のデータは未取得」と明記し、**「—」や空欄で済ませないこと**。"
-            "米国株の点位に新浪 int_ 系の数値（凍結スナップショット）を**引用禁止**。ak_finance の日足/gb_ 実時のみ使う。\n"
+            "米国株の点位に新浪 int_ 系の数値（凍結スナップショット）を**引用禁止**。ak_finance の日足/gb_ 実時のみ使う。"
+            "**リンクは必ず実測**：URL（記事・プロジェクト・文書）を出す前に、それが本当に主張どおりの"
+            "場所を指すか確認すること。タイトル不一致、本文で見かけただけの URL は捏造と同じ。"
+            "確認できなければ「リンク未確認」と書くか出さない。\n"
             "4. 🔔 約束ゲート：「終値になったら知らせる／あとで通知する／見守る」など将来の動作を"
             "約束するなら、**その場で create_cron を呼んでタスクを実際に作ること**。作れないなら"
             "「時間どおりに通知できません」と明言する。**タスクを作らず口だけの約束は禁止。**\n"
@@ -370,7 +397,11 @@ def _build_chat_messages(body: dict, messages: list) -> list:
             "не смешивай их и указывай, какую цитируешь. Поле, которое не удалось получить, пиши как "
             "«данные за этот день не получены», а не «—» и не пустым. "
             "Никогда не цитируй котировки США из新浪 int_* (замороженный снимок) — только ak_finance "
-            "(дневные свечи / gb_ в реальном времени).\n"
+            "(дневные свечи / gb_ в реальном времени). "
+            "**Проверяй каждую ссылку**: прежде чем давать URL (статья/проект/документация), убедись, "
+            "что он действительно ведёт туда, куда ты утверждаешь; несовпадающий заголовок или URL, "
+            "просто увиденный в тексте, — это выдумка. Не можешь подтвердить — напиши «ссылка не проверена» "
+            "или не давай её.\n"
             "4. 🔔 Шлюз обещаний: любое обещание будущего действия («напомню к закрытию», «позже сообщу») "
             "ОБЯЗАНО в этот же ход создать задачу через create_cron; если не можешь — так и скажи. "
             "Не обещай, не создав задачу.\n"
@@ -388,13 +419,8 @@ def _build_chat_messages(body: dict, messages: list) -> list:
     # ②每轮尾注提醒。实测动因：语气行位于系统提示 64% 深处、其后还压着技能目录与
     # 交付纪律，而最后一条用户消息不含任何语气信息 → 模型"忘记语气、平铺直叙，
     # 你提醒一句才照做"。本地模型对最近的文字权重最高，所以要在尾部也说一次。
-    _tone = ""
-    for _m in user_identity:
-        if (_m.get("file") or "") == "SOUL.md":
-            _tm = re.search(r"^-\s*对话语气：\s*(.+?)\s*$", _m.get("content") or "", re.M)
-            if _tm:
-                _tone = _tm.group(1).strip()
-            break
+    # 2026-09-29：解析抽到 current_tone()，终答轮（另一条尾部指令）也复用它。
+    _tone = current_tone()
     if user_identity:
         _hdr_suffix = f"｜当前语气：{_tone}" if _tone else ""
         _add_part("system_prompt", _get_localized_text(user_lang, {

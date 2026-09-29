@@ -253,3 +253,46 @@ def test_language_requirement_follows_user_language(monkeypatch, tmp_path):
     out = PB._build_chat_messages(body, list(body["messages"]))
     tail = _tail_of(out)
     assert "English" in tail and "简体中文" not in tail, f"英文用户不该被要求中文：{tail[-160:]!r}"
+
+
+class TestLinkVerificationRule(unittest.TestCase):
+    """链接实测规则（2026-09-29）：实测事故——一篇讲 A 项目的文章末尾地址指向
+    完全无关的项目（Tencent/WeKnora），读者照着走白忙。四语硬规则都要有。"""
+
+    def test_all_langs_have_link_rule(self):
+        cases = [
+            ("读取这个文件", "链接必须实测"),
+            ("read this file for me", "Verify every link"),
+            ("このファイルを読んで", "リンクは必ず実測"),
+            ("прочитай этот файл", "Проверяй каждую ссылку"),
+        ]
+        for text, marker in cases:
+            body = {"messages": [{"role": "user", "content": text}]}
+            sys_content = _build_chat_messages(body, body["messages"])[0]["content"]
+            self.assertIn(marker, sys_content, f"{text!r} 的硬规则缺少链接实测条款")
+
+
+class TestFinalizeToneInjection(unittest.TestCase):
+    """终答轮指令带语气（2026-09-29）：表格型长回答漂回中性——抽样实测同模型同一天
+    一次带语气一次不带。头部身份块与每轮尾注都盖不到终答轮这条尾部指令。"""
+
+    def test_tone_appended_when_present(self):
+        from agent.loop import _finalize_tail_directive
+        out = _finalize_tail_directive("zh", "暧昧露骨")
+        self.assertIn("收尾", out)
+        self.assertIn("暧昧露骨", out)
+        self.assertLess(out.index("收尾"), out.index("暧昧露骨"), "语气行应在收口令之后同一尾部")
+
+    def test_no_tone_no_extra_line(self):
+        from agent.loop import _finalize_tail_directive
+        self.assertEqual(_finalize_tail_directive("zh", ""), _finalize_tail_directive("zh"))
+
+    def test_tone_line_localized(self):
+        from agent.loop import _finalize_tail_directive
+        for lang, marker in (("en", "Tone for this reply"), ("ja", "トーン"), ("ru", "Тон")):
+            self.assertIn(marker, _finalize_tail_directive(lang, "x"),
+                          f"{lang} 语气行未本地化")
+
+    def test_current_tone_reads_soul(self):
+        from agent.prompt_build import current_tone
+        self.assertIsInstance(current_tone(), str)

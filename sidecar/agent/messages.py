@@ -85,6 +85,28 @@ MESSAGES: dict[str, dict[str, str]] = {
         "ru": "… (промежуточные заметки этого раунда; скрыто {n} символов)",
     },
     # ── 循环自保 ──
+    # 预算守卫（2026-09-29）：本轮累计输入 token 越线——先把模型赶进终答轮，
+    # 再越线就停手交付，不让长循环无声烧完 token。
+    "budget_wrap_now": {
+        "zh": "💸 本轮已用 {used} 输入 token（预算 {budget}）：请立刻基于已收集的数据写出最终答案，不要再调用任何工具。",
+        "en": "💸 {used} input tokens used this turn (budget {budget}): write the final answer now from the data you have — no more tool calls.",
+        "ja": "💸 今回の入力トークンは {used}（予算 {budget}）：今すぐ収集済みデータで最終回答を書き、ツールは呼ばないでください。",
+        "ru": "💸 Израсходовано {used} входных токенов (бюджет {budget}): напишите финальный ответ по собранным данным, без вызовов инструментов.",
+    },
+    "budget_exhausted": {
+        "zh": "⚠️ 本轮累计输入已达 {used} token（预算 {budget}），已停止继续调用工具。以上为已收集到的内容；需要继续请发新消息。",
+        "en": "⚠️ This turn reached {used} input tokens (budget {budget}); tool calls have stopped. Above is what was collected — send a new message to continue.",
+        "ja": "⚠️ 今回の入力が {used} トークンに達しました（予算 {budget}）。ツール呼び出しは停止しました。続けるには新しいメッセージを送ってください。",
+        "ru": "⚠️ В этом ходе достигнуто {used} входных токенов (бюджет {budget}); вызовы инструментов остановлены. Отправьте новое сообщение, чтобы продолжить.",
+    },
+    # 硬升级（2026-09-29）：同一工具以同一错误连续失败 ≥N 次——不再空转，
+    # 把"试过什么、卡在哪"交回给用户（Loop 三缺口的最后一件）。
+    "stuck_escalation": {
+        "zh": "⚠️ 工具 `{tool}` 连续 {n} 次以相同错误失败（{err}），已停止重试并把问题交回给你。\n已收集的内容在上面；可以换个思路、提供更具体的输入，或改用云端模型再试。",
+        "en": "⚠️ The tool `{tool}` failed {n} times with the same error ({err}); retries have stopped and the problem is handed back to you.\nWhat was collected is above — try a different angle, give more specific input, or retry with a cloud model.",
+        "ja": "⚠️ ツール `{tool}` が同じエラー（{err}）で {n} 回連続失敗しました。再試行を止め、ここであなたに戻します。\n収集済みの内容は上にあります。別の方法や、より具体的な入力、クラウドモデルをお試しください。",
+        "ru": "⚠️ Инструмент `{tool}` {n} раз подряд завершился одной и той же ошибкой ({err}); повторы остановлены, вопрос возвращается к вам.\nСобранное — выше; попробуйте другой подход, дайте более конкретные входные данные или облачную модель.",
+    },
     "max_steps": {
         "zh": "⚠️ 已达安全步数上限（{n}）。请发送新消息继续。",
         "en": "⚠️ Safety step limit reached ({n}). Send a new message to continue.",

@@ -172,6 +172,7 @@ def _session(session_id: str) -> dict:
         "ttft_samples": [],      # 本轮每步的首 token 延迟（秒）
         "gen_tokens": 0,         # 本轮生成的 completion token 数
         "gen_seconds": 0.0,      # 扣除首 token 等待后的生成耗时
+        "turn_input_tokens": 0,  # 本轮**累计**输入 token（每步相加，供预算守卫用）
     })
 
 
@@ -182,7 +183,8 @@ def begin_turn(session_id: str) -> None:
     with _lock:
         sess = _session(session_id)
         sess.update(steps=0, llm_seconds=0.0, tool_seconds=0.0,
-                    ttft_samples=[], gen_tokens=0, gen_seconds=0.0)
+                    ttft_samples=[], gen_tokens=0, gen_seconds=0.0,
+                    turn_input_tokens=0)
 
 
 def record_step(session_id: str, seconds: float, ttft: float | None = None) -> None:
@@ -414,6 +416,10 @@ def record_usage(session_id: str, usage: dict | None = None, timings: dict | Non
         sess = _session(session_id)
         if prompt_tokens:
             sess["real_prompt_tokens"] = prompt_tokens
+            # 预算守卫（2026-09-29）：**累计**输入（每步的 prompt 都算，长循环里
+            # 每轮都会重发全部历史，所以这是真实的量级）；real_prompt_tokens 仍是
+            # "最后一次快照"，两个口径各司其职。
+            sess["turn_input_tokens"] = int(sess.get("turn_input_tokens") or 0) + prompt_tokens
         if completion_tokens:
             sess["gen_tokens"] += completion_tokens
         if rate is not None:
