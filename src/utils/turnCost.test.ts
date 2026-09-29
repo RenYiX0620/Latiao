@@ -72,4 +72,20 @@ describe("本轮花费展示（成本可见）", () => {
   it("by_source 缺省（旧后端）→ 不给来源行，不炸", () => {
     expect(turnCostView(base, fmt, t)!.sources).toBeNull();
   });
+
+  it("有子代理开销 → 输入行注明不含子代理（预算口径）", () => {
+    const v = turnCostView({ ...base, by_source: {
+      main_turn: { requests: 1, input_tokens: 12000, output_tokens: 300 },
+      subagent: { requests: 2, input_tokens: 3000, output_tokens: 100 },
+    } }, fmt, t)!;
+    expect(v.input).toContain("128000 / 400000（32%）");
+    expect(v.input).toContain("（不含子代理）");
+  });
+
+  it("没有子代理开销 → 输入行不加提示（不制造噪音）", () => {
+    const v = turnCostView({ ...base, by_source: {
+      main_turn: { requests: 1, input_tokens: 12000, output_tokens: 300 },
+    } }, fmt, t)!;
+    expect(v.input).not.toContain("不含子代理");
+  });
 });

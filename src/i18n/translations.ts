@@ -209,6 +209,9 @@ const T: Record<string, Record<Lang, string>> = {
   // 来源归因（2026-09-29，ZCode 的 query_source 对照）：子代理在自己的会话里记账，
   // 父会话靠 credit_parent 才能看见"这轮有多少花在子代理上"
   "chat.ctx_turn_sources": { zh: "来源", en: "Sources", ja: "内訳", ru: "Источники" },
+  // 预算口径提示：子代理的开销只进「来源」不进预算（审计 2026-09-29：同屏两个数字
+  // 口径不一致会误导，明说）
+  "chat.ctx_turn_input_excl_sub": { zh: "（不含子代理）", en: " (excl. sub-agents)", ja: "（サブエージェント除く）", ru: " (без субагентов)" },
   "chat.ctx_src_main": { zh: "主循环 {tok}", en: "main {tok}", ja: "メイン {tok}", ru: "осн. {tok}" },
   "chat.ctx_src_subagent": { zh: "子代理 {tok}（{n} 次）", en: "sub-agent {tok} ({n})", ja: "サブエージェント {tok}（{n} 回）", ru: "субагент {tok} ({n})" },
   "chat.ctx_src_refine": { zh: "知识提炼 {tok}（{n} 次）", en: "refine {tok} ({n})", ja: "知識抽出 {tok}（{n} 回）", ru: "извлечение {tok} ({n})" },

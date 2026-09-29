@@ -93,6 +93,12 @@ async def execute_tool(tool_name: str, arguments: dict) -> str:
     # ── Feedback subsystem: post-execution verification ──
     return _append_run_outcome(tool_name, result, arguments)
 
+# 失败文案的"开头形态"（我们自己的约定）：⛔/❌ 是工具层的失败标记
+_FAIL_PREFIXES = ("Error", "错误", "⛔", "❌")
+# 中文失败句的首词（只认"首行就是失败句"，不做整段子串搜索）
+_FAIL_LINE_PREFIXES = ("未找到", "不存在", "权限不足", "失败", "无法", "不支持")
+
+
 def _looks_like_tool_failure(result: str) -> bool:
     """工具结果是否表示失败（**唯一判据**，2026-09-29 抽出一份）。
 
@@ -100,15 +106,34 @@ def _looks_like_tool_failure(result: str) -> bool:
     "Error" 也无 "⛔"。同错升级的扫描曾自带一份只认英文的判据，于是中文报错的工具
     永远不会被计成失败（受控实测 + 故障注入测试抓到）。这里含中文形态，与
     verify_failed 同源；`_scan_tool_failures` 也复用本函数，避免再次漂移。
+
+    2026-09-29 审计收紧（原实现是"头 200 字里含 不存在/未找到/权限不足 即失败"，
+    实证误判过两类**成功**结果）：读到含这些词的源码、搜索恰好命中这些词
+    （如 tavily 的「🔍 …未找到相关结果。」）都被判成失败 → 计数进同错升级。
+    现在只认**首行的失败句形状**（首行短且以失败词开头）+ 我们的失败前缀 + 结构化
+    `{"status":"error"}`。真失败文案（错误：/⛔/❌/未找到…开头 / adapters 的 dict）
+    全部仍被判定（`test_tool_failure_judge.py` 逐条钉住）。
     """
     r = str(result or "")
+    if not r:
+        return False
     head = r[:200]
-    lower = r.lower()
-    return bool(
-        head.startswith(("Error", "错误", "⛔"))
-        or "permission denied" in lower
-        or "权限不足" in head or "不存在" in head or "未找到" in head
-    )
+    first = (head.splitlines() or [""])[0].strip()
+    if first.startswith(_FAIL_PREFIXES):
+        return True
+    if "permission denied" in head.lower():
+        return True
+    if 0 < len(first) <= 60 and first.startswith(_FAIL_LINE_PREFIXES):
+        return True
+    # adapters 等把结构化结果文本化后以 { 开头（只有 status=error 才算失败）
+    if r.lstrip().startswith("{") and '"status"' in head:
+        try:
+            d = json.loads(r[:4000])
+            if isinstance(d, dict) and str(d.get("status") or "") == "error":
+                return True
+        except Exception:
+            pass
+    return False
 
 
 async def _handle_tool_execution(tc: dict, current_msgs: list, session_id: str,

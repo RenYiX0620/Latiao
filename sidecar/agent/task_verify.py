@@ -17,6 +17,10 @@
 - 本轮**删掉/清空**测试文件 → `hard`（立即交回用户，不给重采机会）；
 - 本轮**改写**测试文件且同轮先红后绿 → `soft`（可能真是测试写错了，允许解释一次）。
 
+2026-09-29 审计订正（hard 判据误杀过三种正常操作）：删除只看**删除命令段**的实参
+（`rm -rf build/ && pytest tests/` 里的 `tests/` 是 pytest 参数）、`mv` 不算删除、
+"清空"只认测试**文件名**（`tests/__init__.py` 这类占位文件不在内）。
+
 两级生效（本模块只给判定，策略在调用方 `agent/loop.py`）：
 第一次未达标 → 尾部消息要求补齐或如实说明（重采一次）；第二次仍不过 → 交回用户。
 `hard` 直接交回。
@@ -41,13 +45,19 @@ _TEST_CMD_RE = re.compile(
     r"|npm\s+(run\s+)?test|pnpm\s+(run\s+)?test|yarn\s+(run\s+)?test"
     r"|cargo\s+test|go\s+test|make\s+test|dotnet\s+test|mvn\s+test)\b")
 
-# 测试文件路径（反作弊的"被验对象"）
-_TEST_PATH_RE = re.compile(
-    r"(^|/)(tests?/|conftest\.py$|test_[^/]*\.[a-z]+$|[^/]*_test\.[a-z]+$"
+# 测试**文件**（反作弊的"被验对象"）：按文件名认，不看它在哪个目录——
+# "tests/ 下的任意文件"会把 tests/__init__.py 这种占位文件也算进来（误杀，实证）
+_TEST_FILE_RE = re.compile(
+    r"(^|/)(conftest\.py$|test_[^/]*\.[a-z]+$|[^/]*_test\.[a-z]+$"
     r"|[^/]*\.(test|spec)\.[jt]sx?$|[^/]*\.feature$)")
 
-# 删除/清空测试文件
-_RM_RE = re.compile(r"(^|[;&|]\s*)(rm|del|trash|mv)\s")
+# 测试**路径**：目录或文件（用于"改测试文件且先红后绿"的软怀疑面）
+_TEST_PATH_RE = re.compile(r"(^|/)(tests?|__tests__)/")
+
+# 删除动作：只认真正的删除命令（mv 是移动/备份，不是删除——实证误杀过），
+# 且只在**命令段**里看实参（`rm -rf build/ && pytest tests/` 里的 tests/ 是 pytest
+# 的参数，不是删除目标——这也是实证误杀）
+_RM_CMDS = {"rm", "del", "trash"}
 
 # 正文里的"完成"宣称（只在"测试是红的"这一条上用作对照）
 _CLAIM_DONE_RE = re.compile(
@@ -108,8 +118,44 @@ def _cmd_of(args: dict) -> str:
     return str(args.get("command") or args.get("cmd") or args.get("script") or "")
 
 
+def _is_test_file(p: str) -> bool:
+    return bool(_TEST_FILE_RE.search(str(p or "").replace("\\", "/")))
+
+
 def _is_test_path(p: str) -> bool:
-    return bool(_TEST_PATH_RE.search(str(p or "").replace("\\", "/")))
+    """测试文件或测试目录（删掉整个 tests/ 也算动了被验对象）。"""
+    q = str(p or "").replace("\\", "/")
+    return bool(_TEST_FILE_RE.search(q) or _TEST_PATH_RE.search(q))
+
+
+def _rm_targets(cmd: str) -> list[str]:
+    """从命令里取出**删除命令的实参**（其余段的参数不算）。
+
+    例：`rm -rf tests/` → ["tests/"]；`rm -rf build/ && pytest tests/` → ["build/"]。
+    实现：按 && || ; | 换行切段 → 段内剥掉 env 赋值与 sudo → 首个 token 是删除命令
+    才收其余非选项 token（去引号）。
+    """
+    out: list[str] = []
+    for seg in re.split(r"&&|\|\||[;|\n]", str(cmd or "")):
+        try:
+            import shlex
+            toks = shlex.split(seg)
+        except Exception:
+            toks = seg.split()
+        i = 0
+        while i < len(toks) and ("=" in toks[i] and not toks[i].startswith("-")):
+            i += 1                      # FOO=bar cmd …（env 前缀）
+        while i < len(toks) and toks[i] in ("sudo", "command", "env", "nohup"):
+            i += 1
+        if i >= len(toks):
+            continue
+        if toks[i].rsplit("/", 1)[-1] not in _RM_CMDS:
+            continue
+        for t in toks[i + 1:]:
+            if t.startswith("-"):
+                continue
+            out.append(t.strip("\"'"))
+    return out
 
 
 def _exit_code(result: str) -> int | None:
@@ -142,10 +188,17 @@ def _structural_problem(fp: Path) -> str:
             json.loads(fp.read_text(encoding="utf-8"))
             return ""
         if suf == ".pdf":
-            raw = fp.read_bytes()
-            if not raw.startswith(b"%PDF"):
-                return "not a PDF (missing %PDF header)"
-            if b"%%EOF" not in raw[-2048:]:
+            # 审计（2026-09-29）：原来 read_bytes() 整文件进内存，而这是**每次交付**都跑
+            # 的检查——几百 MB 的 PDF 会有内存尖峰。只读头 1KB + 尾 2KB 足够判定。
+            size = fp.stat().st_size
+            with fp.open("rb") as fh:
+                head = fh.read(1024)
+                if not head.startswith(b"%PDF"):
+                    return "not a PDF (missing %PDF header)"
+                if size > len(head):
+                    fh.seek(max(0, size - 2048))
+                tail = fh.read()
+            if b"%%EOF" not in tail:
                 return "truncated PDF (missing %%EOF)"
             return ""
         # OOXML：docx/xlsx/pptx 都是 ZIP，且必须有 [Content_Types].xml
@@ -177,15 +230,17 @@ def verify(session_id: str, body_text: str) -> dict | None:
     runs = [e for e in led if e["tool"] == "run_cmd" and _TEST_CMD_RE.search(_cmd_of(e["args"]))]
 
     # ① 反作弊（hard）：本轮删掉/清空被验对象
+    #    - "清空"只认**测试文件**（写空 tests/__init__.py 是正常占位，实证误杀过）
+    #    - "删除"只看**删除命令自己的实参**（同一条命令里 pytest 的参数不算）
     for p, content in writes:
-        if _is_test_path(p) and not content.strip():
+        if _is_test_file(p) and not content.strip():
             return _verdict(False, "test_wiped", f"{p} emptied this turn", hard=True)
     for e in led:
-        cmd = _cmd_of(e["args"])
-        if e["tool"] == "run_cmd" and _RM_RE.search(cmd):
-            for tok in re.split(r"[\s\"']+", cmd):
-                if tok and _is_test_path(tok):
-                    return _verdict(False, "test_deleted", f"{tok} deleted this turn", hard=True)
+        if e["tool"] != "run_cmd":
+            continue
+        for tok in _rm_targets(_cmd_of(e["args"])):
+            if _is_test_path(tok):
+                return _verdict(False, "test_deleted", f"{tok} deleted this turn", hard=True)
 
     # ② 产物存在 + 结构下限
     for p, _content in writes:
@@ -222,7 +277,7 @@ def verify(session_id: str, body_text: str) -> dict | None:
 
     # ⑤ 反作弊（soft）：本轮改了测试文件、且同轮先红后绿（可能是放宽断言换绿）
     if len(runs) >= 2:
-        _mod_tests = [p for p, _c in writes if _is_test_path(p)]
+        _mod_tests = [p for p, _c in writes if _is_test_file(p)]
         if _mod_tests and any(_run_is_red(e["result"]) for e in runs[:-1]) \
                 and not _run_is_red(runs[-1]["result"]):
             return _verdict(False, "test_rewritten",

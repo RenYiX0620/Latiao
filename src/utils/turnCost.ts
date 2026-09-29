@@ -41,14 +41,19 @@ export function turnCostView(turn: TurnCostLike | null | undefined, fmt: Fmt, t:
   const nothingYet =
     !turn.input_tokens && !turn.retries && !turn.refine_calls && !turn.gen_tokens;
   if (nothingYet) return null;
+  const sub = turn.by_source?.["subagent"];
+  const subTok = sub ? (sub.input_tokens || 0) + (sub.output_tokens || 0) : 0;
+  // 子代理的开销只进「来源」桶、不进预算守卫（父提示词的量才是预算口径）——
+  // 有子代理开销时在输入行明说，避免同屏两个数字口径不一致（审计 2026-09-29）
+  const exclSub = subTok > 0 ? t("chat.ctx_turn_input_excl_sub") : "";
   return {
-    input: turn.budget
+    input: (turn.budget
       ? t("chat.ctx_turn_input_val", {
           used: fmt(turn.input_tokens),
           budget: fmt(turn.budget),
           pct: `${turn.budget_percent ?? 0}`,
         })
-      : t("chat.ctx_turn_input_nobudget", { used: fmt(turn.input_tokens) }),
+      : t("chat.ctx_turn_input_nobudget", { used: fmt(turn.input_tokens) })) + exclSub,
     cost: t("chat.ctx_turn_cost_val", {
       gen: fmt(turn.gen_tokens),
       retries: `${turn.retries}`,

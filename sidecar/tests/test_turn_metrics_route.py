@@ -56,16 +56,20 @@ def test_streaming_turn_writes_turn_metrics_row(client):
     # 单例换成真 wrapper（生产同款），桩就不会把请求吃在本地。
     _orig_engine = local_llm._engine
     local_llm._engine = local_llm.LocalLLMEngine()
-    with FakeEngine() as engine:
-        engine.push(_usage_round(1500, 25))
-        r = client.post("/v1/chat/completions", json={
-            "session_id": sid,
-            "messages": [{"role": "user", "content": "打个招呼"}],
-            "model": "fake-model", "stream": True,
-            "cloud_config": {"endpoint": _cloud_endpoint(engine.url),
-                             "model": "fake-model", "key": "k"},
-        }, headers={"X-Latiao-Token": "tm-route-token"})
-    local_llm._engine = _orig_engine
+    try:
+        with FakeEngine() as engine:
+            engine.push(_usage_round(1500, 25))
+            r = client.post("/v1/chat/completions", json={
+                "session_id": sid,
+                "messages": [{"role": "user", "content": "打个招呼"}],
+                "model": "fake-model", "stream": True,
+                "cloud_config": {"endpoint": _cloud_endpoint(engine.url),
+                                 "model": "fake-model", "key": "k"},
+            }, headers={"X-Latiao-Token": "tm-route-token"})
+    finally:
+        # 必须在 finally 还原：post 抛异常时否则会把单例泄漏给后续所有模块
+        # （2026-09-29 审计：这正是我刚在 test_app_flow 修掉的那类泄漏）
+        local_llm._engine = _orig_engine
     assert r.status_code == 200, r.text[:300]
     assert len(engine.requests) == 1, \
         f"桩引擎必须真收到一次请求｜url={engine.url}｜SSE={r.text[:200]}"

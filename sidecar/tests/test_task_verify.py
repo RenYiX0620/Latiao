@@ -149,6 +149,54 @@ def test_wiping_test_file_is_hard(tmp_path):
     assert v and not v["ok"] and v["hard"] and v["kind"] == "test_wiped", v
 
 
+# ── 审计回归（2026-09-29）：hard 判据曾误杀三种**正常**操作 ──
+def test_cleanup_and_test_in_one_command_is_not_deletion():
+    """`rm -rf build/ && pytest tests/`：tests/ 是 pytest 的参数，不是删除目标。"""
+    task_verify.note_tool("s", "run_cmd",
+                          {"command": "rm -rf build/ && python -m pytest tests/ -q"}, "退出码: 0")
+    v = task_verify.verify("s", "已完成，测试全部通过。")
+    assert v and v["ok"], f"这条命令不是篡改测试：{v}"
+
+
+def test_moving_test_file_is_not_deletion():
+    """mv 是移动/备份（实证误杀过），不再算删除。"""
+    task_verify.note_tool("s", "run_cmd",
+                          {"command": "mv tests/test_a.py /tmp/test_a.py.bak"}, "退出码: 0")
+    v = task_verify.verify("s", "已完成。")
+    assert v and v["ok"], f"备份不是删除：{v}"
+
+
+def test_empty_placeholder_under_tests_is_not_wiping():
+    """写空 tests/__init__.py 是正常占位——"清空"只认测试**文件名**（不许判作弊）。
+
+    仍可能命中普通产物规则（空文件 → artifact_empty，soft）：那是如实描述，允许提示
+    一次；这里要钉的是"不再被当成篡改被硬拦"。
+    """
+    task_verify.note_tool("s", "write_file",
+                          {"path": "tests/__init__.py", "content": "   "}, "已写入")
+    v = task_verify.verify("s", "已完成。")
+    assert v is not None and v["kind"] != "test_wiped", f"占位文件被当成篡改：{v}"
+    assert not (v and v["hard"]), f"占位文件不该硬拦：{v}"
+
+
+def test_deletion_still_hard_in_hard_forms():
+    """真作弊的各种写法仍必须拦（含 env 前缀、sudo、引号、整目录）。"""
+    for cmd in ('rm tests/test_a.py', 'rm -rf tests/', 'FOO=1 sudo rm -f "tests/test_b.py"',
+                'cd /repo && rm ./tests/test_c.py'):
+        task_verify.begin_turn("s")
+        task_verify.note_tool("s", "run_cmd", {"command": cmd}, "退出码: 0")
+        v = task_verify.verify("s", "已完成。")
+        assert v and not v["ok"] and v["hard"] and v["kind"] == "test_deleted", f"{cmd} → {v}"
+
+
+def test_emptying_real_test_file_still_hard():
+    task_verify.begin_turn("s")
+    task_verify.note_tool("s", "write_file",
+                          {"path": "tests/test_x.py", "content": "  "}, "已写入")
+    v = task_verify.verify("s", "已修好。")
+    assert v and not v["ok"] and v["hard"] and v["kind"] == "test_wiped", v
+
+
 def test_rewriting_test_and_red_to_green_is_soft(tmp_path):
     """改测试 + 同轮先红后绿 → soft（可能真是测试写错，允许解释一次）。"""
     p = tmp_path / "tests" / "test_b.py"
