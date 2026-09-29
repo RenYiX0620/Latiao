@@ -78,6 +78,16 @@ import collections as _collections
 _recently_confirmed: "_collections.deque[str]" = _collections.deque(maxlen=200)
 
 
+def _record_turn_metrics(session_id: str, model: str, is_local: bool, reason: str) -> None:
+    """每轮指标落库的唯一入口（SSE 层与非流式分支共用，失败只记日志）。"""
+    try:
+        import turn_metrics
+        turn_metrics.record_turn(session_id, model=model, is_local=is_local,
+                                 ended_reason=reason)
+    except Exception:
+        logger.debug("turn_metrics 落库失败", exc_info=True)
+
+
 async def _logged_agent_turn(session_id: str, messages: list, inner,
                               model: str = "", is_local: bool = False):
     """阶段 1/2a 接线：turn 边界事件 + 相位状态机（灰度，见 session_log.py）。
@@ -129,12 +139,7 @@ async def _logged_agent_turn(session_id: str, messages: list, inner,
                 logger.warning("failed to end turn state for %s", session_id, exc_info=True)
         # 每轮指标落库（2026-09-29，ZCode 对照后的增补）：与 turn/end 同源，
         # 一行一轮、失败只记日志（记账绝不能影响回合结束）
-        try:
-            import turn_metrics
-            turn_metrics.record_turn(session_id, model=model, is_local=is_local,
-                                     ended_reason=reason)
-        except Exception:
-            logger.debug("turn_metrics 落库失败", exc_info=True)
+        _record_turn_metrics(session_id, model, is_local, reason)
 
 
 def _get_cloud_model_names() -> list[dict]:
@@ -559,8 +564,12 @@ async def chat_completion(request: Request):
                     break  # Done
         except Exception as e:
             logger.error("Non-streaming agent loop error: %s", e)
+            _record_turn_metrics(session_id, model, is_local, "error")
             return JSONResponse({"error": f"Agent 循环错误: {e}"}, status_code=500)
 
+        # 每轮指标落库（审计⑤，2026-09-29）：非流式分支（Tauri HTTP 插件）不经过
+        # `_logged_agent_turn`，此前整体不落库 → 那部分轮次在历史里缺失
+        _record_turn_metrics(session_id, model, is_local, "completed")
         if not full_content:
             # Model may return empty when context is too long or only thinking tokens
             logger.warning("Non-streaming agent loop: model returned empty content, tool_count=%d", tool_count)

@@ -11,7 +11,9 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -102,3 +104,71 @@ def test_route_does_not_500_when_engine_errors(client):
     rows = [x for x in tm.list_turns(sid, limit=5) if x["session_id"] == sid]
     assert rows, "失败回合同样要留痕（否则'哪轮最贵/最慢'会漏掉失败轮）"
     assert json.loads(json.dumps(rows[0]["by_source"])) is not None
+
+# ── 审计⑤：非流式分支（Tauri HTTP 插件）也要落库 ──
+class _JsonEngine(BaseHTTPRequestHandler):
+    """非流式引擎桩：返回 chat.completion JSON（不是 SSE）。
+
+    刻意不复用 FakeEngine：它一律回 SSE，而"改造成支持非流式"会波及所有用它的用例。
+    """
+
+    calls = 0
+
+    def do_POST(self):                                    # noqa: N802
+        _JsonEngine.calls += 1
+        n = int(self.headers.get("Content-Length") or 0)
+        self.rfile.read(n)
+        body = json.dumps({
+            "id": "cmpl-stub", "object": "chat.completion", "created": 0, "model": "fake-model",
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": "你好，这是非流式回答。"}}],
+            "usage": {"prompt_tokens": 800, "completion_tokens": 18},
+        }).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *a):                            # 静音
+        pass
+
+
+def test_non_streaming_branch_writes_turn_metrics(client):
+    """`stream: false`（Tauri HTTP 插件的路径）此前整体不落库 → 历史里缺这段。"""
+    import turn_metrics as tm
+    _JsonEngine.calls = 0
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _JsonEngine)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    sid = f"tm-ns-{time.time_ns()}"
+    try:
+        r = client.post("/v1/chat/completions", json={
+            "session_id": sid,
+            "messages": [{"role": "user", "content": "打个招呼"}],
+            "model": "fake-model", "stream": False,
+            "cloud_config": {"endpoint": base, "model": "fake-model", "key": "k"},
+        }, headers={"X-Latiao-Token": "tm-route-token"})
+    finally:
+        srv.shutdown()
+    assert _JsonEngine.calls == 1, "非流式分支必须真打到模型"
+    assert r.status_code == 200, r.text[:300]
+    rows = [x for x in tm.list_turns(sid, limit=5) if x["session_id"] == sid]
+    assert len(rows) == 1, f"非流式轮次也要留痕：{rows}"
+    assert rows[0]["ended_reason"] == "completed"
+    assert rows[0]["model"] == "fake-model"
+
+
+def test_non_streaming_branch_records_on_error(client):
+    """引擎不可达时同样留痕（reason=error），别让失败轮在历史里消失。"""
+    import turn_metrics as tm
+    sid = f"tm-ns-err-{time.time_ns()}"
+    r = client.post("/v1/chat/completions", json={
+        "session_id": sid,
+        "messages": [{"role": "user", "content": "打个招呼"}],
+        "model": "fake-model", "stream": False,
+        "cloud_config": {"endpoint": "http://127.0.0.1:1/v1", "model": "fake-model", "key": "k"},
+    }, headers={"X-Latiao-Token": "tm-route-token"})
+    assert r.status_code in (200, 500), r.text[:200]
+    rows = [x for x in tm.list_turns(sid, limit=5) if x["session_id"] == sid]
+    assert rows and rows[0]["ended_reason"] == "error", f"失败轮要留痕：{rows}"

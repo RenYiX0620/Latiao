@@ -163,3 +163,29 @@ async def test_warning_fires_once_per_turn(monkeypatch):
     sid, events, _engine = await _run_with_seeded_usage(monkeypatch, TEST_BUDGET, 850)
     shown = "".join(str(e.get("content") or "") for e in events)
     assert shown.count("已达预算的 85%") == 1
+
+# ── ④ 审计⑧⑨：一步越线要先提示；子代理归因与父会话归因同锁（不跨轮）──
+@pytest.mark.asyncio
+async def test_single_step_overshoot_still_warns(monkeypatch):
+    """一步直接从 80% 以下跳到 100% 以上：用户也要先看到缘由，而不是只被收口。"""
+    sid, events, _engine = await _run_with_seeded_usage(monkeypatch, TEST_BUDGET, 1500)
+    shown = "".join(str(e.get("content") or "") for e in events)
+    assert "已达预算的 150%" in shown, f"越线也要说明（pct 可>100%）：{shown[:300]!r}"
+
+
+@pytest.mark.asyncio
+async def test_subagent_credit_lands_in_same_turn():
+    """子代理开销与父会话本轮归因在同一把锁内完成（审计⑨：此前可能落到下一轮）。"""
+    import context_stats as cs
+    import time as _t
+    parent, sub = f"race-{_t.time_ns()}", f"race-{_t.time_ns()}:s"
+    cs.begin_turn(parent)
+    cs.record_usage(sub, {"prompt_tokens": 700, "completion_tokens": 30},
+                    source="subagent", parent_session_id=parent)
+    # 父会话立刻开新一轮：上一笔仍应留在**旧**轮（这里用"归因在 begin_turn 之前就完成"
+    # 来验证同一把锁：若竞态存在，credit 会落到新一轮）
+    got_before = cs.turn_cost(parent)["by_source"].get("subagent", {}).get("input_tokens")
+    assert got_before == 700, f"归因必须在本轮就已落账：{got_before}"
+    cs.begin_turn(parent)
+    after = cs.turn_cost(parent)["by_source"].get("subagent")
+    assert not after, f"新一轮来源桶应为空：{after}"

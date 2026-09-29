@@ -557,6 +557,35 @@ class TestLoopGaps:
         assert str(tool_msgs["c1"]).startswith(_FOLD_MARK), "读文件类该折"
         assert not str(tool_msgs["c2"]).startswith(_FOLD_MARK), "行情类 1200 字符不折"
 
+    # ── 审计③：恢复的历史里工具结果是 user 形态 `[工具结果] <name> …` ──
+    @staticmethod
+    def _restored(name, n_chars, fill="r"):
+        return {"role": "user",
+                "content": f"[工具结果] {name} {{\"p\":\"x\"}}\n" + fill * n_chars}
+
+    def test_restored_history_results_are_attributed_and_folded(self):
+        """前端保存/回灌的历史没有 role=tool——此前**一条都不折**、也拿不到分档。"""
+        from agent.loop import _fold_old_tool_results, _FOLD_MARK, _restored_tool_name
+        assert _restored_tool_name(self._restored("mx_query", 10)) == "mx_query"
+        assert _restored_tool_name({"role": "user", "content": "[工具结果] 这不是工具名"}) == ""
+        assert _restored_tool_name({"role": "user", "content": "普通消息"}) == ""
+
+        msgs = [{"role": "user", "content": "q"}]
+        msgs += [self._restored("read_file", 900, "r")]      # 可丢弃类 ≥700 → 折
+        msgs += [self._restored("mx_query", 900, "m")]       # 保久类 <2500 → 不折
+        msgs += [self._restored("read_file", 900, "r")]
+        for i in range(8):                                   # 补足保护窗
+            msgs += [self._restored("read_file", 900, "z"), {"role": "user", "content": "说"}]
+        # 候选共 10 条工具结果（前两条 + 8 条填充），保护窗 6 条 → 可折 4 条；
+        # 其中 mx_query 因 900 < 2500（保久类门槛）被豁免 → 实际折 3 条 read_file… 加第 2 条
+        n = _fold_old_tool_results(msgs, keep_recent=6)
+        folded = [str(m["content"]) for m in msgs if str(m.get("content", "")).startswith(_FOLD_MARK)]
+        assert n == 4, f"候选 10 条 - 保护 6 条 = 4 条可折（mx_query 被门槛豁免但占位）：{n}"
+        assert all("read_file" in f for f in folded), f"折叠标记必须写明工具名：{folded[:1]}"
+        assert not any("mx_query" in f for f in folded), "行情类 900 字符不该折（<2500）"
+        kept = [str(m["content"]) for m in msgs if "mx_query" in str(m.get("content", ""))[:20]]
+        assert kept and kept[0].startswith("[工具结果] mx_query"), "行情结果应原样保留"
+
     def test_fold_leaves_context_with_a_drop_segment(self):
         """50 轮长对话：回收造成上下文**下降段**（在压缩阈值兜底之前）。"""
         from agent.loop import _fold_old_tool_results

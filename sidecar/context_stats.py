@@ -531,6 +531,11 @@ def record_usage(session_id: str, usage: dict | None = None, timings: dict | Non
         if completion_tokens:
             sess["gen_tokens"] += completion_tokens
         _bump_source(sess, source, prompt_tokens, completion_tokens)
+        # 子代理归因放在**同一把锁内**（审计⑨）：此前在锁外单独再取一次锁，若父会话
+        # 的 begin_turn 正好插在中间，这笔开销会被记到下一轮。同一把锁内不会交错。
+        if str(source) == "subagent" and parent_session_id:
+            _bump_source(_session(parent_session_id), "subagent",
+                         prompt_tokens, completion_tokens)
         if rate is not None:
             _fp = sess.get("head_fp") or "-"
             _prev = sess.get("head_prev")
@@ -547,8 +552,6 @@ def record_usage(session_id: str, usage: dict | None = None, timings: dict | Non
             sess["cache_samples"].append(rate)
             if len(sess["cache_samples"]) > CACHE_SAMPLES:
                 del sess["cache_samples"][:-CACHE_SAMPLES]
-    if str(source) == "subagent" and parent_session_id:
-        credit_parent(parent_session_id, prompt_tokens, completion_tokens, "subagent")
 
 
 def _turn_cost(sess: dict) -> dict:

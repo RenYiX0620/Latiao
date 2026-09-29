@@ -424,6 +424,37 @@ _FOLD_HEAD_KEEP = 900           # 保久类：多留数据行（表格常在前 
 _FOLD_KEEP_EXTRA_RECENT = 6     # 保久类的保护窗 = keep_recent + 6（"保持原样更久"）
 
 
+_RESTORED_TOOL_PREFIX = "[工具结果]"
+
+
+def _restored_tool_name(m: dict) -> str:
+    """从**恢复的历史**里取工具名（2026-09-29 审计③）。
+
+    为什么需要：前端保存/回灌的历史里没有 `role:"tool"` 消息——`buildApiMessages`
+    把它转成了 `user` 消息 `[工具结果] <工具名> <参数JSON>\n<内容>`（后端非流式路径
+    同样这么转，见 api_routes 的 Qwen 兼容分支）。所以按 `assistant.tool_calls`
+    建映射对恢复的历史**整体失效**：那些结果既不会被折、也拿不到分档（行情数字的
+    "保久"保护在长会话里等于没有）。
+    """
+    c = str(m.get("content") or "")
+    if not c.startswith(_RESTORED_TOOL_PREFIX):
+        return ""
+    rest = c[len(_RESTORED_TOOL_PREFIX):].lstrip()
+    if not rest:
+        return ""
+    name = rest.split(None, 1)[0] if rest.split(None, 1) else ""
+    # 只认像工具名的 token（工具名是 [a-z_]+）；否则当没解析出来
+    return name if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{1,40}", name or "") else ""
+
+
+def _is_tool_result_msg(m: dict) -> bool:
+    """工具结果消息：本回合的 `role:"tool"` 或恢复历史里的 `[工具结果] …` 用户消息。"""
+    if m.get("role") == "tool":
+        return True
+    return str(m.get("role")) == "user" and str(m.get("content") or "").startswith(
+        _RESTORED_TOOL_PREFIX)
+
+
 def _tool_name_by_call_id(msgs: list) -> dict:
     """tool 消息 → 工具名（assistant.tool_calls 里的 id→name 映射）。
 
@@ -468,10 +499,14 @@ def _fold_old_tool_results(current_msgs: list,
     晚折、多留 900 字符（丢数字行 = 模型凭记忆复述错值，比多占窗糟得多）。
     `min_chars` 参数是**默认档**（调用方显式传入时对全部工具生效，测试用）。
 
+    2026-09-29 审计③：候选集从"只看 `role:"tool"`"扩到"`role:"tool"` 或恢复历史里的
+    `[工具结果] …` 用户消息"——前端保存/回灌的历史里工具结果全是后者，此前**一条都不折**、
+    分档也拿不到工具名（长会话里行情数字的"保久"保护等于没有）。
+
     current_msgs 是本轮请求的**副本**（构造时 dict 展开），折叠只影响模型视野；
     完整结果仍在工具台账与会话记录里。幂等：带折叠标记的跳过。
     """
-    tool_idx = [i for i, m in enumerate(current_msgs) if m.get("role") == "tool"]
+    tool_idx = [i for i, m in enumerate(current_msgs) if _is_tool_result_msg(m)]
     if len(tool_idx) <= keep_recent:
         return 0
     _names = _tool_name_by_call_id(current_msgs)
@@ -482,7 +517,9 @@ def _fold_old_tool_results(current_msgs: list,
         c = m.get("content")
         if not isinstance(c, str):
             continue
-        nm = _names.get(str(m.get("tool_call_id") or ""), "")
+        # 工具名：本回合走 call_id→name 映射；恢复的历史从 `[工具结果] <name>` 前缀解析
+        nm = (_names.get(str(m.get("tool_call_id") or ""), "")
+              or _restored_tool_name(m))
         _min, _head = _fold_params(nm)
         if min_chars != _TOOL_FOLD_MIN_CHARS:
             _min = min_chars        # 调用方显式指定（测试/一次性收紧）
@@ -1685,6 +1722,16 @@ class ThinAgentLoop:
                 if _budget:
                     _used = _turn_input_tokens(self.session_id)
                     if _used > _budget:
+                        if not self._budget_warned:
+                            # 审计⑧：单步直接从 80% 以下跳到 100% 以上时，此前用户只会
+                            # 看到收口、看不到缘由——先补一次提示（pct 可以是 >100%）
+                            self._budget_warned = True
+                            _pct = int(_used * 100 / _budget)
+                            self._step_log("预算提醒", f"一步越线（{_pct}%）→ 先提示再收口")
+                            yield {"content": "\n\n" + _msg("budget_warning", self.user_lang,
+                                                            used=f"{_used:,}",
+                                                            budget=f"{_budget:,}",
+                                                            pct=f"{_pct}")}
                         if not self._finalize_round:
                             self._finalize_round = True
                             self._budget_wrapped = True
