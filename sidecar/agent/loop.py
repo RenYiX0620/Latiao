@@ -1206,7 +1206,13 @@ class ThinAgentLoop:
             if not isinstance(m, dict) or m.get("role") != "tool":
                 continue
             c = m.get("content")
-            if not isinstance(c, str) or ("Error" not in c[:200] and "⛔" not in c[:200]):
+            if not isinstance(c, str):
+                continue
+            # 判据与 verify_failed **同源**（含中文形态：错误/不存在/未找到/权限不足）。
+            # 曾自带一份只认英文的版本 → 中文报错的工具（如 read_file 缺文件）永不计入
+            # 失败，同错升级形同虚设（故障注入测试抓到）。
+            from agent.tool_exec import _looks_like_tool_failure
+            if not _looks_like_tool_failure(c):
                 continue
             if "已拒绝重复执行" in c[:200]:      # 闸门回复不是工具失败
                 continue

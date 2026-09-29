@@ -93,6 +93,24 @@ async def execute_tool(tool_name: str, arguments: dict) -> str:
     # ── Feedback subsystem: post-execution verification ──
     return _append_run_outcome(tool_name, result, arguments)
 
+def _looks_like_tool_failure(result: str) -> bool:
+    """工具结果是否表示失败（**唯一判据**，2026-09-29 抽出一份）。
+
+    为什么必须共享：`read_file` 缺文件返回的是「错误：文件不存在 - …」——既无
+    "Error" 也无 "⛔"。同错升级的扫描曾自带一份只认英文的判据，于是中文报错的工具
+    永远不会被计成失败（受控实测 + 故障注入测试抓到）。这里含中文形态，与
+    verify_failed 同源；`_scan_tool_failures` 也复用本函数，避免再次漂移。
+    """
+    r = str(result or "")
+    head = r[:200]
+    lower = r.lower()
+    return bool(
+        head.startswith(("Error", "错误", "⛔"))
+        or "permission denied" in lower
+        or "权限不足" in head or "不存在" in head or "未找到" in head
+    )
+
+
 async def _handle_tool_execution(tc: dict, current_msgs: list, session_id: str,
                                  agent_id: str, access_mode: str = "confirm",
                                  pre_started: dict | None = None) -> tuple[bool, list[dict]]:
@@ -357,12 +375,7 @@ async def _handle_tool_execution_inner(tc: dict, current_msgs: list, session_id:
         logger.warning("auto-verify 失败（不影响工具结果）: %s", tool_name, exc_info=True)
         verify_report = ""
     verify_failed = bool(verify_report and "❌" in verify_report)
-    result_lower = result.lower()
-    if not verify_failed and (
-        result.startswith("Error") or result.startswith("错误") or
-        result.startswith("⛔") or "permission denied" in result_lower or
-        "权限不足" in result or "不存在" in result or "未找到" in result
-    ):
+    if not verify_failed and _looks_like_tool_failure(result):
         verify_failed = True
 
     # 反思链路唯一入口：生成文案 + 诚实 was_useful + 真失败提升为 learning（⑧）
