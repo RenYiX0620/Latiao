@@ -126,8 +126,34 @@ _UNTRUSTED_OPEN = '<untrusted_data tool="{tool}">\n'
 _UNTRUSTED_CLOSE = "\n</untrusted_data>"
 
 
+# 新浪 int_ 美股接口是**冻结快照**（2026-09-28 实测：道指 46247 / 纳指 22484 / 标普 6643，
+# 与真实收盘 51828 / 27068 / 7743 差 11–20%），而同一主机的 gb_ 是活源。搜索/抓取
+# 结果里一旦出现 int_ 行，模型会把假数字当实时行情。策略：整行作废 + 明确告警，
+# 宁缺毋假——缺数据可以说"工具没返回"，假数据会直接进答案。
+_STALE_SINA_US_RE = re.compile(
+    r"^.*int_(?:dji|nasdaq|sp500|ixic|rut)\b.*$",
+    re.I | re.M,
+)
+
+
+def scrub_stale_sina_us(text: str) -> str:
+    """剔除新浪 int_ 冻结美股快照（只出不进：替换为拒绝说明）。"""
+    if not text or "int_dji" not in text and "int_nasdaq" not in text and "int_sp500" not in text \
+            and "int_ixic" not in text and "int_rut" not in text:
+        return text
+
+    def _repl(m: re.Match) -> str:
+        return ("⚠️ [已屏蔽冻结数据源 int_：新浪该接口返回的是过期快照，禁止引用。"
+                "美股点位请改用 ak_finance（带日期日线/ gb_ 实时）]")
+
+    out = _STALE_SINA_US_RE.sub(_repl, text)
+    logger.info("数据源清洗：屏蔽了新浪 int_ 冻结美股快照")
+    return out
+
+
 def guard_tool_result(tool_name: str, text: str, session_id: str = "") -> str:
     """工具结果注入扫描：命中则加"这是数据"标注，未命中原样返回（零改动零开销）。"""
+    text = scrub_stale_sina_us(text)
     hits = scan_for_threats(text)
     if not hits:
         return text

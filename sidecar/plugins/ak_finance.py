@@ -304,13 +304,100 @@ _US_INDEX_MAP = (
 
 
 def _us_index_targets(query: str) -> list[tuple[str, str]]:
-    """从 query 里识别美股指数（可一次多个：道指/标普/纳指）。"""
+    """从 query 里识别美股指数（可一次多个：道指/标普/纳指）。
+
+    09-28 补：「美股」单独出现时视为三大指数全查——此前 map 只有具体指数名，
+    「美股现在是啥情况」匹配不到任何目标 → 掉进网页搜索 → 撞上 int_ 假源。
+    """
     q = (query or "").lower()
     out = []
     for keys, sym, name in _US_INDEX_MAP:
         if any(k in q for k in keys):
             out.append((sym, name))
+    if not out and ("美股" in q or "us stock" in q or "美国股市" in q or "wall street" in q):
+        out = [(".DJI", "道琼斯工业平均指数"), (".INX", "标普500指数"), (".IXIC", "纳斯达克综合指数")]
     return out
+
+
+# ── 美股盘中实时（09-28）───────────────────────────────────────────
+# 事故：模型上网搜「美股现在」拿到新浪 int_ 冻结假数据（道指 46247 vs 真实 51828）。
+# gb_ 是带时间戳的活源（实测 2026-09-28 10:51 AM EDT、-0.61% 与行情一致）。
+# 禁止使用 int_dji / int_nasdaq / int_sp500（冻结快照，差 11–20%）。
+_US_RT_MAP = (
+    (("道琼斯", "道指", "dow", "dji"), "gb_dji", "道琼斯工业平均指数"),
+    (("标普", "s&p", "s&p500", "sp500"), "gb_inx", "标普500指数"),
+    (("纳斯达克", "纳指", "nasdaq", "ixic"), "gb_ixic", "纳斯达克综合指数"),
+    (("美股", "us stock", "美国股市", "wall street"), "gb_dji", "道琼斯工业平均指数"),
+)
+_US_RT_KW = ("现在", "实时", "盘中", "最新", "当前", "行情", "多少", "什么价",
+             "today", "now", "realtime", "current", "点位")
+# int_ 冻结源拉黑（在本工具内双保险；全局清洗见 threat_scan.scrub_stale_sina_us）
+_STALE_SINA_US = ("int_dji", "int_nasdaq", "int_sp500", "int_ixic", "int_rut")
+
+
+def _us_rt_targets(query: str) -> list[tuple[str, str, str]]:
+    q = (query or "").lower()
+    out = []
+    # 「美股」泛指 → 一次给三大指数（09-28：此前匹配不到就掉网页搜索撞 int_ 假源）
+    if ("美股" in q or "us stock" in q or "美国股市" in q or "wall street" in q) \
+            and not any(k in q for k in ("道指", "道琼斯", "标普", "纳指", "纳斯达克", "dow", "dji", "sp500", "ixic")):
+        return [("gb_dji", "道琼斯", "道琼斯工业平均指数"),
+                ("gb_inx", "标普500", "标普500指数"),
+                ("gb_ixic", "纳指", "纳斯达克综合指数")]
+    for keys, sym, name in _US_RT_MAP:
+        if any(k in q for k in keys):
+            if not any(t[0] == sym for t in out):
+                out.append((sym, name, name))
+    return out
+
+
+async def _query_us_realtime(query: str) -> str:
+    """美股盘中/实时（新浪 gb_ 活源，带时间戳）。失败返回 "" 让调用方走日线。"""
+    targets = _us_rt_targets(query)
+    if not targets:
+        return ""
+    import requests
+    syms = [t[0] for t in targets]
+    url = "https://hq.sinajs.cn/list=" + ",".join(syms)
+    try:
+        resp = requests.get(url, headers={"Referer": "https://finance.sina.com.cn"}, timeout=6)
+        raw = resp.content.decode("gbk", errors="replace")
+    except Exception as e:
+        return f"（美股实时查询失败：{type(e).__name__}，改用下方带日期的日线数据）"
+    # 禁止引用 int_ 冻结源
+    if any(s in raw for s in _STALE_SINA_US) and "gb_" not in raw:
+        return "（数据源异常：新浪返回冻结快照，已拒用。请改用日线数据并注明来源与日期。）"
+    lines = []
+    # var hq_str_gb_dji="名,价,涨跌%,北京时间,涨跌额,开,高,低,52高,52低,...,美东时间,昨收"
+    for line in raw.splitlines():
+        m = re.search(r'hq_str_(gb_\w+)="([^"]*)"', line)
+        if not m:
+            continue
+        code, body = m.group(1), m.group(2)
+        parts = [p.strip() for p in body.split(",")]
+        if len(parts) < 5:
+            continue
+        name = parts[0] or code
+        try:
+            price = float(parts[1])
+            pct = float(parts[2])
+            ts_bj = parts[3]
+            chg = float(parts[4])
+        except (TypeError, ValueError):
+            continue
+        open_ = parts[5] if len(parts) > 5 else ""
+        prev = parts[-2] if len(parts) > 8 and parts[-2] not in ("", "--") else ""
+        et_ts = ""
+        for p in parts:
+            if "EDT" in p or "EST" in p:
+                et_ts = p
+        lines.append(
+            f"📊 {name} [{code}] 实时 {price:,.2f}（{chg:+,.2f} / {pct:+.2f}%）"
+            f"｜今开 {open_}｜昨收 {prev}\n"
+            f"   时间戳：北京时间 {ts_bj}" + (f"｜美东 {et_ts}" if et_ts else "")
+            + "\n   数据源：新浪 gb_（实时）"
+        )
+    return "\n".join(lines) if lines else ""
 
 
 async def _query_us_index(query: str) -> str:
@@ -367,6 +454,11 @@ async def execute(args: dict) -> str:
     try:
         # 0) 美股指数（09-20）：道指/标普/纳指/罗素 → 新浪美股日线（精确收盘点位）
         if _us_index_targets(query):
+            # 0a) 含「现在/实时/盘中」→ 先走 gb_ 活源（09-28：int_ 冻结源事故）
+            if any(k in query for k in _US_RT_KW):
+                rt = await _query_us_realtime(query)
+                if rt and "失败" not in rt and "拒用" not in rt:
+                    return rt + "\n\n（以上为盘中实时；历史收盘点位见下）"
             r = await _query_us_index(query)
             if r and "查询失败" not in r:
                 return r

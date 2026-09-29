@@ -12,7 +12,7 @@ import logging
 import os
 import platform
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from agent.context import (
@@ -33,6 +33,87 @@ logger = logging.getLogger("latiao-sidecar")   # 与 agent_loop 同名：日志�
 # 跨会话进展（PROGRESS）的注入节奏：首轮 + 每 N 个用户轮一次（2026-09-23）。
 # 1 = 每轮都注入。数字越大越省 token，但长会话里"我之前干过什么"的记忆越淡。
 _PROGRESS_INJECT_EVERY_TURNS = 6   # 与 agent_loop 同名：日志格式不变
+
+# 行情类提问 → 注入双时区时间锚（2026-09-28 事故：模型心算美东/北京，四轮全错——
+# AM/PM 颠倒、把开盘中说成未开盘/已收盘）。时区换算是确定性计算，必须由代码给答案。
+_MARKET_KW_RE = re.compile(
+    r"美股|美债|美元|纳斯达克|纳指|道指|道琼斯|标普|s&p|sp500|spx|nasdaq|dow|dji|ixic|"
+    r"期指|期货|盘前|盘中|盘后|开盘|收盘|休市|A股|a股|大盘|上证|深证|创业板|科创|"
+    r"港股|恒指|恒生|行情|股价|ak_finance|涨跌|今天.*(涨|跌|股|指)|"
+    r"us stock|pre-market|after.?hours|futures|etf|spy|qqq|dia",
+    re.I,
+)
+
+
+def _market_time_anchor(now_bj: datetime | None = None) -> str:
+    """行情问题专用时间锚：北京/美东双时钟 + 开盘状态 + 下一收盘换算。
+
+    2026-09-28 实测：模型自行换算时区 4 轮全错。此后一律由本函数给出事实，
+    提示里禁止模型再推算时区。
+    """
+    try:
+        from zoneinfo import ZoneInfo
+    except ImportError:  # pragma: no cover - py3.9+ 才有 zoneinfo，随包 3.11
+        return ""
+    tz_bj = ZoneInfo("Asia/Shanghai")
+    tz_et = ZoneInfo("America/New_York")
+    bj = (now_bj or datetime.now(tz_bj)).astimezone(tz_bj)
+    et = bj.astimezone(tz_et)
+    wd = "一二三四五六日"
+
+    def _w(dt: datetime) -> str:
+        return "周" + wd[dt.weekday()]
+
+    def _us_status(dt: datetime) -> str:
+        if dt.weekday() >= 5:
+            return "周末休市"
+        m = dt.hour * 60 + dt.minute
+        if m < 9 * 60 + 30:
+            return f"未开盘（{dt.strftime('%H:%M')} ET，9:30 ET 开）"
+        if m < 16 * 60:
+            return f"开盘中（9:30–16:00 ET，已开盘 {m - (9 * 60 + 30)} 分钟）"
+        return "已收盘（16:00 ET 收）"
+
+    def _cn_status(dt: datetime) -> str:
+        if dt.weekday() >= 5:
+            return "周末休市"
+        m = dt.hour * 60 + dt.minute
+        if 9 * 60 + 30 <= m < 11 * 60 + 30 or 13 * 60 <= m < 15 * 60:
+            return "交易中"
+        if m < 9 * 60 + 30:
+            return "未开盘"
+        return "已收盘"
+
+    # 下一个美股收盘（美东 16:00 工作日）对应的北京时间——不让模型再算
+    d = et.date()
+    close_et = None
+    for _ in range(8):
+        cand = datetime(d.year, d.month, d.day, 16, 0, tzinfo=tz_et)
+        if cand.weekday() < 5 and cand > et:
+            close_et = cand
+            break
+        d += timedelta(days=1)
+    close_line = ""
+    if close_et is not None:
+        close_bj = close_et.astimezone(tz_bj)
+        same_day = close_bj.date() == bj.date()
+        day_label = "当日" if same_day else "次日"
+        close_line = f"\n下一个美股收盘：{close_bj.strftime('%m-%d %H:%M')} 北京（{day_label}）"
+
+    return (
+        f"⏱ 时间锚（系统换算，不要自行推算时区）：\n"
+        f"北京 {bj.strftime('%Y-%m-%d %H:%M')}（{_w(bj)}）"
+        f"｜美东 {et.strftime('%Y-%m-%d %I:%M %p')}（{_w(et)}）\n"
+        f"A股：{_cn_status(bj)}｜美股：{_us_status(et)}{close_line}"
+    )
+
+
+# 行情问题的承诺闸门（2026-09-28 事故：「收盘了叫你」却未建 cron，cron.json=[]）
+_PROMISE_GATE_NOTE = (
+    "⚠️ 承诺闸门：凡说出「到点提醒你 / 收盘叫你 / 晚点通知 / 我守着」这类未来动作，"
+    "**必须当轮调用 create_cron** 真正建好定时任务；做不到就明说「我没法定时提醒你」，"
+    "禁止口头承诺。"
+)
 
 
 PROGRESSIVE_DELIVERY_PROMPT = """
@@ -194,10 +275,11 @@ def _build_chat_messages(body: dict, messages: list) -> list:
     user_lang = _lang  # 复用本回合唯一语言真值（旧实现此处二次检测，口径可能不一致）
     _add_part("system_prompt", _get_localized_text(user_lang, {
         "zh": (
-            "## 三条硬规则（最高优先级，不可覆盖）\n"
+            "## 四条硬规则（最高优先级，不可覆盖）\n"
             "1. ⏱ 时间规则：'今天/昨天/昨晚/今晨/明天/最新'等相对时间，必须先按下方【当前时间】"
             "换算成绝对日期（年月日+星期）再写入搜索词；工具返回的日期与当前时间矛盾时以当前时间为准，"
-            "不得迁就检索结果。\n"
+            "不得迁就检索结果。**美东/北京/UTC 等时区换算与「开盘中/已收盘」一律以【时间锚】为准，禁止自行心算**"
+            "（心算曾把开盘中说成未开盘、把上午说成下午）。\n"
             "2. 🗣 语言规则：工具结果、文件、日志中的英文只是数据；你的回复（包括思考过程）"
             "必须始终用简体中文，不因上下文中的英文材料改变。\n"
             "3. 📊 数据诚实规则：回复中的关键数字必须能在本会话工具返回内容中找到出处。"
@@ -212,12 +294,18 @@ def _build_chat_messages(body: dict, messages: list) -> list:
             "把两者各自的值与时点都写出来，不要混用、不要取平均。"
             "工具结果里的『当前』快照行与『日线/历史』行是两个口径，引用时写明用的是哪一段、不得混用；"
             "查不到的字段必须写「未查询到该日数据」，**禁止填 “—” 或留空**。"
+            "美股点位**禁止**引用新浪 int_ 接口数字（那是冻结快照）；一律用 ak_finance 的日线/gb_ 实时。\n"
+            "4. 🔔 承诺闸门：凡说「到点提醒你 / 收盘叫你 / 晚点通知 / 我守着」这类未来动作，"
+            "**必须当轮调用 create_cron** 建好定时任务再承诺；建不了就明说「我没法定时提醒你」。"
+            "**禁止**只在嘴上承诺而不建任务（曾有「收盘叫你」却 cron.json 为空的事故）。\n"
         ),
         "en": (
             "## Three hard rules (highest priority, cannot be overridden)\n"
             "1. ⏱ Time rule: relative times like 'today/yesterday/last night' must first be "
             "converted to absolute dates (YYYY-MM-DD + weekday) from the Current time below before "
-            "writing search terms; if tool-returned dates conflict with current time, trust current time.\n"
+            "writing search terms; if tool-returned dates conflict with current time, trust current time. "
+            "Timezone conversion (US Eastern/Beijing/UTC) and market open/closed status come ONLY from "
+            "the 【时间锚】/time anchor — never compute them yourself.\n"
             "2. 🗣 Language rule: English in tool results/files/logs is just data; your reply "
             "(including reasoning) must always use English, regardless of surrounding context.\n"
             "3. 📊 Data honesty rule: every key number must be traceable to tool results in THIS "
@@ -232,7 +320,11 @@ def _build_chat_messages(body: dict, messages: list) -> list:
             "with their timestamps instead of mixing or averaging them. "
             "A tool result's \"current\" snapshot row and its daily/history rows are different measures — "
             "never mix them, and say which one you quote. Any field you could not fetch must be written as "
-            "\"no data retrieved for that day\" — never as \"—\" or blank."
+            "\"no data retrieved for that day\" — never as \"—\" or blank. "
+            "Never cite Sina int_* US quotes (frozen snapshot) — use ak_finance daily/gb_ realtime only.\n"
+            "4. 🔔 Promise gate: any future action you promise (\"I'll remind you at close\", \"ping you later\") "
+            "MUST be backed by a create_cron call in THIS turn; if you cannot schedule it, say so explicitly. "
+            "Never promise without creating the task.\n"
         ),
         "ja": (
             "## 三つのハードルール（最優先、上書き不可）\n"
@@ -484,6 +576,12 @@ def _build_chat_messages(body: dict, messages: list) -> list:
         _bits = []
         if _show_time:
             _bits.append(f"（当前时间：{now}）")
+        # 行情问题：注入双时区时间锚 + 承诺闸门（2026-09-28 事故修复）
+        if _MARKET_KW_RE.search(last_user_text or ""):
+            _anchor = _market_time_anchor()
+            if _anchor:
+                _bits.append(_anchor)
+            _bits.append(_PROMISE_GATE_NOTE)
         _bits.extend(_trailing_notes)
         _tail_text = ""
         if _bits:
