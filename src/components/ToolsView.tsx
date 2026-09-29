@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { useTranslation } from "../i18n";
 import { authFetch } from "../utils/api";
+import QuickCall from "./QuickCall";
 
 
 interface ExtensionInfo {
@@ -484,6 +485,9 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
 
   return (
     <div>
+      {/* ═══ 快捷调用：UI 与 Agent 同源（同一 execute_tool） ═══ */}
+      <QuickCall showToast={showToast} />
+
       {/* ═══ 扩展市场 ═══ */}
       <div className="card-desc" style={{ marginBottom: 12 }}>
         {t("tools.market_desc")}

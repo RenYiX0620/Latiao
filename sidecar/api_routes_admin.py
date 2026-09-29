@@ -225,6 +225,49 @@ async def get_tools():
     return {"status": "ok", "tools": tools_info}
 
 
+@router.post("/v1/tools/invoke")
+async def invoke_tool(request: Request):
+    """UI 直调工具——与 Agent 走同一条 execute_tool（2026-09-29 Action 同源）。
+
+    业务动作只有一份（plugins/*.py 的 execute），按钮和 AI 共用：
+    - `name` + `args` 与 Agent 工具调用完全同构
+    - `confirmed: true` 表示用户在 UI 上亲自点击（confirm 级工具的合法确认）
+    - 结果写入 tool_calls 台账（与 Agent 路径同一张表），UI 可立刻在「最近执行」看到
+    """
+    body = await _json_body(request)
+    name = str(body.get("name") or "").strip()
+    args = body.get("args") or {}
+    if not isinstance(args, dict):
+        return {"status": "error", "message": "args 必须是对象"}
+    if not name:
+        return {"status": "error", "message": "name 必填"}
+
+    hub, _m = _hub()
+    if name not in hub.TOOL_DISPATCH:
+        return {"status": "error", "message": f"未知工具: {name}"}
+
+    perm = hub.TOOL_PERMISSIONS.get(name, "safe")
+    # UI 点击 = 用户确认。confirm 级工具必须带 confirmed:true（按钮二次确认/表单提交）。
+    if perm == "confirm" and not body.get("confirmed"):
+        return {
+            "status": "need_confirm",
+            "message": f"工具 {name} 需要用户确认（permission=confirm）",
+            "permission": perm,
+        }
+
+    from agent.tool_exec import _record_tool_call_db, execute_tool
+    session_id = str(body.get("session_id") or "ui-invoke")
+    try:
+        result = await asyncio.wait_for(execute_tool(name, args), timeout=120)
+    except asyncio.TimeoutError:
+        result = f"Error: 工具 {name} 执行超时（120s）"
+    except Exception as e:
+        result = f"Error executing {name}: {e}"
+
+    _record_tool_call_db(session_id, name, args, result)
+    return {"status": "ok", "name": name, "result": result, "permission": perm}
+
+
 @router.get("/v1/permissions")
 async def get_permissions():
     """Return current custom permission rules (path 级规则，工具级权限已迁移至 capabilities 表)."""
