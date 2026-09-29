@@ -407,6 +407,51 @@ _TOOL_FOLD_MIN_CHARS = 1500     # 小于此长度不值得折（收益小、还�
 _TOOL_FOLD_HEAD = 400           # 折叠后保留的开头（表格头/结论/日期多在最前）
 _FOLD_MARK = "[已折叠·旧工具结果]"
 
+# 可丢弃工具名单（gap P3，2026-09-29）：不同工具的结果"重新拿一次"的代价与
+# "丢了就错"的后果完全不同——一刀切的 1500/400 要么折得太晚（读文件/搜索类白占窗），
+# 要么折得太狠（行情/财务表格丢了数字行，模型会凭记忆复述错值）。
+_FOLD_FAST_TOOLS = {            # 看一眼就够、随时可重拿 → 更早折、只留头
+    "read_file", "list_dir", "search_files",
+    "tavily_search", "bing_search", "web_search", "dokobot_search",
+}
+_FOLD_KEEP_TOOLS = {            # 数字即结论 / 重拿代价高 → 晚折、多留数据行
+    "mx_query", "ak_finance", "delegate_task",
+}
+_FOLD_MIN_FAST = 700            # 可丢弃类：700 字符以上就折
+_FOLD_MIN_KEEP = 2500           # 保久类：2500 字符以上、且更旧时才折
+_FOLD_HEAD_FAST = 250           # 可丢弃类：留到文件头/首屏即可
+_FOLD_HEAD_KEEP = 900           # 保久类：多留数据行（表格常在前 900 字符里）
+_FOLD_KEEP_EXTRA_RECENT = 6     # 保久类的保护窗 = keep_recent + 6（"保持原样更久"）
+
+
+def _tool_name_by_call_id(msgs: list) -> dict:
+    """tool 消息 → 工具名（assistant.tool_calls 里的 id→name 映射）。
+
+    两种协议都覆盖：native（assistant 带 tool_calls）与围栏解析（解析出的
+    tool_calls 同样写回 assistant 消息，见 run 里 `asst["tool_calls"] = tool_calls`）。
+    """
+    out: dict = {}
+    for m in msgs:
+        if m.get("role") != "assistant":
+            continue
+        for tc in (m.get("tool_calls") or []):
+            if not isinstance(tc, dict):
+                continue
+            cid = tc.get("id")
+            nm = (tc.get("function") or {}).get("name") or ""
+            if cid and nm:
+                out[str(cid)] = str(nm)
+    return out
+
+
+def _fold_params(tool_name: str) -> tuple[int, int]:
+    """(min_chars, head_chars) —— 按工具类别选折叠力度。"""
+    if tool_name in _FOLD_FAST_TOOLS:
+        return _FOLD_MIN_FAST, _FOLD_HEAD_FAST
+    if tool_name in _FOLD_KEEP_TOOLS:
+        return _FOLD_MIN_KEEP, _FOLD_HEAD_KEEP
+    return _TOOL_FOLD_MIN_CHARS, _TOOL_FOLD_HEAD
+
 
 def _fold_old_tool_results(current_msgs: list,
                            keep_recent: int = _TOOL_FOLD_KEEP_RECENT,
@@ -418,22 +463,40 @@ def _fold_old_tool_results(current_msgs: list,
     消化或写进了答案。这里只折 **不在最近 keep_recent 条之内**、且 >= min_chars 的
     那些；保留开头（表格头/结论行），并注明可重新调用。
 
+    2026-09-29 再补（gap P3"可丢弃工具名单"）：阈值按工具类别分档——读文件/搜索类
+    （`_FOLD_FAST_TOOLS`）更早折、只留 250 字符；行情/财务/子代理报告（`_FOLD_KEEP_TOOLS`）
+    晚折、多留 900 字符（丢数字行 = 模型凭记忆复述错值，比多占窗糟得多）。
+    `min_chars` 参数是**默认档**（调用方显式传入时对全部工具生效，测试用）。
+
     current_msgs 是本轮请求的**副本**（构造时 dict 展开），折叠只影响模型视野；
     完整结果仍在工具台账与会话记录里。幂等：带折叠标记的跳过。
     """
     tool_idx = [i for i, m in enumerate(current_msgs) if m.get("role") == "tool"]
     if len(tool_idx) <= keep_recent:
         return 0
+    _names = _tool_name_by_call_id(current_msgs)
+    _n_tools = len(tool_idx)
     folded = 0
-    for i in tool_idx[:-keep_recent]:
+    for _pos, i in enumerate(tool_idx):
         m = current_msgs[i]
         c = m.get("content")
-        if not isinstance(c, str) or len(c) < min_chars:
+        if not isinstance(c, str):
+            continue
+        nm = _names.get(str(m.get("tool_call_id") or ""), "")
+        _min, _head = _fold_params(nm)
+        if min_chars != _TOOL_FOLD_MIN_CHARS:
+            _min = min_chars        # 调用方显式指定（测试/一次性收紧）
+        # 保护窗：一般工具 = 最近 keep_recent 条；保久类更长（数字要"保持原样更久"）
+        _guard = keep_recent + (_FOLD_KEEP_EXTRA_RECENT if nm in _FOLD_KEEP_TOOLS else 0)
+        if _pos >= _n_tools - _guard:
+            continue
+        if len(c) < _min:
             continue
         if c.startswith(_FOLD_MARK) or _FOLD_MARK in c[:60]:
             continue
-        m["content"] = (f"{_FOLD_MARK} 原 {len(c)} 字符，仅保留开头：\n"
-                        f"{c[:_TOOL_FOLD_HEAD]}\n"
+        _who = f"{nm} " if nm else ""
+        m["content"] = (f"{_FOLD_MARK} {_who}原 {len(c)} 字符，仅保留开头：\n"
+                        f"{c[:_head]}\n"
                         "…（其余已被回收以节省上下文；需要完整数据可重新调用该工具）")
         folded += 1
     return folded

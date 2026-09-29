@@ -503,6 +503,75 @@ class TestLoopGaps:
         assert _fold_old_tool_results(big, keep_recent=6) == 0, "二次调用必须幂等"
         assert sum(1 for m in big if str(m["content"]).startswith(_FOLD_MARK)) == 2
 
+    # ── 可丢弃工具名单（gap P3）：按工具类别分档折叠 ──
+    @staticmethod
+    def _call(i, name, n_chars, fill="x"):
+        """一条 assistant(tool_calls) + tool 结果 的配对（带 id→name 映射）。"""
+        cid = f"c{i}"
+        return [{"role": "assistant", "content": "", "tool_calls": [
+                    {"id": cid, "type": "function",
+                     "function": {"name": name, "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": cid, "content": fill * n_chars}]
+
+    def test_fold_policy_by_tool_category(self):
+        from agent.loop import _fold_old_tool_results, _FOLD_MARK
+        msgs = [{"role": "user", "content": "q"}]
+        # ① 读文件类：1000 字符就该折，且只留开头 250（可重拿）
+        msgs += self._call(1, "read_file", 1000, "r")
+        # ② 行情类 2000 字符：**不折**（数字即结论；阈值 2500）
+        msgs += self._call(2, "mx_query", 2000, "m")
+        # ③ 行情类超大：折，但多留数据行（900）
+        msgs += self._call(3, "mx_query", 4000, "n")
+        # ④ 一般工具（run_cmd）：默认档 1500 才折
+        msgs += self._call(4, "run_cmd", 1600, "c")
+        # ⑤…⑱ 十四个读文件类结果充作"更后面的调用"：
+        #      — 一般工具的保护窗是最近 6 条 → ⑤…⑫ 可折（8 条）
+        #      — 行情类的保护窗是最近 6+6=12 条 → ③ 要活下来就得更旧
+        for i in range(5, 19):
+            msgs += self._call(i, "read_file", 900, "z")
+
+        n = _fold_old_tool_results(msgs, keep_recent=6)
+        assert n == 11, f"应折 1(read_file)+1(mx_query 大)+1(run_cmd)+8(read_file 填充)，实际 {n}"
+        tool_msgs = {m["tool_call_id"]: m["content"] for m in msgs if m.get("role") == "tool"}
+        assert str(tool_msgs["c1"]).startswith(_FOLD_MARK), "读文件类结果该被回收"
+        assert str(tool_msgs["c1"]).count("r") < 300, "读文件类只留开头（250）"
+        assert "read_file" in str(tool_msgs["c1"]), "标记里要写明是哪个工具的结果，便于重拿"
+        assert not str(tool_msgs["c2"]).startswith(_FOLD_MARK), "行情类 2000 字符不折"
+        assert str(tool_msgs["c3"]).startswith(_FOLD_MARK), "行情类超大才折"
+        assert str(tool_msgs["c3"]).count("n") >= 900, "行情类多留数据行（900）"
+        assert str(tool_msgs["c4"]).startswith(_FOLD_MARK), "一般工具走默认档（1500）"
+        # 保护窗：最近 6 条一律不动
+        for i in range(13, 19):
+            assert not str(tool_msgs[f"c{i}"]).startswith(_FOLD_MARK), "最近 6 条必须原样"
+
+    def test_fold_keeps_numeric_results_longer_than_reads(self):
+        """同为 1200 字符、同样旧：读文件被折、行情类保持原样（数字要"更久"）。"""
+        from agent.loop import _fold_old_tool_results, _FOLD_MARK
+        msgs = [{"role": "user", "content": "q"}]
+        msgs += self._call(1, "read_file", 1200, "r")
+        msgs += self._call(2, "mx_query", 1200, "m")
+        for i in range(3, 20):
+            msgs += self._call(i, "read_file", 900, "z")
+        _fold_old_tool_results(msgs, keep_recent=6)
+        tool_msgs = {m["tool_call_id"]: m["content"] for m in msgs if m.get("role") == "tool"}
+        assert str(tool_msgs["c1"]).startswith(_FOLD_MARK), "读文件类该折"
+        assert not str(tool_msgs["c2"]).startswith(_FOLD_MARK), "行情类 1200 字符不折"
+
+    def test_fold_leaves_context_with_a_drop_segment(self):
+        """50 轮长对话：回收造成上下文**下降段**（在压缩阈值兜底之前）。"""
+        from agent.loop import _fold_old_tool_results
+        msgs = [{"role": "user", "content": "q"}]
+        for i in range(50):
+            # 每轮一次读文件（可丢弃类）+ 一次行情（保久类，但 1200 < 2500 不折）
+            msgs += self._call(i * 2, "read_file", 1200)
+            msgs += self._call(i * 2 + 1, "mx_query", 1200)
+        before = sum(len(str(m.get("content") or "")) for m in msgs)
+        assert before > 18000, "先超过压缩阈值，才能说明回收是新的早出口"
+        n = _fold_old_tool_results(msgs, keep_recent=6)
+        after = sum(len(str(m.get("content") or "")) for m in msgs)
+        assert n == 47, f"100 条结果里：行情类 50 条不折、读文件 50 条中 3 条在保护窗 → 应折 47，实际 {n}"
+        assert after < before - 30000, f"下降段应显著（{before} → {after}）"
+
     # ── 同错硬升级（按轮去重）──
     def _loop_with_tool_msgs(self, msgs):
         from agent.loop import ThinAgentLoop
