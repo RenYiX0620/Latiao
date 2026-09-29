@@ -385,3 +385,44 @@ ZCode 那种"两种口径都存 + 用总量自检"的做法正是为这个准备
 `test_task_verify.py` 增 5 条审计回归（含 4 种真作弊写法）。A/B：回退
 `task_verify.py`/`tool_exec.py` → **9 红**；修复后全绿。全量 `1234 passed, 1 skipped`，
 前端 96 条 + tsc + eslint 全绿。
+
+---
+
+## 七、结构性问题修复：三套循环 → 一套（2026-09-29 晚）
+
+第二轮审计查出的**结构性问题**：闸门只装在三套工具循环里的一套上——
+
+| 入口 | 之前 | 现在 |
+|---|---|---|
+| SSE 聊天 / 通道 / 子代理 | `ThinAgentLoop`（全部闸门）| 不变 |
+| **定时任务** | `cron.py` 自带 10 轮循环：task_verify / 预算 / 停滞 / 压缩 / 回收 / 用量记账**全无** | ✅ **并入 ThinAgentLoop** |
+| **非流式**（Tauri HTTP 插件）| 自带 30 轮循环：同样全无 | ⑤ 已补落库；闸门待下一轮 |
+
+**定时任务并入唯一循环（本次）**：cron 只保留自己特有的四件事——**模型选择**（本地优先 /
+云端 / 429 回退本地重跑）、**工具白名单**（`_cron_tool_whitelist`：禁 `delegate_task`［防主任务
+与派生任务抢同一个本地引擎］、按任务相关性收窄、最多 5 个）、**工具档位**
+（`job.access_mode`，默认 `full`＝原行为；无人值守可显式设 `read_only`）、**结果落库与事件**。
+执行、闸门、记账、交付兜底全部交给唯一循环。删掉的重复实现：自带循环体、
+`_convert_tool_messages_for_local`、`_cron_can_finalize`、`_looks_like_tool_markup` 导入、
+以及 conftest 里只服务旧循环的夹具（`cron_env`/`_tool_call_msg`/`_text_msg`/`_LONG_FINAL`）。
+
+**顺带修掉的两个真问题**：
+- **定时任务静默失败**：1200s 超时 / 应用退出取消此前只有 `logger.warning`，job 状态、历史、
+  事件都不更新——用户设的"收盘叫我"超时时聊天里什么都不出现。现在三种中止（超时/取消/异常）
+  都经 `_record_cron_result` 留痕（状态统一 `error` + 明确文案；前端只认 success/error，
+  其他值会显示成"已跳过"，比静默更误导）。超时预算同时提成 `LATIAO_CRON_TIMEOUT` 可配。
+- **首启引导误记**：引导期里 `_process_onboarding` 会把非空、非提问的文本**当成答案记下来**
+  （称呼/名字/语气）——定时任务的短任务名（如"日报"）会被记成用户的名字，通道消息同理。
+  新增 `body["non_interactive"]` 闸（cron 与通道路径都带上），交互式对话照旧走引导。
+
+**测试**：新增 `tests/test_cron_via_loop.py` 7 条（走唯一循环 / 白名单禁 delegate_task 且 ≤5 /
+档位来自 job 且默认 full / turn_metrics 记 `cron` / 429 回退本地 / 无模型记 skipped /
+非交互闸不触发引导——含"交互式仍走引导"的反证）；`test_cron.py` 增 3 条（超时/异常/取消留痕）。
+删除已过时用例：`test_cron_final_round.py` 整文件（旧循环内部契约）、markup 与 cmd_safety 里
+4+1 条旧 cron 用例（契约已由循环承担：scrub 有单元用例、重复调用有 `test_dup_gate.py`）、
+脱敏测试的 cron 两条改为**结构禁令**（`cron` 源码里不得出现 `await execute_tool(`）。
+A/B：回退 `cron.py`/`prompt_build.py`/`channels_bridge.py` → **9 红**；新实现全绿。
+全量 `1235 passed, 1 skipped`。
+
+**仍未做**：非流式分支（Tauri HTTP 插件）只补了落库，它的 30 轮循环还没有闸门——并入或补
+闸门留作下一轮（该路径使用面较小，但同样是旁路）。

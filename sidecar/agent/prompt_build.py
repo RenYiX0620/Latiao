@@ -200,8 +200,17 @@ def _build_chat_messages(body: dict, messages: list) -> list:
     _lang, _lang_confident = detect_language_decision(last_user_text, _hist)
     # 首启引导（新安装专用）优先消费本轮消息：它的答案归一化更宽松（短回答即名字）。
     # 被消费时跳过常规身份意图识别，避免同一句话被两套规则重复写盘。
-    onboard_directive, onboard_handled = _process_onboarding(last_user_text, _lang)
-    intent_result = None if onboard_handled else _process_identity_intents(last_user_text)
+    #
+    # 非交互闸（2026-09-29 审计）：定时任务/通道消息**不是**用户在回答引导问题。
+    # 引导期（state.done=False）里 `process_message` 会把非空、非提问的文本**当成答案
+    # 记下来**（称呼/名字/语气）——定时任务文本「定时任务: 分析今天大盘…」会被记成
+    # 用户的名字，通道消息同理。调用方传 body["non_interactive"]=True 即可跳过。
+    _interactive = not bool(body.get("non_interactive"))
+    if _interactive:
+        onboard_directive, onboard_handled = _process_onboarding(last_user_text, _lang)
+        intent_result = None if onboard_handled else _process_identity_intents(last_user_text)
+    else:
+        onboard_directive, onboard_handled, intent_result = None, True, None
 
     system_parts = []
     # 分类打标：上下文统计面板按类别展示各段占比（context_stats.record_system_parts）

@@ -87,7 +87,9 @@ async def run_channel_turn(channel: str, chat_id: str, text: str, *,
         # 通道提示走一条 frontend system 消息（_build_chat_messages 会把前端 system
         # 并入系统提示）——不新增 body 字段，避免"字段没人读、静默失效"。
         _hint = _CHANNEL_HINT.format(channel=channel)
-        body = {"agent": agent, "session_id": session_id,
+        # non_interactive：通道消息不是"用户在回答首启引导"（否则引导期里会被记成
+        # 称呼/名字——2026-09-29 审计的同一类问题）
+        body = {"agent": agent, "session_id": session_id, "non_interactive": True,
                 "messages": [{"role": "system", "content": _hint}]
                             + history + [{"role": "user", "content": text}]}
         msgs = _build_chat_messages(body, body["messages"])

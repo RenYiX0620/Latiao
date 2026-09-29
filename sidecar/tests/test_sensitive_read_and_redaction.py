@@ -122,7 +122,9 @@ def test_report_and_progress_writes_are_redacted():
     assert "_record_tool_call_db(session_id, tool_name, args, redact_secrets(result))" in src, \
         "记忆库写入未脱敏"
     assert "tool_log_preview(tool_name, result)" in src, "工具结果日志未脱敏"
+    # cron 2026-09-29 起走唯一循环（ThinAgentLoop），工具执行与日志都在 tool_exec：
+    # 这里改成**结构性禁令**——定时任务不得自行执行工具，否则又会绕过脱敏与全部闸门。
     import cron
     cron_src = inspect.getsource(cron)
-    assert "tool_log_preview(tool_name, result)" in cron_src, "cron 工具结果日志未脱敏"
-    assert "redact_secrets(str(tool_args))" in cron_src, "cron 工具参数日志未脱敏"
+    assert "await execute_tool(" not in cron_src, "cron 不得自行执行工具（脱敏/闸门都在 tool_exec 与循环里）"
+    assert "execute_tool(" not in cron_src.split("def ")[0], "cron 顶部也不该持有工具执行入口"

@@ -122,20 +122,5 @@ class TestSessionCancelRegistry(unittest.TestCase):
         _clear_session_cancel("sess-a")
 
 
-class TestCronToolRoleConversion(unittest.TestCase):
-    def test_tool_to_user_conversion(self):
-        from cron import _convert_tool_messages_for_local
-        msgs = [
-            {"role": "system", "content": "sys"},
-            {"role": "user", "content": "hi"},
-            {"role": "tool", "content": "result 1"},
-            {"role": "assistant", "content": "ok"},
-        ]
-        out = _convert_tool_messages_for_local(msgs)
-        self.assertEqual([m["role"] for m in out],
-                         ["system", "user", "user", "assistant"])
-        self.assertEqual(out[2]["content"], "[工具结果] result 1")
-
-
 if __name__ == "__main__":
     unittest.main()

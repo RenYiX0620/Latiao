@@ -8,7 +8,6 @@
 2. cron 没有主循环的重复调用守卫：实测同一个 read_file 被同参调 3 次，每轮吃掉
    一次 10 轮预算 + 2-35s 生成时间，并把上下文撑长（更容易撞上面的截断）。
 """
-import asyncio
 
 import pytest
 
@@ -19,13 +18,6 @@ from agent.parsing import (
 )
 
 # 复用 cron 测试的桩环境与消息构造器（同一份，避免两套假客户端漂移）
-from tests.conftest import (  # noqa: E402
-    _LONG_FINAL,
-    _job,
-    _text_msg,
-    _tool_call_msg,
-)
-# cron_env 夹具由 conftest.py 提供（无需导入）
 
 _P = "/Users/langzuxiang/Desktop/Agent/local-ai-os/config.json"
 
@@ -69,62 +61,9 @@ def test_truncated_markup_is_not_parseable_but_is_scrubbable():
     assert _scrub_tool_markup(truncated) == "", "但必须能清掉，别把 JSON 发给用户"
 
 
-# ── cron 接线：交付前清洗 + 重复调用守卫 ──────────────────────────────
-
-def test_cron_finalize_rejects_markup_body():
-    """收口判据兜底：正文里有标记就不算可交付（哪怕够长）。"""
-    import cron
-    body = "<tool_call>\n<function=read_file>\n" + '{"path": "/tmp/x"}' * 6
-    ok, why = cron._cron_can_finalize(body, tool_count=1)
-    assert ok is False and "标记" in why
-
-
-def test_cron_scrubs_truncated_markup_before_delivery(cron_env):
-    """整轮是被截断的调用标记 → 不写进报告，而是让模型重新作答。"""
-    import cron
-    truncated = f'<tool_call>\n<function=read_file>\n{{"path": "{_P}"}}'
-    cron_env["set_script"]([
-        _tool_call_msg(),          # 第 1 轮：真工具调用
-        _text_msg(truncated),      # 第 2 轮：被截断的半截调用（旧实现会交付它）
-        _text_msg(_LONG_FINAL),    # 第 3 轮：真正的结论
-    ])
-    asyncio.run(cron._execute_cron_job(_job()))
-    _status, content = cron_env["recorded"][-1]
-    assert "path" not in content and "tool_call" not in content, f"垃圾被交付了：{content[:80]!r}"
-    assert "cloud_models" in content
-
-
-def test_cron_repeat_guard_blocks_third_identical_call(cron_env):
-    """同参已成功 ≥2 次 → 第 3 次不再执行，回一句引导而不是再跑一遍。"""
-    import agent_loop
-    calls = []
-
-    async def _counting_exec(tool_name, args):
-        calls.append((tool_name, args))
-        return "[stub] 读取成功：内容"
-    agent_loop.execute_tool = _counting_exec
-    import cron as _cron
-    _cron.execute_tool = _counting_exec
-
-    # 5 轮都调同一个文件（同参）→ 应只真执行 2 次
-    cron_env["set_script"]([_tool_call_msg(cid=f"c{i}") for i in range(5)] + [{"choices": []}])
-    asyncio.run(_cron._execute_cron_job(_job()))
-    assert len(calls) == 2, f"重复调用守卫失效，真执行了 {len(calls)} 次：{calls}"
-
-
-def test_cron_repeat_allowed_tools_exempt(cron_env):
-    """例外工具（screen_capture/control_wait）不受守卫限制——与主循环一致。"""
-    import agent_loop
-    calls = []
-
-    async def _counting_exec(tool_name, args):
-        calls.append(tool_name)
-        return "[stub] ok"
-    agent_loop.execute_tool = _counting_exec
-    import cron as _cron
-    _cron.execute_tool = _counting_exec
-
-    cron_env["set_script"]([_tool_call_msg(name="control_wait", args={"seconds": 1}, cid=f"w{i}")
-                            for i in range(3)] + [{"choices": []}])
-    asyncio.run(_cron._execute_cron_job(_job()))
-    assert len(calls) == 3, f"例外工具被误拦：{calls}"
+# ── 关于 cron 的旧用例（2026-09-29 删除）─────────────────────────────
+# 这里原有 4 条针对 **cron 自带循环** 的用例（收口判据 / 交付前清洗 / 重复调用守卫）。
+# cron 现在走与聊天同一个 ThinAgentLoop（审计：结构性问题——三套循环只装一套闸门），
+# 这些契约因此由循环承担：清洗由 `_clean`/`_scrub_tool_markup` 单元用例（本文件上半）
+# 守住，重复调用守卫由 test_dup_gate.py 守住；cron 侧只保留"确实走了循环"的接线用例
+# （见 tests/test_cron_via_loop.py）。
