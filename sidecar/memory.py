@@ -423,6 +423,60 @@ def mark_injection_used(session_id: str, used: bool) -> int:
         return 0
 
 
+# ── 工具报错类学习的时效（2026-09-29 事故）─────────────────────────────
+# 9-23 的「mx_query 免费额度当日用完」学习 6 天后被语义召回，模型信以为真绕开
+# mx_query → ak_finance 撞上东财持续拒连 → 板块查询全挂。失败分两类：
+# **瞬态**（额度/限流/网络——当天有效，隔天就是谎言）与**结构**（不支持某查询
+# ——长期有用）。只对瞬态类做 TTL：过期即不再注入，并顺手从库里清掉。
+_TOOL_ERROR_TTL_HOURS = 24.0
+_TRANSIENT_FAIL_RE = re.compile(
+    r"调用次数已用|额度|限流|429|ConnectionError|RemoteDisconnected"
+    r"|连接中止|连接被拒|超时|timeout|timed?\s*out",
+    re.I,
+)
+# 反思提炼的固定开头："X(query=…) 失败：工具 X 执行出错"（memory.py 反思链写入）
+_TOOL_FAIL_STEM = "%失败：工具%"
+
+
+def _filter_stale_tool_failures(results: list[dict]) -> list[dict]:
+    """注入前把**过期的瞬态**工具报错学习剔掉，并把全库同类过期项顺手清掉。
+
+    只动「失败：工具 …」开头且命中瞬态标记（额度/限流/网络）的行；结构性失败
+    （"未返回数据/仅支持…"）是长期知识，不过期。清库走 learnings 表；
+    learnings_fts 是 JOIN 查询，主表行删掉后孤儿行自然失配，无需重建。
+    """
+    if not results:
+        return results
+    try:
+        from datetime import timedelta
+        cutoff = (datetime.now() - timedelta(hours=_TOOL_ERROR_TTL_HOURS)).isoformat()
+        markers = ("调用次数已用", "额度", "限流", "429", "ConnectionError",
+                   "RemoteDisconnected", "连接中止", "连接被拒", "超时", "timeout")
+        where_markers = " OR ".join("content LIKE ?" for _ in markers)
+        conn = _get_db()
+        with _db_write_lock:
+            conn.execute(
+                f"DELETE FROM learnings WHERE content LIKE ? AND created_at < ? "
+                f"AND ({where_markers})",
+                [_TOOL_FAIL_STEM, cutoff] + [f"%{m}%" for m in markers],
+            )
+            conn.commit()
+        # 召回结果里再拦一道：DELETE 之后仍留在旧结果列表里的过期项按"行已消失"识别
+        out = []
+        for r in results:
+            c = str(r.get("content") or "")
+            if "失败：" in c and _TRANSIENT_FAIL_RE.search(c):
+                row = conn.execute("SELECT created_at FROM learnings WHERE id = ?",
+                                   (r.get("id"),)).fetchone()
+                if row is None or str(row[0] or "") < cutoff:
+                    continue
+            out.append(r)
+        return out
+    except Exception:
+        logger.debug("瞬态工具报错学习过期过滤失败（fail-open）", exc_info=True)
+        return results
+
+
 def _retrieve_relevant_learnings(query: str, limit: int = MAX_LEARNINGS_INJECT,
                                  prev_user_text: str = "", session_id: str = "") -> list[dict]:
     """Search past learnings using TF-IDF semantic similarity.
@@ -442,6 +496,7 @@ def _retrieve_relevant_learnings(query: str, limit: int = MAX_LEARNINGS_INJECT,
         results = tf_candidates[:limit]
     results = [r for r in results
                if not _learning_is_garbage(r.get("topic", ""), r.get("content", ""))]
+    results = _filter_stale_tool_failures(results)
 
     if results:
         _log_injection(session_id, query, results)
@@ -521,6 +576,7 @@ def _retrieve_relevant_learnings(query: str, limit: int = MAX_LEARNINGS_INJECT,
         # 用户看到的是"我说什么他都去找股市、新会话也记得"。
         results = [r for r in results
                    if not _learning_is_garbage(r.get("topic"), r.get("content"))]
+        results = _filter_stale_tool_failures(results)
         _q_tokens = [t for t in _tokenize_zh(query) if len(t) >= 2]
         if _q_tokens:
             results = [r for r in results

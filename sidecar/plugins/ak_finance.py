@@ -442,7 +442,8 @@ async def _query_us_index(query: str) -> str:
             blocks.append("\n".join(lines))
         except Exception as e:
             blocks.append(f"📊 {name} ({sym}): 查询失败（{type(e).__name__}，已重试 3 次）。"
-                          "请改用 tavily_search 获取该指数的报道口径数字，并在答案里写明来源与日期。")
+                          "行情请改用 mx_query（妙想）；只有报道口径的数字才用 tavily_search"
+                          "（须写明来源与日期）。")
     return "\n\n".join(blocks)
 
 
@@ -488,12 +489,18 @@ async def execute(args: dict) -> str:
         r = await _query_a_share_spot(query)
         if "未找到" in r:
             r += ("\n\n💡 免费接口提示：ak_finance 只支持具体标的（个股/指数/单板块）。"
-                  "全市场汇总或模糊板块排行请改用 tavily_search；"
+                  "全市场汇总或模糊板块排行请改用 **mx_query（妙想）**；"
                   "个股请带 6 位代码（如 '600519 今日行情'）。"
-                  "东财接口偶发拒绝连接，重试一次可能成功。")
+                  "东财部分接口对本机持续拒连，重试无效。")
         return r
     except Exception as e:
-        return f"Error: 金融数据查询失败: {type(e).__name__}: {e}\n💡 接口偶发拒绝连接（东财风控），重试一次或改用 tavily_search。"
+        # 文案必须是真话（2026-09-26 实测 + 09-29 复发）：东财板块/汇总类接口对本机
+        # 是**接口级持续拒连**（同主机 K线/日线 200，clist 一类必挂），"偶发、重试
+        # 一次"是错的，重试只会再撞一次。行情的正确替补是 mx_query（妙想，数据源
+        # 不同、不受此接口影响）；tavily 只能给新闻口径的数字，不能给实时行情。
+        return (f"Error: 金融数据查询失败: {type(e).__name__}: {e}\n"
+                "💡 东财该接口对本机持续拒绝连接（非偶发，重试无效）。"
+                "行情数据请改用 **mx_query（妙想）**；只有新闻/报道口径才用 tavily_search。")
 
 
 if __name__ == "__main__":
