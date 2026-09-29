@@ -165,6 +165,15 @@ async def _handle_tool_execution(tc: dict, current_msgs: list, session_id: str,
             )
         except Exception:
             logger.warning("failed to log tool/result for %s", session_id, exc_info=True)
+    # 任务级验证账本（gap 清单 P1，2026-09-29）：本函数是全循环唯一的工具执行入口
+    # （云/本地、串行/并行、含早退路径都在此交汇），在这里记账最不容易漏。只记录，
+    # 不做任何判定——判定在交付前（`agent/task_verify.verify`）。
+    try:
+        from agent import task_verify as _tv
+        _tv.note_tool(session_id, _tname, tc.get("function", {}).get("arguments", ""),
+                      _tool_end_result(events))
+    except Exception:
+        logger.debug("task_verify.note_tool 失败", exc_info=True)
     return verify_failed, events
 
 async def _handle_tool_execution_inner(tc: dict, current_msgs: list, session_id: str,

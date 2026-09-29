@@ -115,6 +115,20 @@ MESSAGES: dict[str, dict[str, str]] = {
         "ja": "（以前の履歴は圧縮されました。具体的な数値・ファイル名・番号が必要なら、ツールを再実行して取得してください。記憶から引用しないこと。）",
         "ru": "(Более ранняя история сжата. Если нужны конкретные числа, имена файлов или ID — запросите их инструментом заново, не цитируйте по памяти.)",
     },
+    # 任务级验证器（2026-09-29，gap 清单 P1）：机械校验与"我已完成"的说法矛盾时——
+    # 第一次只要求补齐或如实说明（重采一次），第二次/作弊则明确"不按完成交付"。
+    "task_verify_nudge": {
+        "zh": "⛔ 机械校验未通过：{detail}。你上一条回答宣称完成，与此矛盾——请**补齐并重新验证**，或**如实说明卡在哪里**；不要再次宣称完成。",
+        "en": "⛔ Mechanical check failed: {detail}. Your previous answer claimed completion, which contradicts that — **finish it and verify again**, or **state plainly where it is stuck**; do not claim completion again.",
+        "ja": "⛔ 機械チェックに通りませんでした：{detail}。前回の回答は完了を主張していますが矛盾します。**仕上げて再検証**するか、**どこで止まっているか正直に述べて**ください。再度「完了」と主張しないでください。",
+        "ru": "⛔ Механическая проверка не пройдена: {detail}. В прошлом ответе заявлено о завершении — это противоречит фактам: **доведите и проверьте снова** либо **честно скажите, где застряли**; не заявляйте о завершении снова.",
+    },
+    "task_unverified": {
+        "zh": "⚠️ 这一轮我不按「完成」交付：{detail}。以上是本轮已经拿到的内容，请你决定下一步（补数据 / 调整目标 / 手工处理）。",
+        "en": "⚠️ I am not delivering this turn as complete: {detail}. The above is what this turn produced; the next step is yours to decide (more data / a different goal / handle it manually).",
+        "ja": "⚠️ このターンは「完了」として納品しません：{detail}。以上が今回得られた内容です。次の手順（データ追加／目標の調整／手作業）はご判断ください。",
+        "ru": "⚠️ Я не выдаю этот ход как завершённый: {detail}. Выше — то, что получено в этом ходу; решение о следующем шаге (данные / другая цель / вручную) за вами.",
+    },
     "max_steps": {
         "zh": "⚠️ 已达安全步数上限（{n}）。请发送新消息继续。",
         "en": "⚠️ Safety step limit reached ({n}). Send a new message to continue.",

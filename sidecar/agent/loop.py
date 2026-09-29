@@ -59,6 +59,7 @@ from agent.context import (
 from agent.gates import _build_local_tools_prompt
 from agent.context import _NATIVE_LEAN_PROMPT
 from agent.plugins.builtin import setup_all
+from agent import task_verify
 
 logger = logging.getLogger("latiao-sidecar")
 
@@ -701,6 +702,13 @@ class ThinAgentLoop:
         self._finalize_round = False           # 停滞闸门收口轮：无工具直接作答
         self._plan_nudge_used = 0              # 空转闸门：只声明计划不行动的一次纠正
         self._finalize_retry_used = False      # 终答轮空生成温度重采（一次）
+        # 任务级验证器（gap 清单 P1，2026-09-29）：本轮工具账本 + 等级校验
+        # 第一次未达标只提示（重采一次），第二次/作弊才交回用户（两级生效）
+        self._task_verify_used = False
+        try:
+            task_verify.begin_turn(session_id)
+        except Exception:
+            logger.debug("task_verify.begin_turn 失败", exc_info=True)
         self._quota_hint_injected = False      # 当日额度用尽提示（每 turn 一次）
         # 可配置阈值：主循环用默认值，子代理实例化后收紧（09-13 子代理收紧）
         self.max_steps = MAX_STEPS             # 步数上限
@@ -1885,6 +1893,18 @@ class ThinAgentLoop:
                     else:
                         # 正文已在 _sample 逐字流式下发，不再重复交付全文
                         self._step_log("终答轮", f"已交付 {len(body_text)} 字")
+                        # 收口轮已是最后一轮（不再重采）——机械校验若不过，就在交付时
+                        # **明说没达标**，绝不把"已完成"留给用户自己发现（P1 反作弊/诚实）
+                        try:
+                            _tv = task_verify.verify(self.session_id, body_text)
+                        except Exception:
+                            _tv = None
+                            logger.debug("task_verify.verify 失败", exc_info=True)
+                        if _tv is not None and not _tv["ok"]:
+                            _td = _tv.get("detail") or _tv.get("kind") or ""
+                            self._step_log("任务级验证", f"收口轮未达标（{_tv['kind']}：{_td}）")
+                            yield {"content": "\n\n" + _msg("task_unverified", self.user_lang,
+                                                            detail=_td)}
                     return
 
                 self._step_log("采样完成",
@@ -1903,6 +1923,31 @@ class ThinAgentLoop:
                     continue
 
                 if not tool_calls:
+                    # 任务级验证器（gap 清单 P1）：交付前做机械验收——判据只来自本轮
+                    # 工具账本（写文件/跑测试/正文声称的产物），开放问答返回 None。
+                    # 两级生效：第一次未达标 → 要求补齐或如实说明（重采一次）；
+                    # 第二次仍未达标、或作弊（删/清空被验对象）→ 交回用户，不冒充完成。
+                    # 记账无涉（本轮的检索计数/增量已在工具执行时完成，见施工约束 1）。
+                    try:
+                        _tv = task_verify.verify(self.session_id, body_text)
+                    except Exception:
+                        _tv = None
+                        logger.debug("task_verify.verify 失败", exc_info=True)
+                    if _tv is not None and not _tv["ok"]:
+                        _td = _tv.get("detail") or _tv.get("kind") or ""
+                        if _tv.get("hard") or self._task_verify_used:
+                            self._step_log("任务级验证",
+                                           f"{_tv['kind']} → 交回用户（{_td}）")
+                            yield {"content": "\n\n" + _msg("task_unverified", self.user_lang,
+                                                            detail=_td)}
+                            return
+                        self._task_verify_used = True
+                        self.current_msgs.append(_note_msg(
+                            _msg("task_verify_nudge", self.user_lang, detail=_td)))
+                        self._step_log("任务级验证",
+                                       f"{_tv['kind']} 未达标 → 要求补齐或如实说明（{_td}）")
+                        yield {"event": "heartbeat"}
+                        continue
                     # deliver waterfall：弱模型辅助（思考-only/空响应诊断/语言替换）
                     # 正文已实时流出——辅助只能"替换"（content_revised）或补充，不得重复
                     payload = {
