@@ -1212,11 +1212,22 @@ class ThinAgentLoop:
             # 曾自带一份只认英文的版本 → 中文报错的工具（如 read_file 缺文件）永不计入
             # 失败，同错升级形同虚设（故障注入测试抓到）。
             from agent.tool_exec import _looks_like_tool_failure
-            if not _looks_like_tool_failure(c):
+            _hard_fail = _looks_like_tool_failure(c)
+            # 验证报告（_auto_verify）追加在结果**末尾**——头部可能是"已写入 …"这种
+            # 成功文案，所以单独扫尾（2026-09-29：验证失败此前既不停也不计数）。
+            # 签名取"检查项名"（回读比对/文件存在/退出码/…），数字与路径不参与，
+            # 这样"同一类校验反复不过"才计成同一签名。
+            _vfail = ""
+            if not _hard_fail and "❌" in c[-600:]:
+                for _line in reversed(c[-600:].splitlines()):
+                    if "❌" in _line:
+                        _vfail = _line.split("❌", 1)[1].split("：", 1)[0].strip()[:30]
+                        break
+            if not _hard_fail and not _vfail:
                 continue
             if "已拒绝重复执行" in c[:200]:      # 闸门回复不是工具失败
                 continue
-            sig = re.sub(r"\d+", "#", c[:80])
+            sig = f"verify:{_vfail}" if _vfail else re.sub(r"\d+", "#", c[:80])
             seen[sig] = str(id2name.get(str(m.get("tool_call_id") or "")) or "")
         for sig, tool_name in seen.items():
             key = f"{tool_name}|{sig}"
