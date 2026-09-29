@@ -617,7 +617,8 @@ def _clear_steer(session_id: str) -> None:
     _steer_inbox.pop(session_id, None)
 
 
-def _record_engine_usage(session_id: str, line: str) -> None:
+def _record_engine_usage(session_id: str, line: str, source: str = "main_turn",
+                         parent_session_id: str = "") -> None:
     """从原始 SSE 行提取引擎真实用量（云端 usage / llama.cpp timings）→ 上下文统计。
 
     薄循环此前把这些字段整体丢弃；缓存命中率与真实输入 token 数只能从这里来。
@@ -638,7 +639,8 @@ def _record_engine_usage(session_id: str, line: str) -> None:
     try:
         import context_stats
         context_stats.record_usage(session_id, usage if isinstance(usage, dict) else None,
-                                   timings if isinstance(timings, dict) else None)
+                                   timings if isinstance(timings, dict) else None,
+                                   source=source, parent_session_id=parent_session_id)
     except Exception:
         logger.debug("上下文统计记录用量失败", exc_info=True)
 
@@ -718,6 +720,13 @@ class ThinAgentLoop:
         self.api_url = api_url
         self.headers = headers
         self.access_mode = _normalize_access(access_mode)
+        # 用量来源归因（2026-09-29，ZCode 的 query_source 对照）：子代理用受限档
+        # 且会话 id 形如 "parent:sub"（agent/subagent.py）——据此把它的用量记到
+        # 父会话的来源桶里，父会话面板能看出"多少花在子代理上"（ZCode 实测 17%）。
+        self._usage_source = "subagent" if self.access_mode == "subagent" else "main_turn"
+        self._usage_parent = (session_id.split(":", 1)[0]
+                              if self._usage_source == "subagent" and ":" in (session_id or "")
+                              else "")
         self.thinking_level = thinking_level
         # is_local 由路由层显式传入（v1 同口径）；未传时按 URL 推导兜底
         self.is_local = _is_local_llm_url(api_url) if is_local is None else bool(is_local)
@@ -1151,7 +1160,9 @@ class ThinAgentLoop:
                 yield {"event": "engine_recovered"}
             if '"usage"' in line or '"timings"' in line:
                 # 上下文统计：真实输入 token 数与缓存命中（云端 usage / llama.cpp timings）
-                _record_engine_usage(self.session_id, line)
+                _record_engine_usage(self.session_id, line,
+                                     source=self._usage_source,
+                                     parent_session_id=self._usage_parent)
             try:
                 done, delta = _parse_delta_line(line)
             except Exception:

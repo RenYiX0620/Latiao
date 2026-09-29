@@ -50,4 +50,26 @@ describe("本轮花费展示（成本可见）", () => {
     const v = turnCostView({ ...base, retries: 0, retry_kinds: [] }, fmt, t)!;
     expect(v.retryKinds).toBeNull();
   });
+
+  it("来源行：只有一类来源时不显示（避免噪音）", () => {
+    const v = turnCostView({ ...base, by_source: {
+      main_turn: { requests: 3, input_tokens: 12000, output_tokens: 300 },
+    } }, fmt, t)!;
+    expect(v.sources).toBeNull();
+  });
+
+  it("来源行：主循环 + 子代理 + 知识提炼各一片（子代理带次数）", () => {
+    const v = turnCostView({ ...base, by_source: {
+      main_turn: { requests: 3, input_tokens: 12000, output_tokens: 300 },
+      subagent: { requests: 2, input_tokens: 3000, output_tokens: 100 },
+      refine: { requests: 9, input_tokens: 400, output_tokens: 60 },
+    } }, fmt, t)!;
+    expect(v.sources).toContain("主循环 12300");
+    expect(v.sources).toContain("子代理 3100（2 次）");
+    expect(v.sources).toContain("知识提炼 460（9 次）");
+  });
+
+  it("by_source 缺省（旧后端）→ 不给来源行，不炸", () => {
+    expect(turnCostView(base, fmt, t)!.sources).toBeNull();
+  });
 });

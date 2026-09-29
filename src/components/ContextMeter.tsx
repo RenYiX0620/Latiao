@@ -144,6 +144,12 @@ export default function ContextMeter({ sessionId, fallbackTokens, fallbackLimit 
                   {turnView.retryKinds}
                 </div>
               )}
+              {turnView.sources && (
+                <div className="ctx-row">
+                  <span className="ctx-row-label">{t("chat.ctx_turn_sources")}</span>
+                  <span className="ctx-row-val">{turnView.sources}</span>
+                </div>
+              )}
             </div>
           )}
           <div className="ctx-foot">

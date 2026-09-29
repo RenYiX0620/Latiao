@@ -308,3 +308,24 @@ assistant 消息，所以两种协议都能认），再按类别选阈值：
 **还没做的三件"框架先行"的事**（不属本清单，另行排期）：飞书/微信等**通道凭据**要用户提供；
 P1 的**字段级 schema 校验**（先要定产物契约）；**云端配额/429/退避/按 provider 记账**
 （见 [[latiao-cloud-concurrency]] 那条：保险而非现债）。
+
+---
+
+## 五、ZCode 对照后的增补（2026-09-29，非原文清单，来自逆向对照）
+
+把 ZCode（我运行所在 harness）打包产物 + 真实 `~/.zcode/cli/db/db.sqlite` 逐条读完后，
+它的"使用统计"模块有三处比我们做得好，其中两条当天落地：
+
+| # | ZCode 的做法（实测） | 我们的落地（2026-09-29） |
+|---|---|---|
+| 1 | `model_usage` 同时存 `provider_total_tokens`（供应商报）与 `computed_total_tokens`（本地算），读时用 `oas()` **拿供应商总量反推 input 是否含缓存** | **未做**（我们靠实测定了 `prompt_n + cache_n` 的口径；要做的话＝两口径都存 + 自检告警，列在待办） |
+| 2 | `query_source` 维度（本机实测：`main_turn` 14772 / **`subagent` 3071 = 17.2%** / `compact` 22 / `session_title` 7） | ✅ **已做**：`context_stats.by_source` 分桶 + `credit_parent()`（子代理的用量记进**父会话**的来源桶；父会话自身的输入量/缓存样本不受污染）+ 循环按会话形态判定来源（`parent:sub` + 受限档）→ 面板「来源」一行 |
+| 3 | 时延/重试**落库可查历史**（`duration_ms`/`time_to_first_token_ms`/`retry_count`、30 天滚动删） | ✅ **已做**：`turn_metrics` 表（`memory.db`）一行一轮，轮末由 SSE 层 `finally` 与通道路径写入，保留期 180 天（`LATIAO_TURN_METRICS_DAYS`），`by_source` 存 JSON |
+
+**没做的第 1 条的代价**：哪天引擎改了 `timings` 语义（或换引擎），我们会静默算错输入量——
+ZCode 那种"两种口径都存 + 用总量自检"的做法正是为这个准备的。列入下一步候选。
+
+**证据**：`sidecar/tests/test_source_attribution.py` 10 条（含真循环集成：子代理身份跑一回合，
+引擎报的 900 token 落进父会话 `subagent` 桶、父会话自身输入仍为 0）+ `src/utils/turnCost.test.ts`
+3 条来源行用例。A/B：只回退 `context_stats.py`/`loop.py` → **8/10 红**；新代码 10/10 绿。
+全量 `1213 passed, 1 skipped`（CI 同款 venv）。

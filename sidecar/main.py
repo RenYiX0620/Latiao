@@ -452,6 +452,9 @@ async def lifespan(app: FastAPI):
                 await run_in_threadpool(db.prune_reflections)
                 await run_in_threadpool(db.prune_learnings)
                 await run_in_threadpool(db.prune_injections)
+                # 每轮指标保留期（2026-09-29）：一行一轮，默认 180 天
+                import turn_metrics as _tm
+                await run_in_threadpool(_tm.prune)
                 # ⑥：空闲就停掉嵌入服务（腾内存）；下次检索按需再起
                 try:
                     import embedding_service as _emb

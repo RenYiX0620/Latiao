@@ -154,6 +154,26 @@ def _init_db():
         except Exception:
             logger.error("Failed to create sessions tables", exc_info=True)
 
+        # ⑤ 每轮运行指标落库（2026-09-29，ZCode 对照后的增补）：此前 token/TTFT/重试
+        # 只在 context_stats 的内存里，重启即失、也没法回答"上周哪次最慢/最贵"。一行一轮，
+        # 轮末由 api_routes / channels_bridge 写入（数值取自同一份计数器，不新增埋点）。
+        # by_source 存 JSON（主循环 / 子代理 / 知识提炼的归因）——列会随口径演化，
+        # 学 session_messages 的做法把易变部分塞进 JSON，别逐字段建列。
+        try:
+            conn.execute("CREATE TABLE IF NOT EXISTS turn_metrics ("
+                "id TEXT PRIMARY KEY, session_id TEXT NOT NULL, model TEXT DEFAULT '', "
+                "is_local INTEGER DEFAULT 0, started_at TEXT NOT NULL, ended_at TEXT NOT NULL, "
+                "duration_ms INTEGER DEFAULT 0, input_tokens INTEGER DEFAULT 0, "
+                "gen_tokens INTEGER DEFAULT 0, retries INTEGER DEFAULT 0, steps INTEGER DEFAULT 0, "
+                "ttft_ms INTEGER, refine_calls INTEGER DEFAULT 0, refine_tokens INTEGER DEFAULT 0, "
+                "budget INTEGER DEFAULT 0, by_source TEXT DEFAULT '{}', ended_reason TEXT DEFAULT '')")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_turn_metrics_sid "
+                "ON turn_metrics(session_id, started_at DESC)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_turn_metrics_started "
+                "ON turn_metrics(started_at DESC)")
+        except Exception:
+            logger.error("Failed to create turn_metrics", exc_info=True)
+
         # ④ 记忆注入日志（09-23）：记录"哪一轮注入了哪些知识"，供点赞/点踩时
         # 标成标签（used=1/0）——门槛怎么调，长期只能靠真实标签说话，不能再拿
         # 我编的 13 个查询去拟合（那样是过拟合）。

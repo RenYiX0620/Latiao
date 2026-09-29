@@ -206,6 +206,12 @@ const T: Record<string, Record<Lang, string>> = {
   "chat.ctx_turn_cost": { zh: "本轮开销", en: "Turn spend", ja: "今回のコスト", ru: "Расход хода" },
   "chat.ctx_turn_cost_val": { zh: "生成 {gen} · 重采 {retries} 次 · 知识提炼 {refine} 次（{refineTok}）", en: "gen {gen} · {retries} retries · {refine} refinements ({refineTok})", ja: "生成 {gen} · 再サンプル {retries} 回 · 知識抽出 {refine} 回（{refineTok}）", ru: "ген {gen} · пересэмплов {retries} · извлечений {refine} ({refineTok})" },
   "chat.ctx_turn_retry_kinds": { zh: "重采原因：{kinds}", en: "retry reasons: {kinds}", ja: "再サンプル理由：{kinds}", ru: "причины пересэмплов: {kinds}" },
+  // 来源归因（2026-09-29，ZCode 的 query_source 对照）：子代理在自己的会话里记账，
+  // 父会话靠 credit_parent 才能看见"这轮有多少花在子代理上"
+  "chat.ctx_turn_sources": { zh: "来源", en: "Sources", ja: "内訳", ru: "Источники" },
+  "chat.ctx_src_main": { zh: "主循环 {tok}", en: "main {tok}", ja: "メイン {tok}", ru: "осн. {tok}" },
+  "chat.ctx_src_subagent": { zh: "子代理 {tok}（{n} 次）", en: "sub-agent {tok} ({n})", ja: "サブエージェント {tok}（{n} 回）", ru: "субагент {tok} ({n})" },
+  "chat.ctx_src_refine": { zh: "知识提炼 {tok}（{n} 次）", en: "refine {tok} ({n})", ja: "知識抽出 {tok}（{n} 回）", ru: "извлечение {tok} ({n})" },
   "settings.persona_title": { zh: "人格与称呼", en: "Persona & Address", ja: "ペルソナと呼称", ru: "Персона и обращение" },
   "settings.persona_desc": { zh: "新安装的用户第一次对话时，辣条会先自我介绍，再依次询问称呼、名字和语气；升级版本不会重新询问。", en: "On a fresh install, Latiao introduces itself, then asks how to address you, what to call itself and your preferred tone. Updates never re-ask.", ja: "新規インストールの初回会話で自己紹介し、呼び方・自分の名前・口調を順に確認します。更新時に再確認はしません。", ru: "При первой установке Latiao представится и спросит, как к вам обращаться, как называть себя и какой тон предпочитаете. Обновления не спрашивают повторно." },
   "settings.persona_user": { zh: "对你称呼", en: "Addresses you", ja: "呼び方", ru: "Обращение" },

@@ -78,7 +78,8 @@ import collections as _collections
 _recently_confirmed: "_collections.deque[str]" = _collections.deque(maxlen=200)
 
 
-async def _logged_agent_turn(session_id: str, messages: list, inner):
+async def _logged_agent_turn(session_id: str, messages: list, inner,
+                              model: str = "", is_local: bool = False):
     """阶段 1/2a 接线：turn 边界事件 + 相位状态机（灰度，见 session_log.py）。
 
     事件记录放在 SSE 消费层（而非两个生成器内部），零侵入地拿到完整 turn
@@ -126,6 +127,14 @@ async def _logged_agent_turn(session_id: str, messages: list, inner):
                 state.end_turn(reason)
             except Exception:
                 logger.warning("failed to end turn state for %s", session_id, exc_info=True)
+        # 每轮指标落库（2026-09-29，ZCode 对照后的增补）：与 turn/end 同源，
+        # 一行一轮、失败只记日志（记账绝不能影响回合结束）
+        try:
+            import turn_metrics
+            turn_metrics.record_turn(session_id, model=model, is_local=is_local,
+                                     ended_reason=reason)
+        except Exception:
+            logger.debug("turn_metrics 落库失败", exc_info=True)
 
 
 def _get_cloud_model_names() -> list[dict]:
@@ -412,7 +421,8 @@ async def chat_completion(request: Request):
             # 新请求清除上一次停止的取消标记（重发消息不受影响）
             _clear_session_cancel(session_id)
             return StreamingResponse(
-                _logged_agent_turn(session_id, messages, agent_loop_wrapper()),
+                _logged_agent_turn(session_id, messages, agent_loop_wrapper(),
+                                   model=model, is_local=is_local),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache"},
             )

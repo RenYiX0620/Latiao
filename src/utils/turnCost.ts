@@ -13,6 +13,13 @@ export interface TurnCostLike {
   retry_kinds: string[];
   refine_calls: number;
   refine_tokens: number;
+  by_source?: Record<string, SourceBucket>;
+}
+
+export interface SourceBucket {
+  requests: number;
+  input_tokens: number;
+  output_tokens: number;
 }
 
 export interface TurnCostView {
@@ -22,6 +29,8 @@ export interface TurnCostView {
   cost: string;
   /** 重采原因（有才给，避免空行） */
   retryKinds: string | null;
+  /** 来源行：主循环 / 子代理 / 知识提炼（只有 ≥2 类时才给，避免噪音） */
+  sources: string | null;
 }
 
 type Fmt = (n: number) => string;
@@ -50,5 +59,29 @@ export function turnCostView(turn: TurnCostLike | null | undefined, fmt: Fmt, t:
       turn.retry_kinds && turn.retry_kinds.length > 0
         ? t("chat.ctx_turn_retry_kinds", { kinds: turn.retry_kinds.join(", ") })
         : null,
+    sources: sourceParts(turn.by_source, fmt, t),
   };
+}
+
+/** 来源分片：每片套自己的模板后拼接（各语序不同，别拼句子） */
+function sourceParts(by: Record<string, SourceBucket> | undefined, fmt: Fmt, t: Tr): string | null {
+  if (!by) return null;
+  const parts: string[] = [];
+  const main = by["main_turn"];
+  if (main && (main.input_tokens || main.output_tokens)) {
+    parts.push(t("chat.ctx_src_main", { tok: fmt(main.input_tokens + main.output_tokens) }));
+  }
+  const sub = by["subagent"];
+  if (sub && (sub.input_tokens || sub.output_tokens)) {
+    parts.push(t("chat.ctx_src_subagent", {
+      tok: fmt(sub.input_tokens + sub.output_tokens), n: `${sub.requests}`,
+    }));
+  }
+  const ref = by["refine"];
+  if (ref && (ref.input_tokens || ref.output_tokens)) {
+    parts.push(t("chat.ctx_src_refine", {
+      tok: fmt(ref.input_tokens + ref.output_tokens), n: `${ref.requests}`,
+    }));
+  }
+  return parts.length >= 2 ? parts.join(" · ") : null;
 }

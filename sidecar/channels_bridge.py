@@ -102,6 +102,13 @@ async def run_channel_turn(channel: str, chat_id: str, text: str, *,
     except Exception as e:
         logger.error("通道轮次失败: %s", e, exc_info=True)
         reply = f"⚠️ 处理这条消息时出错：{type(e).__name__}。请重试；若持续失败请到辣条里看日志。"
+    # 每轮指标落库（2026-09-29）：通道路径同样一行一轮（与 SSE 层同源口径）
+    try:
+        import turn_metrics
+        turn_metrics.record_turn(session_id, model=body.get("model") or "",
+                                 is_local=bool(is_local), ended_reason="channel")
+    except Exception:
+        logger.debug("turn_metrics 落库失败（通道）", exc_info=True)
     _save_turn(session_id, channel, text, reply, history)
     logger.info("通道消息: %s/%s → 回复 %d 字", channel, str(chat_id)[:12], len(reply))
     return reply

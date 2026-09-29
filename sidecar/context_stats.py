@@ -181,6 +181,13 @@ def _session(session_id: str) -> dict:
         "turn_refine_tokens": 0, # 其中已知的 token 数（引擎不回 usage 时不计）
         "refine_calls_total": 0, # 会话累计（跨轮看长期开销）
         "refine_tokens_total": 0,
+        # ── 来源归因（2026-09-29，ZCode 对照后的增补）──
+        # ZCode 的 model_usage 有 query_source 维度，能看出"多少花在子代理上"；
+        # 我们的子代理在自己的 session 里记账，父会话看不见 → 这里按来源分桶，
+        # 子代理的用量同时记进**父会话**的 by_source["subagent"]（不影响父会话
+        # 自身的预算与缓存样本——那是父提示词的量）。
+        "by_source": {},         # {"main_turn"|"subagent"|"refine": {requests,input_tokens,output_tokens}}
+        "turn_started_ms": 0,    # 本轮起点（墙钟，轮末算 duration 用）
     })
 
 
@@ -193,7 +200,36 @@ def begin_turn(session_id: str) -> None:
         sess.update(steps=0, llm_seconds=0.0, tool_seconds=0.0,
                     ttft_samples=[], gen_tokens=0, gen_seconds=0.0,
                     turn_input_tokens=0, turn_retries=0, turn_retry_kinds=[],
-                    turn_refine_calls=0, turn_refine_tokens=0)
+                    turn_refine_calls=0, turn_refine_tokens=0,
+                    by_source={}, turn_started_ms=int(time.time() * 1000))
+
+
+def _bump_source(sess: dict, source: str, prompt_tokens: int = 0,
+                 completion_tokens: int = 0, requests: int = 1) -> None:
+    """按来源累加（调用方已持锁；refine 也走这里，面板与落库只认一个形状）。"""
+    src = str(source or "main_turn")
+    bucket = dict(sess.get("by_source") or {})
+    cur = dict(bucket.get(src) or {"requests": 0, "input_tokens": 0, "output_tokens": 0})
+    cur["requests"] = int(cur.get("requests") or 0) + requests
+    cur["input_tokens"] = int(cur.get("input_tokens") or 0) + int(prompt_tokens or 0)
+    cur["output_tokens"] = int(cur.get("output_tokens") or 0) + int(completion_tokens or 0)
+    bucket[src] = cur
+    sess["by_source"] = bucket
+
+
+def credit_parent(parent_session_id: str, prompt_tokens: int = 0,
+                  completion_tokens: int = 0, source: str = "subagent") -> None:
+    """把子代理的用量记到**父会话**的来源桶里（只动 by_source）。
+
+    刻意不碰父会话的 turn_input_tokens / cache_samples / real_prompt_tokens：
+    那三个是"父提示词自己的量"（预算守卫与缓存命中率的语义），子代理的是一笔
+    独立开销——混进去会让预算提前触发、缓存命中率被无关提示词带偏。
+    """
+    if not parent_session_id:
+        return
+    with _lock:
+        sess = _session(parent_session_id)
+        _bump_source(sess, source, prompt_tokens, completion_tokens)
 
 
 def record_retry(session_id: str, kind: str = "") -> None:
@@ -240,6 +276,7 @@ def record_refine(session_id: str, usage: dict | None = None, ok: bool = True) -
         sess = _session(session_id)
         sess["turn_refine_calls"] = int(sess.get("turn_refine_calls") or 0) + 1
         sess["refine_calls_total"] = int(sess.get("refine_calls_total") or 0) + 1
+        _bump_source(sess, "refine", pt, ct)
         if pt or ct:
             sess["turn_refine_tokens"] = int(sess.get("turn_refine_tokens") or 0) + pt + ct
             sess["refine_tokens_total"] = int(sess.get("refine_tokens_total") or 0) + pt + ct
@@ -459,8 +496,14 @@ def _head_fp(messages: list, tools: list) -> str:
     return h.hexdigest()[:8]
 
 
-def record_usage(session_id: str, usage: dict | None = None, timings: dict | None = None) -> None:
-    """记录引擎返回的真实用量：输入 token 总数 + 缓存命中率样本。"""
+def record_usage(session_id: str, usage: dict | None = None, timings: dict | None = None,
+                 source: str = "main_turn", parent_session_id: str = "") -> None:
+    """记录引擎返回的真实用量：输入 token 总数 + 缓存命中率样本。
+
+    source（2026-09-29，ZCode 的 query_source 对照）：`main_turn` / `subagent`——
+    子代理调用额外把用量记进父会话的来源桶（`credit_parent`），父会话面板因此
+    能显示"这轮有多少花在子代理上"（ZCode 本机实测子代理占 17%）。
+    """
     if not session_id:
         return
     prompt_tokens = 0
@@ -487,6 +530,7 @@ def record_usage(session_id: str, usage: dict | None = None, timings: dict | Non
             sess["turn_input_tokens"] = int(sess.get("turn_input_tokens") or 0) + prompt_tokens
         if completion_tokens:
             sess["gen_tokens"] += completion_tokens
+        _bump_source(sess, source, prompt_tokens, completion_tokens)
         if rate is not None:
             _fp = sess.get("head_fp") or "-"
             _prev = sess.get("head_prev")
@@ -503,6 +547,8 @@ def record_usage(session_id: str, usage: dict | None = None, timings: dict | Non
             sess["cache_samples"].append(rate)
             if len(sess["cache_samples"]) > CACHE_SAMPLES:
                 del sess["cache_samples"][:-CACHE_SAMPLES]
+    if str(source) == "subagent" and parent_session_id:
+        credit_parent(parent_session_id, prompt_tokens, completion_tokens, "subagent")
 
 
 def _turn_cost(sess: dict) -> dict:
@@ -521,7 +567,22 @@ def _turn_cost(sess: dict) -> dict:
         "refine_tokens": int(sess.get("turn_refine_tokens") or 0),
         "refine_calls_total": int(sess.get("refine_calls_total") or 0),
         "refine_tokens_total": int(sess.get("refine_tokens_total") or 0),
+        "by_source": dict(sess.get("by_source") or {}),
+        # 首 token 延迟均值（毫秒）——ZCode 把 TTFT 落库，我们也存一份可查历史
+        "ttft_avg_ms": (round(sum(sess.get("ttft_samples") or [])
+                              / len(sess["ttft_samples"]) * 1000)
+                        if sess.get("ttft_samples") else None),
     }
+
+
+def turn_cost(session_id: str) -> dict:
+    """本轮成本快照（含起点时间戳）——面板（stats 的 turn 块）与轮末落库共用一处口径。"""
+    with _lock:
+        sess = _sessions.get(session_id) or {}
+        d = _turn_cost(sess)
+        started = int(sess.get("turn_started_ms") or 0)
+    d["started_ms"] = started
+    return d
 
 
 def stats(session_id: str, limit: int = 0, limit_source: str = "") -> dict:
@@ -531,6 +592,7 @@ def stats(session_id: str, limit: int = 0, limit_source: str = "") -> dict:
         snap = dict(sess.get("snapshot") or {})
         samples = list(sess.get("cache_samples") or [])
         _turn = _turn_cost(sess)
+        _turn["started_ms"] = int(sess.get("turn_started_ms") or 0)
     if not snap:
         return {
             "status": "ok", "available": False, "session_id": session_id,
