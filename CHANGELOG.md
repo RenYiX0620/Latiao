@@ -171,6 +171,75 @@
 
 ---
 
+## v0.3.56 — Loop 工程收官：闸门、成本可见、三套循环合一
+
+# Latiao v0.3.56 — Loop engineering: gates, cost visibility, one single loop
+
+This release finishes the loop-engineering work: every safety gate now lives on **one** loop, and
+what a turn costs is finally visible.
+
+## New
+
+- **Cost visibility.** The context panel now shows two extra rows: this turn's input tokens against
+  the budget, generation, **resample/retry counts with reasons**, and the "knowledge refinement"
+  calls (the invisible extra model call after each tool) — plus a per-source breakdown
+  (main loop / sub-agents / refinement). At 80% of the budget the app now tells you explicitly
+  instead of silently wrapping up, and scheduled jobs are finally accounted for (they used to be
+  invisible).
+- **Per-turn metrics persisted.** One row per turn (input/output tokens, retries, TTFT, duration,
+  source breakdown, end reason) so you can look up "which turn was slowest/most expensive",
+  kept for 180 days by default.
+- **Task-level verifier.** Before delivering, the app mechanically checks the turn's own output:
+  a file it claimed to write that is missing or half-written (truncated JSON), tests still failing
+  while the answer claims success, artifacts named in the answer that do not exist. It then asks
+  the model to finish or to say plainly where it is stuck. **Deleting or emptying test files to
+  "pass" is blocked** — you no longer get a fake "done".
+- **Loop discipline in the system prompt.** On repeated failure the model reports the blocker and
+  hands back to you instead of grinding to the step limit.
+
+## Improvements
+
+- **Scheduled jobs now run on the same loop as chat.** Task verification, budget guard, stall and
+  same-error escalation, context compaction and tool-result recycling used to be bypassed by cron
+  entirely. Timeout / cancel / exception are now **recorded and visible** (previously a job could
+  fail silently and you would just see nothing). Jobs also accept an explicit tool access mode
+  (e.g. read-only).
+- **Tool-result recycling by category.** File reads and searches fold earlier (saving context);
+  market/finance results that contain numbers are kept longer (so digits are not lost and then
+  misquoted). Restored history is recycled too, and the fold marker names the tool.
+- **More reliable compaction.** No more cutting mid-line (numbers and filenames are no longer
+  split in half), with an explicit note of what was dropped plus "re-run the tool if you need a
+  specific number — do not quote from memory".
+- **The non-streaming endpoint and frontend history replay** now truncate on line boundaries too,
+  and the endpoint runs on the single loop.
+- **Input-token self-check.** Both calibers of the input token count are stored, and a smoke alarm
+  fires in the log if the engine's semantics change.
+
+## Fixes (found by audit)
+
+- **Anti-cheat false positives:** `rm -rf build/ && pytest tests/`, moving a test file to a backup
+  location, or writing an empty `tests/__init__.py` were misjudged as tampering and handed the turn
+  back to you. Fixed — while also catching forms that used to slip through (e.g. `sudo rm`).
+- **Failure-judge false positives:** reading source that merely contains "not found"-style wording,
+  or a search that happens to hit those words, was counted as a tool failure and could eventually
+  hand the turn back. It now only treats an error-shaped first line as a failure.
+- **Onboarding mis-capture:** during first-run onboarding a short scheduled-task name (e.g. "日报")
+  could be recorded as your name. A non-interactive gate now prevents this.
+- **Three state leaks in the test suite** (which routed later tests to a stopped stub engine / deleted
+  a module attribute), fixed.
+- One-step budget overshoot now warns before wrapping up; large PDF deliverables are no longer read
+  into memory in full for validation.
+
+## Notes
+
+- Every gate in this batch was verified by "the old code must fail" (A/B) checks; sidecar 1238 tests
+  and 100 frontend tests are green.
+- Please trigger one scheduled job manually in the app to confirm real-model behavior (the log shows
+  it running on the single loop).
+- The three cost/source rows in the panel appear with this build.
+
+---
+
 ## 更早版本
 
 以下标题来自各自的发布提交（完整产物与发布时间见 GitHub Releases）：
