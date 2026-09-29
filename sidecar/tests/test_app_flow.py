@@ -101,14 +101,17 @@ def _start_app() -> str:
 
 
 @pytest.fixture()
-def e2e():
+def e2e(monkeypatch):
     engine = DualFakeEngine()
     fake_url = engine.start()
     import api_routes
     async def fake_target(cfg):
         return ("openai", fake_url + "/v1/chat/completions",
                 {"Authorization": "Bearer fake"}, False)
-    api_routes._resolve_api_target = fake_target
+    # 必须经 monkeypatch（或用后还原）：此前是**裸赋值**，teardown 不还 → 之后所有
+    # 模块的 /v1/chat/completions 都被解析到这个**已停掉的**桩引擎地址（2026-09-29
+    # 实测：后续模块的路由请求连 127.0.0.1:<旧端口> 全部 Connection refused）。
+    monkeypatch.setattr(api_routes, "_resolve_api_target", fake_target)
     base = _start_app()
     yield base, engine
     engine.stop()
