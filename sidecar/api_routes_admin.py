@@ -231,7 +231,8 @@ async def invoke_tool(request: Request):
 
     业务动作只有一份（plugins/*.py 的 execute），按钮和 AI 共用：
     - `name` + `args` 与 Agent 工具调用完全同构
-    - `confirmed: true` 表示用户在 UI 上亲自点击（confirm 级工具的合法确认）
+    - confirm 级工具走**服务端挑战**：先返回 need_confirm + invoke_id，
+      第二次带同一 invoke_id 才执行（客户端无法自认确认，见 agent/confirm.py）
     - 结果写入 tool_calls 台账（与 Agent 路径同一张表），UI 可立刻在「最近执行」看到
     """
     body = await _json_body(request)
@@ -247,13 +248,27 @@ async def invoke_tool(request: Request):
         return {"status": "error", "message": f"未知工具: {name}"}
 
     perm = hub.TOOL_PERMISSIONS.get(name, "safe")
-    # UI 点击 = 用户确认。confirm 级工具必须带 confirmed:true（按钮二次确认/表单提交）。
-    if perm == "confirm" and not body.get("confirmed"):
-        return {
-            "status": "need_confirm",
-            "message": f"工具 {name} 需要用户确认（permission=confirm）",
-            "permission": perm,
-        }
+    # confirm 级工具走服务端挑战（2026-09-29 审计 P1：客户端 confirmed=true 自认无效）。
+    # 第一次：登记待确认，返回一次性 invoke_id；第二次：带同一 invoke_id 且 name/args
+    # 一致才执行。等价于 Agent 路径的 _pending_confirmations 挑战，只是把「弹窗」换成
+    # 「UI 二次点击」，但确认凭证由服务端签发，本地进程无法自行铸造。
+    if perm == "confirm":
+        from agent.confirm import consume_invoke, register_invoke
+        invoke_id = str(body.get("invoke_id") or "")
+        if not invoke_id:
+            iid = register_invoke(name, args)
+            return {
+                "status": "need_confirm",
+                "invoke_id": iid,
+                "message": f"工具 {name} 需要用户确认（permission=confirm）",
+                "permission": perm,
+            }
+        if not consume_invoke(invoke_id, name, args):
+            return {
+                "status": "error",
+                "message": "确认已过期或无效，请重新发起",
+                "permission": perm,
+            }
 
     from agent.tool_exec import _record_tool_call_db, execute_tool
     session_id = str(body.get("session_id") or "ui-invoke")

@@ -69,9 +69,24 @@ def test_invoke_confirm_tool_requires_flag(client):
     data = r.json()
     assert data["status"] == "need_confirm"
     assert data["permission"] == "confirm"
+    # 服务端签发一次性凭证（P1：客户端 confirmed=true 自认无效）
+    assert data.get("invoke_id")
 
 
-def test_invoke_confirm_tool_with_confirmed(client, monkeypatch):
+def test_invoke_confirm_client_cannot_self_confirm(client):
+    """P1 回归：客户端自写 confirmed=true 不得放行，必须走服务端挑战。"""
+    r = client.post("/v1/tools/invoke",
+                    json={"name": "write_file",
+                          "args": {"path": "/tmp/x", "content": "y"},
+                          "confirmed": True},
+                    headers=_h())
+    data = r.json()
+    # 没有 invoke_id 时仍要挑战，不能直接执行
+    assert data["status"] == "need_confirm"
+    assert data.get("invoke_id")
+
+
+def test_invoke_confirm_with_challenge_token(client, monkeypatch):
     from agent import tool_exec as te
 
     async def fake_exec(name, args):
@@ -80,12 +95,33 @@ def test_invoke_confirm_tool_with_confirmed(client, monkeypatch):
     monkeypatch.setattr(te, "execute_tool", fake_exec)
     monkeypatch.setattr(te, "_record_tool_call_db", lambda *a, **k: None)
 
+    args = {"path": "/tmp/x", "content": "y"}
+    step1 = client.post("/v1/tools/invoke",
+                        json={"name": "write_file", "args": args},
+                        headers=_h()).json()
+    assert step1["status"] == "need_confirm"
+    step2 = client.post("/v1/tools/invoke",
+                        json={"name": "write_file", "args": args, "invoke_id": step1["invoke_id"]},
+                        headers=_h()).json()
+    assert step2["status"] == "ok"
+    # 一次性：同一 invoke_id 不可重放
+    step3 = client.post("/v1/tools/invoke",
+                        json={"name": "write_file", "args": args, "invoke_id": step1["invoke_id"]},
+                        headers=_h()).json()
+    assert step3["status"] == "error"
+
+
+def test_invoke_challenge_binds_name_and_args(client):
+    step1 = client.post("/v1/tools/invoke",
+                        json={"name": "write_file", "args": {"path": "/tmp/a", "content": "1"}},
+                        headers=_h()).json()
+    # 换 args 再用同一凭证 → 失败
     r = client.post("/v1/tools/invoke",
                     json={"name": "write_file",
-                          "args": {"path": "/tmp/x", "content": "y"},
-                          "confirmed": True},
-                    headers=_h())
-    assert r.json()["status"] == "ok"
+                          "args": {"path": "/tmp/b", "content": "2"},
+                          "invoke_id": step1["invoke_id"]},
+                    headers=_h()).json()
+    assert r["status"] == "error"
 
 
 def test_recent_ledger_endpoint_exists(client):

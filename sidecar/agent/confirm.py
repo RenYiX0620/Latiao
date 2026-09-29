@@ -191,5 +191,50 @@ class _NullLock:
 _pending_confirmations: dict[str, dict] = {}
 _pending_lock = _NullLock()
 
+# ── UI 直调工具的服务端确认挑战（2026-09-29 审计 P1）────────────────
+# 事故：/v1/tools/invoke 曾用 body["confirmed"]=true 自认确认——持有 token 的
+# 本地进程一行 HTTP 就能执行 write_file 等 confirm 级工具，人工确认形同虚设
+# （与 control_launch 旁路闸门同款）。修法对齐 Agent 路径：服务端发一次性
+# invoke_id，第二次带同一 invoke_id 才执行；客户端无法自行铸造。
+import secrets as _secrets
+import time as _time
+
+# invoke_id → {"name", "args_fingerprint", "ts"}；consume 即弹出（一次性）
+_pending_invokes: dict[str, dict] = {}
+_INVOKE_TTL_SEC = 120.0
+
+
+def _args_fp(args: dict) -> str:
+    import json as _json
+    return _json.dumps(args, sort_keys=True, ensure_ascii=False)
+
+
+def register_invoke(name: str, args: dict) -> str:
+    """登记一次待确认的 UI 直调，返回服务端签发的 invoke_id。"""
+    invoke_id = _secrets.token_urlsafe(16)
+    now = _time.time()
+    # 顺手清理过期挑战，避免长驻进程内存爬升
+    for k in [k for k, v in _pending_invokes.items() if now - v.get("ts", 0) > _INVOKE_TTL_SEC]:
+        _pending_invokes.pop(k, None)
+    _pending_invokes[invoke_id] = {
+        "name": name,
+        "args_fp": _args_fp(args),
+        "ts": now,
+    }
+    return invoke_id
+
+
+def consume_invoke(invoke_id: str, name: str, args: dict) -> bool:
+    """核销挑战：invoke_id 有效、未过期、且 name/args 与登记一致。"""
+    if not invoke_id:
+        return False
+    entry = _pending_invokes.pop(invoke_id, None)
+    if not entry:
+        return False
+    if _time.time() - entry.get("ts", 0) > _INVOKE_TTL_SEC:
+        return False
+    return entry.get("name") == name and entry.get("args_fp") == _args_fp(args)
+
+
 # 兜底超时（秒）。默认 0=不限时（09-21 用户反馈）；可设 LATIAO_CONFIRM_TIMEOUT_SEC 防 SSE 断流挂死。
 _DEFAULT_CONFIRM_TIMEOUT = float(os.environ.get("LATIAO_CONFIRM_TIMEOUT_SEC", "0") or "0")

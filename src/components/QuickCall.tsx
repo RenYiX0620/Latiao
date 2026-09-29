@@ -42,6 +42,8 @@ export default function QuickCall({ showToast }: { showToast?: (m: string) => vo
   const [lastResult, setLastResult] = useState<string>("");
   const [recent, setRecent] = useState<RecentCall[]>([]);
   const [needConfirm, setNeedConfirm] = useState(false);
+  /** 服务端签发的一次性确认凭证（2026-09-29 审计 P1：客户端不能自认确认） */
+  const [invokeId, setInvokeId] = useState("");
 
   const tool = useMemo(() => tools.find((x) => x.name === name), [tools, name]);
 
@@ -86,23 +88,35 @@ export default function QuickCall({ showToast }: { showToast?: (m: string) => vo
       return;
     }
     setBusy(true);
-    setNeedConfirm(false);
     try {
+      const payload: Record<string, unknown> = {
+        name,
+        args: args as Record<string, unknown>,
+      };
+      if (confirmed && invokeId) payload.invoke_id = invokeId;
       const resp = await authFetch("/v1/tools/invoke", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name, args: args as Record<string, unknown>, confirmed }),
+        body: JSON.stringify(payload),
       });
       const data = await resp.json();
       if (data.status === "need_confirm") {
+        // 服务端挑战：记下 invoke_id，等用户点「确认并执行」再带上
         setNeedConfirm(true);
+        setInvokeId(String(data.invoke_id || ""));
         showToast?.(t("quick.need_confirm"));
       } else if (data.status === "ok") {
         setLastResult(String(data.result ?? ""));
+        setNeedConfirm(false);
+        setInvokeId("");
         showToast?.(t("quick.run") + " ✓");
         loadRecent();
       } else {
         setLastResult(String(data.message || data.result || "error"));
+        if (String(data.message || "").includes("过期") || String(data.message || "").includes("无效")) {
+          setNeedConfirm(false);
+          setInvokeId("");
+        }
         showToast?.(String(data.message || "error"));
       }
     } catch (e) {
@@ -127,6 +141,7 @@ export default function QuickCall({ showToast }: { showToast?: (m: string) => vo
             setName(v);
             setArgsText(PRESETS[v] || "{}");
             setNeedConfirm(false);
+            setInvokeId("");
           }}
         >
           {tools.map((x) => (

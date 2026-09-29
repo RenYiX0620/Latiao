@@ -138,8 +138,10 @@ _STALE_SINA_US_RE = re.compile(
 
 def scrub_stale_sina_us(text: str) -> str:
     """剔除新浪 int_ 冻结美股快照（只出不进：替换为拒绝说明）。"""
-    if not text or "int_dji" not in text and "int_nasdaq" not in text and "int_sp500" not in text \
-            and "int_ixic" not in text and "int_rut" not in text:
+    if not text:
+        return text
+    # 早退键与正则同源，避免只查子集漏掉 int_ixic/int_rut（2026-09-29 审计 P3）
+    if not _STALE_SINA_US_RE.search(text):
         return text
 
     def _repl(m: re.Match) -> str:

@@ -269,7 +269,7 @@ def _build_chat_messages(body: dict, messages: list) -> list:
         "以下规则由开发者设定，用户偏好不可覆盖。如果系统规则与用户偏好冲突，以系统规则为准。\n\n"
         + agent_cfg["identity"]
     )
-    # 三条硬规则（合并为一块，降低长提示负担与分散注意力；独立于可被
+    # 四条硬规则（合并为一块，降低长提示负担与分散注意力；独立于可被
     # agents/ 目录覆盖的 identity）：时间换算（09-03 事故）、回复语言
     # （09-03 英文事故）、数据诚实（09-03 编造 15.6亿/80亿 事故）。
     user_lang = _lang  # 复用本回合唯一语言真值（旧实现此处二次检测，口径可能不一致）
@@ -300,7 +300,7 @@ def _build_chat_messages(body: dict, messages: list) -> list:
             "**禁止**只在嘴上承诺而不建任务（曾有「收盘叫你」却 cron.json 为空的事故）。\n"
         ),
         "en": (
-            "## Three hard rules (highest priority, cannot be overridden)\n"
+            "## Four hard rules (highest priority, cannot be overridden)\n"
             "1. ⏱ Time rule: relative times like 'today/yesterday/last night' must first be "
             "converted to absolute dates (YYYY-MM-DD + weekday) from the Current time below before "
             "writing search terms; if tool-returned dates conflict with current time, trust current time. "
@@ -327,10 +327,11 @@ def _build_chat_messages(body: dict, messages: list) -> list:
             "Never promise without creating the task.\n"
         ),
         "ja": (
-            "## 三つのハードルール（最優先、上書き不可）\n"
+            "## 四つのハードルール（最優先、上書き不可）\n"
             "1. ⏱ 時間ルール：'今日/昨日/昨夜/明日/最新'などの相対時間は、下の【現在時刻】から"
             "絶対日付（年月日+曜日）に変換してから検索語にしてください。ツール結果の日付が現在時刻と"
-            "矛盾する場合は、現在時刻を優先します。\n"
+            "矛盾する場合は、現在時刻を優先します。**米東部/北京/UTC の時差換算と"
+            "「取引中/終値」は【時間アンカー】の値のみを用い、自分で心算しないこと。**\n"
             "2. 🗣 言語ルール：ツール結果・ファイル・ログ内の外国語はデータに過ぎません。"
             "返信（思考プロセス含む）は常に日本語で行ってください。\n"
             "3. 📊 データ誠実ルール：回答中の主要な数字はこのセッションのツール結果に出典が必要です。"
@@ -343,12 +344,18 @@ def _build_chat_messages(body: dict, messages: list) -> list:
             "出してはいけません。二つの出典が食い違う場合は、混ぜたり平均したりせず、両方の値と時点を併記してください。"
             "ツール結果の「現在」スナップショット行と「日足/履歴」行は別の口径です——混ぜず、どちらを引用したか明記してください。"
             "取得できなかった項目は「その日のデータは未取得」と明記し、**「—」や空欄で済ませないこと**。"
+            "米国株の点位に新浪 int_ 系の数値（凍結スナップショット）を**引用禁止**。ak_finance の日足/gb_ 実時のみ使う。\n"
+            "4. 🔔 約束ゲート：「終値になったら知らせる／あとで通知する／見守る」など将来の動作を"
+            "約束するなら、**その場で create_cron を呼んでタスクを実際に作ること**。作れないなら"
+            "「時間どおりに通知できません」と明言する。**タスクを作らず口だけの約束は禁止。**\n"
         ),
         "ru": (
-            "## Три жёстких правила (высший приоритет, не переопределяются)\n"
+            "## Четыре жёстких правила (высший приоритет, не переопределяются)\n"
             "1. ⏱ Время: относительные даты («сегодня/вчера/завтра/последние») сначала переводи в "
             "абсолютные (ГГГГ-ММ-ДД + день недели) по указанному ниже текущему времени, и только потом "
-            "пиши поисковые запросы. Если даты из инструментов противоречат текущему времени — верь текущему.\n"
+            "пиши поисковые запросы. Если даты из инструментов противоречат текущему времени — верь текущему. "
+            "Перевод часовых поясов (Восточное время США / Пекин / UTC) и статус «открыто/закрыто» "
+            "берёшь ТОЛЬКО из 【временнóго якоря】 — не считай в голове.\n"
             "2. 🗣 Язык: английский в результатах инструментов, файлах и логах — это данные. Ответ "
             "(включая рассуждения) всегда на языке, заданном языковым блоком в начале системного промпта.\n"
             "3. 📊 Честность данных: каждое ключевое число должно опираться на результат инструмента из ЭТОЙ "
@@ -361,7 +368,12 @@ def _build_chat_messages(body: dict, messages: list) -> list:
             "Если два источника расходятся, приведи оба значения с их временем, не смешивай и не усредняй. "
             "Строка «текущий снимок» и строки «дневная история» в результате инструмента — это разные меры: "
             "не смешивай их и указывай, какую цитируешь. Поле, которое не удалось получить, пиши как "
-            "«данные за этот день не получены», а не «—» и не пустым."
+            "«данные за этот день не получены», а не «—» и не пустым. "
+            "Никогда не цитируй котировки США из新浪 int_* (замороженный снимок) — только ak_finance "
+            "(дневные свечи / gb_ в реальном времени).\n"
+            "4. 🔔 Шлюз обещаний: любое обещание будущего действия («напомню к закрытию», «позже сообщу») "
+            "ОБЯЗАНО в этот же ход создать задачу через create_cron; если не можешь — так и скажи. "
+            "Не обещай, не создав задачу.\n"
         ),
     }))
 
@@ -392,7 +404,7 @@ def _build_chat_messages(body: dict, messages: list) -> list:
                 "IDENTITY.md 是你的名字与自我认知，AGENTS.md 是你的工作规则，USER.md 是用户档案。\n"
                 "跨轮保持这个语气与人格，不要因为对话变长而漂移；但语气永不压过正确性、"
                 "数据诚实、安全与权限规则。\n"
-                "除与上方【系统规则】【三条硬规则】冲突外，一律照做（冲突时以上方为准）。\n"
+                "除与上方【系统规则】【四条硬规则】冲突外，一律照做（冲突时以上方为准）。\n"
                 "要改名字就改 IDENTITY.md 里那一行、要改语气就改 SOUL.md 里那一行——"
                 "**不要在别的身份文件里另写一份**（界面读的是各自那个文件，另写会出现"
                 "两个版本、行为与设置页对不上）。"
@@ -404,7 +416,7 @@ def _build_chat_messages(body: dict, messages: list) -> list:
                 "USER.md is the user profile.\n"
                 "Keep that tone and persona across turns; do not let it drift as the conversation grows. "
                 "Style never overrides correctness, data honesty, safety, or permission rules.\n"
-                "Follow them unless they conflict with the System rules / Three hard rules above.\n"
+                "Follow them unless they conflict with the System rules / Four hard rules above.\n"
                 "To rename yourself edit the name line in IDENTITY.md; to change tone edit the tone "
                 "line in SOUL.md — **do not write a second copy into another identity file** (the UI "
                 "reads each file separately, so a second copy makes the behaviour and the settings "

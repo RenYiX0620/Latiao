@@ -119,7 +119,7 @@ class TestRussianSupport(unittest.TestCase):
         self.assertIn("русском", lang_retry_hint("ru"))
         body = {"messages": [{"role": "user", "content": "прочитай файл"}]}
         sys_content = _build_chat_messages(body, body["messages"])[0]["content"]
-        self.assertIn("Три жёстких правила", sys_content)   # 俄语硬规则，而非回落中文
+        self.assertIn("Четыре жёстких правила", sys_content)   # 俄语四条硬规则（含承诺闸门），而非回落中文
 
     def test_retry_hint_languages(self):
         from agent.gates import lang_retry_hint

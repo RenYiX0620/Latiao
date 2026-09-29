@@ -73,6 +73,16 @@ def test_scrub_stale_sina_us():
     assert scrub_stale_sina_us(clean) == clean
 
 
+def test_scrub_stale_sina_us_ixic_rut_variants():
+    """P3 回归：int_ixic / int_rut 不得从早退路径漏网。"""
+    from threat_scan import scrub_stale_sina_us
+
+    for code in ("int_ixic", "int_rut", "int_sp500"):
+        out = scrub_stale_sina_us(f"quote {code}=12345.67 frozen")
+        assert "12345.67" not in out, code
+        assert "已屏蔽冻结数据源" in out, code
+
+
 def test_guard_tool_result_scrubs_int():
     from threat_scan import guard_tool_result
 
