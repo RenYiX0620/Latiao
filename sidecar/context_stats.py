@@ -188,6 +188,11 @@ def _session(session_id: str) -> dict:
         # 自身的预算与缓存样本——那是父提示词的量）。
         "by_source": {},         # {"main_turn"|"subagent"|"refine": {requests,input_tokens,output_tokens}}
         "turn_started_ms": 0,    # 本轮起点（墙钟，轮末算 duration 用）
+        # ── 输入 token 的两个口径（2026-09-29，ZCode 的 oas() 双口径对照）──
+        # 本地引擎只报"新评估 prompt_n"与"缓存命中 cache_n"，全量 = 两者之和；
+        # 两个数都留着：将来引擎改语义时能一眼看出是哪一半变了，而不是只有一个合并值。
+        "input_eval_tokens": 0,  # prompt_n 累计（本轮）
+        "input_cache_tokens": 0, # cache_n 累计（本轮）
     })
 
 
@@ -201,7 +206,8 @@ def begin_turn(session_id: str) -> None:
                     ttft_samples=[], gen_tokens=0, gen_seconds=0.0,
                     turn_input_tokens=0, turn_retries=0, turn_retry_kinds=[],
                     turn_refine_calls=0, turn_refine_tokens=0,
-                    by_source={}, turn_started_ms=int(time.time() * 1000))
+                    by_source={}, turn_started_ms=int(time.time() * 1000),
+                    input_eval_tokens=0, input_cache_tokens=0)
 
 
 def _bump_source(sess: dict, source: str, prompt_tokens: int = 0,
@@ -508,6 +514,7 @@ def record_usage(session_id: str, usage: dict | None = None, timings: dict | Non
         return
     prompt_tokens = 0
     completion_tokens = 0
+    _timings_split: tuple[int, int] | None = None
     if isinstance(usage, dict):
         prompt_tokens = int(usage.get("prompt_tokens") or 0)
         completion_tokens = int(usage.get("completion_tokens") or 0)
@@ -517,8 +524,11 @@ def record_usage(session_id: str, usage: dict | None = None, timings: dict | Non
         # "复用 X / 共 Y" 的 Y = cache_n + prompt_n）。旧实现只取 prompt_n →
         # 预算守卫在本地引擎上按"新增量"累加（实测 6 步仅 6797，真实约 4 万），
         # 等于永不触发；上下文面板的"真实输入"校准同样偏低。取两者之和 = 全量输入。
-        prompt_tokens = int(timings.get("prompt_n") or 0) + int(timings.get("cache_n") or 0)
+        _pn = int(timings.get("prompt_n") or 0)
+        _cn = int(timings.get("cache_n") or 0)
+        prompt_tokens = _pn + _cn
         completion_tokens = int(timings.get("predicted_n") or 0)
+        _timings_split = (_pn, _cn)
     rate = _extract_cache_rate(usage, timings)
     with _lock:
         sess = _session(session_id)
@@ -531,6 +541,22 @@ def record_usage(session_id: str, usage: dict | None = None, timings: dict | Non
         if completion_tokens:
             sess["gen_tokens"] += completion_tokens
         _bump_source(sess, source, prompt_tokens, completion_tokens)
+        if _timings_split is not None:
+            sess["input_eval_tokens"] = int(sess.get("input_eval_tokens") or 0) + _timings_split[0]
+            sess["input_cache_tokens"] = int(sess.get("input_cache_tokens") or 0) + _timings_split[1]
+            # 烟雾报警器（不是证明）：本地引擎报的全量若远低于我们自己对提示词的估算，
+            # 且它自称零缓存命中——正是"只算了 prompt_n"那个 bug 的形状（2026-09-29 实测
+            # 6 步 6797 vs 真实约 4 万）。估算本身是字符近似（可差 2–3 倍），阈值取 25%
+            # 以免误报；本会话命中一次后不再重复。
+            _est = int((sess.get("snapshot") or {}).get("estimated_total") or 0)
+            if (not sess.get("_input_semantics_warned") and _est > 2000
+                    and _timings_split[1] == 0 and prompt_tokens < _est * 0.25):
+                sess["_input_semantics_warned"] = True
+                logger.warning(
+                    "输入 token 口径可疑：引擎报 %d，本会话提示词估算约 %d（且 cache_n=0）。"
+                    "若这确实是全量输入请忽略；否则 timings 语义可能变了，请核对 "
+                    "context_stats.record_usage 的 prompt_n+cache_n 口径",
+                    prompt_tokens, _est)
         # 子代理归因放在**同一把锁内**（审计⑨）：此前在锁外单独再取一次锁，若父会话
         # 的 begin_turn 正好插在中间，这笔开销会被记到下一轮。同一把锁内不会交错。
         if str(source) == "subagent" and parent_session_id:
@@ -571,6 +597,8 @@ def _turn_cost(sess: dict) -> dict:
         "refine_calls_total": int(sess.get("refine_calls_total") or 0),
         "refine_tokens_total": int(sess.get("refine_tokens_total") or 0),
         "by_source": dict(sess.get("by_source") or {}),
+        "input_eval_tokens": int(sess.get("input_eval_tokens") or 0),
+        "input_cache_tokens": int(sess.get("input_cache_tokens") or 0),
         # 首 token 延迟均值（毫秒）——ZCode 把 TTFT 落库，我们也存一份可查历史
         "ttft_avg_ms": (round(sum(sess.get("ttft_samples") or [])
                               / len(sess["ttft_samples"]) * 1000)

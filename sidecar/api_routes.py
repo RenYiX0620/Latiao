@@ -12,7 +12,6 @@ import json
 import logging
 import uuid
 from datetime import datetime
-from cmd_safety import redact_secrets   # 工具日志脱敏（09-23）
 
 import httpx
 from fastapi import Query, Request
@@ -22,32 +21,19 @@ from starlette.concurrency import run_in_threadpool
 import cron
 import local_llm
 from agent_loop import (
-    _NATIVE_TOOL_RE,
     CONFIG_FILE,
-    TOOLS,
     _build_chat_messages,
-    _build_local_tools_prompt,
-    _cap_tools,
     _deduplicate_response,
     _extract_last_user_text,
-    _filter_tools,
-    _get_agent_tools,
     _last_cloud_config,
     _local_llm_serialized,
     _local_llm_stream,
-    _parse_native_tool_calls,
-    _parse_prompt_tool_calls,
     _pending_confirmations,
     _pending_lock,
-    _record_tool_call_db,
     _clear_session_cancel,
     _event_log_for,
     _request_session_cancel,
     _resolve_api_target,
-    _resolve_max_tokens,
-    _spawn,
-    _strip_native_tool_calls,
-    execute_tool,
     _THINK_FENCE_RE,
 )
 from config import save_config
@@ -60,9 +46,7 @@ from main import (
 from loop_state import turn_state_for
 from memory import (
     get_recent_learnings_for_ui,
-    _refine_learnings,
 )
-from tool_executor import _resolve_permission
 
 logger = logging.getLogger("latiao-sidecar")
 
@@ -177,7 +161,6 @@ async def chat_completion(request: Request):
     Auto-routes to best model based on task type when no specific model is selected."""
     body = await _json_body(request)
     messages = body.get("messages", [])
-    last_user_text = _extract_last_user_text(messages)
 
     # Assemble full message context (identity, env, skill catalog, agent, image)
     # 技能目录由 capability_registry 在 _build_chat_messages 内注入，模型按需调用 use_skill
@@ -216,7 +199,6 @@ async def chat_completion(request: Request):
             pass
 
     skip_tools = body.get("skip_tools", False)
-    agent_id = body.get("agent", "latiao")
     # 不要在这里重新读取 cloud_config：上面的自动路由可能已为代码任务
     # 选中了云端模型，重新从 body 取值会把路由结果覆盖回 None → 又落回本地模型。
     _last_cloud_config.set(cloud_config)
@@ -434,145 +416,30 @@ async def chat_completion(request: Request):
 
     # Non-streaming agent loop (for Tauri HTTP plugin compatibility)
     if not skip_tools and protocol == "openai":
-        # Run agent loop synchronously — collect all content + tool results
-        current_msgs = [dict(m) for m in messages]
-        # Truncate to prevent context overflow (8K token limit)
-        if len(current_msgs) > 30:
-            # Keep system messages + last 20 exchanges
-            system_msgs = [m for m in current_msgs if m.get("role") == "system"]
-            other_msgs = [m for m in current_msgs if m.get("role") != "system"]
-            current_msgs = system_msgs + other_msgs[-20:]
-        agent_tools_ns = _get_agent_tools(agent_id, TOOLS)
-        active_tools_ns = _filter_tools(last_user_text, agent_tools_ns) if last_user_text else agent_tools_ns
-        use_prompt_tools = is_local  # Local models use prompt-based tool calling
-        # Cap tools: 7 for native function calling, 8 for prompt-based (less overhead)
-        tool_cap = 8 if use_prompt_tools else 5
-        if len(active_tools_ns) > tool_cap:
-            active_tools = _cap_tools(active_tools_ns, tool_cap)
-        else:
-            active_tools = active_tools_ns
-        full_content = ""
-        tool_count = 0
-        local_tools_prompt = _build_local_tools_prompt(active_tools) if use_prompt_tools else ""
-
+        # 2026-09-29 审计（结构性）：这里原有一套自研的 30 轮工具循环——任务级验证器、
+        # 预算守卫与近阈提示、停滞/同错升级、压缩与旧结果回收、用量记账**全都没有**
+        # （该路径前端从不使用，只有兼容外部客户端会走到，但仍是旁路）。
+        # 现在与 SSE 路径共用唯一循环：消费生成器 → 拼接正文 → 按 chat.completion 返回。
+        from agent.loop import ThinAgentLoop
+        _parts: list[str] = []
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(120)) as client:
-                for _ in range(30):  # max iterations, non-streaming
-                    loop_msgs = list(current_msgs)
-                    # Convert role:"tool" → role:"user" for Qwen chat format compatibility
-                    loop_msgs = [
-                        {"role": "user", "content": f"[工具结果] {m['content']}"}
-                        if m.get("role") == "tool" else dict(m)
-                        for m in loop_msgs
-                    ]
-                    if use_prompt_tools:
-                        # Inject tool prompt into the LAST system message (append, don't create new)
-                        # Creating a second system message triggers a llama-cpp bug → empty response
-                        last_sys_idx = -1
-                        for i, m in enumerate(loop_msgs):
-                            if m.get("role") == "system":
-                                last_sys_idx = i
-                        if last_sys_idx >= 0:
-                            loop_msgs[last_sys_idx]["content"] += "\n\n" + local_tools_prompt
-                        else:
-                            loop_msgs.insert(0, {"role": "system", "content": local_tools_prompt})
-
-                    if use_prompt_tools:
-                        async with _local_llm_serialized(api_url):
-                            resp = await client.post(api_url, json={
-                            "model": model, "messages": loop_msgs,
-                            "max_tokens": _resolve_max_tokens(model), "stream": False,
-                            "temperature": 0.5,
-                            "frequency_penalty": 0.6,
-                "stop": ["<|im_end|>", "<|endoftext|>", "<end_of_turn>", "<eos>"],
-                        }, headers=headers)
-                    else:
-                        resp = await client.post(api_url, json={
-                            "model": model, "messages": current_msgs,
-                            "tools": active_tools, "tool_choice": "auto",
-                            "max_tokens": 2048, "stream": False,
-                            "temperature": 0.5,
-                            "frequency_penalty": 0.6,
-                "stop": ["<|im_end|>", "<|endoftext|>", "<end_of_turn>", "<eos>"],
-                        }, headers=headers)
-                    resp.raise_for_status()  # httpx 不自动抛 4xx/5xx，必须显式检查
-                    resp_data = resp.json()
-                    choices = resp_data.get("choices", [])
-                    if not choices:
-                        break
-                    msg = choices[0].get("message", {})
-                    content = msg.get("content", "") or ""
-                    reasoning = msg.get("reasoning", "") or ""
-                    tc_data = msg.get("tool_calls", [])
-
-                    # Native tool call detection for Gemma
-                    if not tc_data and content and _NATIVE_TOOL_RE.search(content):
-                        native_tcs = _parse_native_tool_calls(content)
-                        if native_tcs:
-                            content = _strip_native_tool_calls(content)
-                            tc_data = native_tcs
-
-                    # Prompt-based tool call detection for local models
-                    if not tc_data and content and use_prompt_tools:
-                        clean_text, prompt_tcs = _parse_prompt_tool_calls(content)
-                        if prompt_tcs:
-                            content = clean_text
-                            tc_data = prompt_tcs
-
-                    if tc_data:
-                        tool_count += 1
-                        current_msgs.append({
-                            "role": "assistant",
-                            "content": content or None,
-                            "tool_calls": tc_data,
-                        })
-                        for tc in tc_data:
-                            call_id = tc.get("id", str(uuid.uuid4()))
-                            tool_name = tc.get("function", {}).get("name", "")
-                            tool_args_str = tc.get("function", {}).get("arguments", "{}")
-                            try:
-                                tool_args = json.loads(tool_args_str) if isinstance(tool_args_str, str) else tool_args_str
-                            except json.JSONDecodeError:
-                                tool_args = {}
-                            # Respect permissions — non-streaming can't ask for user confirmation
-                            perm = _resolve_permission(tool_name, tool_args)
-                            if perm == "confirm":
-                                result = f"⛔ 操作需要用户确认: {tool_name}。请在流式模式下重试。"
-                            elif perm in ("danger", "deny", "blocked"):
-                                result = f"⛔ 权限规则已阻止: {tool_name}（级别 {perm}）。"
-                            else:
-                                logger.info("Tool executing (non-streaming): %s %s", tool_name,
-                            redact_secrets(str(tool_args))[:100])
-                                result = await execute_tool(tool_name, tool_args)
-                                # Self-evolution: record + background-refine learning
-                                _record_tool_call_db(session_id, tool_name, tool_args, result)
-                                _spawn(_refine_learnings(tool_name, tool_args, result, session_id))
-                            if len(result) > 5000:
-                                result = result[:5000] + "\n...(截断)"
-                            current_msgs.append({
-                                "role": "tool",
-                                "tool_call_id": call_id,
-                                "content": result,
-                            })
-                        continue  # Loop again with tool results
-
-                    # Text response
-                    if content:
-                        full_content += content
-                    elif reasoning:
-                        full_content += reasoning
-                    break  # Done
+            _ns_loop = ThinAgentLoop(
+                messages, model, api_url, headers, session_id,
+                str(body.get("access_mode") or "confirm"),
+                str(body.get("thinking_level") or "high"),
+                is_local=is_local)
+            async for _ev in _ns_loop.run():
+                if isinstance(_ev, dict) and _ev.get("content"):
+                    _parts.append(str(_ev["content"]))
         except Exception as e:
             logger.error("Non-streaming agent loop error: %s", e)
             _record_turn_metrics(session_id, model, is_local, "error")
             return JSONResponse({"error": f"Agent 循环错误: {e}"}, status_code=500)
 
-        # 每轮指标落库（审计⑤，2026-09-29）：非流式分支（Tauri HTTP 插件）不经过
-        # `_logged_agent_turn`，此前整体不落库 → 那部分轮次在历史里缺失
+        full_content = "".join(_parts).strip()
         _record_turn_metrics(session_id, model, is_local, "completed")
         if not full_content:
-            # Model may return empty when context is too long or only thinking tokens
-            logger.warning("Non-streaming agent loop: model returned empty content, tool_count=%d", tool_count)
+            logger.warning("Non-streaming agent loop: empty content for %s", session_id)
             full_content = "（模型未生成文本回复。可能是上下文过长。请开启新会话或缩短对话历史。）"
         return {
             "id": "chatcmpl-sidecar",

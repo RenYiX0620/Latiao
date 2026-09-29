@@ -56,3 +56,32 @@ export function shouldSendOnEnter(
   if (e.key !== "Enter" || e.shiftKey) return false;
   return !isComposingKey(now, composingUntil, e);
 }
+
+/** 工具结果回灌给模型时的截断（2026-09-29，与后端 `_truncate_keep_lines` 同一策略）。
+ *
+ * 后端 compaction 早就按**整行**截断（旧实现 `slice(0,n)` 会把 `1376.55` 切成 `137`，
+ * 模型据此复述出错值）；前端这条回灌路径此前仍是 `raw.slice(0, 1000)`——**从行中间切**，
+ * 而这是恢复会话里模型看到工具结果的唯一形态。现在同样按行边界切，并写明省略量，
+ * 让模型知道"要看全的得重新调用工具"，而不是凭半截数字复述。
+ */
+export function truncateToolResult(text: string, limit = 1000): string {
+  const raw = String(text ?? "");
+  if (raw.length <= limit) return raw;
+  const lines = raw.split("\n");
+  const kept: string[] = [];
+  let used = 0;
+  for (const ln of lines) {
+    if (kept.length && used + ln.length + 1 > limit) break;
+    // 单行本身就超限：只留这一行并截断它（后面会加标记说明）
+    kept.push(ln.length > limit ? ln.slice(0, limit) : ln);
+    used += ln.length + 1;
+    if (used >= limit) break;
+  }
+  const body = kept.join("\n");
+  const droppedLines = Math.max(0, lines.length - kept.length);
+  const droppedChars = Math.max(0, raw.length - body.length);
+  return (
+    body +
+    `\n…(已省略 ${droppedLines} 行 / ${droppedChars} 字符；需要完整内容请重新调用该工具，不要凭记忆引用具体数字)…`
+  );
+}

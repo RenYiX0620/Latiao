@@ -5,6 +5,7 @@ import logoUrl from "./assets/logo.png";
 import type { Message, PendingFile, SessionInfo, ViewId, CloudModel } from "./types";
 import { saveSessionsWithFallback } from "./utils/storage";
 import { needsEngineLoad } from "./utils/modelSelection";
+import { truncateToolResult } from "./utils/composer";
 import { localVoicesForLang, speechSupported, voicesForLang } from "./utils/speech";
 // API keys stored in OS keychain via Rust commands (store_secret/get_secret/delete_secret)
 import { useSessions } from "./hooks/useSessions";
@@ -97,7 +98,8 @@ function buildApiMessages(session: SessionInfo, extraUser?: Message, planMode?: 
       // 工具消息不回灌会让"继续/重试"变成失忆的全新请求（P0-2）：
       // 转成 user 角色 [工具结果] 回灌，模型知道之前查过什么
       const raw = (msg.toolResult || msg.content || "").toString();
-      const preview = raw.length > 1000 ? raw.slice(0, 1000) + "\n...(truncated)" : raw;
+      // 整行截断（旧实现从行中间切，会把数字劈成两半——见 utils/composer.ts 注释）
+      const preview = truncateToolResult(raw, 1000);
       if (preview.trim()) {
         msgs.push({
           role: "user",

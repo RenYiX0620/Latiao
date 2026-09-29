@@ -189,3 +189,44 @@ async def test_subagent_credit_lands_in_same_turn():
     cs.begin_turn(parent)
     after = cs.turn_cost(parent)["by_source"].get("subagent")
     assert not after, f"新一轮来源桶应为空：{after}"
+
+
+# ── ⑤ 双口径自检（ZCode 的 oas() 对照）：两个口径都存 + 与自身估算严重不符时报警 ──
+def test_dual_caliber_is_stored(_fresh_session):
+    sid = _fresh_session
+    cs.record_usage(sid, None, {"prompt_n": 6000, "cache_n": 34000, "predicted_n": 50})
+    t = cs.turn_cost(sid)
+    assert t["input_tokens"] == 40000, "全量 = prompt_n + cache_n"
+    assert t["input_eval_tokens"] == 6000 and t["input_cache_tokens"] == 34000, \
+        "两个口径都要留（将来引擎改语义时能看出是哪一半变了）"
+    cs.begin_turn(sid)
+    t2 = cs.turn_cost(sid)
+    assert t2["input_eval_tokens"] == 0 and t2["input_cache_tokens"] == 0, "新一轮要清零"
+
+
+def test_input_semantics_smoke_alarm(_fresh_session, caplog):
+    """引擎只报"新评估"（自称零缓存）而总量远低于我们自己的估算 → 报警一次。"""
+    import logging
+    sid = _fresh_session
+    with cs._lock:
+        cs._session(sid)["snapshot"] = {"estimated_total": 40000, "counts": {},
+                                        "token_source": "estimated"}
+    with caplog.at_level(logging.WARNING, logger="latiao-sidecar"):
+        cs.record_usage(sid, None, {"prompt_n": 6000, "cache_n": 0, "predicted_n": 50})
+        cs.record_usage(sid, None, {"prompt_n": 6000, "cache_n": 0, "predicted_n": 50})
+    hits = [r for r in caplog.records if "输入 token 口径可疑" in r.getMessage()]
+    assert len(hits) == 1, f"应当只报警一次（不刷屏）：{len(hits)}"
+
+
+def test_input_semantics_no_alarm_on_sane_numbers(_fresh_session, caplog):
+    import logging
+    sid = _fresh_session
+    with cs._lock:
+        cs._session(sid)["snapshot"] = {"estimated_total": 40000, "counts": {},
+                                        "token_source": "estimated"}
+    with caplog.at_level(logging.WARNING, logger="latiao-sidecar"):
+        # 正常：全量与估算同量级（含缓存命中）
+        cs.record_usage(sid, None, {"prompt_n": 6000, "cache_n": 34000, "predicted_n": 50})
+        # 云端 usage：总量由供应商给，不参与本地 timings 的烟雾判据
+        cs.record_usage(sid, {"prompt_tokens": 1200, "completion_tokens": 30})
+    assert not [r for r in caplog.records if "输入 token 口径可疑" in r.getMessage()]
