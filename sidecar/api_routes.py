@@ -791,8 +791,10 @@ from api_routes_media import (  # noqa: E402
 from api_routes_admin import router as _admin_router  # noqa: E402
 from api_routes_cron_local import router as _cron_local_router  # noqa: E402
 from api_routes_extensions import router as _extensions_router  # noqa: E402
+from api_routes_channels import router as _channels_router  # noqa: E402
 
 app.include_router(_media_router)
 app.include_router(_admin_router)
 app.include_router(_cron_local_router)
 app.include_router(_extensions_router)
+app.include_router(_channels_router)

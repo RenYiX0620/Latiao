@@ -29,6 +29,9 @@ a = Analysis(
         # 收集不到，必须显式列出，否则 sidecar.exe 运行时报 ModuleNotFoundError）
         'capability_registry', 'discovery', 'adapters',
         'mcp_client', 'extension_manager',
+        # 通道（2026-09-29）：飞书 SDK 与自适应层都在函数内惰性 import
+        'channels', 'channels.feishu', 'channels_bridge', 'api_routes_channels',
+        'lark_oapi', 'lark_oapi.ws', 'lark_oapi.api.im.v1',
         'cron', 'identity', 'memory', 'local_llm', 'db', 'config',
         'tool_system', 'tool_executor',
         # Stage 1-5 拆分：agent/ 包（薄循环/Scope 容器/传输/解析/上下文/闸门/子代理），

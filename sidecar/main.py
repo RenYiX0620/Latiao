@@ -432,6 +432,14 @@ async def lifespan(app: FastAPI):
     catchup_task = asyncio.create_task(run_cron_catchup())  # 补跑关闭期间错过的任务
     logger.info("Sidecar 启动 — cron loop started")
 
+    # 通道（2026-09-29）：飞书走长连接（无需公网）；微信等经 /v1/channels/inbound。
+    # 未启用/未装 lark-oapi/未配置凭据时只留一条日志，不影响其它功能。
+    try:
+        from channels import feishu as _feishu
+        _feishu.start()
+    except Exception:
+        logger.warning("飞书通道启动失败", exc_info=True)
+
     # 工具调用历史保留策略（2026-09-23，用户定 30 天）：启动跑一次 + 之后每天一次。
     # 放线程池/后台任务里做，VACUUM 是同步阻塞操作，不能在事件循环里跑。
     async def _prune_loop():
