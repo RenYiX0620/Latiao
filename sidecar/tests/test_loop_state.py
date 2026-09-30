@@ -3,6 +3,7 @@
 覆盖：状态迁移、重入拒绝、停止幂等与原因先行、end_turn 幂等与
 completed→aborted 修正、无活动 no-op、并发不变式。
 """
+import unittest
 import threading
 
 import pytest
@@ -101,3 +102,43 @@ def test_concurrent_request_stop_single_settlement():
         t.join()
     assert results.count(True) == 1      # 只有一个置位成功（相位迁移被锁保护）
     assert s.stop_requested() is True
+
+
+class TestStaleTurnSelfHeal(unittest.TestCase):
+    """僵尸轮次自愈（2026-09-30）：活动轮超龄未结算 → 强制回 IDLE 并放行新轮。
+
+    实测背景：引擎零输出时生成器挂住，SSE 消费者的 finally 永不执行 → 会话卡 RUNNING
+    约 4 分钟，期间用户发消息被拒、按停止也无效（前端是看门狗 cancel，不走 Stop 路径）。
+    """
+
+    def _state(self, sid):
+        from loop_state import turn_state_for
+        return turn_state_for(sid)
+
+    def test_stale_turn_is_force_ended_and_new_turn_allowed(self):
+        import time
+        from loop_state import Phase
+        st = self._state("stale-1")
+        tok = st.begin_turn()
+        tok.started_at = time.time() - 999
+        self.assertTrue(st.force_end_stale_turn(180))
+        self.assertIs(st.phase, Phase.IDLE)
+        st.begin_turn()                     # 放行新轮（不抛）
+        self.assertIs(st.phase, Phase.RUNNING)
+
+    def test_fresh_turn_is_not_touched(self):
+        from loop_state import StopRequested
+        st = self._state("stale-2")
+        st.begin_turn()
+        self.assertFalse(st.force_end_stale_turn(180), "新鲜轮不许被动")
+        with self.assertRaises(StopRequested):
+            st.begin_turn()                 # 原语义保持：重入仍拒绝
+
+    def test_no_active_turn_is_noop(self):
+        st = self._state("stale-3")
+        self.assertFalse(st.force_end_stale_turn(0))
+
+
+if __name__ == "__main__":
+    unittest.main()
+

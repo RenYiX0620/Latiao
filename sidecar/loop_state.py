@@ -26,6 +26,7 @@ Latiao 现状（agent_loop.py:486）：`_session_cancelled: set[str]` 只有布�
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from dataclasses import dataclass, field
@@ -46,6 +47,9 @@ class StopRequested(Exception):
         self.reason = reason
         self.cause = cause
         super().__init__(f"turn stopped ({reason})")
+
+
+logger = logging.getLogger("latiao-sidecar")
 
 
 @dataclass
@@ -167,6 +171,29 @@ class TurnState:
         self._end_reason = reason
         self._active = None
         self._phase = Phase.IDLE
+
+    def force_end_stale_turn(self, max_age_secs: float) -> bool:
+        """僵尸轮次自愈（2026-09-30）：活动轮超过 max_age_secs 仍未结算 → 强制结算回 IDLE。
+
+        为什么需要：生成器一旦挂住（引擎不出数据、且超时按"收到的行"计时），SSE 消费者
+        的 finally 永远不跑 → 会话状态卡 RUNNING（实测卡约 4 分钟；期间用户发消息被拒
+        "上一轮任务仍在运行中"，而前端那次是**看门狗 cancel**、不是 Stop 路径，按停止
+        也无效）。这里把"可能永久锁死"降级为"最多等 N 秒后自愈放行"。
+
+        阈值用 started_at 作保守代理（不追踪事件时间，避免动状态机的核心数据结构）：
+        给足阈值（默认调用方传 180s）时不会误伤正常长轮——真正的长轮在跑，其
+        `end_turn` 会正常结算。
+        """
+        with self._lock:
+            active = self._active
+            if active is None or self._phase is Phase.IDLE:
+                return False
+            if time.time() - float(getattr(active, "started_at", 0.0)) < max_age_secs:
+                return False
+            logger.warning("会话 %s：上一轮超过 %.0fs 未结算（僵尸轮次）→ 强制结束并放行新轮",
+                           self.session_id, max_age_secs)
+            self._record_end(active, "stale")
+            return True
 
     def end_turn(self, reason: str = "completed") -> TurnToken | None:
         """结算当前 turn（幂等）。返回被结算的令牌（无活动返回 None）。

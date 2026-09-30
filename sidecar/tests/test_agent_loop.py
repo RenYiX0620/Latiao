@@ -544,15 +544,30 @@ class TestTransientReminders:
 
 
 class TestSingleFlight:
-    """双发防御：_running_turns 认领/释放语义。"""
+    """双发防御：_running_turns 认领/释放语义。
+
+    2026-09-30 起是 **{session_id: 开始时间}** 的字典（不是 set）：僵尸轮次自愈要按
+    "开始多久"判断超龄（生成器挂住时清理路径不跑，裸集合会把会话永久留在里面 →
+    用户被"上一轮任务仍在运行中"永久挡住）。
+    """
 
     def test_claim_and_release(self):
+        import time
         from api_routes import _running_turns
         sid = "sf-test-session"
-        _running_turns.add(sid)
-        assert sid in _running_turns
-        _running_turns.discard(sid)
+        _running_turns[sid] = time.time()
+        assert sid in _running_turns and _running_turns[sid] > 0
+        _running_turns.pop(sid, None)
         assert sid not in _running_turns
+
+    def test_stale_entry_can_be_told_apart(self):
+        """带时间戳的意义：能判断"开始多久"，超龄即可自愈放行（不再永久锁死）。"""
+        import time
+        from api_routes import _running_turns
+        sid = "sf-test-stale"
+        _running_turns[sid] = time.time() - 999
+        assert time.time() - _running_turns[sid] > 180
+        _running_turns.pop(sid, None)
 
 
 class TestConfirmationWait:

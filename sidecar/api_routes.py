@@ -10,6 +10,8 @@ Code is a verbatim move from main.py. Only import adjustments were made:
 import asyncio
 import json
 import logging
+import os
+import time
 import uuid
 from datetime import datetime
 
@@ -53,7 +55,11 @@ logger = logging.getLogger("latiao-sidecar")
 from http_json import _json_body  # noqa: E402 — 唯一定义
 
 # 单飞守卫（双发防御）：同会话同时允许一个回合在跑。add/discard 原子，无需锁。
-_running_turns: set[str] = set()
+# 会话级"正在跑"标记：{session_id: 开始时间}。**必须带时间戳**——2026-09-30 实测：
+# 生成器挂住时（引擎零输出 + 超时按"收到的行"计时 → 永不触发），清理路径不跑，
+# 集合里的会话永远留着 → 用户发任何消息都被拒"上一轮任务仍在运行中，请稍候或先停止"，
+# 而按停止也无效（前端那次是看门狗 cancel，不走 Stop 路径）。带时间戳后可在入口自愈。
+_running_turns: dict[str, float] = {}
 
 # 已处理确认的 LRU（双击去重：第二次点击不再误报"确认已过期"）
 import collections as _collections
@@ -389,10 +395,21 @@ async def chat_completion(request: Request):
                     yield "data: [DONE]\n\n"
                 finally:
                     # 单飞守卫释放：无论正常/异常/停止路径，回合结束即放行下一回合
-                    _running_turns.discard(session_id)
+                    _running_turns.pop(session_id, None)
             # 单飞守卫（双发防御）：同会话已有回合在跑时拒绝新回合，防止
             # 双击发送/重复发包导致并行双答（17:30 观测：同窗口两条完整回复）。
             # 停止后的重发不受影响（停止走 turn/end，回合已释放）。
+            _stale_after = float(os.environ.get("LATIAO_TURN_STALE_SECS", "180") or 180)
+            _started = _running_turns.get(session_id)
+            if _started is not None and (time.time() - _started) > _stale_after:
+                # 僵尸轮次自愈：超龄未清理 → 强制放行新轮（并结算状态机）
+                logger.warning("会话 %s 的上一轮已 %.0fs 未结束（僵尸轮次）→ 强制清理后放行",
+                               session_id, time.time() - _started)
+                _running_turns.pop(session_id, None)
+                try:
+                    turn_state_for(session_id).force_end_stale_turn(_stale_after)
+                except Exception:
+                    logger.debug("僵尸轮次结算失败", exc_info=True)
             if session_id in _running_turns:
                 return StreamingResponse(
                     iter([
@@ -402,7 +419,7 @@ async def chat_completion(request: Request):
                     media_type="text/event-stream",
                     headers={"Cache-Control": "no-cache"},
                 )
-            _running_turns.add(session_id)
+            _running_turns[session_id] = time.time()
             # 顺序契约（P1-1 修复）：clear 必须先于 _logged_agent_turn 的 begin_turn
             # ——否则新开幕令牌会被 abandon() 作废，停止语义丢失。
             # 新请求清除上一次停止的取消标记（重发消息不受影响）

@@ -63,6 +63,14 @@ def _engine_slots() -> int:
         return 1
 
 
+def _engine_wait_max() -> float:
+    """等引擎恢复的总时长上限（秒）。默认压在前端看门狗（180s）之内，见调用点注释。"""
+    try:
+        return max(30.0, float(os.environ.get("LATIAO_ENGINE_WAIT_MAX", "170") or 170))
+    except (TypeError, ValueError):
+        return 170.0
+
+
 def _queue_wait_max() -> float:
     try:
         return max(5.0, float(os.environ.get("LATIAO_ENGINE_WAIT_MAX", "900")))
@@ -295,14 +303,23 @@ async def _local_llm_stream(client, api_url: str, body: dict, headers: dict,
         # 等待恢复的总时长上限：72 次尝试本意覆盖 ~6 分钟重载窗口（每次失败
         # 连接被拒是秒级的），但引擎"挂起"（端口活、不吐响应头）时单次尝试
         # 要耗满读超时 120s——无时间上限理论上可静默拖 2.5 小时。
-        _wait_deadline = time.monotonic() + 600
+        # 等引擎恢复的总时长上限（2026-09-30 修：原本写死 600s，而**前端看门狗是
+        # 180s**——引擎重载/排队期间 `_local_llm_stream` 还没 yield 响应对象，
+        # `_stream` 的泵/队列与心跳都还没开始，`_sample` 一行都收不到 → 前端零字节
+        # 被掐断，后端却继续静默等满 600s（实测：21:30:25 起 5 分钟零日志，用户看到
+        # "180s 无数据"且随后 4 分钟发不出消息）。默认压到 170s：**宁可在看门狗之前
+        # 明确失败并让用户重试**（此时引擎仍在后台重载，重发即成功），也不要静默拖到
+        # 被前端掐断。需要更长等待可用 LATIAO_ENGINE_WAIT_MAX 覆盖。
+        _wait_deadline = time.monotonic() + _engine_wait_max()
         # 引擎挂起判定计数：连续 2 次读超时（端口活但不吐数据）
         _hung_strikes = 0
         try:
             for _attempt in range(72):
                 if time.monotonic() >= _wait_deadline:
                     raise httpx.ConnectError(
-                        "等待本地模型恢复超时（10 分钟）。请到模型页检查引擎状态后重发消息。"
+                        f"等待本地模型恢复超时（{int(_engine_wait_max())} 秒）。"
+                        "模型可能仍在加载/重载——稍等片刻后**重发消息**即可；"
+                        "若持续失败，请到模型页检查引擎状态。"
                     )
                 try:
                     async with client.stream("POST", api_url, json=body, headers=headers) as r:
