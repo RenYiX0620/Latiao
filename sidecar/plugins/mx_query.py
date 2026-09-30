@@ -1,6 +1,7 @@
 from cmd_safety import child_env   # ④ 子进程 env 白名单
 #!/usr/bin/env python3
 """mx_query - 妙想金融数据查询工具"""
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -84,6 +85,82 @@ def _mx_child_env():
                      allow_prefixes=("MX_",))
 
 
+# ── 名称核对（2026-09-30）：空结果时告诉模型"名字不对"，而不是让它换同义名 ──
+# 事故：问"超节点/超算中心 涨跌幅 资金流向" → 两个名字都不在东财标的库（正式板块是
+# 「算力概念」「液冷服务器」）→ 模型在同义名之间打转。这里用东财**公开搜索建议**接口
+# 核对一次名称（匿名可用、不吃妙想配额；失败即降级，绝不因此吞掉原始报错）。
+_SUGGEST_URL = ("https://searchapi.eastmoney.com/api/suggest/get"
+                "?input={kw}&type=14&count=8")
+_STRIP_WORDS = ("涨跌幅", "涨跌", "资金流向", "资金", "主力", "净流入", "净流出",
+                "今日", "今天", "昨天", "本周", "本月", "行情", "走势", "最新",
+                "板块", "概念", "行业", "数据", "查询", "的", "了", "请")
+_SUMMARY_SIGNS = ("全部", "所有", "各个", "各板", "全市场", "排行", "排名", "汇总", "一览")
+
+
+def _name_candidates(query: str) -> list[str]:
+    """从查询里挑出"可能是标的/板块名"的词（去掉意图词与标点），最多 2 个。"""
+    q = str(query or "")
+    for w in _STRIP_WORDS:
+        q = q.replace(w, " ")
+    out: list[str] = []
+    for tok in re.split(r"[\s、，,;；/]+", q):
+        tok = tok.strip("：:。.!！?？\"'")
+        if len(tok) >= 2 and tok not in out:
+            out.append(tok)
+    return out[:2]
+
+
+def _suggest_names(kw: str) -> list[tuple[str, str]]:
+    """东财搜索建议 → [(名称, 代码)]（板块优先）。任何失败都返回空表（降级）。"""
+    import json as _json
+    import urllib.parse as _up
+    import urllib.request as _ur
+    try:
+        url = _SUGGEST_URL.format(kw=_up.quote(kw))
+        req = _ur.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with _ur.urlopen(req, timeout=5) as r:
+            data = _json.loads(r.read().decode("utf-8", "replace"))
+        items = ((data.get("QuotationCodeTable") or {}).get("Data")) or []
+        hits = [(str(i.get("Name") or ""), str(i.get("Code") or "")) for i in items
+                if i.get("Name")]
+        # 板块（BK 开头）排前面：模型要的就是它
+        hits.sort(key=lambda x: (not x[1].startswith("BK"),))
+        return hits[:4]
+    except Exception:
+        return []
+
+
+def _name_check_hint(query: str) -> str:
+    """空结果时的名称核对说明（挑不出名字或接口失败时返回空串，由调用方走原兜底）。"""
+    cands = _name_candidates(query)
+    if not cands:
+        return ""
+    lines: list[str] = []
+    found = False
+    for kw in cands:
+        hits = _suggest_names(kw)
+        if not hits:
+            lines.append(f"· 「{kw}」不在东财标的库中（板块/个股/基金/指数都没有这个名称）。")
+            continue
+        found = True
+        show = "、".join(f"{n}({c})" if c else n for n, c in hits)
+        lines.append(f"· 「{kw}」→ 相近的正式名称：{show}")
+    if not lines:
+        return ""
+    head = "\n【名称核对】"
+    tail = ("\n请**用上面的正式名称重新查询**（板块名可直接带「板块」二字），或改用 tavily_search "
+            "搜该题材新闻（并在回答里注明：该题材没有板块级行情/资金数据）；"
+            "也可以改查该题材的产业链个股。" if found else
+            "\n这类题材/口语名在东财体系里没有对应板块——请改用相近的正式板块名、"
+            "或查该题材的产业链个股、或用 tavily_search 搜新闻并注明无板块级数据。"
+            "**不要**继续换同义名重试。")
+    return head + "\n".join(lines) + tail
+
+
+def _is_summary_query(query: str) -> bool:
+    return any(k in str(query or "") for k in _SUMMARY_SIGNS)
+
+
 def execute(args: dict) -> str:
     """Execute a financial data query using the mx_data skill.
     查询失败（接口无法解析措辞）时自动用规范化变体重试。"""
@@ -164,9 +241,20 @@ def execute(args: dict) -> str:
             return "Error: Query timed out (120s)"
         except Exception as e:
             return f"Error: {str(e)}"
-    return ("Error: 查询未返回数据（已尝试多种措辞）。本工具仅支持 A股/港股/基金/板块/指数，美股等其它市场请改用 tavily_search 重试。\n"
-            "⚠️ 东方财富接口不支持「全市场/全部板块/行业板块/概念板块」这类汇总查询——请改为指定单个板块名称再查，"
-            "如：'半导体板块资金流向'、'人工智能板块今日涨跌幅'、'银行板块主力资金净流入'。若用户要的是全市场板块排名，请改用 tavily_search 搜索。")
+    _base = ("Error: 查询未返回数据（已尝试多种措辞）。本工具仅支持 A股/港股/基金/板块/指数，"
+             "美股等其它市场请改用 tavily_search 重试。")
+    if _is_summary_query(query):
+        return (_base + "\n⚠️ 东方财富接口不支持「全市场/全部板块/行业板块/概念板块」这类汇总查询——"
+                "请改为指定单个板块名称再查，如：'半导体板块资金流向'、'人工智能板块今日涨跌幅'、"
+                "'银行板块主力资金净流入'。若用户要的是全市场板块排名，请改用 tavily_search 搜索。")
+    # 非汇总查询：多半是**名字不对**。核对一次名称，把"该换什么"直接告诉模型
+    # （此前这里套的是"汇总查询"提示，把模型引向"换个板块名再试" → 同义名打转）
+    try:
+        _hint = _name_check_hint(query)
+    except Exception:      # 核对本身出任何问题都不许顶掉"查询未返回数据"这个原始事实
+        _hint = ""
+    return _base + (_hint or "\n提示：若查的是题材/口语名（东财没有该正式板块），请改用相近的"
+                             "正式板块名、或该题材的产业链个股，或用 tavily_search 搜新闻。")
 
 
 if __name__ == "__main__":
