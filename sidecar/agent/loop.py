@@ -381,6 +381,12 @@ def _note_msg(text: str, label: str = "【系统提示】") -> dict:
     return {"role": "user", "content": label + text}
 
 
+# ── 轮次生命周期守卫（2026-09-30）──
+# 两次实测：① 模型长时间只思考不写正文 → 后端零字节 → 前端 180s 看门狗误杀；
+# ② 引擎彻底不出数据时，_sample 的超时按"收到的行"计时 → 永不触发 → 生成器挂住 →
+#    会话状态卡 running（前端"上一轮任务仍在运行中"，按停止也无效）。
+
+
 _TOOL_FOLD_KEEP_RECENT = 6      # 最近 N 条工具结果保持原样
 _TURN_TOKEN_BUDGET_DEFAULT = 400_000   # 本轮输入 token 预算（0 = 关闭）
 
@@ -1233,10 +1239,10 @@ class ThinAgentLoop:
                     _first_delta_at = time.monotonic()   # 真·首 token：闸前打点
                 reasoning += think
                 streamed += think
-                if _gate_open:
-                    yield {"reasoning": think, "ts": int(time.time() * 1000)}
-                else:
-                    _pending.append({"reasoning": think, "ts": int(time.time() * 1000)})
+                # 思考**不进**语言漂移闸（2026-09-30）：漂移判定只看正文（body_text），
+                # 思考被攒着纯属"共用闸门"的副作用——模型长时间只思考不写正文时闸门永
+                # 不开 → 后端零字节 → 前端 180s 看门狗误杀（13:33 / 21:29 两次实测）。
+                yield {"reasoning": think, "ts": int(time.time() * 1000)}
             if content:
                 if _first_delta_at is None:
                     _first_delta_at = time.monotonic()
