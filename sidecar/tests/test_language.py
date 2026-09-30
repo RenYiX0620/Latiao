@@ -296,3 +296,30 @@ class TestFinalizeToneInjection(unittest.TestCase):
     def test_current_tone_reads_soul(self):
         from agent.prompt_build import current_tone
         self.assertIsInstance(current_tone(), str)
+
+
+class TestNameFallbackLadder(unittest.TestCase):
+    """「名称不存在时的退路」四语齐备（2026-09-30）。
+
+    事故背景：问"超节点/超算中心 涨跌幅 资金流向"，mx_query 两次空返回（这两个名字不在
+    东财标的库里，正式板块是「算力概念」「液冷服务器」），而错误文案把它导向"换个板块名
+    再查" → 模型在同义名之间打转。提示词里补一条阶梯：正式板块名 → 产业链个股 → tavily
+    搜新闻并注明无结构化数据；本测试保证四语都写进去了（漏一语的症状是那种语言用户
+    得不到这条退路，属于静默降级）。
+    """
+
+    PROBES = {
+        "zh": ("今天超节点板块怎么样", "名称不存在时的退路"),
+        "en": ("How is the supernode sector today", "When a name does not exist"),
+        "ja": ("今日の相場はどうですか", "名称が存在しない場合"),
+        "ru": ("Как дела у рынка сегодня", "Если названия нет в базе"),
+    }
+
+    def test_ladder_present_in_all_languages(self):
+        from agent.prompt_build import _build_chat_messages
+        for lang, (msg, probe) in self.PROBES.items():
+            with self.subTest(lang=lang):
+                msgs = _build_chat_messages({"session_id": "t"},
+                                            [{"role": "user", "content": msg}])
+                blob = "".join(str(m.get("content") or "") for m in msgs)
+                self.assertIn(probe, blob, f"{lang} 缺少「名称不存在时的退路」阶梯")
