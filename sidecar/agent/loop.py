@@ -1960,9 +1960,15 @@ class ThinAgentLoop:
                         (t_first_token - t_sample) if t_first_token else None)
                 except Exception:
                     logger.debug("记录采样步耗时失败", exc_info=True)
+                # TTFT（首个 delta 到达时刻）进日志：它证明"线缆上有没有字节在流"——
+                # 前端看门狗靠收字节重置，而**思考在前端是"只攒不发、定稿时一次性附着"**
+                # （useChatStream 的防闪现设计），所以"思考实时可见"这个观察点不成立；
+                # 以后判断有没有被误杀，直接看这行：TTFT 远小于耗时 = 早在流了。
+                _ttft = (t_first_token - t_sample) if t_first_token else None
                 self._step_log("流结束",
                                f"delta={raw_deltas} 思考={len(reasoning)}字 "
-                               f"正文={len(body_text)}字 耗时={time.monotonic()-t_sample:.1f}s")
+                               f"正文={len(body_text)}字 耗时={time.monotonic()-t_sample:.1f}s "
+                               f"TTFT={f'{_ttft:.1f}s' if _ttft is not None else '—'}")
 
                 # 工具调用：原生优先，围栏兜底
                 tool_calls = []
