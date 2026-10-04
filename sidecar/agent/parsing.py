@@ -90,6 +90,32 @@ def _salvage_tool_args(args_str: str) -> dict:
     return result or {"raw": args_str}
 
 
+def _extract_first_json_object(text: str) -> dict | None:
+    """从混杂文本提取第一个可解析的 JSON 对象（raw_decode 位置扫描，非正则）。
+
+    标准解析器按真正的 JSON 语法切界：字符串里的花括号、嵌套对象、对象前后
+    的杂物（寒暄、`</think>` 残留、围栏碎片）都不影响；贪婪 `\{.*\}` 在
+    "对象后跟含 } 的尾巴"上会抓错区间、非贪婪 `\{.*?\}` 会被嵌套截断——
+    两类都曾让方言解析整段失效。手法来源：EnSIMem 复现包 llm.py（其注释
+    原话 tolerating markdown and Qwen think blocks）。think 块策略由调用方
+    决定，本函数不剥。
+    """
+    if not text:
+        return None
+    decoder = json.JSONDecoder()
+    i = text.find("{")
+    while i != -1:
+        try:
+            obj, _end = decoder.raw_decode(text, i)
+        except json.JSONDecodeError:
+            i = text.find("{", i + 1)
+            continue
+        if isinstance(obj, dict):
+            return obj
+        i = text.find("{", i + 1)
+    return None
+
+
 def _strip_native_tool_calls(text: str) -> str:
     """Remove native tool call blocks from text, keeping only the real content."""
     return _NATIVE_TOOL_RE.sub("", text).strip()
@@ -180,8 +206,11 @@ _PROMPT_TOOL_FENCE_RE = re.compile(
 # Qwen3.8/MoziAI 等 27B 级模型实测输出此格式（工具名在 JSON 内部而非栅栏语言位），
 # 此前 Fenced/XML/Bare/Inline 四层全不认 → 模型反复正确输出工具调用却被当纯文本，
 # nudge 3 次后放弃 → "任务刚开始就停"（09-02 09:14 事故）。
+# 10-04 起：捕获整段栅栏内容（允许前置说明文字），JSON 本体交给
+# _extract_first_json_object——旧 `\{.*?\}` 要求 { 紧跟围栏，栅栏里有一句
+# "好的，这是查询：" 整个方言就失明。
 _PROMPT_JSON_FENCE_RE = re.compile(
-    r'```json\s*(\{.*?\})\s*```',
+    r'```json\s*(.*?)\s*```',
     re.DOTALL,
 )
 
@@ -408,9 +437,8 @@ def _parse_prompt_tool_calls(text: str) -> tuple[str, list[dict]]:
     # 被当纯文本，任务"刚开始就停"
     if not tool_calls:
         for idx, jm in enumerate(_PROMPT_JSON_FENCE_RE.finditer(search_text)):
-            try:
-                obj = json.loads(jm.group(1))
-            except json.JSONDecodeError:
+            obj = _extract_first_json_object(jm.group(1))
+            if obj is None:
                 continue
             if not (isinstance(obj, dict) and obj.get("name") and "arguments" in obj):
                 continue
@@ -436,12 +464,9 @@ def _parse_prompt_tool_calls(text: str) -> tuple[str, list[dict]]:
             try:
                 _obj = json.loads(_body)
             except json.JSONDecodeError:
-                _jm = re.search(r"\{.*\}", _body, re.DOTALL)
-                if _jm:
-                    try:
-                        _obj = json.loads(_jm.group(0))
-                    except json.JSONDecodeError:
-                        _obj = _salvage_tool_args(_jm.group(0))
+                _obj = _extract_first_json_object(_body)
+                if _obj is None:
+                    _obj = _salvage_tool_args(_body)
             if not isinstance(_obj, dict):
                 continue
             _wname = str(_obj.get("name") or _obj.get("tool")
@@ -477,14 +502,11 @@ def _parse_prompt_tool_calls(text: str) -> tuple[str, list[dict]]:
                     _fargs[pm.group(1)] = _raw
             if not _fargs:
                 # 混合方言（09-19 实测）：body 直接是 {"query": ...}（可能只带 </parameter> 收尾）
-                _jm = re.search(r"\{.*\}", fm.group(2), re.DOTALL)
-                if _jm:
-                    try:
-                        _obj = json.loads(_jm.group(0))
-                    except json.JSONDecodeError:
-                        _obj = _salvage_tool_args(_jm.group(0))
-                    if isinstance(_obj, dict):
-                        _fargs = _obj
+                # 10-04：raw_decode 扫描替换贪婪 `\{.*\}`——对象后跟含 } 的尾巴时旧
+                # 区间抓错 → 解析出垃圾参数，工具拿烂参数白跑一轮。
+                _obj = _extract_first_json_object(fm.group(2))
+                if _obj is not None:
+                    _fargs = _obj
             tool_calls.append({
                 "id": f"local_qwxml_{_fname}_{f_idx}",
                 "type": "function",
