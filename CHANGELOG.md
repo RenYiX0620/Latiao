@@ -290,6 +290,23 @@ falsely abort a turn.
 
 ---
 
+## v0.3.58 — v0.3.58 — engine bump to latest upstream
+
+## Engine
+
+- Bundled llama.cpp updated to the latest upstream build (b11382+, fetched at release build time). No configuration change needed — the new engine ships with the installer.
+
+## Fixes
+
+- **Custom-engine reload with bare model names** (found live in the occamy reload incident): auto-reload passes a bare model name without a path; the custom-engine branch of `start_model` failed silently ("model path not found", no error logged), cleared engine state and left the UI showing "engine not running". Bare names are now resolved through the same fuzzy scan the standard branch uses. Directory layouts also prefer the same-named inner main GGUF, so the mmproj projector can no longer be picked up as the main model by alphabetical order.
+- **Tool-call dialect parsing** now extracts JSON with a `raw_decode` position scan instead of greedy/anchored regex: the ```json fence tolerates leading prose, `<tool_call>{json}` survives trailing brace junk, and the Qwen `<function=…>` mixed dialect no longer produces garbage argument keys. Array-wrapped call objects are accepted as well.
+
+## Developer tooling
+
+- `scripts/dual_judge.py`: grade one batch of answers with two LLM judges from different model families and report the agreement rate — a low rate means the rubric (not the tested variant) is the problem, so fix the ruler before trusting any number. Intended for one-variable-at-a-time A/Bs.
+
+---
+
 ## 更早版本
 
 以下标题来自各自的发布提交（完整产物与发布时间见 GitHub Releases）：
