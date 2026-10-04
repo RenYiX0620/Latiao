@@ -2196,16 +2196,20 @@ class ThinAgentLoop:
                     yield {"event": "content_revised", "content": _folded}
                     _narr_text = _folded
                 if _narr_text and _narration_seen(self.session_id, _narr_text):
-                    # 近重复过渡叙述：截断为短摘要入历史（真流式已让用户看过
-                    # 一次）——历史里不再累积相同叙述，打破逐轮复述吸引子。
-                    # 2026-10-05 occamy 三连复述事故：光改历史不够——前端把各轮
-                    # 正文累加进同一气泡，重复句照样进终答（日志里抑制已触发、
-                    # 用户仍看到三遍）。下发空 content_revised 让前端撤回本轮
-                    # 气泡（配合 round_start 气泡切片，撤的是本轮自己的叙述，
-                    # 不伤前轮）；非流式消费方按轮缓冲同步丢弃。
-                    asst = {"role": "assistant", "content": _narr_text[:60] + "…（同前）"}
+                    # 近重复过渡叙述：历史条目**置空**（只留 tool_calls 入史）。
+                    # 2026-10-05 occamy 三连复述事故，两层教训：
+                    # ① 光改历史不够——前端把各轮正文累加进同一气泡，重复句照样
+                    #    进终答 → 下发空 content_revised 让前端撤回本轮气泡
+                    #    （配合 round_start 气泡切片，撤的是本轮自己的叙述，
+                    #    不伤前轮）；非流式消费方按轮缓冲同步丢弃。
+                    # ② 原来历史里写的"…（同前）"省略标记被模型**模仿**——它开始
+                    #    自产"…（上略）/…（同前）"当过程摘要写进正式回答
+                    #    （14:47 板块轮实测）。给模型看的速记会漏进它的文体，
+                    #    所以历史里不放任何省略标记：空正文+工具调用是最自然的
+                    #    模型行为，无可模仿之物。
+                    asst = {"role": "assistant", "content": ""}
                     yield {"event": "content_revised", "content": ""}
-                    self._step_log("重复叙述抑制", f"{len(_narr_text)}字 近重复（已下发撤回）")
+                    self._step_log("重复叙述抑制", f"{len(_narr_text)}字 近重复（气泡已撤回，历史置空）")
                 else:
                     asst = {"role": "assistant", "content": clean_text or ""}
                 # 无论 native/fence，解析出的 tool_calls 都要入史：
