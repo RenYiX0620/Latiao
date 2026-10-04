@@ -95,20 +95,20 @@ def list_turns(session_id: str = "", limit: int = 50) -> list[dict]:
             conn = _get_db()
             if session_id:
                 rows = conn.execute(
-                    "SELECT session_id, model, is_local, started_at, duration_ms, input_tokens, "
+                    "SELECT id, session_id, model, is_local, started_at, duration_ms, input_tokens, "
                     "gen_tokens, retries, steps, ttft_ms, refine_calls, refine_tokens, budget, "
                     "by_source, ended_reason FROM turn_metrics WHERE session_id = ? "
                     "ORDER BY started_at DESC LIMIT ?", (session_id, int(limit))).fetchall()
             else:
                 rows = conn.execute(
-                    "SELECT session_id, model, is_local, started_at, duration_ms, input_tokens, "
+                    "SELECT id, session_id, model, is_local, started_at, duration_ms, input_tokens, "
                     "gen_tokens, retries, steps, ttft_ms, refine_calls, refine_tokens, budget, "
                     "by_source, ended_reason FROM turn_metrics "
                     "ORDER BY started_at DESC LIMIT ?", (int(limit),)).fetchall()
     except sqlite3.Error:
         logger.warning("turn_metrics 读取失败", exc_info=True)
         return []
-    keys = ("session_id", "model", "is_local", "started_at", "duration_ms", "input_tokens",
+    keys = ("id", "session_id", "model", "is_local", "started_at", "duration_ms", "input_tokens",
             "gen_tokens", "retries", "steps", "ttft_ms", "refine_calls", "refine_tokens",
             "budget", "by_source", "ended_reason")
     out = []
@@ -120,6 +120,23 @@ def list_turns(session_id: str = "", limit: int = 50) -> list[dict]:
             d["by_source"] = {}
         out.append(d)
     return out
+
+
+def count_turns(session_id: str = "") -> int:
+    """库内总轮数（跨会话或按会话）——给汇总界面的"共 N 轮"一个准确数，
+    避免用 list_turns 的行数上限冒充总数。"""
+    try:
+        with _db_write_lock:
+            conn = _get_db()
+            if session_id:
+                row = conn.execute("SELECT COUNT(*) FROM turn_metrics WHERE session_id = ?",
+                                   (session_id,)).fetchone()
+            else:
+                row = conn.execute("SELECT COUNT(*) FROM turn_metrics").fetchone()
+            return int(row[0] if row else 0)
+    except sqlite3.Error:
+        logger.warning("turn_metrics 计数失败", exc_info=True)
+        return 0
 
 
 def prune(days: int | None = None) -> int:

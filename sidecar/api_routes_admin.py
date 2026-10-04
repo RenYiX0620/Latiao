@@ -29,6 +29,10 @@ logger = logging.getLogger("latiao-sidecar")
 
 from http_json import _json_body  # noqa: E402 — 唯一定义
 
+# 历史轮次汇总的聚合上限（行）。一行一轮、180 天保留，正常远达不到；
+# 超过时 summary.agg_capped=true，前端提示"只统计了最近 N 行"。
+_AGG_MAX_ROWS = 2000
+
 
 def _hub():
     """枢纽符号惰性取（agent_loop / main）。模块级 import 会造回环。"""
@@ -131,6 +135,67 @@ async def get_context_stats(session_id: str = ""):
     except Exception:
         logger.debug("读取本地引擎上下文上限失败", exc_info=True)
     return context_stats.stats(session_id, limit=limit, limit_source=limit_source)
+
+
+@router.get("/v1/turn-metrics/summary")
+async def get_turn_metrics_summary(session_id: str = "", limit: int = 50):
+    """历史轮次用量汇总（turn_metrics 表，2026-10-04）。
+
+    - 聚合口径：取最近 `_AGG_MAX_ROWS` 行做合计/按天/按模型分布；极端情况下
+      覆盖不满全库时 summary.agg_capped=true（总数来自 count_turns 的准确值）。
+    - session_id 为空 = 跨会话全部；给了 = 仅该会话。
+    - 聚合在 Python 里做：行量小（一行一轮、180 天保留），不值得上 SQL 聚合。
+    """
+    import turn_metrics
+    try:
+        limit = max(1, min(200, int(limit)))
+    except (TypeError, ValueError):
+        limit = 50
+    rows = turn_metrics.list_turns(session_id, limit=_AGG_MAX_ROWS)
+    total = turn_metrics.count_turns(session_id)
+
+    totals = {"input": 0, "gen": 0, "retries": 0, "refine_calls": 0, "refine_tokens": 0}
+    by_model: dict[str, dict] = {}
+    ended: dict[str, int] = {}
+    ttft_local: list[int] = []
+    per_day: dict[str, dict] = {}
+    for r in rows:
+        _inp, _gen = int(r.get("input_tokens") or 0), int(r.get("gen_tokens") or 0)
+        totals["input"] += _inp
+        totals["gen"] += _gen
+        totals["retries"] += int(r.get("retries") or 0)
+        totals["refine_calls"] += int(r.get("refine_calls") or 0)
+        totals["refine_tokens"] += int(r.get("refine_tokens") or 0)
+        is_local = bool(r.get("is_local"))
+        m = str(r.get("model") or "未知")
+        b = by_model.setdefault(m, {"model": m, "is_local": is_local, "n": 0,
+                                    "input": 0, "gen": 0})
+        b["n"] += 1
+        b["input"] += _inp
+        b["gen"] += _gen
+        reason = str(r.get("ended_reason") or "unknown")
+        ended[reason] = ended.get(reason, 0) + 1
+        if is_local and isinstance(r.get("ttft_ms"), int):
+            ttft_local.append(int(r["ttft_ms"]))
+        day = str(r.get("started_at") or "")[:10]
+        if day:
+            d = per_day.setdefault(day, {"date": day, "n": 0, "input": 0, "gen": 0})
+            d["n"] += 1
+            d["input"] += _inp
+            d["gen"] += _gen
+    summary = {
+        "n_turns_total": total,
+        "n_rows_aggregated": len(rows),
+        "agg_capped": total > len(rows),
+        "local_turns": sum(1 for r in rows if r.get("is_local")),
+        "cloud_turns": sum(1 for r in rows if not r.get("is_local")),
+        "totals": totals,
+        "by_model": sorted(by_model.values(), key=lambda x: -x["n"])[:8],
+        "ended": ended,
+        "avg_ttft_ms_local": (sum(ttft_local) // len(ttft_local)) if ttft_local else None,
+        "per_day": [per_day[k] for k in sorted(per_day)][-14:],
+    }
+    return {"status": "ok", "summary": summary, "recent": rows[:limit]}
 
 
 # ── 首启引导（新安装第一次对话时自我介绍并收集 称呼/名字/语气）──

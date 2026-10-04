@@ -1,7 +1,9 @@
 import { useCallback, useMemo, useRef, useState } from "react";
 import { useTranslation } from "../i18n";
 import { authFetch } from "../utils/api";
+import { fmtTokens, type TurnHistoryData } from "../utils/turnHistory";
 import { turnCostView, type TurnCostLike } from "../utils/turnCost";
+import TurnHistory from "./TurnHistory";
 
 /** 与后端 context_stats.CATEGORIES 一一对应（顺序即展示顺序）。 */
 const ROWS: { key: string; i18n: string; color: string }[] = [
@@ -27,20 +29,7 @@ interface CtxStats {
   turn?: TurnCostLike | null;
 }
 
-/** token 数按语言习惯缩写：中文用「万」，其余用 k/M（对齐同类工具的面板写法）。 */
-function fmtTokens(n: number, lang: string): string {
-  if (!n) return "0";
-  if (lang === "zh") {
-    if (n >= 10000) {
-      const w = n / 10000;
-      return `${w >= 100 ? Math.round(w) : w.toFixed(1).replace(/\.0$/, "")}万`;   // 仅 zh 分支走到这里
-    }
-    return n.toLocaleString();
-  }
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1).replace(/\.0$/, "")}M`;
-  if (n >= 1000) return `${(n / 1000).toFixed(1).replace(/\.0$/, "")}k`;
-  return n.toLocaleString();
-}
+/** token 数缩写逻辑已上移 src/utils/turnHistory.ts（历史面板共用同一份）。 */
 
 /**
  * 上下文容量指示器 + 悬浮面板。
@@ -57,6 +46,9 @@ export default function ContextMeter({ sessionId, fallbackTokens, fallbackLimit 
   const { t, lang } = useTranslation();
   const [data, setData] = useState<CtxStats | null>(null);
   const [open, setOpen] = useState(false);
+  const [showHist, setShowHist] = useState(false);
+  const [histData, setHistData] = useState<TurnHistoryData | null>(null);
+  const [histScopeAll, setHistScopeAll] = useState(true);
   const fetchedAt = useRef(0);
 
   const load = useCallback(async () => {
@@ -77,6 +69,34 @@ export default function ContextMeter({ sessionId, fallbackTokens, fallbackLimit 
     setOpen(true);
     if (Date.now() - fetchedAt.current > 2000) void load();
   }, [load]);
+
+  /** 历史用量：只在点击（切入口/切范围）时拉取——react-hooks 不允许挂载即
+   * setState，且与"按需请求"的哲学一致。 */
+  const loadHist = useCallback(async (scopeAll: boolean) => {
+    const sid = scopeAll ? "" : (sessionId || "");
+    const q = sid ? `?session_id=${encodeURIComponent(sid)}` : "";
+    try {
+      const r = await authFetch(`/v1/turn-metrics/summary${q}`);
+      const d = await r.json();
+      if (d && d.status === "ok") setHistData(d as TurnHistoryData);
+    } catch {
+      /* 侧车未就绪：面板保持空态 */
+    }
+  }, [sessionId]);
+
+  const toggleHist = useCallback(() => {
+    setShowHist((v) => {
+      if (!v) void loadHist(true);
+      return !v;
+    });
+  }, [loadHist]);
+
+  const toggleHistScope = useCallback(() => {
+    setHistScopeAll((v) => {
+      void loadHist(!v);
+      return !v;
+    });
+  }, [loadHist]);
 
   const live = !!data?.available;
   const total = live ? data!.total : fallbackTokens;
@@ -111,6 +131,17 @@ export default function ContextMeter({ sessionId, fallbackTokens, fallbackLimit 
               {percent !== null ? `（${percent}%）` : ""}
             </span>
           </div>
+          <button
+            type="button"
+            className="ctx-hist-toggle"
+            onClick={toggleHist}
+          >
+            {showHist ? t("chat.ctx_hist_back") : t("chat.ctx_hist_toggle")}
+          </button>
+          {showHist ? (
+            <TurnHistory data={histData} scopeAll={histScopeAll} onToggleScope={toggleHistScope} />
+          ) : (
+            <>
           <div className="ctx-stack" aria-hidden="true">
             {live && rows.map((r) => (
               <i key={r.key} style={{ width: `${r.pct}%`, background: r.color }} />
@@ -160,6 +191,8 @@ export default function ContextMeter({ sessionId, fallbackTokens, fallbackLimit 
                 : `${(cache * 100).toFixed(1)}%${data!.cache_samples > 1 ? ` · ${data!.cache_samples}x` : ""}`}
             </span>
           </div>
+            </>
+          )}
         </div>
       )}
     </span>
