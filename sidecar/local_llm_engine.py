@@ -720,6 +720,14 @@ class EngineProcess:
         cache_models = Path.home() / ".cache" / "huggingface" / "models"
         return _search_dir(cache_models)
 
+    def _resolve_custom_model_path(self, model_id: str) -> str:
+        """custom_engine 分支的 model_id 归一：已是文件/目录则原样返回；
+        裸名走 _find_gguf 模糊解析（LM Studio 目录布局返回内部同名主文件，
+        天然跳过 mmproj）；解析失败返回原值，由 _custom_engine_target 给可读错误。"""
+        if Path(model_id).is_file() or Path(model_id).is_dir():
+            return model_id
+        return self._find_gguf(model_id) or model_id
+
     def _find_gguf_for_delete(self, model_id: str) -> str | None:
         """删除专用的精确查找：只在 ~/Models 内、stem 或文件名完全相等。
 
@@ -850,7 +858,11 @@ class EngineProcess:
             # （量化类型/完整性闸门的理由正是"我们的引擎读不了这种文件"）。
             _custom = _custom_engine_spec(model_id)
             if _custom:
-                _ok, _target = _custom_engine_target(model_id)
+                # 自动重载/状态恢复传来的 model_id 可能是裸名（无路径）——标准分支
+                # 由 _start_llama_cpp 内部解析，custom 分支此前直接查路径，裸名必
+                # 死于"模型路径不存在"且不留 ERROR 日志（2026-10-03 occamy 重载事故）。
+                _mid = self._resolve_custom_model_path(model_id)
+                _ok, _target = _custom_engine_target(_mid)
                 if _ok != "ok":
                     self.server_status = "error"
                     self.status_message = f"自定义引擎（{_custom['name']}）无法加载：{_target}"
@@ -858,8 +870,8 @@ class EngineProcess:
                     self.current_model_name = ""
                     return self.get_status()
                 logger.info("使用自定义引擎 '%s': %s ← %s", _custom["name"], _custom["binary"], _target)
-                self.current_model_id = model_id
-                self.current_model_name = Path(model_id).stem
+                self.current_model_id = _mid
+                self.current_model_name = Path(_mid).stem
                 self.server_status = "starting"
                 self.status_message = (f"正在用自定义引擎 {_custom['name']} 加载 "
                                        f"{self.current_model_name}...")

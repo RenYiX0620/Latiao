@@ -132,6 +132,11 @@ def _custom_engine_target(model_id: str) -> tuple[str, str]:
         except Exception as e:
             return ("err", f"无法读取 {p}: {e}")
     if p.is_dir():
+        # LM Studio 布局：目录名以 .gguf 结尾、内部有同名主文件——必须优先取它，
+        # 否则 sorted[0] 会按字母序选中 mmproj 投影器当主模型（m < o）。
+        inner = p / p.name
+        if inner.is_file():
+            return ("ok", str(inner))
         ggufs = sorted(p.glob("*.gguf"))
         if ggufs:
             return ("ok", str(ggufs[0]))
