@@ -321,6 +321,19 @@ falsely abort a turn.
 
 ---
 
+## v0.3.60 — v0.3.60 — usage dashboard + narration leak fixes
+
+## New
+
+- **Usage Statistics page**: a dedicated view in the sidebar — five summary cards (all-time tokens with total turns, peak day, longest turn, current/longest day streaks), a GitHub-style token-activity heatmap (26 weeks, columns aligned to Monday; daily / weekly / cumulative modes) and a per-model daily token trend with 7/30-day ranges. The smaller usage-history panel inside the context meter popover remains as a quick view.
+
+## Fixes
+
+- **Duplicate round narrations no longer pile into the answer**: when a model repeats the same opening narration in every tool round (observed with a local MoE model), the duplicate rounds are now withdrawn from the delivered reply and only the first occurrence is kept. Chat bubbles are now sliced per round, and the non-streaming/cron paths apply the same semantics.
+- **Omission markers are no longer written into model-facing history**: truncated narration markers were being imitated by the model (it began writing its own pseudo-summaries into real answers); duplicate-narration history entries are now empty, leaving nothing to imitate.
+
+---
+
 ## 更早版本
 
 以下标题来自各自的发布提交（完整产物与发布时间见 GitHub Releases）：
