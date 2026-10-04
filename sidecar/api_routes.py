@@ -437,8 +437,10 @@ async def chat_completion(request: Request):
         # 预算守卫与近阈提示、停滞/同错升级、压缩与旧结果回收、用量记账**全都没有**
         # （该路径前端从不使用，只有兼容外部客户端会走到，但仍是旁路）。
         # 现在与 SSE 路径共用唯一循环：消费生成器 → 拼接正文 → 按 chat.completion 返回。
-        from agent.loop import ThinAgentLoop
-        _parts: list[str] = []
+        # 2026-10-05：按轮缓冲（RoundTextAccumulator）——content_revised 的
+        # 折叠/撤回语义在这里等价生效，不再把撤回的重复叙述拼进返回。
+        from agent.loop import ThinAgentLoop, RoundTextAccumulator
+        _acc = RoundTextAccumulator()
         try:
             _ns_loop = ThinAgentLoop(
                 messages, model, api_url, headers, session_id,
@@ -446,14 +448,13 @@ async def chat_completion(request: Request):
                 str(body.get("thinking_level") or "high"),
                 is_local=is_local)
             async for _ev in _ns_loop.run():
-                if isinstance(_ev, dict) and _ev.get("content"):
-                    _parts.append(str(_ev["content"]))
+                _acc.feed(_ev)
         except Exception as e:
             logger.error("Non-streaming agent loop error: %s", e)
             _record_turn_metrics(session_id, model, is_local, "error")
             return JSONResponse({"error": f"Agent 循环错误: {e}"}, status_code=500)
 
-        full_content = "".join(_parts).strip()
+        full_content = _acc.join()
         _record_turn_metrics(session_id, model, is_local, "completed")
         if not full_content:
             logger.warning("Non-streaming agent loop: empty content for %s", session_id)

@@ -288,7 +288,16 @@ export function useChatStream(deps: ChatStreamDeps) {
               if (parsed.event === "round_start") {
                 // 轮次透明化（09-05 23:52：本地慢生成多轮拉锯时前端黑盒）
                 currentRound = Number(parsed.iteration) || currentRound;
-                flushStream();
+                // 轮次即气泡边界（2026-10-05 occamy 三连复述事故）：上一轮已
+                // 流出的正文定稿成独立气泡，新轮从空累积——多轮的重复叙述
+                // 不再堆进同一个气泡，撤回事件也只撤本轮自己的叙述
+                if (full.trim()) {
+                  streamFinalized = true;
+                  flushStream();
+                  full = "";
+                  streamFinalized = false;
+                  thinkingAttached = false;
+                }
                 continue;
               }
               if (parsed.event === "tool_confirm") {
@@ -357,6 +366,8 @@ export function useChatStream(deps: ChatStreamDeps) {
               } else if (parsed.event === "content_revised") {
                 // 追问续写轮：把最后一条 assistant 消息替换为当前累积文本。
                 // 与 reflection_revised 的区别：不加"已自查修正"角标。
+                // 空内容 = 撤回本轮气泡（后端"重复叙述抑制"：该轮只有近重复
+                // 叙述，真流式已闪现一次，这里撤掉——三连复述事故的收口）。
                 flushStream();
                 const revised = String(parsed.content ?? "");
                 if (revised.trim()) {
@@ -368,6 +379,23 @@ export function useChatStream(deps: ChatStreamDeps) {
                     for (let i = msgs.length - 1; i >= 0; i--) {
                       if (msgs[i].role === "assistant" && msgs[i].content && msgs[i].content.trim()) {
                         msgs[i] = { ...msgs[i], content: revised };
+                        break;
+                      }
+                    }
+                    return msgs;
+                  });
+                } else {
+                  // 撤回本轮气泡：删掉最后一条有正文的 assistant 消息（round_start
+                  // 已按轮切片，它就是本轮自己的叙述；工具消息在其后，不受影响）
+                  full = "";
+                  streamFinalized = false;
+                  pendingThinking = "";
+                  thinkingAttached = false;
+                  writeMessages((prev) => {
+                    const msgs = [...prev];
+                    for (let i = msgs.length - 1; i >= 0; i--) {
+                      if (msgs[i].role === "assistant" && String(msgs[i].content || "").trim()) {
+                        msgs.splice(i, 1);
                         break;
                       }
                     }

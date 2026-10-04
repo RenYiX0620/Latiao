@@ -263,6 +263,42 @@ def _narration_seen(session_id: str, text: str) -> bool:
     return False
 
 
+class RoundTextAccumulator:
+    """非流式消费方（api_routes 非流式分支 / cron）的**按轮**正文缓冲。
+
+    流式路径的"重复叙述撤回"由前端实现（round_start 切气泡 + 空
+    content_revised 撤回）；非流式没有气泡，但消费的是同一组事件，需要
+    等价语义——否则撤回事件被当成普通 content 跳过，重复叙述照样进
+    cron 摘要/非流式返回（2026-10-05 occamy 三连复述事故的机器侧版）。
+
+    - content 增量 → 追加进当前轮缓冲；
+    - round_start → 开新轮缓冲；
+    - content_revised 非空 → 替换当前轮缓冲（过程叙述折叠）；
+    - content_revised 空 → 清空当前轮缓冲（重复叙述撤回）；
+    - join() 轮与轮之间空行相连（对齐前端的逐轮气泡观感）。
+    """
+
+    def __init__(self) -> None:
+        self._rounds: list[list[str]] = [[]]
+
+    def feed(self, ev: object) -> None:
+        if not isinstance(ev, dict):
+            return
+        if ev.get("event") == "round_start":
+            if any(s for s in self._rounds[-1]):
+                self._rounds.append([])
+            return
+        if ev.get("event") == "content_revised":
+            rev = str(ev.get("content") or "")
+            self._rounds[-1] = [rev] if rev else []
+            return
+        if ev.get("content"):
+            self._rounds[-1].append(str(ev["content"]))
+
+    def join(self) -> str:
+        return "\n\n".join("".join(r) for r in self._rounds if any(r)).strip()
+
+
 def mark_session_tools(session_id: str, names) -> None:
     """把工具标记为本会话已用/已承诺——后续轮次目录并集保留。"""
     if not session_id or not names:
@@ -2161,9 +2197,15 @@ class ThinAgentLoop:
                     _narr_text = _folded
                 if _narr_text and _narration_seen(self.session_id, _narr_text):
                     # 近重复过渡叙述：截断为短摘要入历史（真流式已让用户看过
-                    # 一次）——历史里不再累积相同叙述，打破逐轮复述吸引子
+                    # 一次）——历史里不再累积相同叙述，打破逐轮复述吸引子。
+                    # 2026-10-05 occamy 三连复述事故：光改历史不够——前端把各轮
+                    # 正文累加进同一气泡，重复句照样进终答（日志里抑制已触发、
+                    # 用户仍看到三遍）。下发空 content_revised 让前端撤回本轮
+                    # 气泡（配合 round_start 气泡切片，撤的是本轮自己的叙述，
+                    # 不伤前轮）；非流式消费方按轮缓冲同步丢弃。
                     asst = {"role": "assistant", "content": _narr_text[:60] + "…（同前）"}
-                    self._step_log("重复叙述抑制", f"{len(_narr_text)}字 近重复")
+                    yield {"event": "content_revised", "content": ""}
+                    self._step_log("重复叙述抑制", f"{len(_narr_text)}字 近重复（已下发撤回）")
                 else:
                     asst = {"role": "assistant", "content": clean_text or ""}
                 # 无论 native/fence，解析出的 tool_calls 都要入史：

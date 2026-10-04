@@ -393,11 +393,13 @@ async def _execute_cron_job(job: dict, force_local: bool = False):
             tool_whitelist=_cron_tool_whitelist(task))
         # 无人值守：步数收紧（原实现是 10 轮迭代），预算/停滞/同错闸门照常生效
         loop.max_steps = _CRON_MAX_STEPS
-        parts: list[str] = []
+        # 2026-10-05：按轮缓冲——content_revised 的折叠/撤回语义在 cron 侧
+        # 等价生效（撤回的重复叙述不再拼进任务摘要）。
+        from agent.loop import RoundTextAccumulator
+        acc = RoundTextAccumulator()
         async for ev in loop.run():
-            if isinstance(ev, dict) and ev.get("content"):
-                parts.append(str(ev["content"]))
-        ai_content = "".join(parts).strip()
+            acc.feed(ev)
+        ai_content = acc.join().strip()
         _steps = getattr(loop, "steps", 0)
     except Exception as e:
         # 引擎/装配层异常（循环内部的错误都已转成内容交付，不会到这儿）

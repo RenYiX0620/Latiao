@@ -654,3 +654,62 @@ class TestLoopGaps:
             loop.current_msgs.extend(self._tool_msg(f"Error: HTTP 500 after {i * 3} tries"))
             out = loop._scan_tool_failures()
         assert out is not None, "错误里的数字变化不应破坏签名"
+
+
+@pytest.mark.asyncio
+async def test_duplicate_narration_withdraws_bubble():
+    """重复叙述抑制要下发空 content_revised（撤回本轮气泡）。
+
+    2026-10-05 occamy 三连复述事故：抑制只改了历史、用户仍看到三遍。
+    回归钉住：两轮相同开场白 + 工具调用 → 第二轮必须出现 content="" 的
+    content_revised 撤回事件；第一轮（首次出现）不撤。
+    """
+    from agent.loop import ThinAgentLoop
+    from tests.test_loop_scenarios import _StubEngine
+    import local_llm
+    with FakeEngine() as engine:
+        NARR = "分析美股走势情况。"
+        engine.push(engine.native_tool_response("list_dir", {"path": "."}, content=NARR))
+        engine.push(engine.native_tool_response("list_dir", {"path": "sidecar"}, content=NARR))
+        engine.push(engine.text_response(NEUTRAL_TEXT))
+        old = local_llm._engine
+        local_llm._engine = _StubEngine()
+        try:
+            events = await _collect(ThinAgentLoop(
+                MESSAGES, "fake-model", engine.url, HEADERS,
+                session_id=f"thin-wd-{time.time()}", access_mode="full").run())
+        finally:
+            local_llm._engine = old
+        withdraws = [e for e in events
+                     if e.get("event") == "content_revised" and not str(e.get("content") or "").strip()]
+        assert len(withdraws) == 1, [e.get("event") for e in events]
+        # 撤回事件之后不应再有该叙述的 content 增量（终答轮不受影响）
+        idx = events.index(withdraws[0])
+        tail_texts = [str(e.get("content") or "") for e in events[idx:]
+                      if e.get("event") != "content_revised" and e.get("content")]
+        assert all(NARR not in t for t in tail_texts), tail_texts
+
+
+def test_round_text_accumulator_withdraw_and_fold():
+    """非流式/cron 的按轮缓冲：撤回丢本轮、折叠换本轮、轮间空行。"""
+    from agent.loop import RoundTextAccumulator
+    acc = RoundTextAccumulator()
+    for ev in [
+        {"event": "round_start", "iteration": 1},
+        {"content": "分析美股走势情况。"},
+        {"event": "tool_start", "tool": "list_dir"},
+        {"event": "tool_end"},
+        {"event": "round_start", "iteration": 2},
+        {"content": "分析美股走势情况。"},
+        {"event": "content_revised", "content": ""},          # 撤回第二轮
+        {"event": "round_start", "iteration": 3},
+        {"content": "美股上周收出小阳周K。"},
+        {"event": "round_start", "iteration": 4},
+        {"content": "超长叙述" * 300},
+        {"event": "content_revised", "content": "（折叠）"},   # 折叠第四轮
+    ]:
+        acc.feed(ev)
+    out = acc.join()
+    assert out == "分析美股走势情况。\n\n美股上周收出小阳周K。\n\n（折叠）"
+    # 空轮（撤光）不产生空段落
+    assert "\n\n\n" not in out
