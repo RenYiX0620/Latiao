@@ -198,6 +198,22 @@ async def get_turn_metrics_summary(session_id: str = "", limit: int = 50):
     return {"status": "ok", "summary": summary, "recent": rows[:limit]}
 
 
+@router.get("/v1/turn-metrics/dashboard")
+async def get_turn_metrics_dashboard(window: int = 182):
+    """整页"使用统计"的聚合（对齐 ZCode 的使用统计页，2026-10-04）。
+
+    全库合计（累计 Token / 最长单轮）+ 窗口内按天、按天×模型（趋势线用）、
+    峰值单日、连续天数。窗口钳到 [7,365]；保留期 180 天，再大的窗口也只是
+    空热力图。
+    """
+    import turn_metrics
+    try:
+        window = max(7, min(365, int(window)))
+    except (TypeError, ValueError):
+        window = 182
+    return {"status": "ok", **turn_metrics.dashboard_stats(window)}
+
+
 # ── 首启引导（新安装第一次对话时自我介绍并收集 称呼/名字/语气）──
 @router.get("/v1/onboarding")
 async def get_onboarding():

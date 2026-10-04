@@ -51,7 +51,7 @@ export interface IdentityFile {
   content: string;
 }
 
-export type ViewId = "chat" | "models" | "tools" | "skills" | "cron" | "channels" | "agents" | "settings" | "logs";
+export type ViewId = "chat" | "models" | "tools" | "skills" | "cron" | "channels" | "agents" | "usage" | "settings" | "logs";
 
 export interface CloudModel {
   name: string;

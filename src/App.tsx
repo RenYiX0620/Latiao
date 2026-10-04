@@ -23,10 +23,11 @@ import ToolsView from "./components/ToolsView";
 import CronView from "./components/CronView";
 import ChannelsView from "./components/ChannelsView";
 import AgentView from "./components/AgentView";
+import UsageStatsView from "./components/UsageStatsView";
 import SettingsView from "./components/SettingsView";
 import RecoveryView from "./components/RecoveryView";
 import LogsView from "./components/LogsView";
-import { MessageSquare, Brain, Wrench, Clock, Radio, Bot, Settings, ScrollText } from "lucide-react";
+import { MessageSquare, Brain, Wrench, Clock, Radio, Bot, BarChart3, Settings, ScrollText } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import "./App.css";
 
@@ -77,6 +78,7 @@ const NAV_ITEMS: { id: ViewId; icon: LucideIcon; key: string }[] = [
   { id: "cron", icon: Clock, key: "nav.cron" },
   { id: "channels", icon: Radio, key: "nav.channels" },
   { id: "agents", icon: Bot, key: "nav.agents" },
+  { id: "usage", icon: BarChart3, key: "nav.usage" },
   { id: "settings", icon: Settings, key: "nav.settings" },
   { id: "logs", icon: ScrollText, key: "nav.logs" },
 ];
@@ -1389,6 +1391,14 @@ const [timeFilter, setTimeFilter] = useState("all");
           </div>
           <div className="page-body">
             <AgentView key={lang} activeAgent={activeAgent} setActiveAgent={setActiveAgent} showToast={showToast} />
+          </div>
+        </div>
+        <div className={`view-panel${activeView === "usage" ? " active" : ""}`} id="view-usage" style={sidecarStatus === "offline" ? { display: "none" } : undefined}>
+          <div className="page-header">
+            <div><div className="page-title">{t("page.usage")}</div><div className="page-desc">{t("page.usage_desc")}</div></div>
+          </div>
+          <div className="page-body">
+            <UsageStatsView key={lang} />
           </div>
         </div>
         <div className={`view-panel${activeView === "settings" ? " active" : ""}`} id="view-settings" style={sidecarStatus === "offline" ? { display: "none" } : undefined}>

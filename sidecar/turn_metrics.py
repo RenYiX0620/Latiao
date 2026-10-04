@@ -139,6 +139,78 @@ def count_turns(session_id: str = "") -> int:
         return 0
 
 
+def dashboard_stats(window_days: int = 182) -> dict:
+    """整页"使用统计"仪表盘的聚合（2026-10-04，对齐 ZCode 的使用统计页）。
+
+    - 重活在 SQL：全库合计一行、按天一查询、按天×模型一查询；行量由 180 天
+      保留期兜底（窗口超过保留期没有额外意义）。
+    - 连续天数从按天日期序列推（当前连续从今天起算，今天没用则从昨天——
+      与 ZCode 的口径一致：半夜后看仍是连续的）。
+    - 失败返回全零形状，不抛（仪表盘不能把页面打挂）。
+    """
+    from datetime import date as _date
+
+    empty = {"all_time": {"n": 0, "input": 0, "gen": 0, "longest_turn_ms": 0},
+             "per_day": [], "per_day_model": [], "peak_day": None,
+             "streak_current": 0, "streak_longest": 0, "window_days": int(window_days)}
+    try:
+        window_days = max(7, min(365, int(window_days)))
+        cutoff = (datetime.now() - timedelta(days=window_days)).isoformat()
+        with _db_write_lock:
+            conn = _get_db()
+            all_row = conn.execute(
+                "SELECT COUNT(*), COALESCE(SUM(input_tokens),0), COALESCE(SUM(gen_tokens),0), "
+                "COALESCE(MAX(duration_ms),0) FROM turn_metrics").fetchone()
+            per_day = conn.execute(
+                "SELECT substr(started_at,1,10) d, COUNT(*), COALESCE(SUM(input_tokens),0), "
+                "COALESCE(SUM(gen_tokens),0) FROM turn_metrics WHERE started_at >= ? "
+                "GROUP BY d ORDER BY d", (cutoff,)).fetchall()
+            per_day_model = conn.execute(
+                "SELECT substr(started_at,1,10) d, model, COALESCE(SUM(input_tokens+gen_tokens),0) "
+                "FROM turn_metrics WHERE started_at >= ? GROUP BY d, model", (cutoff,)).fetchall()
+    except sqlite3.Error:
+        logger.warning("turn_metrics 仪表盘聚合失败", exc_info=True)
+        return empty
+    days = [{"date": r[0], "n": int(r[1]), "input": int(r[2]), "gen": int(r[3])}
+            for r in per_day]
+    by_day_model = [{"date": r[0], "model": str(r[1] or "未知"), "tokens": int(r[2])}
+                    for r in per_day_model]
+
+    # 连续天数：最长 = 日期序列里最长的逐日连续段
+    dset: set[str] = set()
+    longest = cur = 0
+    prev: _date | None = None
+    for d in sorted(d for x in days if (d := x["date"])):
+        try:
+            cur_date = _date.fromisoformat(d)
+        except ValueError:
+            continue
+        cur = cur + 1 if (prev is not None and (cur_date - prev).days == 1) else 1
+        longest = max(longest, cur)
+        prev = cur_date
+        dset.add(d)
+    # 当前连续：今天起算；今天还没用则从昨天起算（半夜间口径）
+    cur_streak = 0
+    probe = _date.fromisoformat(datetime.now().date().isoformat())
+    if probe.isoformat() not in dset:
+        probe -= timedelta(days=1)
+    while probe.isoformat() in dset:
+        cur_streak += 1
+        probe -= timedelta(days=1)
+
+    peak = max(days, key=lambda x: x["input"] + x["gen"]) if days else None
+    return {
+        "all_time": {"n": int(all_row[0]), "input": int(all_row[1]),
+                     "gen": int(all_row[2]), "longest_turn_ms": int(all_row[3])},
+        "per_day": days,
+        "per_day_model": by_day_model,
+        "peak_day": peak,
+        "streak_current": cur_streak,
+        "streak_longest": max(longest, cur_streak),
+        "window_days": window_days,
+    }
+
+
 def prune(days: int | None = None) -> int:
     """删除超过保留期的行，返回删除条数（0 = 关闭或没有可删）。"""
     d = retention_days() if days is None else max(0, int(days))
