@@ -307,6 +307,20 @@ falsely abort a turn.
 
 ---
 
+## v0.3.59 — v0.3.59 — usage statistics dashboard
+
+## New
+
+- **Usage Statistics page**: a dedicated view in the sidebar — five summary cards (all-time tokens with total turns, peak day, longest turn, current/longest day streaks), a GitHub-style token-activity heatmap (26 weeks, columns aligned to Monday; daily / weekly / cumulative modes) and a per-model daily token trend with 7/30-day ranges.
+- **Usage history in the context meter**: the meter popover now offers a "Usage history" toggle — totals, local/cloud split, average local TTFT, per-day bars and a recent-turns table (all sessions or the current session only).
+
+## Notes
+
+- Usage rows are recorded per turn (since v0.3.56) and kept for 180 days; the heatmap fills in as history accumulates.
+- The current-streak counter counts from yesterday when today has no usage yet, so the number does not reset at midnight before your first turn of the day.
+
+---
+
 ## 更早版本
 
 以下标题来自各自的发布提交（完整产物与发布时间见 GitHub Releases）：
