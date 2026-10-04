@@ -68,6 +68,7 @@ from agent.confirm import (  # noqa: F401  —— re-export（旧导入路径继
 )
 from agent.tool_exec import (  # noqa: F401  —— re-export（旧导入路径继续可用）
     _dispatch_delegate,
+    _dispatch_update_todos,
     _dispatch_use_skill,
     _get_agent_tools,
     _handle_tool_execution,
@@ -299,7 +300,7 @@ _delegate_tool_def = {
             "type": "object",
             "properties": {
                 "agent": {"type": "string", "enum": ["explore", "code-reviewer", "doc-generator", "debugger", "translator"], "description": "The specialist agent type."},
-                "task": {"type": "string", "description": "The specific task for the sub-agent. Be clear and concise."},
+                "task": {"type": "string", "description": "Self-contained task description — the sub-agent CANNOT see your conversation, so include: (1) the goal, (2) key context it needs (file paths, known facts, what you already tried), (3) the expected output format (e.g. 'list file:line for each finding'). Be specific, not just brief."},
                 "background": {"type": "boolean", "description": "Run in background without blocking the main conversation. Progress appears in the sub-agent panel. Use background=true for long-running work (research, multi-directory scans, >1min) — the result will be automatically delivered back to you when done. Default false."},
             },
             "required": ["agent", "task"],
@@ -313,6 +314,39 @@ if not any(t.get("function", {}).get("name") == "delegate_task" for t in TOOLS):
 
 TOOL_DISPATCH["delegate_task"] = _dispatch_delegate
 TOOL_PERMISSIONS["delegate_task"] = "safe"
+
+# 任务清单（todo 面板，2026-10-04）：多步任务的可视化进度。
+# 照 delegate_task 的"内建工具"模式；存储/快照在 todos.py，渲染走心跳轮询。
+_update_todos_tool_def = {
+    "type": "function",
+    "function": {
+        "name": "update_todos",
+        "description": "Maintain a short task checklist so the user can see progress on multi-step work. Call it when the task needs 3+ distinct steps; skip it for simple one-shot requests. Rules: mark a step in_progress BEFORE starting it, mark completed immediately when done, and add newly discovered follow-up steps as you go. Keep it short — one line per step, max ~8 steps.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "todos": {
+                    "type": "array",
+                    "description": "The full checklist (replaces the previous one).",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "step": {"type": "string", "description": "Short imperative step description."},
+                            "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
+                        },
+                        "required": ["step", "status"],
+                    },
+                },
+            },
+            "required": ["todos"],
+        },
+    },
+}
+if not any(t.get("function", {}).get("name") == "update_todos" for t in TOOLS):
+    TOOLS.append(_update_todos_tool_def)
+
+TOOL_DISPATCH["update_todos"] = _dispatch_update_todos
+TOOL_PERMISSIONS["update_todos"] = "safe"
 # 描述补充 background 参数（模型需要知道才能用）
 
 _create_cron_def = {

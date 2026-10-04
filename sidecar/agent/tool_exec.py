@@ -490,6 +490,16 @@ def _dispatch_delegate(args: dict):
         return _delegate_task_bg(agent, task, parent_session=parent_session)
     return _delegate_task_fg(agent, task)
 
+
+def _dispatch_update_todos(args: dict):
+    """update_todos 分发：写入本会话的任务清单（存储/快照在 todos.py）。
+    session 从 contextvar 捕获——与 delegate_task 同一套语义（loop.run() 每轮
+    起始 set(self.session_id)，见 agent/loop.py）。"""
+    from todos import update as _update
+    from agent.subagent import _CURRENT_PARENT_SESSION
+    session = _CURRENT_PARENT_SESSION.get() or ""
+    return _update(session, args.get("todos") or [])
+
 def _dispatch_use_skill(args: dict) -> str:
     """use_skill 分发：从 registry 取技能全文。未启用/不存在时返回可用目录。"""
     import capability_registry
