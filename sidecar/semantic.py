@@ -64,7 +64,8 @@ def load_vectors(force: bool = False) -> int:
             conn = _get_db()
             rows = conn.execute(
                 "SELECT id, embedding, embedding_model FROM learnings "
-                "WHERE embedding IS NOT NULL LIMIT ?", (VECTOR_CACHE_MAX,)).fetchall()
+                "WHERE embedding IS NOT NULL AND COALESCE(archived, 0) = 0 "
+                "LIMIT ?", (VECTOR_CACHE_MAX,)).fetchall()
         except Exception:
             logger.warning("读取语义向量失败", exc_info=True)
             return len(_vectors)
@@ -83,7 +84,8 @@ def missing_count() -> int:
     """还差多少条没有（当前模型下的）向量。"""
     try:
         conn = _get_db()
-        total = conn.execute("SELECT COUNT(*) FROM learnings").fetchone()[0]
+        total = conn.execute(
+            "SELECT COUNT(*) FROM learnings WHERE COALESCE(archived, 0) = 0").fetchone()[0]
     except Exception:
         return 0
     have = sum(1 for _v, mid in _vectors.values() if mid == emb.MODEL_ID)
@@ -101,7 +103,8 @@ def ensure_vectors(allow_cold_start: bool = True, max_batches: int = 200) -> int
             conn = _get_db()
             rows = conn.execute(
                 "SELECT id, topic, content, embedding_model FROM learnings "
-                "WHERE embedding IS NULL OR embedding_model IS NULL OR embedding_model != ? "
+                "WHERE (embedding IS NULL OR embedding_model IS NULL OR embedding_model != ?) "
+                "AND COALESCE(archived, 0) = 0 "
                 "LIMIT ?", (emb.MODEL_ID, BATCH)).fetchall()
         except Exception:
             logger.warning("读取待编码学习失败", exc_info=True)

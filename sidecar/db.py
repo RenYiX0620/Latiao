@@ -196,6 +196,16 @@ def _init_db():
             except Exception:
                 pass
 
+        # ⑦ 记忆固化（2026-10-04）：归档标记。归档条目不参与检索/注入/技能生成
+        # （Trash 文化：只归档不删除，archived=0 即恢复）。写入见
+        # memory_consolidate.py --apply；读取侧过滤见 memory.py / semantic.py /
+        # api_routes_admin.py 的 COALESCE(archived, 0) = 0。
+        # 立项依据（真库盘点）：637 条 learnings 里 285 条是噪音/误分类。
+        try:
+            conn.execute("ALTER TABLE learnings ADD COLUMN archived INTEGER DEFAULT 0")
+        except Exception:
+            pass
+
         try:
             conn.execute("CREATE TABLE IF NOT EXISTS reflections ("
                 "id TEXT PRIMARY KEY, session_id TEXT NOT NULL, tool_name TEXT NOT NULL, "

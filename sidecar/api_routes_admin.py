@@ -405,7 +405,8 @@ async def search_learnings(q: str = Query(default="", min_length=0), limit: int 
                 rows = conn.execute(
                     """SELECT l.id, l.topic, l.content, l.confidence, l.hit_count, l.source_type, l.created_at
                        FROM learnings l JOIN learnings_fts f ON l.rowid = f.rowid
-                       WHERE learnings_fts MATCH ? ORDER BY l.confidence DESC LIMIT ?""",
+                       WHERE learnings_fts MATCH ? AND COALESCE(l.archived, 0) = 0
+                       ORDER BY l.confidence DESC LIMIT ?""",
                     (safe_q, limit),
                 ).fetchall()
             # LIKE fallback for CJK text that FTS5 unicode61 tokenizer misses
@@ -413,14 +414,15 @@ async def search_learnings(q: str = Query(default="", min_length=0), limit: int 
                 like_q = f"%{q.strip()}%"
                 rows = conn.execute(
                     """SELECT id, topic, content, confidence, hit_count, source_type, created_at
-                       FROM learnings WHERE topic LIKE ? OR content LIKE ?
+                       FROM learnings WHERE (topic LIKE ? OR content LIKE ?) AND COALESCE(archived, 0) = 0
                        ORDER BY confidence DESC LIMIT ?""",
                     (like_q, like_q, limit),
                 ).fetchall()
         else:
             rows = conn.execute(
                 """SELECT id, topic, content, confidence, hit_count, source_type, created_at
-                   FROM learnings ORDER BY confidence DESC, updated_at DESC LIMIT ?""",
+                   FROM learnings WHERE COALESCE(archived, 0) = 0
+                   ORDER BY confidence DESC, updated_at DESC LIMIT ?""",
                 (limit,),
             ).fetchall()
         results = [
@@ -813,11 +815,14 @@ async def memory_stats():
         if not MEMORY_DB.exists():
             return {"status": "ok", "stats": {}}
         conn = _get_db()
-        learnings_count = conn.execute("SELECT COUNT(*) FROM learnings").fetchone()[0]
+        # 统计口径 = 活跃记忆（归档的不算"我的记忆"，2026-10-04 记忆固化）
+        learnings_count = conn.execute(
+            "SELECT COUNT(*) FROM learnings WHERE COALESCE(archived, 0) = 0").fetchone()[0]
         prefs_count = conn.execute("SELECT COUNT(*) FROM preferences").fetchone()[0]
         reflections_count = conn.execute("SELECT COUNT(*) FROM reflections").fetchone()[0]
         tool_calls_count = conn.execute("SELECT COUNT(*) FROM tool_calls").fetchone()[0]
-        avg_confidence = conn.execute("SELECT AVG(confidence) FROM learnings").fetchone()[0] or 0
+        avg_confidence = conn.execute(
+            "SELECT AVG(confidence) FROM learnings WHERE COALESCE(archived, 0) = 0").fetchone()[0] or 0
         return {"status": "ok", "stats": {
             "learnings": learnings_count,
             "preferences": prefs_count,
@@ -825,6 +830,24 @@ async def memory_stats():
             "tool_calls": tool_calls_count,
             "avg_learning_confidence": round(avg_confidence, 3),
         }}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@router.get("/v1/memory/handbook")
+async def memory_handbook():
+    """记忆手册（结构化全景）：按分区组织的活跃记忆 + 已生效偏好。
+
+    生成逻辑在 memory_consolidate.build_handbook（只读生成，不改库内数据）；
+    文件不存在时就地生成一份。供前端展示 / 用户直接阅读
+    （~/.local-ai-os/memory/handbook.md）。
+    """
+    try:
+        from memory_consolidate import HANDBOOK_PATH, build_handbook
+        if not HANDBOOK_PATH.exists():
+            build_handbook()
+        return {"status": "ok", "path": str(HANDBOOK_PATH),
+                "content": HANDBOOK_PATH.read_text(encoding="utf-8")}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
