@@ -590,6 +590,10 @@ img.sidebar-logo {
   padding: 10px 12px; margin: 2px 0; font-size: 13px;
   color: var(--text-muted); cursor: pointer; border-radius: 8px;
 }
+/* ── 任务清单（todo 面板，2026-10-04）：复用 subagent-bar/row 布局 ── */
+.todo-mark { flex-shrink: 0; width: 14px; text-align: center; color: var(--text-disabled); font-size: 11px; }
+.todo-mark.completed { color: var(--success); }
+.todo-mark.in_progress { color: var(--warning); }
 .subagent-line:hover { background: var(--bg-input); }
 .subagent-line-icon { color: var(--text-disabled); display: inline-flex; flex-shrink: 0; }
 .subagent-line-label { font-weight: 650; color: var(--text-primary); flex-shrink: 0; }
@@ -1022,7 +1026,10 @@ img.sidebar-logo {
 .session-preview { font-size: 11px; color: #e6e6e8; }
 .session-item.active .session-name, .session-item.active .session-preview { color: #ffffff; }
 .session-item.active { color: #ffffff; }
-.time-filter .btn { color: #ffffff; }
+/* 仅未选中态强制白字（侧栏磨砂背景上需要）；选中态走 btn-primary 的浅底深字——
+   此前一刀切写 .time-filter .btn，把选中态的深色字也覆盖成白色 → 白底白字
+   （2026-10-04 用户截图："点哪个哪个就全白了"）。 */
+.time-filter .btn-ghost { color: #ffffff; }
 .sidebar-model-select { font-size: 12px; color: #ffffff; }
 .sidebar-collapse-btn { color: #ffffff; }
 .sidebar .sidebar-online, .sidebar .sidebar-offline { color: #ffffff; }

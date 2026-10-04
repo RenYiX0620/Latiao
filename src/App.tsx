@@ -212,6 +212,8 @@ const [timeFilter, setTimeFilter] = useState("all");
   const [activeTask, setActiveTask] = useState<string | null>(null);
   // 后台子智能体任务（ZCode 式活动栏：delegate_task background=true 产生）
   const [subagents, setSubagents] = useState<{ id: string; agent: string; task: string; status: string; steps?: number; activity?: Record<string, number>; last_activity?: string; summary?: string }[]>([]);
+  // 任务清单（todo 面板，2026-10-04）：模型的 update_todos 工具写入，随心跳回传
+  const [todos, setTodos] = useState<{ step: string; status: string }[]>([]);
   const [taskStartAt, setTaskStartAt] = useState<number | null>(null);
   // 流式中的思考缓冲（运行中 Think 行实时摘要；800ms 节流，见 flushStream）
   const [streamingThink, setStreamingThink] = useState<string>("");
@@ -550,6 +552,8 @@ const [timeFilter, setTimeFilter] = useState("all");
           setRecentLearnings(data.learnings || []);
           // 后台子智能体任务快照
           setSubagents((data.subagents || []) as typeof subagents);
+          // 任务清单快照（todo 面板）
+          setTodos((data.todos || []) as typeof todos);
           // Cron completion toasts (skip "skipped" to avoid spam)
           for (const ev of (data.cron_events || []) as { ts: string; task: string; status: string; summary?: string; full?: string }[]) {
             const key = `${ev.ts}|${ev.task}`;
@@ -1306,6 +1310,7 @@ const [timeFilter, setTimeFilter] = useState("all");
             taskStartAt={taskStartAt}
             streamingThink={streamingThink}
             subagents={subagents}
+            todos={todos}
             routeInfo={routeInfo}
             localModelId={localLLMStatus.model_id}
             localModelName={localLLMStatus.model_name}

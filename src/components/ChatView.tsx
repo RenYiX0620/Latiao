@@ -145,6 +145,7 @@ interface ChatViewProps {
   taskStartAt: number | null;
   streamingThink?: string;  // 流式中的思考缓冲（运行中 Think 行实时摘要）
   subagents?: { id: string; agent: string; task: string; status: string; summary?: string }[];
+  todos?: { step: string; status: string }[];  // 任务清单（update_todos 工具维护，心跳回传）
   routeInfo?: { engine: string; declaredModel: string } | null;  // 实际引擎路由（engine_route/route_fallback）
   localModelId?: string;    // 已加载的本地模型 id（选择器展示 💻 选项）
   localModelName?: string;  // 已加载的本地模型名
@@ -159,7 +160,7 @@ export default memo(function ChatView({
   chatEndRef, handleDrop, onPasteImage,
   cloudModels, selectedModel, onSelectModelAndLoad, engineStatus, sessionId,
   accessMode, setAccessMode, thinkingLevel, setThinkingLevel,
-  contextEstimate, showToast, activeTask, taskStartAt, streamingThink, subagents,
+  contextEstimate, showToast, activeTask, taskStartAt, streamingThink, subagents, todos,
   routeInfo, localModelId, localModelName,
 }: ChatViewProps) {
   const { t } = useTranslation();
@@ -470,6 +471,18 @@ export default memo(function ChatView({
   return (
     <>
       <div className="chat-wrap">
+      {(todos && todos.length > 0) && (
+        <div className="subagent-bar todo-bar">
+          {todos.map((td, i) => (
+            <div key={i} className={`subagent-row todo-row${td.status === "in_progress" ? " running" : ""}`}>
+              <span className={`todo-mark ${td.status}`}>
+                {td.status === "completed" ? "✓" : td.status === "in_progress" ? "●" : "○"}
+              </span>
+              <span className="subagent-task">{td.step}</span>
+            </div>
+          ))}
+        </div>
+      )}
       {(subagents && subagents.length > 0) && (
         <div className="subagent-bar">
           {(subagents as { id: string; agent: string; task: string; status: string; steps?: number; activity?: Record<string, number>; last_activity?: string; summary?: string }[]).map(sa => {

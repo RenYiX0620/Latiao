@@ -609,6 +609,7 @@ def _engine_gate_snapshot() -> dict:
 async def heartbeat(session_id: str = Query(default="", description="只返回该会话的子任务")):
     """Unified polling endpoint: returns downloads, LLM status, and learnings in one call."""
     from tool_executor import _subtask_snapshot
+    from todos import snapshot as _todos_snapshot
     return {
         "status": "ok",
         "downloads": await run_in_threadpool(local_llm.get_all_downloads),
@@ -618,6 +619,8 @@ async def heartbeat(session_id: str = Query(default="", description="只返回�
         "learnings": get_recent_learnings_for_ui(8),  # 对象格式（UI 需要 topic/confidence）
         "cron_events": cron.get_recent_cron_events(10),
         "subagents": _subtask_snapshot(session_id),
+        # 任务清单（todo 面板，2026-10-04）：模型的 update_todos 工具写入，随心跳回传
+        "todos": _todos_snapshot(session_id),
         # 引擎并发槽位/排队（多会话并行诊断：容量=N 时第 N+1 个请求排队）
         "engine_gate": _engine_gate_snapshot(),
     }
