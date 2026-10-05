@@ -713,3 +713,92 @@ def test_round_text_accumulator_withdraw_and_fold():
     assert out == "分析美股走势情况。\n\n美股上周收出小阳周K。\n\n（折叠）"
     # 空轮（撤光）不产生空段落
     assert "\n\n\n" not in out
+
+
+@pytest.mark.asyncio
+async def test_cancel_mid_stream_stops_promptly():
+    """停止键要在**生成中**生效（2026-10-05 事故回归）。
+
+    此前取消只在每步开头检查：用户点停止后生成还跑完 108.9s。现在 _sample
+    每 4 行探测一次取消标记，命中即断流（显式 aclose 关引擎连接）+ run 收尾。
+    这里用 10 行流触发 %4 探测路径，断言：只跑 1 轮、以"已停止"收尾。
+    """
+    import time as _t
+    import agent_loop as _al
+    from agent.loop import ThinAgentLoop
+    from tests.test_loop_scenarios import _StubEngine
+    import local_llm
+
+    sid = f"thin-cancel-a-{_t.time()}"
+    state = {"n": 0}
+    def fake_cancel(_sid):
+        state["n"] += 1
+        return state["n"] > 1          # 步骤开头第 1 次 False，流中探测起 True
+
+    with FakeEngine() as engine:
+        engine.push([_sse({"choices": [{"delta": {"content": "句子。"}}]} ) for _ in range(10)]
+                    + ["data: [DONE]\n\n"])
+        old = local_llm._engine
+        local_llm._engine = _StubEngine()
+        orig = _al._session_cancel_requested
+        _al._session_cancel_requested = fake_cancel
+        try:
+            t0 = _t.monotonic()
+            events = await _collect(ThinAgentLoop(
+                MESSAGES, "fake-model", engine.url, HEADERS,
+                session_id=sid, access_mode="full").run())
+            elapsed = _t.monotonic() - t0
+        finally:
+            local_llm._engine = old
+            _al._session_cancel_requested = orig
+
+    rounds = [e for e in events if e.get("event") == "round_start"]
+    assert len(rounds) == 1, "取消后不得进入下一轮"
+    texts = "".join(str(e.get("content", "")) for e in events if isinstance(e, dict))
+    assert "已停止" in texts, events
+    assert elapsed < 10, f"取消收尾太慢：{elapsed:.1f}s"
+
+
+@pytest.mark.asyncio
+async def test_cancel_before_tool_execution_skips_tool():
+    """取消到达后模型刚请求的工具**不得执行**（事故里点了停止还写了文件）。
+
+    短响应走"流末兜底探测"路径：__result__ 仍回传，但 run 见 _cancelled
+    直接收尾——不执行 write_file。
+    """
+    import os
+    import time as _t
+    import agent_loop as _al
+    from agent.loop import ThinAgentLoop
+    from tests.test_loop_scenarios import _StubEngine
+    import local_llm
+
+    victim = f"/tmp/cancel-skip-{os.getpid()}.txt"
+    if os.path.exists(victim):
+        os.unlink(victim)
+
+    sid = f"thin-cancel-b-{_t.time()}"
+    state = {"n": 0}
+    def fake_cancel(_sid):
+        state["n"] += 1
+        return state["n"] > 1
+
+    with FakeEngine() as engine:
+        engine.push(engine.native_tool_response(
+            "write_file", {"path": victim, "content": "should not exist"}))
+        old = local_llm._engine
+        local_llm._engine = _StubEngine()
+        orig = _al._session_cancel_requested
+        _al._session_cancel_requested = fake_cancel
+        try:
+            events = await _collect(ThinAgentLoop(
+                MESSAGES, "fake-model", engine.url, HEADERS,
+                session_id=sid, access_mode="full").run())
+        finally:
+            local_llm._engine = old
+            _al._session_cancel_requested = orig
+
+    assert not os.path.exists(victim), "取消后工具仍被执行（写了文件）"
+    assert not any(isinstance(e, dict) and e.get("event") == "tool_start" for e in events), events
+    texts = "".join(str(e.get("content", "")) for e in events if isinstance(e, dict))
+    assert "已停止" in texts, events

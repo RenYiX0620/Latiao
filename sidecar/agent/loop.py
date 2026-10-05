@@ -790,6 +790,10 @@ def _append_lang_retry_note(body: dict, lang: str) -> None:
 class ThinAgentLoop:
     """单一 agent 循环：cloud/local 共用，差异只体现在请求组装与辅助层开关。"""
 
+    # 取消标记的类级默认：测试用 __new__ 造替身（不跑 __init__）时也能安全读取；
+    # 真实实例在 __init__ 里复位为实例属性。
+    _cancelled = False
+
     def __init__(self, messages: list, model: str, api_url: str, headers: dict,
                  session_id: str = "", access_mode: str = "confirm",
                  thinking_level: str = "high", is_local: bool | None = None,
@@ -798,6 +802,12 @@ class ThinAgentLoop:
         self.model = model
         self.api_url = api_url
         self.headers = headers
+        # 用户按停止（/v1/chat/cancel → _request_session_cancel）的循环内标记。
+        # 此前取消**只**在每一步开头检查（run 的 while 顶部）：流式生成中（实测
+        # 单步 108.9s）和生成后的工具执行都不看，用户点了停止还会跑完生成、
+        # 执行 write_file（2026-10-05 事故）。现在 _sample 流中探测 + run 在
+        # 工具执行前拦截，两处任一置位即中止本轮。
+        self._cancelled = False
         self.access_mode = _normalize_access(access_mode)
         # 用量来源归因（2026-09-29，ZCode 的 query_source 对照）：子代理用受限档
         # 且会话 id 形如 "parent:sub"（agent/subagent.py）——据此把它的用量记到
@@ -1214,7 +1224,18 @@ class ThinAgentLoop:
         _gate_open = False          # 是否已通过漂移检查（通过后正常实时下发）
         _pending: list[dict] = []   # 检查通过前攒下的事件
         _drift_hit = False
-        async for line in self._stream(client, body, wait_info=_wait):
+        # 流中取消探测（2026-10-05）：停止键必须能打断**生成中**的长步——
+        # 每 N 行查一次会话取消标记，命中即 break：跳出 async for 会关闭
+        # _stream 生成器（finally 取消泵任务 + async with 关闭引擎响应/连接，
+        # 引擎侧中止该槽生成），run 侧见 self._cancelled 后不再执行工具。
+        from agent_loop import _session_cancel_requested as _cancel_probe
+        _seen_lines = 0
+        _stream_gen = self._stream(client, body, wait_info=_wait)
+        async for line in _stream_gen:
+            _seen_lines += 1
+            if _seen_lines % 4 == 0 and _cancel_probe(self.session_id):
+                self._cancelled = True
+                break
             if time.monotonic() > deadline:
                 raise _GenerationLoopError("单步生成超时(900s)，已截断")
             if not _wait_reported and _wait.get("waited", 0) >= 1.5:
@@ -1298,7 +1319,16 @@ class ThinAgentLoop:
                         for _ev in _pending:
                             yield _ev
                         _pending.clear()
-        if _drift_hit:
+        # 流结束兜底探测：短响应（行数不足 %4）探不到；也覆盖"取消已到、生成刚结束"
+        if not self._cancelled and _cancel_probe(self.session_id):
+            self._cancelled = True
+        # 显式收尾引擎流（2026-10-05）：无论循环怎么退出（[DONE] / 漂移丢弃 break /
+        # 取消 break），生成器都停在 yield 处没有关闭。旧代码靠临时对象被 GC 回收
+        # 来关（时机不定）；改成命名变量后不再自动回收，transport 闸门槽位
+        # （随 async with 释放）被死占 → 漂移重试的第二次流在闸门前死等
+        # （test_lang_drift_* 实测卡死）。aclose 幂等：已结束的生成器立即返回。
+        await _stream_gen.aclose()
+        if _drift_hit and not self._cancelled:
             # 丢弃这次生成：重试一次（在最后一条用户消息尾部追加更强的语言要求）。
             # 只重试一次——再漂就照常交付，交给交付闸门去翻译（那条兜底仍在）。
             if not getattr(self, "_lang_retried", False):
@@ -1313,8 +1343,10 @@ class ThinAgentLoop:
             logger.info("thin loop: 重试后仍漂移，照常交付（交付闸门会翻译）")
             _gate_open = True
         if _pending and not _gate_open:
-            # 短回复（没攒够检查长度就结束）：检查一次，再决定放行还是重试
-            if (getattr(self, "user_lang_confident", False)
+            # 短回复（没攒够检查长度就结束）：检查一次，再决定放行还是重试。
+            # 已取消（用户停止）不再重试生成，直接放行走到 __result__ 交给 run 收尾。
+            if (not self._cancelled
+                    and getattr(self, "user_lang_confident", False)
                     and _looks_like_lang_drift(body_text, self.user_lang)
                     and not getattr(self, "_lang_retried", False)):
                 self._lang_retried = True
@@ -1863,6 +1895,14 @@ class ThinAgentLoop:
                     if result is None:
                         return
                     streamed, body_text, reasoning, native, finish_reason, _first_delta_at = result
+                    if self._cancelled:
+                        # 用户在生成中按了停止（_sample 流中探测置位）：本轮中止——
+                        # 模型刚请求的工具**不执行**（此前取消只在下一步开头检查，
+                        # 实测点了停止 75 秒后还执行了 write_file，2026-10-05 事故），
+                        # 直接以"已停止"收尾；下一步开头的老检查点保留（步骤间取消）。
+                        self._step_log("取消", "用户停止：本轮中止（工具不执行）")
+                        yield {"content": "\n\n" + _msg("task_stopped", self.user_lang)}
+                        return
                     # 真·首 token 优先（闸前打点）；消费者自己的测量（过闸后）只作兜底
                     if _first_delta_at:
                         t_first_token = _first_delta_at
