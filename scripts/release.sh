@@ -161,7 +161,9 @@ ARCHIVE_PATH="$BUNDLE_DIR/$ARCHIVE_NAME"
 
 info "Archive: $ARCHIVE_NAME"
 cd "$BUNDLE_DIR"
-tar czf "$ARCHIVE_NAME" "$(basename "$APP_BUNDLE")"
+# COPYFILE_DISABLE=1 + 排除 ._*：禁止 macOS 把 AppleDouble 伴随文件打进更新包——
+# 它们会让 Tauri updater 解包时报 "failed to unpack `._X.app`"（2026-10-05 加固）。
+COPYFILE_DISABLE=1 tar --exclude='._*' --exclude='.DS_Store' -czf "$ARCHIVE_NAME" "$(basename "$APP_BUNDLE")"
 cd "$PROJECT_DIR"
 ok "Archive created: $ARCHIVE_NAME"
 
@@ -207,7 +209,8 @@ ok "latest.json generated"
 
 # ─── Git tag ──────────────────────────────────────────────────────────────
 info "Committing version change..."
-git add src-tauri/tauri.conf.json latest.json 2>/dev/null || true
+# package.json 也一起提交（此前只 add 另两个 → 版本 bump 残留在工作区，2026-10-05 修）
+git add src-tauri/tauri.conf.json package.json latest.json 2>/dev/null || true
 git commit -m "release: v$VERSION" 2>/dev/null || warn "Nothing to commit"
 
 TAG="v$VERSION"
@@ -240,6 +243,7 @@ gh release create "$TAG" \
   --repo "$GH_REPO" \
   --title "Latiao v$VERSION" \
   --notes-file "$NOTES_FILE" \
+  --target "$(git rev-parse HEAD)" \
   --latest \
   "$ARCHIVE_PATH" \
   "$SIG_FILE" \
