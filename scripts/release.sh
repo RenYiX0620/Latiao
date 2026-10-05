@@ -72,6 +72,23 @@ d['version'] = '$VERSION'
 json.dump(d, open(fp, 'w'), indent=2, ensure_ascii=False)
 open(fp, 'a').write('\n')
 "
+  # Cargo.toml / Cargo.lock 同步（2026-10-05 事故：脚本从不碰这两个文件 →
+  # v0.3.61 的 Rust 二进制编译期自报 0.3.60（env!("CARGO_PKG_VERSION") 经
+  # LATIAO_APP_VERSION 进侧车）→ 界面显示旧版本 + 更新检查永远"有新版本"，
+  # 更新完重启依旧，死循环。四处版本号必须一起升。）
+  python3 -c "
+import re
+fp = 'src-tauri/Cargo.toml'
+t = open(fp).read()
+t = re.sub(r'(^version = \")[0-9]+\.[0-9]+\.[0-9]+(\")', r'\g<1>$VERSION\g<2>', t, count=1, flags=re.M)
+open(fp, 'w').write(t)
+fp = 'src-tauri/Cargo.lock'
+t = open(fp).read()
+t = re.sub(r'(name = \"local-ai-os\"\nversion = \")[0-9]+\.[0-9]+\.[0-9]+(\")', r'\g<1>$VERSION\g<2>', t, count=1)
+open(fp, 'w').write(t)
+"
+  # 把关：四处一致才允许继续（脚本历史上从不跑这道，靠 CI 事后发现 = 包已发出）
+  python3 scripts/check_versions.py || { err "版本号不一致，发版中止"; exit 1; }
   ok "Version updated"
 else
   info "Keeping current version $VERSION"
@@ -210,7 +227,8 @@ ok "latest.json generated"
 # ─── Git tag ──────────────────────────────────────────────────────────────
 info "Committing version change..."
 # package.json 也一起提交（此前只 add 另两个 → 版本 bump 残留在工作区，2026-10-05 修）
-git add src-tauri/tauri.conf.json package.json latest.json 2>/dev/null || true
+# Cargo.toml/.lock 再加（2026-10-05 事故：这两处不提交 → 二进制自报 0.3.60 死循环）
+git add src-tauri/tauri.conf.json package.json src-tauri/Cargo.toml src-tauri/Cargo.lock latest.json 2>/dev/null || true
 git commit -m "release: v$VERSION" 2>/dev/null || warn "Nothing to commit"
 
 TAG="v$VERSION"
