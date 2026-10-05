@@ -3,6 +3,7 @@ import type { Message, PendingFile } from "../types";
 import { useTranslation } from "../i18n";
 import { loadedMismatch } from "../utils/modelSelection";
 import RunMetrics from "./RunMetrics";
+import { ToolConfirmCard } from "./ToolConfirmCard";
 import ToolCallBubble from "./ToolCallBubble";
 import { FileEditCard, ToolActivityCard, SubagentRow } from "./TurnCards";
 import type { PreviewItem } from "./PreviewPanel";
@@ -164,14 +165,19 @@ export default memo(function ChatView({
   routeInfo, localModelId, localModelName,
 }: ChatViewProps) {
   const { t } = useTranslation();
+  // 待确认的工具调用（转录区可能已滚出屏幕）→ 停靠在输入栏正上方（2026-10-05，
+  // 对齐 ZCode 的权限面板形态）。同一条消息在转录区不再重复渲染按钮，只作记录。
+  const pendingConfirm = useMemo(
+    () => [...messages].reverse().find((m) => m.type === "tool_call" && m.toolStatus === "confirming"),
+    [messages],
+  );
   // WebKit (WKWebView) 下 compositionend 先于最终 keydown 派发，
   // 仅靠 e.nativeEvent.isComposing 会在按 Enter 确认候选词时已变 false
   // → 半句话被发送。用 compositionend 时间戳做一小段缓冲（VSCode 同款方案）。
   // 09-21 修：原来组词开始时把缓冲设成 Number.MAX_SAFE_INTEGER，一旦某次
   // compositionend 没派发就**永久锁死回车**（症状：回车只换行、点按钮才发送）；
   // 且 300ms 窗口会连"打完字紧接着按的回车"一起吞掉。判定逻辑见 utils/composer.ts。
-  const composingUntilRef = useRef(0);
-  const handleCompositionStart = useCallback(() => {
+  const composingUntilRef = useRef(0);  const handleCompositionStart = useCallback(() => {
     composingUntilRef.current = Date.now() + COMPOSING_BACKSTOP_MS;
   }, []);
   const handleCompositionEnd = useCallback(() => {
@@ -703,7 +709,8 @@ export default memo(function ChatView({
                     )}
                     {activityMsgs.length > 0 && <ToolActivityCard msgs={activityMsgs} />}
                     {activeTools.map((m) => (
-                      <ToolCallBubble key={m.id} msg={m} sessionId={sessionId} onConfirm={confirmTool} />
+                      <ToolCallBubble key={m.id} msg={m} sessionId={sessionId} onConfirm={confirmTool}
+                        confirmHidden={pendingConfirm?.id === m.id} />
                     ))}
                   </>
                 );
@@ -717,6 +724,14 @@ export default memo(function ChatView({
       </div>
 
       <div className="input-area">
+        {pendingConfirm && (
+          <ToolConfirmCard
+            msg={pendingConfirm}
+            onConfirm={confirmTool}
+            sessionId={sessionId}
+            docked
+          />
+        )}
         {pendingFile && (
           <div className="file-preview">
             <div className={`file-preview-thumb ${pendingFile.type === "pdf" ? "pdf" : "code"}`}>
