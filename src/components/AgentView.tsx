@@ -16,6 +16,8 @@ interface AgentViewProps {
   activeAgent: string;
   setActiveAgent: (id: string) => void;
   showToast: (msg: string) => void;
+  /** 页面是否在前台（App 传 activeView === "agents"）：取数时机门控。 */
+  active?: boolean;
 }
 
 const BUILTIN_IDENTITY: Record<string, string[]> = {
@@ -48,7 +50,7 @@ const BUILTIN_AGENT_I18N: Record<string, { name: string; display: string }> = {
   translator: { name: "agent.translator", display: "agent.translator_display" },
 };
 
-export default function AgentView({ activeAgent, setActiveAgent, showToast }: AgentViewProps) {
+export default function AgentView({ activeAgent, setActiveAgent, showToast, active = true }: AgentViewProps) {
   const { t } = useTranslation();
   const [agents, setAgents] = useState<AgentInfo[]>(DEFAULT_AGENTS);
   const [showForm, setShowForm] = useState(false);
@@ -71,7 +73,13 @@ export default function AgentView({ activeAgent, setActiveAgent, showToast }: Ag
       .catch(() => { /* sidecar not running */ });
   };
 
-  useEffect(() => { fetchAgents(); }, []);
+  // 取数只在页面激活时发起（2026-10-05）：面板常驻 DOM、应用启动即挂载，
+  // 挂载即拉会撞上侧车启动竞态（webview ~1s 发请求 vs sidecar 2-4s 就绪）
+  // → 失败无重试 → 列表永远空。打开页面时侧车必然就绪，顺带每次进页刷新。
+  useEffect(() => {
+    if (!active) return;
+    void Promise.resolve().then(() => fetchAgents());
+  }, [active]);
 
   const toggleTool = (tool: string) => {
     setNewAgent(prev => ({

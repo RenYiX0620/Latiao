@@ -1395,7 +1395,7 @@ const [timeFilter, setTimeFilter] = useState("all");
             <button className="btn btn-md btn-primary" style={{ marginLeft: "auto" }} onClick={() => showToast(t("agent.created_simple"))}>{t("agent.new_btn")}</button>
           </div>
           <div className="page-body">
-            <AgentView key={lang} activeAgent={activeAgent} setActiveAgent={setActiveAgent} showToast={showToast} />
+            <AgentView key={lang} activeAgent={activeAgent} setActiveAgent={setActiveAgent} showToast={showToast} active={activeView === "agents"} />
           </div>
         </div>
         <div className={`view-panel${activeView === "usage" ? " active" : ""}`} id="view-usage" style={sidecarStatus === "offline" ? { display: "none" } : undefined}>
