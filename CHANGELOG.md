@@ -353,6 +353,14 @@ falsely abort a turn.
 
 ---
 
+## v0.3.62 — v0.3.62 — version reporting fix
+
+## Fixes
+
+- **The app now reports its own version correctly.** v0.3.61 was built with an internal version mismatch: the installed app believed it was 0.3.60. As a result the update check kept seeing a "newer" version forever — updating and restarting never cleared the update prompt, and the version shown in Settings stayed at the old number. This release compiles the correct version into the app; after this update the banner stops reappearing and Settings shows the right version.
+
+---
+
 ## 更早版本
 
 以下标题来自各自的发布提交（完整产物与发布时间见 GitHub Releases）：
