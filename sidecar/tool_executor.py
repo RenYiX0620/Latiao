@@ -3,6 +3,7 @@
 Split from main.py (Section 4: Tool Fallbacks + permission helpers). Code is a
 verbatim move from main.py — only imports were adjusted for the module split.
 """
+import contextvars
 import fnmatch
 import json
 import logging
@@ -11,6 +12,7 @@ import platform
 import re
 import shlex
 import subprocess
+import time
 from pathlib import Path
 
 import httpx
@@ -20,6 +22,79 @@ import httpx
 from cmd_safety import child_env, reject_sensitive_read
 
 logger = logging.getLogger("latiao-sidecar")
+
+# 当前工具调用所属会话（agent/tool_exec.py 在派发前 set；asyncio.to_thread 会
+# 拷贝 context → 线程里的 run_cmd 读得到）。用途：停止键要能杀掉正在跑的命令
+# （2026-10-05：此前取消只影响后续步骤，5 分钟的命令会跑满自己的超时）。
+CURRENT_TOOL_SESSION: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "latiao_tool_session", default="")
+
+
+def _tool_cancel_requested() -> bool:
+    """当前工具所属会话是否已被要求停止（停止键 / 客户端断流）。"""
+    sid = CURRENT_TOOL_SESSION.get("")
+    if not sid:
+        return False
+    try:
+        from agent.session_events import _session_cancel_requested
+        return _session_cancel_requested(sid)
+    except Exception:
+        return False
+
+
+def _kill_proc_tree(proc: subprocess.Popen) -> None:
+    """杀掉命令进程树（POSIX 用进程组，Windows 用 taskkill /T）。"""
+    try:
+        if os.name == "posix":
+            import signal as _signal
+            os.killpg(os.getpgid(proc.pid), _signal.SIGKILL)
+        else:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           capture_output=True, timeout=10)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+class CommandCancelled(Exception):
+    """命令因用户停止（会话取消）被终止——由 run_cmd 转成可读结果。"""
+
+
+def _run_cancellable(tokens: list, timeout: float) -> subprocess.CompletedProcess:
+    """subprocess.run(capture_output=True, text=True, timeout=…) 的可取消版。
+
+    等待期间每 0.5s 轮询一次会话取消标记：用户按停止 → 杀进程组并抛
+    CommandCancelled（此前命令会一直跑到自己的 300s 超时）。超时语义不变
+    （抛 TimeoutExpired，由上层转成既有"超时"结果）。
+    """
+    _kwargs: dict = {}
+    if os.name == "posix":
+        _kwargs["start_new_session"] = True     # 独立进程组：杀树时子进程一起收
+    proc = subprocess.Popen(tokens, shell=False, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True,
+                            env=child_env(), **_kwargs)
+    deadline = time.monotonic() + max(1.0, float(timeout))
+    while True:
+        try:
+            out, err = proc.communicate(timeout=0.5)
+            return subprocess.CompletedProcess(tokens, proc.returncode, out, err)
+        except subprocess.TimeoutExpired:
+            if _tool_cancel_requested():
+                _kill_proc_tree(proc)
+                try:
+                    proc.communicate(timeout=2)
+                except Exception:
+                    pass
+                raise CommandCancelled("用户停止") from None
+            if time.monotonic() >= deadline:
+                _kill_proc_tree(proc)
+                try:
+                    proc.communicate(timeout=2)
+                except Exception:
+                    pass
+                raise subprocess.TimeoutExpired(tokens, timeout)
 
 
 def __getattr__(name: str):
@@ -219,12 +294,21 @@ def _run_pipeline(left: str, right: str, timeout: int) -> str:
                    stderr=_sp.PIPE, text=True, env=child_env())
     if p1.stdout:
         p1.stdout.close()
-    try:
-        out, err = p2.communicate(timeout=timeout)
-    except _sp.TimeoutExpired:
-        p1.kill()
-        p2.kill()
-        return "超时"
+    # 等待期间响应停止键（与 _run_cancellable 同款轮询）；超时语义不变
+    _deadline = time.monotonic() + max(1.0, float(timeout))
+    while True:
+        try:
+            out, err = p2.communicate(timeout=0.5)
+            break
+        except _sp.TimeoutExpired:
+            if _tool_cancel_requested():
+                p1.kill()
+                p2.kill()
+                return "⏹ 已停止：命令被用户中断（进程已终止）"
+            if time.monotonic() >= _deadline:
+                p1.kill()
+                p2.kill()
+                return "超时"
     p1.wait(timeout=5)
     body = (out or "").strip()
     if p2.returncode != 0:
@@ -277,10 +361,13 @@ def run_cmd(cmd: str) -> str:
             tokens = shlex.split(cmd)
         except ValueError as e:
             return f"命令格式错误: {e}"
-        r = subprocess.run(tokens, shell=False, capture_output=True, text=True, timeout=300,
-                           # ④ 兜底执行器同样过白名单：命令由模型给出，子进程不该拿到
-                           # sidecar token 与云模型密钥（审查时靠 test_spawn_env_guard 抓到）
-                           env=child_env())
+        try:
+            # ④ 兜底执行器同样过白名单：命令由模型给出，子进程不该拿到
+            # sidecar token 与云模型密钥（审查时靠 test_spawn_env_guard 抓到）；
+            # _run_cancellable 内部即 env=child_env()，并在等待中响应停止键。
+            r = _run_cancellable(tokens, timeout=300)
+        except CommandCancelled:
+            return "⏹ 已停止：命令被用户中断（进程已终止）"
         out = r.stdout.strip()
         if r.returncode != 0:
             out += f"\n(退出码: {r.returncode})"

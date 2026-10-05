@@ -28,6 +28,7 @@ from agent.core import Scope
 from agent.transport import (
     _is_local_llm_url,
     _local_llm_stream,
+    TurnCancelled,
 )
 from agent.parsing import (
     _parse_delta_line,
@@ -1214,7 +1215,9 @@ class ThinAgentLoop:
         finish_reason = None
         deadline = time.monotonic() + 900
         # 等引擎放行的时长：多会话并行时这一轮可能排在别的会话后面（见 transport 闸门）
-        _wait: dict = {}
+        # 等引擎放行的时长：多会话并行时这一轮可能排在别的会话后面（见 transport 闸门）。
+        # session_id 进 wait_info：transport 在排队/等重载期间据此响应停止键（2026-10-05）
+        _wait: dict = {"session_id": self.session_id}
         _wait_reported = False
         _wait_started = 0.0   # 首次"等引擎/静默"心跳的时刻（进度事件按此算已等秒数）
         _recovering = False   # 是否已向前端报过"等引擎/静默"（数据恢复时发 engine_recovered 收尾）
@@ -1938,6 +1941,13 @@ class ThinAgentLoop:
                         logger.warning("thin loop: finish=length 重试仍截断，丢弃 %d 个 tool-call",
                                        len(native))
                         native = {}
+                except TurnCancelled:
+                    # 排队/等引擎重载期间用户按了停止（transport 探测到取消标记）
+                    # → 直接收尾：不执行工具、不重试、不进入后续步骤（2026-10-05）
+                    self._cancelled = True
+                    self._step_log("取消", "等待引擎期间用户停止（不进入后续步骤）")
+                    yield {"content": "\n\n" + _msg("task_stopped", self.user_lang)}
+                    return
                 except _GenerationLoopError as e:
                     # 复读/截断 = mlx 确定性解码退化（温度 0.0 下「继续」必然复发，
                     # 09-07 22:10 事故）。先做一次温度抖动重采（资源级重试，

@@ -51,8 +51,8 @@ def _append_run_outcome(tool_name: str, result: str, arguments: dict) -> str:
         except Exception as e:
             result += f"\n⚠️ Verification failed: could not read back file ({e})."
     elif tool_name == "run_cmd":
-        # 没执行（被拒/超时/格式错误）→ 不加任何成功标记
-        _not_run = result.lstrip().startswith(("⛔", "❌", "⚠️", "超时"))
+        # 没执行（被拒/超时/格式错误/用户停止）→ 不加任何成功标记
+        _not_run = result.lstrip().startswith(("⛔", "❌", "⚠️", "超时", "⏹"))
         if not _not_run and ("(退出码: 0)" in result or "退出码" not in result):
             result += "\n✅ Exit code: 0 (success)"
     return result
@@ -376,7 +376,14 @@ async def _handle_tool_execution_inner(tc: dict, current_msgs: list, session_id:
     # 参数预览也要脱敏：run_cmd 的 token、api key 常出现在参数里（09-23）
     logger.info("Tool executing: %s %s", tool_name,
                 redact_secrets(json.dumps(args, ensure_ascii=False))[:120])
-    result = await execute_tool(tool_name, args)
+    # 会话上下文进线程（asyncio.to_thread 拷贝 context）：run_cmd 等长命令据此
+    # 感知停止键——取消到达即杀进程树，不再跑满自己的超时（2026-10-05）
+    from tool_executor import CURRENT_TOOL_SESSION
+    _tool_ctx = CURRENT_TOOL_SESSION.set(session_id)
+    try:
+        result = await execute_tool(tool_name, args)
+    finally:
+        CURRENT_TOOL_SESSION.reset(_tool_ctx)
     # 结果预览脱敏：read_file 这类内容工具只记长度（真机实测原样落盘过 API key）
     logger.info("Tool result: %s → %s", tool_name, tool_log_preview(tool_name, result))
 

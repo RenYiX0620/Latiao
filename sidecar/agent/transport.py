@@ -146,6 +146,25 @@ class EngineQueueTimeout(RuntimeError):
     """在闸门队列里等到超过上限仍未轮到（引擎被长时间占用/流泄漏）。"""
 
 
+class TurnCancelled(RuntimeError):
+    """等待引擎/排队期间用户按了停止——由 agent/loop.py 转成正常收尾（不是错误）。
+
+    2026-10-05：停止键此前对"排队等槽位 / 等引擎重载"完全无效——已取消的请求
+    会一直等到放行，然后在流中探测到取消才收尾。这两个等待点现在也查取消标记。
+    """
+
+
+def _session_cancel_check(sid: str) -> bool:
+    """惰性检查会话取消标记（transport 不静态依赖 agent 包，避免环）。"""
+    if not sid:
+        return False
+    try:
+        from agent.session_events import _session_cancel_requested
+        return _session_cancel_requested(sid)
+    except Exception:
+        return False
+
+
 def _set_wait_phase(wait_info: dict | None, phase: str | None) -> None:
     """回填"正在等引擎"的相位：``queue``=排队等槽位，``reload``=等自动重载。
 
@@ -190,17 +209,30 @@ async def _local_llm_serialized(api_url: str | None, wait_info: dict | None = No
     if _local:
         sem = _stream_lock()
         _t0 = time.monotonic()
+        _sid = str((wait_info or {}).get("session_id") or "")
         _set_wait_phase(wait_info, "queue")   # 排队中（前端据此报"等待引擎"进度）
         _gate_stats["waiting"] = _gate_stats.get("waiting", 0) + 1
+        _deadline = time.monotonic() + _queue_wait_max()
         try:
-            await asyncio.wait_for(sem.acquire(), timeout=_queue_wait_max())
-        except asyncio.TimeoutError:
-            waited = time.monotonic() - _t0
-            logger.warning("本地引擎排队超时：等待 %.1fs（容量 %d，排队 %d）",
-                           waited, _engine_slots(), int(_gate_stats.get("waiting", 0)))
-            raise EngineQueueTimeout(
-                f"等待本地引擎超过 {int(_queue_wait_max())} 秒仍未轮到；"
-                "另一会话可能正在长生成，可稍后重试或在设置里提高并发槽位") from None
+            while True:
+                # 切片 = min(1s, 剩余预算)：预算比 1s 短时（含测试里的 0.15s）
+                # 不能靠 1s 切片顺延——超时必须由循环头按精确剩余量判定
+                _remaining = _deadline - time.monotonic()
+                if _remaining <= 0:
+                    waited = time.monotonic() - _t0
+                    logger.warning("本地引擎排队超时：等待 %.1fs（容量 %d，排队 %d）",
+                                   waited, _engine_slots(), int(_gate_stats.get("waiting", 0)))
+                    raise EngineQueueTimeout(
+                        f"等待本地引擎超过 {int(_queue_wait_max())} 秒仍未轮到；"
+                        "另一会话可能正在长生成，可稍后重试或在设置里提高并发槽位") from None
+                try:
+                    await asyncio.wait_for(sem.acquire(), timeout=min(1.0, _remaining))
+                    break
+                except asyncio.TimeoutError:
+                    # 排队期间也响应停止键（2026-10-05）：已取消的请求不该继续占队，
+                    # 更不该排到队后再启动一次注定被丢弃的生成
+                    if _session_cancel_check(_sid):
+                        raise TurnCancelled("排队等待期间用户停止") from None
         finally:
             # 放行或超时都要把"排队计数"退掉（只在这里退一次，避免双退）
             _gate_stats["waiting"] = max(0, _gate_stats.get("waiting", 0) - 1)
@@ -315,6 +347,10 @@ async def _local_llm_stream(client, api_url: str, body: dict, headers: dict,
         _hung_strikes = 0
         try:
             for _attempt in range(72):
+                # 等引擎重载期间响应停止键（2026-10-05）：每轮（5s）查一次，
+                # 用户取消后立即放弃等待（此前会等满整个重载窗口）
+                if _session_cancel_check(str((wait_info or {}).get("session_id") or "")):
+                    raise TurnCancelled("等待引擎恢复期间用户停止")
                 if time.monotonic() >= _wait_deadline:
                     raise httpx.ConnectError(
                         f"等待本地模型恢复超时（{int(_engine_wait_max())} 秒）。"
