@@ -47,20 +47,26 @@ describe("pivotModelSeries", () => {
 });
 
 describe("heatGrid", () => {
-  const days: DashDay[] = DATES.map((d, i) => ({
+  // 日期相对"今天"生成。曾经写死 2026-09-28..30：本地 10-04（周日）跑是绿的，
+  // 一到 10-05（周一）周界滚动、写死的日期全部落到窗口外 → CI 上 max=0 挂掉。
+  // 热力图的窗口跟随真实今天，测试就必须跟随真实今天。
+  const dayMs = 86_400_000;
+  const iso = (ms: number) => new Date(ms).toISOString().slice(0, 10);
+  const now = Date.now();
+  const RECENT = [iso(now - 2 * dayMs), iso(now - dayMs), iso(now)];
+  const days: DashDay[] = RECENT.map((d, i) => ({
     date: d, n: 1, input: (i + 1) * 100, gen: 0,
   }));
-  it("daily 模式取当日量；窗口外为 null", () => {
-    const { columns, max } = heatGrid(days, "daily", 1);
-    // 1 列 = 最近一周；末格是今天（2026-… 假设今天不是 9-28/29/30，则命中的只有窗口里的那几天）
-    const flat = columns[0].cells.filter((x): x is number => x !== null);
-    const got = flat.filter((v) => v > 0);
-    expect(got.every((v) => [100, 200, 300].includes(v))).toBe(true);
+
+  it("daily 模式取当日量（近三天都在 8 周窗口内）", () => {
+    const { max } = heatGrid(days, "daily", 8);
     expect(max).toBe(300);
   });
   it("cumulative 模式单调递增", () => {
-    const { columns } = heatGrid(days, "cumulative", 1);
-    const vals = columns[0].cells.filter((x): x is number => x !== null && x > 0);
+    const { columns } = heatGrid(days, "cumulative", 8);
+    const vals = columns
+      .flatMap((c) => c.cells)
+      .filter((x): x is number => x !== null && x > 0);
     for (let i = 1; i < vals.length; i++) expect(vals[i]).toBeGreaterThanOrEqual(vals[i - 1]);
   });
   it("weekly 模式每列一个值", () => {
