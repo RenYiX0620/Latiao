@@ -32,27 +32,51 @@ function Card({ value, label, sub }: { value: string; label: string; sub?: strin
  * 整页"使用统计"（2026-10-04，对齐 ZCode 使用统计页的形态）：
  * 五张指标卡（累计/峰值/最长单轮/连续天数）、Token 活动热力图（每日/每周/累计）、
  * 按模型分线的每日趋势图（近 7 日/近 30 日）。数据全部来自
- * /v1/turn-metrics/dashboard；挂载拉一次（微任务模式，规避 setState-in-effect）。
+ * /v1/turn-metrics/dashboard。
+ *
+ * 取数策略（2026-10-05 修"页面永远空"）：只在页面**激活**时拉取，带退避重试，
+ * 失败给显式重试按钮。此前是挂载即拉一次——面板常驻 DOM、应用启动时就挂载，
+ * 请求与侧车启动赛跑，输了就永远空着（无重试、切页也不重拉），实测更新后两次
+ * 打开统计页都是空的（后端 83 轮数据完好）。
  */
-export default function UsageStatsView() {
+export default function UsageStatsView({ active = true }: { active?: boolean }) {
   const { t, lang } = useTranslation();
   const [dash, setDash] = useState<DashboardData | null>(null);
+  const [failed, setFailed] = useState(false);
+  const [reloadKey, setReloadKey] = useState(0);
   const [mode, setMode] = useState<HeatMode>("daily");
   const [range, setRange] = useState<7 | 30>(7);
 
   useEffect(() => {
+    if (!active) return;
     let alive = true;
-    void Promise.resolve().then(async () => {
+    let attempt = 0;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const tryLoad = async () => {
       try {
         const r = await authFetch("/v1/turn-metrics/dashboard?window=182");
         const d = await r.json();
-        if (alive && d && d.status === "ok") setDash(d as DashboardData);
+        if (!alive) return;
+        if (d && d.status === "ok") {
+          setDash(d as DashboardData);
+          setFailed(false);
+          return;
+        }
+        throw new Error("dashboard: bad response");
       } catch {
-        /* 侧车未就绪：保持空态 */
+        if (!alive) return;
+        attempt += 1;
+        if (attempt <= 5) {
+          // 侧车可能还没监听（刚启动）：退避重试，别把失败留在页面上
+          timer = setTimeout(() => { void tryLoad(); }, 800 * attempt);
+        } else {
+          setFailed(true);
+        }
       }
-    });
-    return () => { alive = false; };
-  }, []);
+    };
+    void Promise.resolve().then(tryLoad);
+    return () => { alive = false; if (timer) clearTimeout(timer); };
+  }, [active, reloadKey]);
 
   const perDay = useMemo(() => dash?.per_day || [], [dash]);
 
@@ -73,6 +97,23 @@ export default function UsageStatsView() {
   const totalTokens = (dash?.all_time.input || 0) + (dash?.all_time.gen || 0);
   const peak = dash?.peak_day;
   const maxSeriesVal = Math.max(1, ...series.flatMap((s) => s.values));
+
+  // 空态三义：读取中 / 读取失败（可重试）/ 已读但确无数据——不再混成一句"暂无数据"
+  const placeholder = !dash ? (
+    failed ? (
+      <div className="usage-empty">
+        {t("stats.load_failed")}
+        <button type="button" className="usage-retry"
+          onClick={() => setReloadKey((k) => k + 1)}>
+          {t("stats.retry")}
+        </button>
+      </div>
+    ) : (
+      <div className="usage-empty">{t("stats.loading")}</div>
+    )
+  ) : (
+    <div className="usage-empty">{t("stats.empty")}</div>
+  );
 
   return (
     <div className="usage-view">
@@ -104,9 +145,7 @@ export default function UsageStatsView() {
             ))}
           </div>
         </div>
-        {perDay.length === 0 ? (
-          <div className="usage-empty">{t("stats.empty")}</div>
-        ) : (
+        {perDay.length === 0 ? placeholder : (
           <>
             <div className="usage-heat">
               {heat.columns.map((col, ci) => {
@@ -146,9 +185,7 @@ export default function UsageStatsView() {
             ))}
           </div>
         </div>
-        {series.length === 0 ? (
-          <div className="usage-empty">{t("stats.empty")}</div>
-        ) : (
+        {series.length === 0 ? placeholder : (
           <>
             <div className="usage-legend">
               {series.map((s, i) => (

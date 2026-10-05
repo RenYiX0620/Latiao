@@ -1403,7 +1403,7 @@ const [timeFilter, setTimeFilter] = useState("all");
             <div><div className="page-title">{t("page.usage")}</div><div className="page-desc">{t("page.usage_desc")}</div></div>
           </div>
           <div className="page-body">
-            <UsageStatsView key={lang} />
+            <UsageStatsView key={lang} active={activeView === "usage"} />
           </div>
         </div>
         <div className={`view-panel${activeView === "settings" ? " active" : ""}`} id="view-settings" style={sidecarStatus === "offline" ? { display: "none" } : undefined}>
