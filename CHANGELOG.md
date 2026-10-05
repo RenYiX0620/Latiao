@@ -361,6 +361,19 @@ falsely abort a turn.
 
 ---
 
+## v0.3.63 — v0.3.63 — usage stats load fix + docked confirmation card
+
+## Fixes
+
+- **The Usage Statistics page now loads its data.** It used to fetch once, about a second after app start — while the sidecar backend was still booting — and never retried, so the page stayed empty on every launch even though the data was there. It now loads when you open the page, retries with backoff, and shows an explicit "failed to load / Retry" state instead of a silent empty view if the backend is unreachable.
+- **The Agent management page had the same startup race** (fetched once at app start, no retry) and is fixed the same way.
+
+## Improvements
+
+- **The tool-confirmation card (Allow once / Always allow / Deny) now docks above the input bar.** Previously it lived inside the transcript and could scroll out of view; now it appears right where you are typing, with the transcript keeping the tool row as a plain record.
+
+---
+
 ## 更早版本
 
 以下标题来自各自的发布提交（完整产物与发布时间见 GitHub Releases）：
