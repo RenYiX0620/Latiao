@@ -401,6 +401,14 @@ falsely abort a turn.
 
 ---
 
+## v0.3.66 — v0.3.66 — lag-free typing
+
+## Fixes
+
+- **Typing in the input box is no longer laggy.** The input value lived at the app's top level, so every keystroke — including every pinyin candidate update during composition — re-rendered the whole app including the entire chat history. With long chats, letters appeared one by one after the pinyin was already typed. The input is now uncontrolled: the IME writes straight to the DOM with zero re-renders while composing, and typing only re-renders the input box itself. Chinese IME protections (Enter no longer sends mid-composition), image paste, and voice-dictation injection all behave exactly as before.
+
+---
+
 ## 更早版本
 
 以下标题来自各自的发布提交（完整产物与发布时间见 GitHub Releases）：
