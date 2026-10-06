@@ -387,6 +387,20 @@ falsely abort a turn.
 
 ---
 
+## v0.3.65 — v0.3.65 — usage dashboard visual pass
+
+## Improvements
+
+- **Usage Statistics: cleaner trend chart.** The same model no longer appears as two separate lines when older records stored its full file path and newer ones its short name — the trend now merges them into one series (fewer, cleaner lines with no duplicated legend entries). Lines are smoothly curved (Catmull-Rom) instead of jagged point-to-point segments.
+- **Hover interaction on the trend chart.** Data dots no longer sit permanently on the lines; hovering a day lights up that day's points for every model and shows a tooltip listing each model's token count for that day.
+- **Working hover tooltips on the heatmap** (date, input, generated, turns per cell) — the previous ones never appeared inside the app's webview.
+
+## New
+
+- **Usage Statistics: a Clear button** to erase all recorded usage after a confirmation dialog. Sessions, chat history and memory are untouched; counting restarts with the next turn.
+
+---
+
 ## 更早版本
 
 以下标题来自各自的发布提交（完整产物与发布时间见 GitHub Releases）：
