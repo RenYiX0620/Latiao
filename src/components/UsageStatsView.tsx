@@ -126,6 +126,7 @@ export default function UsageStatsView({ active = true }: { active?: boolean }) 
   // 同样不可靠，且圆点命中区只有两三个像素）→ 受控 tooltip：hover 事件记下
   // 屏幕坐标 + 多行内容，fixed 定位小卡片跟随显示（pointer-events:none 防闪烁）。
   const [tip, setTip] = useState<{ x: number; y: number; lines: string[] } | null>(null);
+  const [hoverCol, setHoverCol] = useState<number | null>(null);
   const dayByDate = useMemo(
     () => new Map(perDay.map((d) => [d.date, d])),
     [perDay],
@@ -264,8 +265,7 @@ export default function UsageStatsView({ active = true }: { active?: boolean }) 
               ))}
               {series.map((s, si) => {
                 // 平滑曲线（Catmull-Rom→贝塞尔）：直连 polyline 在点少值差大时
-                // 是生硬的尖锯齿（2026-10-06 用户反馈"线好丑"）；数据点仍由
-                // 下方圆点标出，曲线只是视觉连接。
+                // 是生硬的尖锯齿（2026-10-06 用户反馈"线好丑"）。
                 const pts = s.values.map((v, i) => ({
                   x: dates.length > 1 ? (i / (dates.length - 1)) * 596 + 2 : 300,
                   y: 166 - (v / maxSeriesVal) * 156,
@@ -277,24 +277,40 @@ export default function UsageStatsView({ active = true }: { active?: boolean }) 
                     vectorEffect="non-scaling-stroke" />
                 );
               })}
-              {series.map((s, si) => s.values.map((v, i) => {
-                const cx = dates.length > 1 ? (i / (dates.length - 1)) * 596 + 2 : 300;
+              {/* 数据点默认不画（实心小点密贴在线上像撒芝麻，2026-10-06 反馈）：
+                  悬停某列时才"点亮"该列各系列的圆点（放大 + 底色描边环）。 */}
+              {hoverCol !== null && series.map((s, si) => {
+                const v = s.values[hoverCol];
+                if (v === undefined) return null;
+                const cx = dates.length > 1 ? (hoverCol / (dates.length - 1)) * 596 + 2 : 300;
                 const cy = 166 - (v / maxSeriesVal) * 156;
                 return (
-                  <g key={`${s.model}:${i}`}>
-                    <circle cx={cx} cy={cy} r={2.5} fill={PALETTE[si % PALETTE.length]} />
-                    {/* 透明大热区：r=2.5 的点在 preserveAspectRatio=none 下命中区只有两三像素，
-                        悬停根本碰不到（2026-10-05 tooltip 不弹的第二个原因） */}
-                    <circle cx={cx} cy={cy} r={9} fill="transparent"
-                      style={{ pointerEvents: "all" }}
-                      onMouseEnter={(e) => showTip(e, [
-                        dates[i],
-                        `${shortModel(s.model)} · ${fmtBigTokens(v, lang)}`,
-                      ])}
-                      onMouseLeave={hideTip} />
-                  </g>
+                  <circle key={`dot-${s.model}`} cx={cx} cy={cy} r={4}
+                    fill={PALETTE[si % PALETTE.length]}
+                    stroke="var(--bg-panel, #0f172a)" strokeWidth={2}
+                    vectorEffect="non-scaling-stroke" />
                 );
-              }))}
+              })}
+              {/* 列级热区：整列一个全高透明矩形（主流图表的 hover 交互），
+                  悬停显示该列 tooltip + 点亮数据点；也解决此前 per-point
+                  热区太小的问题。 */}
+              {dates.map((d, i) => {
+                const cx = dates.length > 1 ? (i / (dates.length - 1)) * 596 + 2 : 300;
+                const w = dates.length > 1 ? 600 / (dates.length - 1) : 600;
+                return (
+                  <rect key={`hz-${d}`} x={cx - w / 2} y={0} width={w} height={170}
+                    fill="transparent" style={{ pointerEvents: "all" }}
+                    onMouseEnter={(e) => {
+                      setHoverCol(i);
+                      const lines = [d, ...series
+                        .map((s) => ({ m: s.model, v: s.values[i] ?? 0 }))
+                        .filter((x) => x.v > 0)
+                        .map((x) => `${shortModel(x.m)} · ${fmtBigTokens(x.v, lang)}`)];
+                      showTip(e, lines.length > 1 ? lines : [d, t("stats.empty")]);
+                    }}
+                    onMouseLeave={() => { setHoverCol(null); hideTip(); }} />
+                );
+              })}
             </svg>
             <div className="usage-trend-axis">
               <span>{dates[0]?.slice(5)}</span>
