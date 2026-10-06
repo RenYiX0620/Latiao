@@ -18,6 +18,12 @@ const PALETTE = ["#4c8dff", "#34c77b", "#8b5cf6", "#f87171",
 
 const HEAT_WEEKS = 26;
 
+/** 热力图格子所在日期：列起始（周一）+ 行偏移天数。 */
+function cellDate(start: string, rowIdx: number): string {
+  const t = new Date(start + "T00:00:00Z").getTime() + rowIdx * 86_400_000;
+  return new Date(t).toISOString().slice(0, 10);
+}
+
 function Card({ value, label, sub }: { value: string; label: string; sub?: string }) {
   return (
     <div className="usage-card">
@@ -115,6 +121,25 @@ export default function UsageStatsView({ active = true }: { active?: boolean }) 
   const peak = dash?.peak_day;
   const maxSeriesVal = Math.max(1, ...series.flatMap((s) => s.values));
 
+  // 悬停提示（2026-10-05）：原生 title 在 Tauri 的 WKWebView 里不弹（SVG <title>
+  // 同样不可靠，且圆点命中区只有两三个像素）→ 受控 tooltip：hover 事件记下
+  // 屏幕坐标 + 多行内容，fixed 定位小卡片跟随显示（pointer-events:none 防闪烁）。
+  const [tip, setTip] = useState<{ x: number; y: number; lines: string[] } | null>(null);
+  const dayByDate = useMemo(
+    () => new Map(perDay.map((d) => [d.date, d])),
+    [perDay],
+  );
+  const showTip = (e: React.MouseEvent, lines: string[]) => {
+    if (!lines.length) { setTip(null); return; }
+    setTip({ x: e.clientX, y: e.clientY, lines });
+  };
+  const hideTip = () => setTip(null);
+  // 提示卡片位置：光标右下 12px，贴右边缘时翻到左侧
+  const tipStyle = tip ? {
+    left: tip.x + window.innerWidth - tip.x > 240 ? tip.x + 12 : Math.max(4, tip.x - 228),
+    top: tip.y + 14,
+  } : undefined;
+
   // 空态三义：读取中 / 读取失败（可重试）/ 已读但确无数据——不再混成一句"暂无数据"
   const placeholder = !dash ? (
     failed ? (
@@ -181,14 +206,25 @@ export default function UsageStatsView({ active = true }: { active?: boolean }) 
                     <div className="usage-heat-month">
                       {showMonth ? monthLabel(col.start, lang) : ""}
                     </div>
-                    {col.cells.map((v, ri) => (
-                      <i key={ri}
-                        className={`usage-heat-cell${v === null ? " blank" : ""}`}
-                        style={v ? { background: heatColor(v, maxCell) } : undefined}
-                        title={v !== null && v > 0
-                          ? `${monthLabel(col.start, lang) === "" ? col.start : col.start} · ${fmtBigTokens(v, lang)}`
-                          : undefined} />
-                    ))}
+                    {col.cells.map((v, ri) => {
+                      const date = cellDate(col.start, ri);
+                      const day = dayByDate.get(date);
+                      return (
+                        <i key={ri}
+                          className={`usage-heat-cell${v === null ? " blank" : ""}`}
+                          style={v ? { background: heatColor(v, maxCell) } : undefined}
+                          onMouseEnter={(e) => {
+                            if (!day || (day.input + day.gen) <= 0) { hideTip(); return; }
+                            showTip(e, [
+                              date,
+                              `${t("chat.ctx_hist_input")} ${fmtBigTokens(day.input, lang)}`,
+                              `${t("chat.ctx_hist_gen")} ${fmtBigTokens(day.gen, lang)}`,
+                              `${t("chat.ctx_hist_turns")} ${day.n}`,
+                            ]);
+                          }}
+                          onMouseLeave={hideTip} />
+                      );
+                    })}
                   </div>
                 );
               })}
@@ -238,13 +274,24 @@ export default function UsageStatsView({ active = true }: { active?: boolean }) 
                     vectorEffect="non-scaling-stroke" />
                 );
               })}
-              {series.map((s, si) => s.values.map((v, i) => (
-                <circle key={`${s.model}:${i}`} cx={dates.length > 1 ? (i / (dates.length - 1)) * 596 + 2 : 300}
-                  cy={166 - (v / maxSeriesVal) * 156} r={2.5}
-                  fill={PALETTE[si % PALETTE.length]}>
-                  <title>{`${dates[i]} · ${shortModel(s.model)} · ${fmtBigTokens(v, lang)}`}</title>
-                </circle>
-              )))}
+              {series.map((s, si) => s.values.map((v, i) => {
+                const cx = dates.length > 1 ? (i / (dates.length - 1)) * 596 + 2 : 300;
+                const cy = 166 - (v / maxSeriesVal) * 156;
+                return (
+                  <g key={`${s.model}:${i}`}>
+                    <circle cx={cx} cy={cy} r={2.5} fill={PALETTE[si % PALETTE.length]} />
+                    {/* 透明大热区：r=2.5 的点在 preserveAspectRatio=none 下命中区只有两三像素，
+                        悬停根本碰不到（2026-10-05 tooltip 不弹的第二个原因） */}
+                    <circle cx={cx} cy={cy} r={9} fill="transparent"
+                      style={{ pointerEvents: "all" }}
+                      onMouseEnter={(e) => showTip(e, [
+                        dates[i],
+                        `${shortModel(s.model)} · ${fmtBigTokens(v, lang)}`,
+                      ])}
+                      onMouseLeave={hideTip} />
+                  </g>
+                );
+              }))}
             </svg>
             <div className="usage-trend-axis">
               <span>{dates[0]?.slice(5)}</span>
@@ -253,6 +300,14 @@ export default function UsageStatsView({ active = true }: { active?: boolean }) 
           </>
         )}
       </div>
+
+      {tip && (
+        <div className="usage-tip" style={tipStyle}>
+          {tip.lines.map((ln, i) => (
+            <div key={i} className={i === 0 ? "usage-tip-date" : ""}>{ln}</div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

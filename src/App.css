@@ -1263,3 +1263,15 @@ img.sidebar-logo {
   from { opacity: 0; transform: translateY(6px); }
   to   { opacity: 1; transform: none; }
 }
+
+/* 使用统计的悬停提示（受控 tooltip，2026-10-05）：
+   原生 title / SVG <title> 在 Tauri 的 WKWebView 里不弹，改 hover 事件渲染。 */
+.usage-tip {
+  position: fixed; z-index: 1000; pointer-events: none;
+  max-width: 240px; padding: 6px 10px;
+  background: var(--bg-elevated, #1e293b); color: var(--text-default, #e2e8f0);
+  border: 1px solid var(--border-default); border-radius: 8px;
+  font-size: 11px; line-height: 1.5;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+}
+.usage-tip-date { color: var(--text-muted); margin-bottom: 2px; }
