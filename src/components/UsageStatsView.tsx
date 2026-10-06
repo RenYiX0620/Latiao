@@ -7,6 +7,7 @@ import {
   heatGrid,
   monthLabel,
   pivotModelSeries,
+  smoothPath,
   type DashboardData,
   type HeatMode,
 } from "../utils/usageStats";
@@ -262,15 +263,17 @@ export default function UsageStatsView({ active = true }: { active?: boolean }) 
                   className="usage-trend-grid" />
               ))}
               {series.map((s, si) => {
-                const pts = s.values.map((v, i) => {
-                  const x = dates.length > 1 ? (i / (dates.length - 1)) * 596 + 2 : 300;
-                  const y = 166 - (v / maxSeriesVal) * 156;
-                  return `${x},${y}`;
-                }).join(" ");
+                // 平滑曲线（Catmull-Rom→贝塞尔）：直连 polyline 在点少值差大时
+                // 是生硬的尖锯齿（2026-10-06 用户反馈"线好丑"）；数据点仍由
+                // 下方圆点标出，曲线只是视觉连接。
+                const pts = s.values.map((v, i) => ({
+                  x: dates.length > 1 ? (i / (dates.length - 1)) * 596 + 2 : 300,
+                  y: 166 - (v / maxSeriesVal) * 156,
+                }));
                 return (
-                  <polyline key={s.model} points={pts} fill="none"
+                  <path key={s.model} d={smoothPath(pts)} fill="none"
                     stroke={PALETTE[si % PALETTE.length]}
-                    strokeWidth={2} strokeLinejoin="round" strokeLinecap="round"
+                    strokeWidth={2} strokeLinecap="round"
                     vectorEffect="non-scaling-stroke" />
                 );
               })}

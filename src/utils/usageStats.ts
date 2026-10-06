@@ -160,3 +160,26 @@ export function monthLabel(dateStr: string, lang: string): string {
     "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
   return lang === "zh" ? `${m}月` : names[m - 1];
 }
+
+/** 折线 → 平滑曲线（Catmull-Rom 转三次贝塞尔，张力 0.5）。
+ *  直连 polyline 在点少、值差大时是生硬的尖锯齿（用户实测反馈）；平滑后
+ *  数据点仍由圆点标出，曲线只是视觉连接。首尾点照常。 */
+export function smoothPath(points: { x: number; y: number }[]): string {
+  if (points.length === 0) return "";
+  if (points.length === 1) return `M${points[0].x},${points[0].y}`;
+  const p = points;
+  let d = `M${p[0].x},${p[0].y}`;
+  for (let i = 0; i < p.length - 1; i++) {
+    const p0 = p[i - 1] ?? p[i];
+    const p1 = p[i];
+    const p2 = p[i + 1];
+    const p3 = p[i + 2] ?? p2;
+    // Catmull-Rom 控制点（t = 1/6 · 邻点差）
+    const c1x = p1.x + (p2.x - p0.x) / 6;
+    const c1y = p1.y + (p2.y - p0.y) / 6;
+    const c2x = p2.x - (p3.x - p1.x) / 6;
+    const c2y = p2.y - (p3.y - p1.y) / 6;
+    d += ` C${c1x.toFixed(2)},${c1y.toFixed(2)} ${c2x.toFixed(2)},${c2y.toFixed(2)} ${p2.x},${p2.y}`;
+  }
+  return d;
+}

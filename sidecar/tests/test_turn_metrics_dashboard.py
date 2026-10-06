@@ -48,6 +48,10 @@ def dash_db(tmp_path, monkeypatch):
         {"id": "d4", "session_id": "s", "model": "Hermes-35B", "is_local": 1,
          "started_at": _iso(now - timedelta(days=10)), "input_tokens": 5000,
          "gen_tokens": 4000, "duration_ms": 300_000},
+        # 同一模型的完整路径形态（应与短名合并归一，2026-10-06）
+        {"id": "d6", "session_id": "s", "model": "/Users/x/lmstudio/Hermes-35B.gguf",
+         "is_local": 1, "started_at": _iso(now), "input_tokens": 100, "gen_tokens": 50,
+         "duration_ms": 1_000},
         # 40 天前孤立一天（3 连之外的历史最长段）
         {"id": "d5", "session_id": "s", "model": "mimo-flash", "is_local": 0,
          "started_at": _iso(now - timedelta(days=40)), "input_tokens": 10,
@@ -62,9 +66,9 @@ def test_dashboard_cards_and_streaks(dash_db):
     import turn_metrics
     out = turn_metrics.dashboard_stats(182)
     # 全库合计（不受窗口影响）
-    assert out["all_time"]["n"] == 5
-    assert out["all_time"]["input"] == 1000 + 800 + 600 + 5000 + 10
-    assert out["all_time"]["gen"] == 500 + 400 + 300 + 4000 + 5
+    assert out["all_time"]["n"] == 6
+    assert out["all_time"]["input"] == 1000 + 800 + 600 + 5000 + 10 + 100
+    assert out["all_time"]["gen"] == 500 + 400 + 300 + 4000 + 5 + 50
     assert out["all_time"]["longest_turn_ms"] == 300_000
     # 连续天数：最近 3 天连续 → 当前 3、最长 3
     assert out["streak_current"] == 3
@@ -74,7 +78,8 @@ def test_dashboard_cards_and_streaks(dash_db):
     # 按天×模型：合并口径
     pairs = {(x["date"], x["model"]): x["tokens"] for x in out["per_day_model"]}
     today_key = _iso(datetime.now())[:10]
-    assert pairs[(today_key, "Hermes-35B")] == 1500
+    # 完整路径与短名归一合并：1500（短名）+ 150（路径行）= 1650
+    assert pairs[(today_key, "Hermes-35B")] == 1650
     yest_key = _iso(datetime.now() - timedelta(days=1))[:10]
     assert pairs[(yest_key, "mimo-flash")] == 1200
     # 按天桶覆盖 5 天

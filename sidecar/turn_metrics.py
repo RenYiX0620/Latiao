@@ -173,8 +173,22 @@ def dashboard_stats(window_days: int = 182) -> dict:
         return empty
     days = [{"date": r[0], "n": int(r[1]), "input": int(r[2]), "gen": int(r[3])}
             for r in per_day]
-    by_day_model = [{"date": r[0], "model": str(r[1] or "未知"), "tokens": int(r[2])}
-                    for r in per_day_model]
+    # 模型名归一（2026-10-06）：早期记录存完整文件路径、后期存短名——同一模型
+    # 被拆成两条趋势线（实测 occamy/Qwen-MLX 各两色，图例同名重复）。
+    # 归一 = 取路径末段 + 去 .gguf 后缀，再按（日期, 归一名）重新聚合。
+    def _norm_model_name(m) -> str:
+        s = str(m or "").replace("\\", "/").rstrip("/")
+        base = s.rsplit("/", 1)[-1]
+        if base.lower().endswith(".gguf"):
+            base = base[:-5]
+        return base or "未知"
+
+    _merged: dict[tuple, int] = {}
+    for r in per_day_model:
+        key = (r[0], _norm_model_name(r[1]))
+        _merged[key] = _merged.get(key, 0) + int(r[2])
+    by_day_model = [{"date": d, "model": m, "tokens": t}
+                    for (d, m), t in sorted(_merged.items())]
 
     # 连续天数：最长 = 日期序列里最长的逐日连续段
     dset: set[str] = set()

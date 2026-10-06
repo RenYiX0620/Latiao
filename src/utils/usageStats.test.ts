@@ -81,3 +81,19 @@ describe("monthLabel", () => {
     expect(monthLabel("2026-10-06", "en")).toBe("Oct");
   });
 });
+
+import { smoothPath } from "./usageStats";
+
+describe("smoothPath", () => {
+  it("单点/空：M 指令或空串", () => {
+    expect(smoothPath([])).toBe("");
+    expect(smoothPath([{ x: 5, y: 6 }])).toBe("M5,6");
+  });
+  it("多点：M 开头 + 每段一个 C，终点是最后一个点", () => {
+    const pts = [{ x: 0, y: 10 }, { x: 10, y: 0 }, { x: 20, y: 10 }];
+    const d = smoothPath(pts);
+    expect(d.startsWith("M0,10")).toBe(true);
+    expect((d.match(/ C/g) || []).length).toBe(2);
+    expect(d.endsWith("20,10")).toBe(true);
+  });
+});
