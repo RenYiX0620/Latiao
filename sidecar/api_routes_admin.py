@@ -214,6 +214,22 @@ async def get_turn_metrics_dashboard(window: int = 182):
     return {"status": "ok", **turn_metrics.dashboard_stats(window)}
 
 
+@router.delete("/v1/turn-metrics")
+async def clear_turn_metrics():
+    """清空用量统计（统计页的"清空"按钮；前端已做二次确认，这里再兜底）。
+
+    只删 turn_metrics——会话历史/记忆/设置不碰；下一轮结束后重新开始记录。
+    页面数字每次打开都是现算的（无缓存层），所以不存在"重新计算"端点——
+    清空后重拉即归零。
+    """
+    import turn_metrics
+    deleted = turn_metrics.clear()
+    if deleted < 0:
+        return {"status": "error", "message": "清空失败（详见 sidecar 日志）"}
+    logger.info("turn-metrics 已清空：删除 %d 行", deleted)
+    return {"status": "ok", "deleted": deleted}
+
+
 # ── 首启引导（新安装第一次对话时自我介绍并收集 称呼/名字/语气）──
 @router.get("/v1/onboarding")
 async def get_onboarding():

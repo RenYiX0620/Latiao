@@ -226,3 +226,20 @@ def prune(days: int | None = None) -> int:
     except sqlite3.Error:
         logger.warning("turn_metrics 清理失败", exc_info=True)
         return 0
+
+
+def clear() -> int:
+    """清空全部用量统计（用户在统计页点"清空"），返回删除条数。
+
+    只动 turn_metrics——会话历史（session_messages）、记忆、设置都不碰；
+    下一轮对话结束后会照常重新开始记录。失败返回 -1（调用方转错误提示）。
+    """
+    try:
+        with _db_write_lock:
+            conn = _get_db()
+            cur = conn.execute("DELETE FROM turn_metrics")
+            conn.commit()
+            return int(cur.rowcount or 0)
+    except sqlite3.Error:
+        logger.warning("turn_metrics 清空失败", exc_info=True)
+        return -1

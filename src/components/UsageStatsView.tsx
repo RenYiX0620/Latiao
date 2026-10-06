@@ -46,6 +46,23 @@ export default function UsageStatsView({ active = true }: { active?: boolean }) 
   const [reloadKey, setReloadKey] = useState(0);
   const [mode, setMode] = useState<HeatMode>("daily");
   const [range, setRange] = useState<7 | 30>(7);
+  const [clearing, setClearing] = useState(false);
+
+  /** 清空统计（破坏性，二次确认）。只删用量记录——会话/记忆不受影响。 */
+  const handleClear = async () => {
+    const { ask } = await import("@tauri-apps/plugin-dialog");
+    const ok = await ask(t("stats.clear_confirm"), { title: t("stats.clear_btn") });
+    if (!ok) return;
+    setClearing(true);
+    try {
+      const r = await authFetch("/v1/turn-metrics", { method: "DELETE" });
+      const d = await r.json();
+      if (d && d.status === "ok") {
+        setReloadKey((k) => k + 1);   // 立即重拉 → 归零视图
+      }
+    } catch { /* 失败保持现状，下次进页重拉 */ }
+    finally { setClearing(false); }
+  };
 
   useEffect(() => {
     if (!active) return;
@@ -135,14 +152,22 @@ export default function UsageStatsView({ active = true }: { active?: boolean }) 
       <div className="usage-panel">
         <div className="usage-panel-head">
           <span className="usage-panel-title">{t("stats.heatmap")}</span>
-          <div className="usage-seg">
-            {(["daily", "weekly", "cumulative"] as HeatMode[]).map((m) => (
-              <button key={m} type="button"
-                className={`usage-seg-btn${mode === m ? " active" : ""}`}
-                onClick={() => setMode(m)}>
-                {t(`stats.mode_${m}`)}
-              </button>
-            ))}
+          <div className="usage-panel-tools">
+            <div className="usage-seg">
+              {(["daily", "weekly", "cumulative"] as HeatMode[]).map((m) => (
+                <button key={m} type="button"
+                  className={`usage-seg-btn${mode === m ? " active" : ""}`}
+                  onClick={() => setMode(m)}>
+                  {t(`stats.mode_${m}`)}
+                </button>
+              ))}
+            </div>
+            <button type="button" className="usage-clear-btn"
+              disabled={clearing || !dash?.all_time.n}
+              title={t("stats.clear_hint")}
+              onClick={() => void handleClear()}>
+              {clearing ? t("stats.clearing") : t("stats.clear_btn")}
+            </button>
           </div>
         </div>
         {perDay.length === 0 ? placeholder : (

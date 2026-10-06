@@ -142,3 +142,27 @@ def test_summary_limit_and_empty(tmp_path, monkeypatch):
         assert out2["status"] == "ok"
     finally:
         _teardown_db()
+
+
+def test_clear_endpoint_empties_table(seeded_db):
+    """DELETE /v1/turn-metrics：清空 turn_metrics，会话表（sessions）不碰。"""
+    from api_routes_admin import clear_turn_metrics
+    from db import _db_write_lock, _get_db
+    with _db_write_lock:
+        conn = _get_db()
+        # 整文件跑时 api_routes_admin 的建表链只落在第一个 fixture 的 tmp 库上，
+        # 本 fixture 的库里没有 sessions——自建最小结构（IF NOT EXISTS 兼容单跑）
+        conn.execute("CREATE TABLE IF NOT EXISTS sessions("
+                     "id TEXT PRIMARY KEY, name TEXT NOT NULL, "
+                     "created_at TEXT NOT NULL, updated_at TEXT NOT NULL)")
+        _n_before = conn.execute("SELECT COUNT(*) FROM turn_metrics").fetchone()[0]
+        conn.execute("INSERT OR REPLACE INTO sessions(id, name, created_at, updated_at) "
+                     "VALUES('keep-me', '保留', datetime('now'), datetime('now'))")
+        conn.commit()
+    assert _n_before == len(ROWS)
+    out = asyncio.run(clear_turn_metrics())
+    assert out["status"] == "ok" and out["deleted"] == _n_before
+    with _db_write_lock:
+        conn = _get_db()
+        assert conn.execute("SELECT COUNT(*) FROM turn_metrics").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM sessions WHERE id='keep-me'").fetchone()[0] == 1

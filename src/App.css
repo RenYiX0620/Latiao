@@ -1173,6 +1173,13 @@ img.sidebar-logo {
   color: var(--accent, #4c8dff); font-size: 12px;
 }
 .usage-retry:hover { background: var(--bg-hover, rgba(255,255,255,0.08)); }
+.usage-panel-tools { display: flex; align-items: center; gap: 10px; }
+.usage-clear-btn {
+  border: 1px solid var(--border-default); background: none; cursor: pointer;
+  font-size: 11px; padding: 3px 10px; border-radius: 8px; color: var(--text-muted);
+}
+.usage-clear-btn:hover:not(:disabled) { color: var(--danger, #ef4444); border-color: var(--danger, #ef4444); }
+.usage-clear-btn:disabled { opacity: 0.4; cursor: default; }
 .usage-empty { color: var(--text-muted); font-size: 12.5px; padding: 24px 0; text-align: center; }
 .usage-heat { display: flex; gap: 3px; overflow-x: auto; padding-bottom: 4px; }
 .usage-heat-col { display: flex; flex-direction: column; gap: 3px; }
