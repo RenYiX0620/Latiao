@@ -374,6 +374,19 @@ falsely abort a turn.
 
 ---
 
+## v0.3.64 — v0.3.64 — stop key everywhere + usage page polish
+
+## Fixes
+
+- **The Stop button now stops immediately, at every stage.** Previously, pressing Stop during a long generation only took effect after the current step finished (one case ran 108 seconds past the press), and the tool the model had just requested still executed afterwards (a file was written 75 seconds after Stop). Cancellation is now honored mid-generation (~0.5s), before tool execution, while a tool command is running (the command's process tree is killed), while queued for the engine, and while waiting for an engine reload.
+
+## Improvements
+
+- **Usage Statistics: a Clear button.** Erases all recorded usage (sessions, chat history and memory are untouched; counting restarts with the next turn) after a confirmation dialog. The page computes its numbers fresh on every load, so clearing takes effect immediately.
+- **Usage Statistics: working hover tooltips.** Hovering a heatmap cell now shows date / input / generated / turns, and hovering a trend point shows date · model · tokens (the previous tooltips never appeared inside the app's webview).
+
+---
+
 ## 更早版本
 
 以下标题来自各自的发布提交（完整产物与发布时间见 GitHub Releases）：
