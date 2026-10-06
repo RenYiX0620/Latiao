@@ -16,6 +16,7 @@ import { sidecarFetch, waitForSidecar, authFetch, uploadSidecarFile, uploadLocal
 import { useTranslation } from "./i18n";
 import { useCronJobs } from "./hooks/useCronJobs";
 import ChatView from "./components/ChatView";
+import type { ChatInputApi } from "./components/ChatInput";
 import PreviewPanel from "./components/PreviewPanel";
 import type { PreviewItem } from "./components/PreviewPanel";
 import ModelsView from "./components/ModelsView";
@@ -200,7 +201,10 @@ const [timeFilter, setTimeFilter] = useState("all");
   useEffect(() => { localStorage.setItem("latiao_access", accessMode); }, [accessMode]);
 
 
-  const [prompt, setPrompt] = useState("");
+  // 输入框（2026-10-06 性能重构）：prompt 不再是顶层 state——每键 setState 会
+  // 重渲染整个应用（聊天区 Markdown 树），拼音组合期字"一个一个蹦"（用户实测）。
+  // 现为非受控 textarea + ref API：输入零重渲染，发送/清空/语音注入走 ref。
+  const inputApiRef = useRef<ChatInputApi | null>(null);
   // 处理中状态**按会话**记录（09-23）：此前是一个全局布尔——A 会话在等回复时
   // B 会话的发送键被判定为"处理中"，于是否决发送/被当成"打断"，表现为
   // "一个会话在跑，另一个会话发不出去"。现在是 Record<sessionId, true>，
@@ -670,7 +674,7 @@ const [timeFilter, setTimeFilter] = useState("all");
 
   /* ── Stream Chat (preserved from original) ── */
   const sendMessage = async () => {
-    const text = prompt;
+    const text = inputApiRef.current?.getText() ?? "";
     if (!text.trim() && !pendingFile) return;
     // Re-entrancy guard: if a previous request is still streaming, ignore
     // duplicate sends (double-click, repeated Enter, etc.). Without this,
@@ -707,7 +711,7 @@ const [timeFilter, setTimeFilter] = useState("all");
       return;
     }
 
-    setPrompt("");
+    inputApiRef.current?.setText("");
     setProcessing((p) => ({ ...p, [session.id]: true }));
     setAgentPhase(t("agent.phase_analyze"));
     taskStacksRef.current[session.id] = []; // 清残留工具栈（上次中断/未正常结束）
@@ -1021,7 +1025,7 @@ const [timeFilter, setTimeFilter] = useState("all");
           });
           const data = await resp.json();
           if (data.status === "success" && data.text && data.text !== "(未识别到语音内容)") {
-            setPrompt(prev => (prev ? prev + " " : "") + data.text);
+            inputApiRef.current?.appendText(data.text);
           }
         } catch { /* 实时块识别失败静默,最终完整识别兜底 */ }
         finally { transcribingRef.current = false; }
@@ -1047,7 +1051,7 @@ const [timeFilter, setTimeFilter] = useState("all");
           const data = await resp.json();
           if (data.text) {
             // 完整音频识别更准 → 覆盖实时追加的文本
-            setPrompt(data.text);
+            inputApiRef.current?.setText(data.text);
           }
         } catch (e) { console.error(e); showToast(t("toast.speech_fail")); }
         stream.getTracks().forEach((t) => t.stop());
@@ -1283,7 +1287,7 @@ const [timeFilter, setTimeFilter] = useState("all");
           <ChatView
             messages={messages} isProcessing={isProcessing}
             pendingFile={pendingFile} setPendingFile={setPendingFile}
-            prompt={prompt} setPrompt={setPrompt}
+            inputRef={inputApiRef}
             fileInputRef={fileInputRef} mediaRecorderRef={mediaRecorderRef}
             isRecording={isRecording}
             sendMessage={sendMessage} onStop={() => {

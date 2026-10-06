@@ -3,6 +3,7 @@ import type { Message, PendingFile } from "../types";
 import { useTranslation } from "../i18n";
 import { loadedMismatch } from "../utils/modelSelection";
 import RunMetrics from "./RunMetrics";
+import ChatInput, { type ChatInputApi } from "./ChatInput";
 import { ToolConfirmCard } from "./ToolConfirmCard";
 import ToolCallBubble from "./ToolCallBubble";
 import { FileEditCard, ToolActivityCard, SubagentRow } from "./TurnCards";
@@ -112,8 +113,7 @@ interface ChatViewProps {
   isProcessing: boolean;
   pendingFile: PendingFile | null;
   setPendingFile: (f: PendingFile | null) => void;
-  prompt: string;
-  setPrompt: (p: string) => void;
+  inputRef: React.RefObject<ChatInputApi | null>;
   fileInputRef: React.RefObject<HTMLInputElement | null>;
   mediaRecorderRef: React.MutableRefObject<MediaRecorder | null>;
   isRecording: boolean;
@@ -154,8 +154,8 @@ interface ChatViewProps {
 
 export default memo(function ChatView({
   messages, isProcessing, pendingFile, setPendingFile,
-  prompt, setPrompt,
   fileInputRef, mediaRecorderRef, isRecording,
+  inputRef,
   sendMessage, onStop, handleFileSelect, startRecording, confirmTool, onPreview,
   onSpeak, speakingId,
   chatEndRef, handleDrop, onPasteImage,
@@ -742,12 +742,8 @@ export default memo(function ChatView({
           </div>
         )}
         <div className="input-row">
-          <textarea
-            className={`chat-input${prompt ? "" : " is-empty"}`}
-            value={prompt}
-            onChange={(e) => setPrompt(e.target.value)}
-            onCompositionStart={handleCompositionStart}
-            onCompositionEnd={handleCompositionEnd}
+          <ChatInput
+            ref={inputRef}
             onKeyDown={handleEditableKeyDown}
             onPaste={async (e) => {
               if (!onPasteImage) return;
@@ -762,9 +758,9 @@ export default memo(function ChatView({
                 }
               }
             }}
+            onCompositionStart={handleCompositionStart}
+            onCompositionEnd={handleCompositionEnd}
             placeholder={t("chat.placeholder")}
-            rows={1}
-            style={{ resize: "none", minHeight: 52, maxHeight: 150 }}
           />
           <input type="file" ref={fileInputRef} style={{ display: "none" }} onChange={handleFileSelect} />
           {/* 底部工具栏：左（附件/语音/模式）右（模型/设置/发送） */}
