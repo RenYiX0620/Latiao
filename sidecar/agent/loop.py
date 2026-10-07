@@ -364,6 +364,14 @@ _PLAN_VERB_RE = re.compile(r"查询|检索|调取|查看|获取|读取|搜索|�
 _PLAN_INTENT_RE = re.compile(
     r"我来|让我|我先|我将|我会|接下来|下面我|现在(让我|我来)|先(去|来)?(查|调|搜|读|看看)")
 
+# 工具失败后的"承诺碎片"（2026-10-07 事故：ak_finance 失败后模型连续两轮
+# 只说"这就帮你看看""马上用 mx_query 帮你查"就结束生成，交付闸 <10 字门槛
+# 拦不住，任务半途而废）。现有词表缺"这就/马上/看看/帮你查"等口语变体——
+# 但单独放宽会增大误伤面，所以只在**上一轮确有工具失败**时启用这组口语词。
+_PROMISE_RE = re.compile(r"这就|马上|立刻|我这就|帮你(查|看|搜)|稍等|这就来|先(查|看看)")
+# 有实质内容的信号：多个数字/百分号/表格行——含这些的短正文是"真答案"，不拦
+_DATA_SIGNAL_RE = re.compile(r"(?:\d[.,]?\d){2,}|%|^\|", re.M)
+
 
 def _needs_length_retry(finish_reason, native_calls, empty_body: bool,
                         retry_used: bool) -> bool:
@@ -863,6 +871,8 @@ class ThinAgentLoop:
         self._tool_rounds_no_answer = 0        # 连续工具轮（无实质正文交付）计数
         self._finalize_round = False           # 停滞闸门收口轮：无工具直接作答
         self._plan_nudge_used = 0              # 空转闸门：只声明计划不行动的一次纠正
+        self._toolfail_nudge_used = 0          # 工具失败闸门：承诺碎片的一次纠正
+        self._last_round_tool_failed = False   # 上一轮工具结果是否失败（承诺碎片闸的上下文）
         self._finalize_retry_used = False      # 终答轮空生成温度重采（一次）
         # 任务级验证器（gap 清单 P1，2026-09-29）：本轮工具账本 + 等级校验
         # 第一次未达标只提示（重采一次），第二次/作弊才交回用户（两级生效）
@@ -2173,6 +2183,23 @@ class ThinAgentLoop:
                     self._step_log("空转闸门", "只有计划声明、无工具调用 → 要求直接行动（一次）")
                     yield {"event": "heartbeat"}
                     continue
+                if (not tool_calls and not self._finalize_round
+                        and self._last_round_tool_failed
+                        and not self._toolfail_nudge_used
+                        and len(body_text) < 200
+                        and _PROMISE_RE.search(body_text)
+                        and not _DATA_SIGNAL_RE.search(body_text)):
+                    # 工具失败闸门（2026-10-07 事故）：工具失败后模型连续两轮只说
+                    # "这就帮你看看""马上用 mx_query 帮你查"就结束生成，任务半途
+                    # 而废。收窄启用：仅上一轮确有工具失败 + 短正文 + 承诺口语 +
+                    # 无实质内容信号（数字/表格），独立于空转闸门的一次额度。
+                    self._toolfail_nudge_used += 1
+                    self.current_msgs.append(_note_msg(
+                        _msg("toolfail_nudge", self.user_lang)))
+                    self._step_log("工具失败闸门",
+                                   "承诺碎片（无工具调用）→ 要求换工具重试或给出完整结论")
+                    yield {"event": "heartbeat"}
+                    continue
 
                 if not tool_calls:
                     # 任务级验证器（gap 清单 P1）：交付前做机械验收——判据只来自本轮
@@ -2412,6 +2439,10 @@ class ThinAgentLoop:
                     _res = next((str(e.get("result", "")) for e in events
                                  if isinstance(e, dict) and "result" in e), "")
                     self._maybe_quota_hint(_res)
+                    # 工具失败跟踪（2026-10-07）：承诺碎片闸的上下文信号——
+                    # 失败（Error/⛔/⏱/超时开头）置位，成功清除
+                    self._last_round_tool_failed = _res.lstrip().startswith(
+                        ("Error", "错误", "⛔", "⏱", "超时"))
                     if tname == "mx_query" and "Error" not in _res:
                         _clear_quota_marker("mx_query")
                     _round_results.append(_res)

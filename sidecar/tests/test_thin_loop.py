@@ -802,3 +802,55 @@ async def test_cancel_before_tool_execution_skips_tool():
     assert not any(isinstance(e, dict) and e.get("event") == "tool_start" for e in events), events
     texts = "".join(str(e.get("content", "")) for e in events if isinstance(e, dict))
     assert "已停止" in texts, events
+
+
+@pytest.mark.asyncio
+async def test_tool_failure_promise_fragment_gets_nudged():
+    """工具失败后的"承诺碎片"不交付（2026-10-07 事故回归）。
+
+    现场：ak_finance 失败（东财拒连）→ 模型连续两轮只说"这就帮你看看"
+    "马上用 mx_query 帮你查"就结束生成（22 字/94 字），任务半途而废。
+    修复：工具失败 + 短承诺正文（无数字/表格）→ 注入 toolfail_nudge 继续。
+    """
+    import time as _t
+    from agent.loop import ThinAgentLoop
+    from tests.test_loop_scenarios import _StubEngine
+    import local_llm
+
+    with FakeEngine() as engine:
+        # ① 模型调 read_file（不存在 → Error 结果 = 工具失败）
+        engine.push(engine.native_tool_response("read_file", {"path": "/nonexistent-xyz"}))
+        # ② 模型只说承诺（无工具调用）
+        engine.push(engine.text_response("好的主人，欧娜这就帮你看看这三只票的情况～💋"))
+        # ③ 被 nudge 后给出完整回答
+        engine.push(engine.text_response(NEUTRAL_TEXT))
+        old = local_llm._engine
+        local_llm._engine = _StubEngine()
+        try:
+            events = await _collect(ThinAgentLoop(
+                MESSAGES, "fake-model", engine.url, HEADERS,
+                session_id=f"thin-pf-{_t.time()}", access_mode="full").run())
+        finally:
+            local_llm._engine = old
+
+    texts = "".join(str(e.get("content", "")) for e in events if isinstance(e, dict))
+    # 承诺碎片不能作为终答交付（后续有完整回答 = 循环被续跑）
+    assert "根据刚才的目录输出" in texts, "nudge 后应继续循环并交付完整回答"
+    # 碎片本身也不该出现（它只应作为历史，不当终答下发）——宽松断言：
+    # 交付的最后一条不是碎片
+    assert not texts.rstrip().endswith("💋"), texts[-200:]
+
+
+def test_promise_regex_matches_incident_fragments():
+    """事故里的两句承诺语必须命中 _PROMISE_RE（正则即回归）。"""
+    from agent.loop import _PROMISE_RE, _DATA_SIGNAL_RE
+    a = "好的主人，欧娜这就帮你看看这三只票的情况～💋"
+    b = ("哎呀主人别急嘛～刚才 ak_finance 的东财接口抽风了（连接被拒绝），"
+         "欧娜没及时切到备用工具，所以卡住了 😘 现在马上用 mx_query 帮你查这三只票的情况！💋")
+    assert _PROMISE_RE.search(a)
+    assert _PROMISE_RE.search(b)
+    assert not _DATA_SIGNAL_RE.search(a)   # 无数字/表格
+    assert not _DATA_SIGNAL_RE.search(b)
+    # 对照：含数据的真答案不该命中承诺信号
+    real = "中天科技 收 12.34 元（+2.5%），领益智造 收 8.90 元\n| a | b |\n|---|---|"
+    assert _DATA_SIGNAL_RE.search(real)
