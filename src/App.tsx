@@ -17,6 +17,7 @@ import { useTranslation } from "./i18n";
 import { useCronJobs } from "./hooks/useCronJobs";
 import ChatView from "./components/ChatView";
 import type { ChatInputApi } from "./components/ChatInput";
+import { initJankProbe } from "./utils/jankProbe";
 import PreviewPanel from "./components/PreviewPanel";
 import type { PreviewItem } from "./components/PreviewPanel";
 import ModelsView from "./components/ModelsView";
@@ -205,6 +206,7 @@ const [timeFilter, setTimeFilter] = useState("all");
   // 重渲染整个应用（聊天区 Markdown 树），拼音组合期字"一个一个蹦"（用户实测）。
   // 现为非受控 textarea + ref API：输入零重渲染，发送/清空/语音注入走 ref。
   const inputApiRef = useRef<ChatInputApi | null>(null);
+  useEffect(() => { initJankProbe(); }, []);
   // 处理中状态**按会话**记录（09-23）：此前是一个全局布尔——A 会话在等回复时
   // B 会话的发送键被判定为"处理中"，于是否决发送/被当成"打断"，表现为
   // "一个会话在跑，另一个会话发不出去"。现在是 Record<sessionId, true>，

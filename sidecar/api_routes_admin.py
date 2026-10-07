@@ -198,6 +198,23 @@ async def get_turn_metrics_summary(session_id: str = "", limit: int = 50):
     return {"status": "ok", "summary": summary, "recent": rows[:limit]}
 
 
+@router.post("/v1/diag/trace")
+async def post_diag_trace(request: Request):
+    """前端诊断探针上报（jankProbe）：只写 sidecar 日志，不落任何存储。
+
+    用途：输入卡顿类问题的运行时定罪——前端把 longtask 汇总/慢渲染耗时
+    发到这里，sidecar.log 的 [diag][jank] 行就是"打字卡"的硬数据。
+    """
+    try:
+        body = await request.json()
+        source = str((body or {}).get("source") or "unknown")[:24]
+        for ln in (body or {}).get("lines") or []:
+            logger.info("[diag][%s] %s", source, str(ln)[:200])
+        return {"status": "ok"}
+    except Exception:
+        return {"status": "error"}
+
+
 @router.get("/v1/turn-metrics/dashboard")
 async def get_turn_metrics_dashboard(window: int = 182):
     """整页"使用统计"的聚合（对齐 ZCode 的使用统计页，2026-10-04）。

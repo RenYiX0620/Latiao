@@ -1,4 +1,4 @@
-import { memo, lazy, Suspense, useCallback, useState, useMemo, useRef, useEffect } from "react";
+import { memo, lazy, Suspense, useCallback, useState, useMemo, useRef, useEffect, Profiler } from "react";
 import type { Message, PendingFile } from "../types";
 import { useTranslation } from "../i18n";
 import { loadedMismatch } from "../utils/modelSelection";
@@ -475,7 +475,12 @@ export default memo(function ChatView({
   const estTokens = Math.round(messages.reduce((s, m) => s + m.content.length, 0) * 0.55); // 中文近似
 
   return (
-    <>
+    <Profiler id="chat-view" onRender={(_id, _phase, actualDuration) => {
+      // 渲染埋点（诊断探针）：actualDuration = 本子树本次提交的实际渲染耗时；
+      // >40ms 才上报（"长会话更卡"的硬数据，长期留作诊断能力）
+      void import("../utils/jankProbe").then(({ reportSlowRender }) =>
+        reportSlowRender(actualDuration, messages.length));
+    }}>
       <div className="chat-wrap">
       {(todos && todos.length > 0) && (
         <div className="subagent-bar todo-bar">
@@ -862,6 +867,6 @@ export default memo(function ChatView({
           )}
         </div>
       </div>
-    </>
+    </Profiler>
   );
 });
