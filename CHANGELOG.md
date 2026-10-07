@@ -430,6 +430,15 @@ falsely abort a turn.
 
 ---
 
+## v0.3.69 — v0.3.69 — no more half-finished tasks after tool failures
+
+## Fixes
+
+- **Tasks no longer stop halfway after a tool failure.** When a data tool failed (e.g. the eastmoney endpoint refusing connections), the model would sometimes reply with only a short promise — "I'll look into these right away~" — and end its turn, so the task died mid-way. The agent now recognizes these promise fragments in the exact context they occur (previous tool failed, short reply, promise wording, no actual data) and pushes the model to either retry with a different tool or deliver a complete conclusion.
+- Also carries the diagnostic jank probe from v0.3.68 for new installs.
+
+---
+
 ## 更早版本
 
 以下标题来自各自的发布提交（完整产物与发布时间见 GitHub Releases）：
