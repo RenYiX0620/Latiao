@@ -409,6 +409,19 @@ falsely abort a turn.
 
 ---
 
+## v0.3.67 — v0.3.67 — engine b11457 with K2 Horizon support
+
+## Engine
+
+- **llama.cpp updated to b11457** — this build includes the newly merged **K2 Horizon architecture support** (upstream PR #29535, merged 2026-10-06): dense and MoVA variants, full inference graph on existing GGML operators, plus the K2 chat template with a dedicated reasoning/tool-call parser. IFM/K2-Horizon-MoVA-36B-A4B GGUF and community variants can now be loaded.
+- Note: K2 Horizon on macOS Metal has not been independently benchmarked yet — you may be among the first to run it outside CUDA. If a load or generation fails, please report the sidecar log.
+
+## Fixes
+
+- Carries the v0.3.63–v0.3.66 fixes for new installs: stop button now takes effect at every stage of a running turn, usage dashboard data loading and hover tooltips, model-name merge in the trend chart, the clear-stats button, and the lag-free typing input.
+
+---
+
 ## 更早版本
 
 以下标题来自各自的发布提交（完整产物与发布时间见 GitHub Releases）：
