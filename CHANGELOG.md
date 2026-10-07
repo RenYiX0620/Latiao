@@ -422,6 +422,14 @@ falsely abort a turn.
 
 ---
 
+## v0.3.68 — v0.3.68 — diagnostic build (jank probe)
+
+## Diagnostic
+
+- **Built-in jank probe.** This version ships a lightweight runtime probe to gather hard evidence for the reported typing lag: long main-thread blocks (>50ms) and slow chat renders (with message counts) are aggregated and written to the sidecar log every ~30s. Update, use the app normally for a few minutes (especially typing in your longest session), and the log tells us exactly which of the suspected costs — stream flushes, markdown re-parsing, periodic state storms — actually dominates. No functional changes in this build.
+
+---
+
 ## 更早版本
 
 以下标题来自各自的发布提交（完整产物与发布时间见 GitHub Releases）：
