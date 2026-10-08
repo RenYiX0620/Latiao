@@ -372,6 +372,21 @@ _PLAN_INTENT_RE = re.compile(
     r"我来|让我|我先|我将|我会|接下来|下面我|这就|马上|赶紧|这就来"
     r"|现在(让我|我来)|先(去|来)?(查|调|搜|读|看看)")
 _PLAN_TAIL_SPLIT_RE = re.compile(r"[。～~！!？?\n]+")
+# 装饰段识别：不含任何文字/数字（\w 含 CJK）的段 = 结尾 emoji/星号/波浪线之类
+_WORDISH_RE = re.compile(r"\w")
+
+
+def _plan_tail(text: str) -> str:
+    """取正文的"末句"——承诺碎片的判定窗口。
+
+    2026-10-08 二次清查（真实语料重放）：模型习惯在结尾加装饰（"…给你看～💋"
+    ），按标点切句后末段只剩 "💋"，末句判定被装饰段击穿——库里 4 条真实碎片
+    （含用户报过的"说了三遍"那条）在末句版下全部漏网，旧的整文扫描版反而能
+    拦住。切句后先丢弃不含文字/数字的装饰段，再取末句。
+    """
+    segs = [s.strip() for s in _PLAN_TAIL_SPLIT_RE.split(text) if s.strip()]
+    segs = [s for s in segs if _WORDISH_RE.search(s)]
+    return segs[-1] if segs else ""
 
 
 def _looks_like_plan_only(text: str, has_tools: bool) -> bool:
@@ -389,11 +404,8 @@ def _looks_like_plan_only(text: str, has_tools: bool) -> bool:
     t = re.sub(r"\s+", " ", (text or "")).strip()
     if not t or len(t) > 200:
         return False
-    segs = [s.strip() for s in _PLAN_TAIL_SPLIT_RE.split(t) if s.strip()]
-    if not segs:
-        return False
-    tail = segs[-1]
-    if len(tail) > 120:            # 末句太长：不是一句轻飘飘的承诺
+    tail = _plan_tail(t)
+    if not tail or len(tail) > 120:   # 末句太长：不是一句轻飘飘的承诺
         return False
     return bool(_PLAN_INTENT_RE.search(tail) and _PLAN_VERB_RE.search(tail))
 
@@ -418,16 +430,23 @@ def _needs_length_retry(finish_reason, native_calls, empty_body: bool,
     return bool(native_calls) or empty_body
 
 
-def _looks_like_plan_only(text: str, has_tools: bool) -> bool:
-    """正文是否只是"声明打算做什么"（无实质内容）——09-20 实测：27B 只输出
-    "我来帮你分析…先调取相关数据和复盘方法论。"，工具调用=0，循环把它当终答
-    交付，用户看到的就是"执行到一半就停"。长的/不含工具动词的不拦。"""
-    if not has_tools:
-        return False
+def _delivery_fragment_suspect(text: str) -> str:
+    """交付哨兵（2026-10-08）：正文是否"疑似承诺碎片"——只观测、不拦截。
+
+    闸门必然是有限的（末句形态 + 200 字口径 + 特定路径），漏网变体不该等用户
+    抱怨才被发现。交付时命中就 warning 留痕，把"变体发现"从被动转主动。
+    比闸门更宽：口径放到 240 字、并额外认纯承诺口语词（"这就帮你看看"）。
+    返回命中的信号名（""=干净），便于日志聚合。
+    """
     t = re.sub(r"\s+", " ", (text or "")).strip()
     if not t or len(t) > 240:
-        return False
-    return bool(_PLAN_VERB_RE.search(t) and _PLAN_INTENT_RE.search(t))
+        return ""
+    tail = _plan_tail(t)
+    if tail and _PLAN_INTENT_RE.search(tail) and _PLAN_VERB_RE.search(tail):
+        return "tail-promise"
+    if tail and _PROMISE_RE.search(tail) and not _DATA_SIGNAL_RE.search(t):
+        return "promise-phrase"
+    return ""
 
 
 def _finalize_body_is_junk(body_text: str, stripped_tools: bool) -> bool:
@@ -440,11 +459,19 @@ def _finalize_body_is_junk(body_text: str, stripped_tools: bool) -> bool:
     - 碎片：本轮仍发了工具调用（剥离过）+ 正文 <80 字 + 含工具动词 →
       模型还锁在工具模式里，这句只是它的中间自语，不是给用户的答案。
     不带工具尝试的短正文（如"今日大盘收跌。"）不拦，避免误伤合法短答。
+
+    2026-10-08 二次清查补第三档：末句承诺形态（"…让我拉一下实时数据给你看～"
+    ，57 字、收口轮未再发工具调用）。它不满足前两档（>10 字且未剥离工具），
+    会被当"有效答案"直接交付——并上空转闸门的末句判据。此函数只在工具轮的
+    收口分支调用（四处 `_finalize_round=True` 全在工具循环内），工具可用性
+    恒真，故直接传 has_tools=True。
     """
     t = (body_text or "").strip()
     if len(t) < 10:
         return True
-    return bool(stripped_tools and len(t) < 80 and _PLAN_VERB_RE.search(t))
+    if stripped_tools and len(t) < 80 and _PLAN_VERB_RE.search(t):
+        return True
+    return _looks_like_plan_only(body_text, True)
 
 
 def _note_msg(text: str, label: str = "【系统提示】") -> dict:
@@ -2187,6 +2214,11 @@ class ThinAgentLoop:
                             yield {"content": "\n\n" + _msg("no_final_answer", self.user_lang)}
                     else:
                         # 正文已在 _sample 逐字流式下发，不再重复交付全文
+                        _sent = _delivery_fragment_suspect(body_text)
+                        if _sent:
+                            logger.warning("[交付哨兵] 收口轮疑似碎片交付(%s, %d字): %r",
+                                           _sent, len(body_text.strip()),
+                                           body_text.strip()[:120])
                         self._step_log("终答轮", f"已交付 {len(body_text)} 字")
                         # 收口轮已是最后一轮（不再重采）——机械校验若不过，就在交付时
                         # **明说没达标**，绝不把"已完成"留给用户自己发现（P1 反作弊/诚实）
@@ -2273,6 +2305,12 @@ class ThinAgentLoop:
                     payload = await self.scope.run_waterfall("deliver", payload)
                     for evt in payload.get("events", []):
                         yield evt
+                    # 交付哨兵：观测不拦截——闸门漏掉的碎片变体在日志里主动现形
+                    _sent = _delivery_fragment_suspect(payload.get("text") or body_text)
+                    if _sent:
+                        _ft = (payload.get("text") or body_text).strip()
+                        logger.warning("[交付哨兵] 疑似碎片交付(%s, %d字): %r",
+                                       _sent, len(_ft), _ft[:120])
                     self._step_log("交付",
                                    f"handled={payload.get('handled')} "
                                    f"events={len(payload.get('events', []))}")

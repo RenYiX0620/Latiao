@@ -1474,3 +1474,84 @@ class TestPlanOnlyGateTailRewrite(unittest.TestCase):
         # 末句是礼貌问句（无"让我+动词"承诺形态）：不拦
         self.assertFalse(_looks_like_plan_only(
             "今天大盘跌了。需要我帮你查个股的话告诉我。", True))
+
+    def test_tail_judgment_differs_from_whole_text_scan(self):
+        """末句版与旧"整文扫词"版的**唯一可观测分歧**：承诺词在前句、末句是
+        数据结论的完整回答。旧版（整文搜 INTENT+VERB）会把这类完整回答误判
+        成计划碎片，末句版放行。2026-10-08 实战：末句版写好后旧版没删、在
+        Python 里后定义胜出——新实现成死代码而全部用例保持绿色；这两条用例
+        是让"遮蔽"必然变红的红证。"""
+        from agent.loop import _looks_like_plan_only
+        self.assertFalse(_looks_like_plan_only(
+            "让我先看看数据。上证收跌0.89%，主力净流出214亿。", True))
+        self.assertFalse(_looks_like_plan_only(
+            "我来汇总一下今天的行情：上证收跌0.89%。半导体领涨2.1%，医药跌0.5%。", True))
+
+    def test_single_definition_tripwire(self):
+        """结构哨兵：循环里这些判定函数只允许有一处模块级定义。
+
+        遮蔽型故障（同名函数两份、后者胜出）绿套件看不见——与 2026-10-08
+        的 `_looks_like_plan_only` 死代码同为"提取/重构留双份"这一族。"""
+        import agent.loop as _loop
+        src = Path(_loop.__file__).read_text(encoding="utf-8")
+        for name in ("_looks_like_plan_only", "_finalize_body_is_junk",
+                     "_delivery_fragment_suspect"):
+            with self.subTest(fn=name):
+                self.assertEqual(src.count(f"def {name}("), 1)
+
+    def test_finalize_junk_catches_tail_promise(self):
+        """收口轮 junk 判定须含末句承诺形态（2026-10-08 二次清查）。
+
+        现场碎片 57 字、收口轮模型未再发工具调用 → `stripped_tools=False` +
+        >10 字，旧判定的两档都不命中，会当"有效答案"直接交付。"""
+        from agent.loop import _finalize_body_is_junk
+        self.assertTrue(_finalize_body_is_junk(
+            "今天大盘高开低走，上证微涨0.3%，但科创50跌了1.7%，整体偏震荡。 "
+            "让我拉一下实时数据给你看～", False))
+        # 合法短答不受影响（>10 字；<10 字的空判定是既有口径）
+        self.assertFalse(_finalize_body_is_junk("今日大盘收跌，上证跌0.89%。", False))
+        self.assertFalse(_finalize_body_is_junk("我查了，明天休市，不用等开盘。", False))
+
+    def test_emoji_tail_decoration_not_a_blind_spot(self):
+        """真实语料重放（2026-10-08 二次清查）：结尾装饰"～💋"击穿末句判定。
+
+        模型习惯在句尾加装饰，按标点切句后末段只剩 emoji——库里 4 条真实
+        碎片（含用户报过的"说了三遍"那条）在末句版下漏网，而旧的整文扫描版
+        反而能拦住。切句时丢弃纯装饰段后全部命中；数据型完整回答不受影响。"""
+        from agent.loop import _delivery_fragment_suspect, _looks_like_plan_only
+        # seq=21（10-07 事故原句，带真实结尾装饰）
+        self.assertTrue(_looks_like_plan_only(
+            "好的主人，欧娜这就帮你看看这三只票的情况～💋", True))
+        # seq=10/11（用户报的"说了三遍"那条的两份）
+        self.assertTrue(_looks_like_plan_only(
+            "好的主人，欧娜这就帮你把美股、港股的数据都拉出来，"
+            "再结合最新消息给你分析明天A股的走势～💋", True))
+        # seq=23（工具失败后"马上用 mx_query 帮你查"，94 字）
+        self.assertTrue(_looks_like_plan_only(
+            "哎呀主人别急嘛～刚才 **ak_finance 的东财接口抽风了**（连接被拒绝），"
+            "欧娜没及时切到备用工具，所以卡住了 😘 现在马上用 **mx_query** "
+            "帮你查这三只票的情况！💋", True))
+        self.assertEqual(_delivery_fragment_suspect(
+            "好的主人，欧娜这就帮你看看这三只票的情况～💋"), "tail-promise")
+        # 数据型完整回答 + 装饰结尾：不拦
+        self.assertFalse(_looks_like_plan_only("今日大盘收跌，上证跌0.89%。😢", True))
+        self.assertFalse(_looks_like_plan_only("我查了，明天休市。🍵", True))
+
+    def test_delivery_sentinel_flags_but_is_broader(self):
+        """交付哨兵：只观测不拦截，但要比闸门宽（240 字口径 + 承诺口语词）。"""
+        from agent.loop import _delivery_fragment_suspect
+        self.assertEqual(_delivery_fragment_suspect(
+            "今天大盘高开低走，上证微涨0.3%，但科创50跌了1.7%，整体偏震荡。 "
+            "让我拉一下实时数据给你看～"), "tail-promise")
+        # "这就/马上"同时属两类词表 → 记 tail-promise（标签取先命中者）
+        self.assertEqual(_delivery_fragment_suspect(
+            "好的主人，欧娜这就帮你看看这三只票的情况～"), "tail-promise")
+        # 纯承诺口语（无意图词形态）→ promise-phrase
+        self.assertEqual(_delivery_fragment_suspect(
+            "数据还在拉取中，稍等片刻～"), "promise-phrase")
+        # 干净正文不响：含数据信号的短答 / 过去式汇报 / 空 / 长正文
+        self.assertEqual(_delivery_fragment_suspect("今日大盘收跌，上证 -0.89%。"), "")
+        self.assertEqual(_delivery_fragment_suspect("我查了，明天休市。"), "")
+        self.assertEqual(_delivery_fragment_suspect(""), "")
+        self.assertEqual(_delivery_fragment_suspect(
+            "上证收跌0.89%，主力净流出214亿。" * 20), "")
