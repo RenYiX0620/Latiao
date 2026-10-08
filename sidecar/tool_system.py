@@ -38,7 +38,7 @@ DEFINITION = {
     "type": "function",
     "function": {
         "name": "read_file",
-        "description": "Read the contents of a file at the given path. Large files are truncated.",
+        "description": "Read the contents of a file at the given path. Large files are truncated. Do NOT read files via run_cmd (cat/head/tail) — this tool is faster, needs no confirmation and is recorded in history. When the path is unknown, locate it with search_files first.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -184,7 +184,7 @@ DEFINITION = {
     "type": "function",
     "function": {
         "name": "write_file",
-        "description": "Write text to a file (parent dirs created). Path ending in .docx creates a REAL Word document, .pdf creates a REAL PDF, .xlsx creates a REAL Excel workbook — all from Markdown (headings, lists, **bold**, | tables |) — use this for reports, do NOT write a .py generator script. ⚠️ Requires user confirmation.",
+        "description": "Write text to a file (parent dirs created). Path ending in .docx creates a REAL Word document, .pdf creates a REAL PDF, .xlsx creates a REAL Excel workbook — all from Markdown (headings, lists, **bold**, | tables |) — use this for reports, do NOT write a .py generator script. Do NOT create files via run_cmd (echo/printf with redirection) — always use this tool so the write is recorded and document formats work. ⚠️ Requires user confirmation.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -802,7 +802,7 @@ DEFINITION = {
     "type": "function",
     "function": {
         "name": "list_dir",
-        "description": "List the contents of a directory.",
+        "description": "List the contents of a directory. Do NOT list directories via run_cmd (ls) — this tool is faster and needs no confirmation.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -1168,7 +1168,7 @@ DEFINITION = {
     "type": "function",
     "function": {
         "name": "search_files",
-        "description": "Search for files matching a glob pattern in a directory.",
+        "description": "Search for files matching a glob pattern in a directory. Use this to locate files by name before read_file; do NOT use run_cmd (find/ls | grep) for file lookup.",
         "parameters": {
             "type": "object",
             "properties": {

@@ -8,7 +8,7 @@ DEFINITION = {
     "type": "function",
     "function": {
         "name": "list_dir",
-        "description": "List the contents of a directory.",
+        "description": "List the contents of a directory. Do NOT list directories via run_cmd (ls) — this tool is faster and needs no confirmation.",
         "parameters": {
             "type": "object",
             "properties": {

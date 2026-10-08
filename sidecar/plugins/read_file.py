@@ -20,7 +20,7 @@ DEFINITION = {
     "type": "function",
     "function": {
         "name": "read_file",
-        "description": "Read the contents of a file at the given path. Large files are truncated.",
+        "description": "Read the contents of a file at the given path. Large files are truncated. Do NOT read files via run_cmd (cat/head/tail) — this tool is faster, needs no confirmation and is recorded in history. When the path is unknown, locate it with search_files first.",
         "parameters": {
             "type": "object",
             "properties": {

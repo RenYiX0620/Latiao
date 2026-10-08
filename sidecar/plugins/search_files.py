@@ -9,7 +9,7 @@ DEFINITION = {
     "type": "function",
     "function": {
         "name": "search_files",
-        "description": "Search for files matching a glob pattern in a directory.",
+        "description": "Search for files matching a glob pattern in a directory. Use this to locate files by name before read_file; do NOT use run_cmd (find/ls | grep) for file lookup.",
         "parameters": {
             "type": "object",
             "properties": {

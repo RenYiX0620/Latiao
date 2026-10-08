@@ -15,7 +15,7 @@ DEFINITION = {
     "type": "function",
     "function": {
         "name": "write_file",
-        "description": "Write text to a file (parent dirs created). Path ending in .docx creates a REAL Word document, .pdf creates a REAL PDF, .xlsx creates a REAL Excel workbook — all from Markdown (headings, lists, **bold**, | tables |) — use this for reports, do NOT write a .py generator script. ⚠️ Requires user confirmation.",
+        "description": "Write text to a file (parent dirs created). Path ending in .docx creates a REAL Word document, .pdf creates a REAL PDF, .xlsx creates a REAL Excel workbook — all from Markdown (headings, lists, **bold**, | tables |) — use this for reports, do NOT write a .py generator script. Do NOT create files via run_cmd (echo/printf with redirection) — always use this tool so the write is recorded and document formats work. ⚠️ Requires user confirmation.",
         "parameters": {
             "type": "object",
             "properties": {
