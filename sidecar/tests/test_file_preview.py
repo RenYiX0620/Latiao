@@ -87,18 +87,31 @@ def test_find_soffice_env_override(tmp_path, monkeypatch):
 
 
 def test_office_to_pdf_cached(tmp_path, monkeypatch):
+    import subprocess
+
     import api_routes_media as m
+
     src = tmp_path / "a.docx"
     src.write_bytes(b"PK\x03\x04fake")
+    # 固定源文件 mtime：缓存键是 int(mtime)，别让用例靠"恰好没跨秒"的运气
+    os.utime(src, (1_700_000_000, 1_700_000_000))
     cache = tmp_path / "cache"
     monkeypatch.setattr(m, "_PDF_CACHE", cache)
     called = {"n": 0}
+    _real_run = subprocess.run
 
     def fake_run(cmd, **kw):
+        # subprocess.run 是**全局**打桩：后台线程（市场发现 / 语义预热 / 扩展更新
+        # worker）也可能打到它，把它们算进转换次数会让本用例在负载抖动时假红
+        # （2026-10-08 CI 实测：ubuntu 上偶发 n=2 而 out2==out1，烧掉一次发版门禁）。
+        # 只统计带本次源路径的调用；别人的命令交回真实现。
+        if not any(str(src) in str(c) for c in cmd):
+            return _real_run(cmd, **kw)
         called["n"] += 1
         # 模拟 soffice 输出 a.pdf
         cache.mkdir(parents=True, exist_ok=True)
         (cache / "a.pdf").write_bytes(b"%PDF-1.4 fake")
+
         class R:
             returncode = 0
             stderr = ""
