@@ -439,6 +439,14 @@ falsely abort a turn.
 
 ---
 
+## v0.3.70 — v0.3.70 — engine bump to b11487
+
+## Engine
+
+- **llama.cpp updated to b11486** (from b11474). This range is dominated by continued fixes on the newly merged architectures (including K2 Horizon) and general Metal/backend improvements — CI fetches the newest upstream build at package time.
+
+---
+
 ## 更早版本
 
 以下标题来自各自的发布提交（完整产物与发布时间见 GitHub Releases）：
