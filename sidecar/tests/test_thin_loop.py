@@ -593,6 +593,31 @@ class TestLoopGaps:
         for i in range(13, 19):
             assert not str(tool_msgs[f"c{i}"]).startswith(_FOLD_MARK), "最近 6 条必须原样"
 
+    def test_fold_data_shape_beats_tool_name(self):
+        """数据形态优先于工具名（2026-10-08，09-30 事故的回归）。
+
+        现场：模型自己 `read_file` 读回一份 mx_data_…_raw.json（10051 字符），
+        因**工具名是 read_file** 被判"可丢弃类"、折到 250 字 → 模型叙述成
+        "JSON 文件被截断了/工具坏了"，用户看到"辣条的工具是坏的"。
+        修法：JSON/表格/CSV 形状一律走保久档（晚折、留 900 字），不管工具名。"""
+        from agent.loop import _FOLD_MARK, _fold_old_tool_results
+        json_data = '{\n  "板块": "半导体",\n' + ',"列": [1234.5, 6789.0],\n' * 80 + "}\n"
+        assert len(json_data) > 1000
+        msgs = [{"role": "user", "content": "q"}]
+        msgs += self._call(1, "read_file", len(json_data), "r")   # 数据文件：须保久
+        msgs += self._call(2, "read_file", 1200, "t")             # 纯文本：照旧快折
+        for i in range(3, 20):
+            msgs += self._call(i, "read_file", 900, "z")
+        # 把 ① 的内容换成真 JSON（_call 只造填充文本，分档看的是内容形状）
+        for m in msgs:
+            if m.get("tool_call_id") == "c1":
+                m["content"] = json_data
+        _fold_old_tool_results(msgs, keep_recent=6)
+        tool_msgs = {m["tool_call_id"]: m["content"] for m in msgs if m.get("role") == "tool"}
+        assert not str(tool_msgs["c1"]).startswith(_FOLD_MARK), \
+            "JSON 数据文件（read_file 读回的）不该被当作文本折到 250 字"
+        assert str(tool_msgs["c2"]).startswith(_FOLD_MARK), "普通文本照旧快折"
+
     def test_fold_keeps_numeric_results_longer_than_reads(self):
         """同为 1200 字符、同样旧：读文件被折、行情类保持原样（数字要"更久"）。"""
         from agent.loop import _fold_old_tool_results, _FOLD_MARK

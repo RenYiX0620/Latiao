@@ -607,13 +607,50 @@ def _tool_name_by_call_id(msgs: list) -> dict:
     return out
 
 
-def _fold_params(tool_name: str) -> tuple[int, int]:
-    """(min_chars, head_chars) —— 按工具类别选折叠力度。"""
+def _fold_params(tool_name: str, text: str = "") -> tuple[int, int]:
+    """(min_chars, head_chars) —— 按**内容形状**优先，其次按工具类别分档。
+
+    2026-10-08：形状优先的起因（09-30 用户实测）——模型自己 `read_file` 读回
+    一份 `mx_data_…_raw.json`（10051 字符），因为**工具名是 read_file** 被判
+    "可丢弃类"、折到 250 字，模型读到的残数据让它叙述成"JSON 文件被截断了/
+    工具坏了"，用户看到的是"辣条的工具是坏的"。数据就是数据，不管它经哪个
+    工具回来的：JSON/表格/CSV 形态一律走保久档（晚折、多留 900 字）。
+    """
+    if _looks_like_data_result(text):
+        return _FOLD_MIN_KEEP, _FOLD_HEAD_KEEP
     if tool_name in _FOLD_FAST_TOOLS:
         return _FOLD_MIN_FAST, _FOLD_HEAD_FAST
     if tool_name in _FOLD_KEEP_TOOLS:
         return _FOLD_MIN_KEEP, _FOLD_HEAD_KEEP
     return _TOOL_FOLD_MIN_CHARS, _TOOL_FOLD_HEAD
+
+
+# 数据形态识别（按形状分档的判据）：JSON 开头 / Markdown 表格行或分隔行 / CSV 行。
+# 都要求**行首锚定**，避免正文里偶尔出现的竖线被误判成表格。
+_DATA_JSON_RE = re.compile(r"^\s*[\[{]")
+_DATA_TABLE_RE = re.compile(r"^\s*\|.*\|\s*$", re.M)
+_DATA_DELIM_RE = re.compile(r"^\s*\|?[\s:\-]*-{3,}[\s:|\-]*\|?\s*$", re.M)
+_DATA_CSV_RE = re.compile(r"^\s*[^\n,]{1,40}(,[^\n,]{1,40}){3,}\s*$", re.M)
+
+
+def _looks_like_data_result(text: str) -> bool:
+    """工具结果是否"像数据"（JSON / 表格 / CSV）——分档看形状，不看工具名。
+
+    恢复历史形态 `[工具结果] <工具名> <参数JSON>\\n<正文>` 要先剥掉前缀行再判：
+    否则那个 `[` 会被 `_DATA_JSON_RE` 当成 JSON 数组开头，把**每一条**恢复历史
+    都判成数据（实测：分档测试直接挂成"一条都不折"）。
+    """
+    t = text or ""
+    if t.startswith(_RESTORED_TOOL_PREFIX):
+        _, _, t = t.partition("\n")
+    t = t.lstrip()
+    if not t:
+        return False
+    if _DATA_JSON_RE.match(t):
+        return True
+    if _DATA_TABLE_RE.search(text) or _DATA_DELIM_RE.search(text):
+        return True
+    return bool(_DATA_CSV_RE.search(text))
 
 
 def _fold_old_tool_results(current_msgs: list,
@@ -652,11 +689,14 @@ def _fold_old_tool_results(current_msgs: list,
         # 工具名：本回合走 call_id→name 映射；恢复的历史从 `[工具结果] <name>` 前缀解析
         nm = (_names.get(str(m.get("tool_call_id") or ""), "")
               or _restored_tool_name(m))
-        _min, _head = _fold_params(nm)
+        # 分档看**内容形状**优先（数据形态 = 保久档），工具名只作兜底
+        _is_data = _looks_like_data_result(c)
+        _min, _head = _fold_params(nm, c)
         if min_chars != _TOOL_FOLD_MIN_CHARS:
             _min = min_chars        # 调用方显式指定（测试/一次性收紧）
-        # 保护窗：一般工具 = 最近 keep_recent 条；保久类更长（数字要"保持原样更久"）
-        _guard = keep_recent + (_FOLD_KEEP_EXTRA_RECENT if nm in _FOLD_KEEP_TOOLS else 0)
+        # 保护窗：一般工具 = 最近 keep_recent 条；保久类（含数据形态）更长
+        _guard = keep_recent + (_FOLD_KEEP_EXTRA_RECENT
+                                if (nm in _FOLD_KEEP_TOOLS or _is_data) else 0)
         if _pos >= _n_tools - _guard:
             continue
         if len(c) < _min:
