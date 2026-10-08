@@ -307,6 +307,55 @@ async def test_lang_drift_discards_and_retries_local():
 
 
 @pytest.mark.asyncio
+async def test_lang_drift_retry_also_drifted_still_delivers_content():
+    """两次都漂移时用户也不能看到空回复（2026-10-08 实测，mimo 云端）。
+
+    现场：用户问"sop是什么"，模型两次都首段漂移 → 早退路径截断生成 → 会话库里
+    content 是**空字符串**（thinking 有、正文没有），而 __result__ 仍带全文，
+    上游以为交付成功。既有用例只断言"不再重试第三次"，断言不到"用户看没看到"。
+
+    注意：必须把交付闸门换成直通——默认 scope 的 deliver 插件会把正文当"语言
+    替换"再发一遍，把"流式层一个字没发"这个事实盖住（生产那轮 handled=False
+    events=0，没有这层兜底，所以是真空白）。"""
+    import local_llm
+    from agent.loop import ThinAgentLoop
+    from tests.test_loop_scenarios import _StubEngine
+    with FakeEngine() as engine:
+        engine.push(engine.text_response(_DRIFT_EN))
+        engine.push(engine.text_response(_DRIFT_EN))
+        old = local_llm._engine
+        local_llm._engine = _StubEngine()
+        loop = ThinAgentLoop(
+            MESSAGES, "fake-model", engine.url, HEADERS,
+            session_id=f"thin-drift3-{time.time()}", access_mode="full")
+
+        async def _passthrough(name, payload):
+            return payload
+        loop.scope.run_waterfall = _passthrough
+        try:
+            events = await _collect(loop.run())
+        finally:
+            local_llm._engine = old
+    streamed = "".join(str(e.get("content", "")) for e in events if isinstance(e, dict))
+    assert "I crawl back onto all fours" in streamed, \
+        "两次都漂移时缓冲内容必须补发——否则用户看到的是空回复"
+
+
+def test_lang_drift_ignores_english_term_preamble():
+    """中文回答以英文术语展开开头，不算漂移（2026-10-08 误杀实测）。
+
+    用户问"sop是什么"，正常的中文回答以 `**SOP = Standard Operating Procedure**`
+    （标准作业程序）开头：30 字窗口里一个汉字都没有 → 旧判据整轮丢弃。窗口放到
+    60 字后首个汉字通常已在样本里，比例判据自然放行；整段英文的真漂移不受影响。"""
+    from agent.loop import _LANG_DRIFT_MIN_CHARS, _looks_like_lang_drift
+    body = ("**SOP = Standard Operating Procedure**（标准作业程序）是把你每天重复做的事"
+            "写成一份谁都照着能做的步骤清单，这样新人也能照着交付。")
+    sample = body[:_LANG_DRIFT_MIN_CHARS]
+    assert not _looks_like_lang_drift(sample, "zh"), f"术语开头被误杀: {sample!r}"
+    assert _looks_like_lang_drift(_DRIFT_EN[:_LANG_DRIFT_MIN_CHARS], "zh"), "真漂移仍要判"
+
+
+@pytest.mark.asyncio
 async def test_lang_drift_retries_only_once_local():
     """重试仍漂移 → 不再重试（只一次），照常交付交给交付闸门翻译。"""
     import local_llm
