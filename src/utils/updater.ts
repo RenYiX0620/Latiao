@@ -77,8 +77,16 @@ export async function checkForUpdates(
   onStatus: (key: string, params?: Record<string, string | number>) => void,
   interactive = true,
 ): Promise<UpdateCheckResult> {
+  // 静默检查（启动时自动跑）只允许"更新包真的准备好了"这一条提示落地，进度与
+  // 失败一律不弹。原因（2026-10-08 实测）：启动那一两秒侧车还没监听端口，本地
+  // 清单端点必然取不到 → check() 抛错 → 旧实现无条件 onStatus("update.failed")
+  // → 每次启动都闪一条"更新失败：…"（toast 2.2s，一闪而过，用户以为出事了）。
+  // 同族：UsageStatsView 的"挂载即拉数撞侧车启动竞态"。
+  const say = (key: string, params?: Record<string, string | number>) => {
+    if (interactive || key === "update.prepared") onStatus(key, params);
+  };
   try {
-    onStatus("update.checking");
+    say("update.checking");
     const version = await getAppVersion();
     const waitMs = interactive ? 60 * 60 * 1000 : 90 * 1000;
     let outcome: "done" | "failed" | "up_to_date" | "idle" | null = null;
@@ -92,7 +100,7 @@ export async function checkForUpdates(
         return "none";
       }
       if (outcome === "done") {
-        onStatus("update.verifying");
+        say("update.verifying");
       }
       // failed / null → 落到下方 tauri updater 兜底
     }
@@ -102,13 +110,13 @@ export async function checkForUpdates(
     if (!update) {
       if (prepared && outcome === null) {
         // sidecar 掉线回退：endpoint 仍指向 sidecar → 清单不可得
-        onStatus("update.unavailable");
+        say("update.unavailable");
         return "error";
       }
       if (interactive) onStatus("update.uptodate");
       return "none";
     }
-    onStatus("update.found", { version: update.version });
+    say("update.found", { version: update.version });
     // 静默预下载模式只下不装：启动时自动安装并重启会在用户正聊天时
     // 强制退出（审计 P1）。下载安装/重启仅限用户显式点「检查更新」。
     if (!interactive) {
@@ -169,7 +177,7 @@ export async function checkForUpdates(
     return "none";
   } catch (e) {
     const msg = String((e as { message?: string })?.message ?? e ?? "").slice(0, 120);
-    onStatus("update.failed", { msg: msg || "" });
+    say("update.failed", { msg: msg || "" });
     return "error";
   }
 }
