@@ -52,6 +52,9 @@ jobs:
       - name: pytest（从仓库根跑，与本地一致：sidecar/pytest.ini 固定 rootdir）
         run: python -m pytest sidecar/tests -q
 
+      - name: "承诺碎片回归集（真实语料重放）"
+        run: python scripts/replay_fragments.py
+
   frontend:
     name: Frontend — tsc + vitest + eslint
     runs-on: ubuntu-latest
