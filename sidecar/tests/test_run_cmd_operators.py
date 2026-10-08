@@ -15,12 +15,15 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 os.environ.setdefault("LATIAO_AUTH_TOKEN", "runop-token")
 
-# fd 前缀重定向：没有等价实现，必须整条拒绝（不能只剥 `>`）
+# fd 前缀重定向：**写文件**或**不在尾部**的形态没有等价实现，必须整条拒绝
+# （不能只剥 `>`）。注意 2026-10-08 起，尾部的 `2>&1` / `2>/dev/null` 例外——
+# 它们有精确等价（stderr=STDOUT / DEVNULL），见下面 test_tail_stderr_redirect_*。
 FD_FORMS = [
-    "grep -rl x /tmp 2>/dev/null",
     "grep -rl x /tmp 1>/tmp/o",
     "grep -rl x /tmp 2>>/tmp/e",
     "grep -rl x /tmp &>/tmp/o",
+    "grep -rl x /tmp 2>/tmp/e",
+    "grep -rl x /tmp 2>/dev/null foo",
 ]
 
 
@@ -31,12 +34,46 @@ def test_fd_redirect_is_not_silently_reparsed():
         assert find_unsupported_shell_op(cmd) == ">", f"应当按 '>' 拒绝: {cmd}"
 
 
-def test_fd_redirect_rejected_by_plugin_not_misexecuted(tmp_path):
+def test_fd_redirect_to_file_rejected_by_plugin_not_misexecuted(tmp_path):
     import plugins.run_cmd as rc
-    out = rc.execute({"cmd": f"grep -rl x {tmp_path} 2>/dev/null"})
+    out = rc.execute({"cmd": f"grep -rl x {tmp_path} 2>/tmp/e"})
     assert "不支持 shell 操作符" in out
     # 关键：不能出现"已写入 …（N 字符）"这种静默错执行的痕迹
     assert "已写入" not in out
+
+
+def test_tail_stderr_redirect_supported():
+    """尾部 `2>&1` / `2>/dev/null` 改为受支持（2026-10-08 用户实测）。
+
+    这两个有**精确等价**（stderr=STDOUT / DEVNULL），不像 `&&` 无法翻译；而
+    模型习惯性写这两句——同一条命令连撞三次被挡，白耗轮次。"""
+    from cmd_safety import find_unsupported_shell_op, split_stderr_redirect
+    assert split_stderr_redirect("grep -rl x /tmp 2>/dev/null") == ("grep -rl x /tmp", "discard")
+    assert split_stderr_redirect("grep -rl x /tmp 2>&1") == ("grep -rl x /tmp", "merge")
+    assert split_stderr_redirect("grep -rl x /tmp 2> /dev/null") == ("grep -rl x /tmp", "discard")
+    assert split_stderr_redirect("grep -rl x /tmp 2>NUL") == ("grep -rl x /tmp", "discard")
+    assert split_stderr_redirect("grep -rl x /tmp") == ("grep -rl x /tmp", "")
+    # 连续两个 → 取最后生效（2>&1 2>/dev/null 等价于丢弃）
+    assert split_stderr_redirect("grep x 2>&1 2>/dev/null") == ("grep x", "discard")
+    for cmd in ("grep -rl x /tmp 2>/dev/null", "grep -rl x /tmp 2>&1",
+                "head f 2>&1 | grep x", "head f | grep x 2>/dev/null"):
+        assert find_unsupported_shell_op(cmd) is None, f"应当放行: {cmd}"
+    # 引号内的不算重定向（是脚本内容）
+    assert find_unsupported_shell_op('echo "2>&1"') is None
+
+
+def test_stderr_discard_actually_drops_stderr():
+    import plugins.run_cmd as rc
+    out = rc.execute({"cmd": "ls /definitely-not-here-latiao 2>/dev/null"})
+    assert "不支持 shell 操作符" not in out, out
+    assert "definitely-not-here-latiao" not in out, "错误信息应被丢弃"
+
+
+def test_stderr_merge_shows_stderr():
+    import plugins.run_cmd as rc
+    out = rc.execute({"cmd": "ls /definitely-not-here-latiao 2>&1"})
+    assert "不支持 shell 操作符" not in out, out
+    assert "definitely-not-here-latiao" in out, "错误信息应并入输出"
 
 
 def test_supported_forms_still_pass():

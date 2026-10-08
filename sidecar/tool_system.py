@@ -861,6 +861,7 @@ from cmd_safety import (
     OBFUSCATION_PATTERNS,
     SAFE_CMD_RE,
     check_cmd_with_script,
+    stderr_target,
 )
 
 # 保留旧名字导出：test_security 等引用这些名字
@@ -875,11 +876,11 @@ DEFINITION = {
     "type": "function",
     "function": {
         "name": "run_cmd",
-        "description": "Run ONE single command and return its output (no shell). ⚠️ Requires user confirmation. Destructive commands are always blocked. Do NOT use shell operators like && | ; > < — they are not supported; call this tool once per command instead.",
+        "description": "Run ONE single command and return its output (no shell). ⚠️ Requires user confirmation. Destructive commands are always blocked. No shell operators (&& || ; <) — call this tool once per command instead. Supported: a single pipe `A | B`, trailing `> file` / `>> file`, trailing `2>&1` (merge stderr into output) or `2>/dev/null` (drop stderr).",
         "parameters": {
             "type": "object",
             "properties": {
-                "cmd": {"type": "string", "description": "A single command with arguments, e.g. 'python3 -m pytest -v'. No shell operators (&& | ; >)."}
+                "cmd": {"type": "string", "description": "A single command with arguments, e.g. 'python3 -m pytest -v'. No shell operators (&& || ; <); one pipe or a trailing redirect is allowed."}
             },
             "required": ["cmd"]
         }
@@ -903,11 +904,14 @@ def _reject_shell_operators(cmd: str) -> str | None:
 def _run_pipeline(left: str, right: str, timeout: int) -> str:
     import shlex as _shlex
     import subprocess as _sp
-    from cmd_safety import child_env
-    p1 = _sp.Popen(_shlex.split(left), shell=False, stdout=_sp.PIPE, stderr=_sp.PIPE,
-                   text=True, env=child_env())
+    from cmd_safety import child_env, split_stderr_redirect, stderr_target
+    # 管道两侧各自的 stderr 重定向（`A 2>&1 | grep x` / `A | B 2>/dev/null`）
+    left, _lm = split_stderr_redirect(left)
+    right, _rm = split_stderr_redirect(right)
+    p1 = _sp.Popen(_shlex.split(left), shell=False, stdout=_sp.PIPE,
+                   stderr=stderr_target(_lm), text=True, env=child_env())
     p2 = _sp.Popen(_shlex.split(right), shell=False, stdin=p1.stdout, stdout=_sp.PIPE,
-                   stderr=_sp.PIPE, text=True, env=child_env())
+                   stderr=stderr_target(_rm), text=True, env=child_env())
     if p1.stdout:
         p1.stdout.close()
     try:
@@ -934,6 +938,15 @@ def execute(args: dict) -> str:
         return rejected
 
 
+
+    # 尾部 stderr 重定向（2>&1 / 2>/dev/null）：有精确等价，剥离并记模式
+    # （2026-10-08：模型习惯写这两句，此前一律拒绝、白耗轮次）
+    _stderr_mode = ""
+    try:
+        from cmd_safety import split_stderr_redirect
+        cmd, _stderr_mode = split_stderr_redirect(cmd)
+    except Exception:
+        _stderr_mode = ""
 
     # 单管道：Popen A | B（shell=False 两侧各自 exec）
     _pipe = None
@@ -962,12 +975,14 @@ def execute(args: dict) -> str:
         if denied:
             return denied
         try:
-            r = subprocess.run(shlex.split(cmd), shell=False, capture_output=True, text=True, env=child_env(), timeout=10)
+            r = subprocess.run(shlex.split(cmd), shell=False, stdout=subprocess.PIPE,
+                               stderr=stderr_target(_stderr_mode), text=True,
+                               env=child_env(), timeout=10)
             if _redir:
                 with open(_target, "a" if _append else "w", encoding="utf-8") as _f:
                     _f.write(r.stdout or "")
-                return f"已写入 {_target}（{len(r.stdout or '')} 字符）" + (f"\n{r.stderr.strip()}" if r.stderr.strip() else "")
-            return r.stdout.strip() or r.stderr.strip() or "(无输出)"
+                return f"已写入 {_target}（{len(r.stdout or '')} 字符）" + (f"\n{(r.stderr or '').strip()}" if (r.stderr or "").strip() else "")
+            return r.stdout.strip() or (r.stderr or "").strip() or "(无输出)"
         except subprocess.TimeoutExpired:
             return f"超时: {cmd}"
         except Exception as e:
@@ -987,19 +1002,21 @@ def execute(args: dict) -> str:
         return _run_pipeline(_pipe[0], _pipe[1], 300)
     # 30s 会截断 npm install/构建类长任务——放宽到 300s（P2-15）
     try:
-        r = subprocess.run(shlex.split(cmd), shell=False, capture_output=True, text=True, env=child_env(), timeout=300)
+        r = subprocess.run(shlex.split(cmd), shell=False, stdout=subprocess.PIPE,
+                           stderr=stderr_target(_stderr_mode), text=True,
+                           env=child_env(), timeout=300)
         out = r.stdout.strip()
         if r.returncode != 0:
             out += f"\n(退出码: {r.returncode})"
-            if r.stderr.strip():
-                out += f"\n{r.stderr.strip()}"
+            if (r.stderr or "").strip():
+                out += f"\n{(r.stderr or '').strip()}"
         if _redir:
             body = r.stdout or ""
             with open(_target, "a" if _append else "w", encoding="utf-8") as _f:
                 _f.write(body)
             return (f"已写入 {_target}（{len(body)} 字符）"
                     + (f"\n退出码: {r.returncode}" if r.returncode else "")
-                    + (f"\n{r.stderr.strip()}" if r.stderr and r.stderr.strip() else ""))
+                    + (f"\n{(r.stderr or '').strip()}" if (r.stderr or "").strip() else ""))
         return out or "(无输出)"
     except subprocess.TimeoutExpired:
         return (f"超时: 命令已运行 5 分钟被截断。长任务请拆分为多步执行，"

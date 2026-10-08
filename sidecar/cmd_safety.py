@@ -319,7 +319,8 @@ _SHELL_OPS = ("&&", "||", "$(", ";", "|", ">", "<")
 def shell_op_error(op: str) -> str:
     return (
         f"⛔ 不支持 shell 操作符 '{op}'：本工具以 shell=False 直接执行。\n"
-        f"已支持：尾部 `> 文件`、单管道 `A | B`（如 head f | grep x）。\n"
+        f"已支持：尾部 `> 文件`、尾部 `2>&1` / `2>/dev/null`、单管道 `A | B`"
+        f"（如 head f | grep x）。\n"
         f"仍不支持：`&&` `;` `||` `$()` `<`。复合命令请拆成多次调用。\n"
         f"读文件建议直接用 read_file，不必 head/cat。"
     )
@@ -418,20 +419,94 @@ def split_stdout_redirect(cmd: str) -> tuple[str, str, bool] | None:
     return head, target, op == ">>"
 
 
+def _strip_one_stderr_tail(cmd: str) -> tuple[str, str]:
+    """剥离**一个**尾部 stderr 重定向 → (命令体, "merge"|"discard"|"")。
+
+    只认 split_stderr_redirect 说明里的两种等价形态；其它一律返回 ("", "")。
+    """
+    in_single = in_double = False
+    pos = -1
+    i, n = 0, len(cmd)
+    while i < n:
+        c = cmd[i]
+        if c == "\\" and in_double and i + 1 < n:
+            i += 2
+            continue
+        if c == "'" and not in_double:
+            in_single = not in_single
+        elif c == '"' and not in_single:
+            in_double = not in_double
+        elif not (in_single or in_double) and cmd.startswith("2>", i):
+            # 与 stdout 重定向同款位置判定：必须是独立 token（行首或前面是空白），
+            # 否则 `…x2>&1` 这种粘连形态会被错剥。只在操作符位置判前缀——写成
+            # 对每个位置判会误伤路径（`…/00000gn/`，09-24 实测）。
+            if i == 0 or cmd[i - 1].isspace():
+                pos = i
+        i += 1
+    if pos < 0:
+        return cmd, ""
+    rest = cmd[pos + 2:].strip()
+    if rest == "&1":
+        mode = "merge"
+    elif rest.lower() in ("/dev/null", "nul"):
+        mode = "discard"
+    else:
+        return cmd, ""
+    head = cmd[:pos].rstrip()
+    if not head:
+        return cmd, ""
+    return head, mode
+
+
+def split_stderr_redirect(cmd: str) -> tuple[str, str]:
+    """剥离**尾部** stderr 重定向（可连续多个）→ (命令体, 最后生效的模式)。
+
+    模式：`2>&1` → "merge"（错误信息并入正常输出）；`2>/dev/null`（Windows 写法
+    `2>nul`）→ "discard"（丢弃错误信息）；"" = 没有。
+
+    为什么从"一律拒绝"改为支持（2026-10-08 用户实测）：这两个有**精确等价**——
+    `stderr=STDOUT` / `stderr=DEVNULL`，不像 `&&` 那样无法翻译；而模型习惯性写
+    这两句（同一条命令被挡了三次，白耗轮次）。**其它 fd 形态继续拒绝**：
+    `2> 文件`、`1>`、`2>>`、`&>` 会写到用户路径且无法等价，硬剥会把数字/& 留在
+    命令里（2026-09-24 静默错执行事故）。
+    """
+    mode = ""
+    body = cmd
+    while True:
+        # 从**右往左**剥（_strip_one_stderr_tail 取最后一个 token）——shell 里
+        # 后写的生效，所以第一次剥到的模式就是最终模式，不能被更早的覆盖
+        # （`… 2>&1 2>/dev/null` 等价于丢弃，实测反了才发现）。
+        new, m = _strip_one_stderr_tail(body)
+        if not m:
+            return body, mode
+        body = new
+        if not mode:
+            mode = m
+
+
+def stderr_target(mode: str):
+    """stderr 模式 → subprocess 的 stderr 目标（两条执行路径共用一份定义）。"""
+    import subprocess
+    return {"merge": subprocess.STDOUT,
+            "discard": subprocess.DEVNULL}.get(mode, subprocess.PIPE)
+
+
 def unsupported_op_message(op: str) -> str:
     """不支持的操作符统一文案（插件 / fallback / 内嵌 seed 共用一份）。
 
     此前两份实现的说法互相矛盾：插件写"重定向和管道都不支持"，fallback 写
     "尾部 `> 文件` 已支持"——同一个工具、两条路径给模型的指引不同（2026-09-24
-    用户实测撞上）。实际支持面：末尾 `> 文件` / `>> 文件`、单管道 `A | B`、
-    引号内的 ; | >；其余一律拒绝。
+    用户实测撞上）。实际支持面：末尾 `> 文件` / `>> 文件`、末尾 `2>&1` /
+    `2>/dev/null`（错误信息并入/丢弃）、单管道 `A | B`、引号内的 ; | >；
+    其余一律拒绝。
     """
     return (
         f"⛔ 不支持 shell 操作符 '{op}'：本工具以 shell=False 直接执行，"
         f"无法解释 {op}，否则会把它当参数传给程序（静默失败）。\n"
-        "已支持：末尾 `> 文件` / `>> 文件`、单管道 `A | B`、引号内的 ; | > 。\n"
-        "不支持：`2>&1`、`2>/dev/null` 等 fd 重定向、`&&`、`||`、`;`、`<`、多管道。\n"
-        "请拆成多次调用，每次只运行一条命令；需要看错误信息时让命令直接打印到 stdout。"
+        "已支持：末尾 `> 文件` / `>> 文件`、末尾 `2>&1`（错误并入输出）/ "
+        "`2>/dev/null`（丢弃错误）、单管道 `A | B`、引号内的 ; | > 。\n"
+        "不支持：`&&`、`||`、`;`、`<`、多管道、`2> 文件`（写文件的 fd 重定向）。\n"
+        "请拆成多次调用，每次只运行一条命令；需要看错误信息时用 `2>&1`。"
     )
 
 
@@ -441,20 +516,24 @@ def find_unsupported_shell_op(cmd: str) -> str | None:
     shell=False 不解释引号内的元字符——`python3 -c "a; b"` 里的 `;` 是
     Python 语句分隔符，拦它属于误杀。
     """
-    # 尾部安全重定向（> file）与单管道（A | B）有等价实现，不在此拒
+    # 尾部有等价实现的形态先剥离，再对残余扫描：stderr 重定向（2>&1 / 2>/dev/null）、
+    # stdout 重定向（> file）、单管道（A | B，两侧各自递归）
     body = cmd
     try:
-        sp = split_stdout_redirect(cmd)
+        body, _mode = split_stderr_redirect(body)
+        sp = split_stdout_redirect(body)
         if sp:
             body = sp[0]
-        elif split_pipeline(cmd):
-            # 管道两侧再各查一次（嵌套的 ; && 等）
-            left, right = split_pipeline(cmd)  # type: ignore
-            for side in (left, right):
-                bad = find_unsupported_shell_op(side)
-                if bad and bad != "|":
-                    return bad
-            return None
+        else:
+            _pl = split_pipeline(body)
+            if _pl:
+                # 管道两侧再各查一次（嵌套的 ; && 等）
+                left, right = _pl
+                for side in (left, right):
+                    bad = find_unsupported_shell_op(side)
+                    if bad and bad != "|":
+                        return bad
+                return None
     except Exception:
         body = cmd
     in_single = in_double = False

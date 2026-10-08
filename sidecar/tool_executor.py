@@ -62,8 +62,12 @@ class CommandCancelled(Exception):
     """命令因用户停止（会话取消）被终止——由 run_cmd 转成可读结果。"""
 
 
-def _run_cancellable(tokens: list, timeout: float) -> subprocess.CompletedProcess:
+def _run_cancellable(tokens: list, timeout: float,
+                     stderr=subprocess.PIPE) -> subprocess.CompletedProcess:
     """subprocess.run(capture_output=True, text=True, timeout=…) 的可取消版。
+
+    stderr：命令自带 stderr 重定向时传入目标（`2>&1` → STDOUT、`2>/dev/null`
+    → DEVNULL，由 cmd_safety.split_stderr_redirect 解析），默认单独捕获。
 
     等待期间每 0.5s 轮询一次会话取消标记：用户按停止 → 杀进程组并抛
     CommandCancelled（此前命令会一直跑到自己的 300s 超时）。超时语义不变
@@ -73,7 +77,7 @@ def _run_cancellable(tokens: list, timeout: float) -> subprocess.CompletedProces
     if os.name == "posix":
         _kwargs["start_new_session"] = True     # 独立进程组：杀树时子进程一起收
     proc = subprocess.Popen(tokens, shell=False, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, text=True,
+                            stderr=stderr, text=True,
                             env=child_env(), **_kwargs)
     deadline = time.monotonic() + max(1.0, float(timeout))
     while True:
@@ -287,11 +291,14 @@ def list_dir(path: str) -> str:
 def _run_pipeline(left: str, right: str, timeout: int) -> str:
     import shlex as _shlex
     import subprocess as _sp
-    from cmd_safety import child_env
-    p1 = _sp.Popen(_shlex.split(left), shell=False, stdout=_sp.PIPE, stderr=_sp.PIPE,
-                   text=True, env=child_env())
+    from cmd_safety import child_env, split_stderr_redirect, stderr_target
+    # 管道两侧各自的 stderr 重定向（`A 2>&1 | grep x` / `A | B 2>/dev/null`）
+    left, _lm = split_stderr_redirect(left)
+    right, _rm = split_stderr_redirect(right)
+    p1 = _sp.Popen(_shlex.split(left), shell=False, stdout=_sp.PIPE,
+                   stderr=stderr_target(_lm), text=True, env=child_env())
     p2 = _sp.Popen(_shlex.split(right), shell=False, stdin=p1.stdout, stdout=_sp.PIPE,
-                   stderr=_sp.PIPE, text=True, env=child_env())
+                   stderr=stderr_target(_rm), text=True, env=child_env())
     if p1.stdout:
         p1.stdout.close()
     # 等待期间响应停止键（与 _run_cancellable 同款轮询）；超时语义不变
@@ -325,17 +332,17 @@ def run_cmd(cmd: str) -> str:
         return "错误：命令为空（可能只包含注释行）"
     # 引号外的 shell 操作符才拦（引号内是脚本内容，shell=False 不会解释）
     from cmd_safety import (
-        find_unsupported_shell_op, split_pipeline, split_stdout_redirect,
-        unsupported_op_message,
+        find_unsupported_shell_op, split_pipeline, split_stderr_redirect,
+        split_stdout_redirect, stderr_target, unsupported_op_message,
     )
+    # 尾部 stderr 重定向（2>&1 / 2>/dev/null）：有精确等价，先剥离并记模式
+    _stderr_mode = ""
+    cmd, _stderr_mode = split_stderr_redirect(cmd)
     _redir = split_stdout_redirect(cmd)
     if _redir:
         cmd, _target, _append = _redir
     _pipe = None if _redir else split_pipeline(cmd)
-    if _pipe:
-        op = find_unsupported_shell_op(cmd)  # 两侧已查
-    else:
-        op = find_unsupported_shell_op(cmd)
+    op = find_unsupported_shell_op(cmd)
     if op:
         return unsupported_op_message(op)
     # 统一安全检查（cmd_safety 单点定义——插件/fallback/seed 共用，含脚本内容审查）
@@ -365,14 +372,15 @@ def run_cmd(cmd: str) -> str:
             # ④ 兜底执行器同样过白名单：命令由模型给出，子进程不该拿到
             # sidecar token 与云模型密钥（审查时靠 test_spawn_env_guard 抓到）；
             # _run_cancellable 内部即 env=child_env()，并在等待中响应停止键。
-            r = _run_cancellable(tokens, timeout=300)
+            r = _run_cancellable(tokens, timeout=300,
+                                 stderr=stderr_target(_stderr_mode))
         except CommandCancelled:
             return "⏹ 已停止：命令被用户中断（进程已终止）"
         out = r.stdout.strip()
         if r.returncode != 0:
             out += f"\n(退出码: {r.returncode})"
-            if r.stderr.strip():
-                out += f"\n{r.stderr.strip()}"
+            if (r.stderr or "").strip():
+                out += f"\n{(r.stderr or '').strip()}"
         if _redir:
             body = r.stdout or ""
             with open(_target, "a" if _append else "w", encoding="utf-8") as _f:
