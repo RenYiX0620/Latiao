@@ -379,6 +379,9 @@ _PLAN_TAIL_SPLIT_RE = re.compile(r"[。～~！!？?\n]+")
 # 不是在承诺）。
 _PLAN_DO_RE = re.compile(r"[\u4e00-\u9fff]{1,3}(?:一下|一遍|一趟)")
 _PLAN_DO_STOP = ("知道", "告诉", "说一声", "提醒")
+# 空转闸门的催促额度（2026-10-08：1 次实测不够——模型换个说法继续承诺；两次
+# 仍不改则强制收口作答，两档都留日志便于计数哪种情形多）
+_PLAN_NUDGE_MAX = 2
 # 装饰段识别：不含任何文字/数字（\w 含 CJK）的段 = 结尾 emoji/星号/波浪线之类
 _WORDISH_RE = re.compile(r"\w")
 
@@ -2257,14 +2260,31 @@ class ThinAgentLoop:
                                f"工具调用={len(tool_calls)}")
 
                 if (not tool_calls and not self._finalize_round
-                        and not self._plan_nudge_used
-                        and _looks_like_plan_only(body_text, bool(self._active_tools()))):
+                        and _looks_like_plan_only(body_text, bool(self._active_tools()))
+                        and self._plan_nudge_used < _PLAN_NUDGE_MAX):
                     # 空转闸门：只说了"我来/先调取"就收尾 → 要求真正行动或给出完整
-                    # 答案（每 turn 一次，避免与"确实没工具可用"的场景互相顶住）
+                    # 答案（原为每 turn 一次；2026-10-08 16:13 实测催一次不够——
+                    # 模型在 99% 缓存下 2.4s 又输出一句更具体的承诺，于是被当终答
+                    # 交付。改为最多催两次，仍不改则强制收口，见下一段）
                     self._plan_nudge_used += 1
                     self.current_msgs.append(_note_msg(_msg("plan_nudge", self.user_lang)))
-                    self._step_log("空转闸门", "只有计划声明、无工具调用 → 要求直接行动（一次）")
+                    self._step_log("空转闸门",
+                                   f"只有计划声明、无工具调用 → 要求直接行动"
+                                   f"（{self._plan_nudge_used}/{_PLAN_NUDGE_MAX}）")
                     yield {"event": "heartbeat"}
+                    continue
+                if (not tool_calls and not self._finalize_round
+                        and _looks_like_plan_only(body_text, bool(self._active_tools()))):
+                    # 空转闸门升级档：催促额度用尽仍是承诺 → 不给承诺留交付口，
+                    # 转收口轮"基于已有数据直接作答"。用确定性收尾替代再赌一轮——
+                    # 收口轮自带 junk→重采→数据兜底链（_finalize_body_is_junk），
+                    # 最差也只是"数据+如实说明"，不会再是一句轻飘飘的计划。
+                    self._finalize_round = True
+                    if self.steps >= self.max_steps:
+                        self.steps = self.max_steps - 1
+                    self._step_log("空转闸门",
+                                   f"催促 {self._plan_nudge_used} 次后仍是承诺 → "
+                                   f"强制收口，基于已有数据作答")
                     continue
                 if (not tool_calls and not self._finalize_round
                         and self._last_round_tool_failed

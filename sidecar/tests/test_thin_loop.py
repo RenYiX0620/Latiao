@@ -841,6 +841,47 @@ async def test_tool_failure_promise_fragment_gets_nudged():
     assert not texts.rstrip().endswith("💋"), texts[-200:]
 
 
+@pytest.mark.asyncio
+async def test_repeat_promise_after_nudge_forces_finalize():
+    """催促后仍只承诺 → 强制收口作答（2026-10-08 16:13 实测回归）。
+
+    现场：空转闸门催了一次（日志有"空转闸门"行），模型 2.4s（99% 缓存）后
+    又输出一句更具体的承诺（"让我再搜一下几个头部平台（Temu/Shein/TikTok
+    Shop）的最新动态～"42 字）→ 催促额度已用尽 → 当终答交付，用户又看到
+    "断了"。修复：额度提到 2 次，第三次仍是承诺 → _finalize_round=True 转
+    收口轮，基于已有数据作答（该轮自带 junk→重采→数据兜底链）。
+    """
+    import time as _t
+
+    import local_llm
+    from agent.loop import ThinAgentLoop
+    from tests.test_loop_scenarios import _StubEngine
+
+    with FakeEngine() as engine:
+        engine.push(engine.text_response("让我先查一下今天的最新行情数据～"))
+        engine.push(engine.text_response(
+            "让我再搜一下几个头部平台（Temu/Shein/TikTok Shop）的最新动态～"))
+        engine.push(engine.text_response("让我换个来源再核对一下这些数字～"))
+        # 收口轮：必须给出正文
+        engine.push(engine.text_response(NEUTRAL_TEXT))
+        old = local_llm._engine
+        local_llm._engine = _StubEngine()
+        try:
+            events = await _collect(ThinAgentLoop(
+                MESSAGES, "fake-model", engine.url, HEADERS,
+                session_id=f"thin-esc-{_t.time()}", access_mode="full").run())
+        finally:
+            local_llm._engine = old
+
+    texts = "".join(str(e.get("content", "")) for e in events if isinstance(e, dict))
+    # 第三次承诺之后必须转收口轮（请求里出现收口指令），而不是把它当终答交付
+    assert len(engine.requests) >= 4, f"应继续跑（催 2 次+收口轮），实际请求数 {len(engine.requests)}"
+    last = json.dumps(engine.requests[-1], ensure_ascii=False)
+    assert "收尾：数据已足够" in last, "最后一次请求应是收口轮（尾部带收口指令）"
+    assert "根据刚才的目录输出" in texts, "收口轮应交付完整回答"
+    assert not texts.rstrip().endswith("～"), texts[-200:]
+
+
 def test_promise_regex_matches_incident_fragments():
     """事故里的两句承诺语必须命中 _PROMISE_RE（正则即回归）。"""
     from agent.loop import _PROMISE_RE, _DATA_SIGNAL_RE
