@@ -1537,6 +1537,28 @@ class TestPlanOnlyGateTailRewrite(unittest.TestCase):
         self.assertFalse(_looks_like_plan_only("今日大盘收跌，上证跌0.89%。😢", True))
         self.assertFalse(_looks_like_plan_only("我查了，明天休市。🍵", True))
 
+    def test_dig_verb_and_do_form_catch_new_variant(self):
+        """10-08 三号现场："让我再深挖一下那份"研报引发的暴跌"的具体内容～"。
+
+        24 字、思考 545 字后只发这一句承诺；动词表没有"挖"，闸门/收口/哨兵三道
+        全漏（生产日志实测：闸门 False、收口 False、哨兵 ""，正文被交付=用户
+        又看到"停了"）。修法：动词表加"挖/扒/捋/梳理"+ 结构兜底"意图词 + 汉字
+        动词 + 一下/一遍/一趟"。两条边界必须保住。"""
+        from agent.loop import _delivery_fragment_suspect, _looks_like_plan_only
+        # 现场原句（动词表外的新动词）
+        self.assertTrue(_looks_like_plan_only(
+            '让我再深挖一下那份"研报引发的暴跌"的具体内容～', True))
+        # 动词表外的动作，靠结构兜底命中
+        self.assertTrue(_looks_like_plan_only("让我核对一下这三只票的资金流向～💋", True))
+        # 边界①：对**用户**的请求（不是模型自己要做事）→ 不算承诺
+        self.assertFalse(_looks_like_plan_only("有结果让我知道一下。", True))
+        # 边界②：带数据信号的汇报式短答（说"总结一下"但正文有数据）→ 放行
+        self.assertFalse(_looks_like_plan_only(
+            "让我总结一下今天的情况：上证收跌0.89%，主力净流出214亿。", True))
+        # 哨兵对现场原句必须响
+        self.assertEqual(_delivery_fragment_suspect(
+            '让我再深挖一下那份"研报引发的暴跌"的具体内容～'), "tail-promise")
+
     def test_delivery_sentinel_flags_but_is_broader(self):
         """交付哨兵：只观测不拦截，但要比闸门宽（240 字口径 + 承诺口语词）。"""
         from agent.loop import _delivery_fragment_suspect

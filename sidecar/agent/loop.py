@@ -367,11 +367,18 @@ def _clear_quota_marker(tool: str) -> None:
 # （查/搜/拉/读/调/找）——单字不会误伤"我查了，明天休市"这类过去式汇报
 # （它们没有意图词）。
 _PLAN_VERB_RE = re.compile(
-    r"查|搜|拉|读|调|找|看|试|汇总|整理|复盘|调取|检索|获取|抓取|分析")
+    r"查|搜|拉|读|调|找|看|试|汇总|整理|复盘|调取|检索|获取|抓取|分析"
+    r"|挖|扒|捋|梳理")            # 10-08 三号现场："让我再深挖一下…"
 _PLAN_INTENT_RE = re.compile(
     r"我来|让我|我先|我将|我会|接下来|下面我|这就|马上|赶紧|这就来"
     r"|现在(让我|我来)|先(去|来)?(查|调|搜|读|看看)")
 _PLAN_TAIL_SPLIT_RE = re.compile(r"[。～~！!？?\n]+")
+# 结构兜底："意图词 + 汉字动词 + 一下/一遍/一趟"——动词永远列不全（三次加词
+# 都是新动词），凡这个形态的末句同算承诺。排除两类：①"让我知道一下"这类是
+# **对用户**的请求（不是模型打算自己做的事）；②整段已带数据信号（是在汇报，
+# 不是在承诺）。
+_PLAN_DO_RE = re.compile(r"[\u4e00-\u9fff]{1,3}(?:一下|一遍|一趟)")
+_PLAN_DO_STOP = ("知道", "告诉", "说一声", "提醒")
 # 装饰段识别：不含任何文字/数字（\w 含 CJK）的段 = 结尾 emoji/星号/波浪线之类
 _WORDISH_RE = re.compile(r"\w")
 
@@ -407,7 +414,13 @@ def _looks_like_plan_only(text: str, has_tools: bool) -> bool:
     tail = _plan_tail(t)
     if not tail or len(tail) > 120:   # 末句太长：不是一句轻飘飘的承诺
         return False
-    return bool(_PLAN_INTENT_RE.search(tail) and _PLAN_VERB_RE.search(tail))
+    if not _PLAN_INTENT_RE.search(tail):
+        return False
+    if _PLAN_VERB_RE.search(tail):
+        return True
+    return bool(_PLAN_DO_RE.search(tail)
+                and not any(w in tail for w in _PLAN_DO_STOP)
+                and not _DATA_SIGNAL_RE.search(t))
 
 # 工具失败后的"承诺碎片"（2026-10-07 事故：ak_finance 失败后模型连续两轮
 # 只说"这就帮你看看""马上用 mx_query 帮你查"就结束生成，交付闸 <10 字门槛
@@ -446,6 +459,11 @@ def _delivery_fragment_suspect(text: str) -> str:
         return "tail-promise"
     if tail and _PROMISE_RE.search(tail) and not _DATA_SIGNAL_RE.search(t):
         return "promise-phrase"
+    # 最宽的一档（10-08 三号现场"让我再深挖一下…"倒逼）：末句短 + 含意图词 +
+    # 无数据信号。动词表永远追不上，这一档让"新动词"变体在日志里先现形。
+    if (tail and len(tail) <= 30 and _PLAN_INTENT_RE.search(tail)
+            and not _DATA_SIGNAL_RE.search(t)):
+        return "intent-short"
     return ""
 
 
