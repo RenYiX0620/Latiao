@@ -1431,3 +1431,46 @@ class TestSafeTps(unittest.TestCase):
         cs.record_step(sid, 26.8, 26.79)
         d = cs.stats(sid, limit=0)
         self.assertIsNone(d["tps"], "stats() 也要走地板")
+
+
+class TestPlanOnlyGateTailRewrite(unittest.TestCase):
+    """空转闸门末句判定重构（2026-10-08 二次事故）。
+
+    现场（日志原文）：碎片不止出现在工具失败后——turn 开头（"让我拉一下
+    实时数据"）与工具成功后的新 turn（"让我赶紧搜一下最新情况"）都会发生；
+    且前半句可以带数据。判定改为：短正文 + 末句同时含意图词与数据动词。
+    """
+
+    def test_detects_incident_fragments(self):
+        from agent.loop import _looks_like_plan_only
+        # 10-08 现场 1：前半句有数据、末句承诺（57 字）
+        self.assertTrue(_looks_like_plan_only(
+            "今天大盘高开低走，上证微涨0.3%，但科创50跌了1.7%，整体偏震荡。 "
+            "让我拉一下实时数据给你看～", True))
+        # 10-08 现场 2：工具成功后的新 turn 承诺（59 字）
+        self.assertTrue(_looks_like_plan_only(
+            "今天跌这么狠，核心原因是三重打击。 让我赶紧搜一下今天的最新情况～", True))
+        # 10-07 现场同样应被空转闸门直接拦住（不再依赖工具失败上下文）
+        self.assertTrue(_looks_like_plan_only(
+            "好的主人，欧娜这就帮你看看这三只票的情况～", True))
+
+    def test_old_cases_still_detected(self):
+        from agent.loop import _looks_like_plan_only
+        self.assertTrue(_looks_like_plan_only(
+            "我来帮你分析上周五（9月18日）的大盘走势。先调取相关数据和复盘方法论。", True))
+        self.assertTrue(_looks_like_plan_only("让我先查询一下最近的行情数据。", True))
+
+    def test_no_false_positives(self):
+        from agent.loop import _looks_like_plan_only
+        # 过去式汇报（无意图词）：不拦
+        self.assertFalse(_looks_like_plan_only("我查了，明天休市。", True))
+        self.assertFalse(_looks_like_plan_only("我看到了，确实跌了。", True))
+        # 合法短答：不拦
+        self.assertFalse(_looks_like_plan_only("今日大盘收跌。", True))
+        self.assertFalse(_looks_like_plan_only("1 + 1 = 2。", True))
+        # 长正文（>200 字）即便末句是承诺收尾也放行（主体已完整）
+        long_tail = "上证收跌0.89%，主力净流出214亿。" * 12 + " 需要我继续分析吗？让我知道。"
+        self.assertFalse(_looks_like_plan_only(long_tail, True))
+        # 末句是礼貌问句（无"让我+动词"承诺形态）：不拦
+        self.assertFalse(_looks_like_plan_only(
+            "今天大盘跌了。需要我帮你查个股的话告诉我。", True))
