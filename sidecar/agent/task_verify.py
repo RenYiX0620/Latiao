@@ -284,3 +284,86 @@ def verify(session_id: str, body_text: str) -> dict | None:
                             f"test file modified this turn while tests went red → green: {_mod_tests[0]}")
 
     return _verdict(True, "", "")
+
+
+# ══ 数字溯源哨兵（2026-10-08，两篇 Agent 文章的 Evaluator 最小落地）════════
+# 治"编数据"：正文里像数据引用的数字（百分比/小数/带单位的大数），必须能在本轮
+# 工具结果里找到出处。实测动机：本地引擎探测里模型在**零数据**时凭空编出
+# "误差 15-20%"这种有零有整的数，而正文看着完全正常——现有任何闸门拦不住。
+#
+# **哨兵模式**：只记日志（调用方 loop.py 交付点），不拦截、不影响任何行为。
+# 观察期收误伤样本（模型自算的差值/四舍五入/"近5%"），调完规则再决定接入
+# verify() 的两级生效。已知豁免：
+#   - "近/约/超过/大约" 修饰的数（四舍五入的口语表述）；
+#   - 日期/序号/版本号形态；
+#   - 匹配口径：数字在结果集合里**精确出现**，或是结果数字的前缀（≥3 位，
+#     处理 3795.374→"3795" 的舍入）。
+_TRACE_HEDGE_RE = re.compile(r"[近约大约超过接近]")
+_DATE_RE = re.compile(
+    r"\d{4}[-/年.]\d{1,2}[-/月.]\d{1,2}|\d{1,2}月\d{1,2}|\b(19|20)\d{2}\b")
+# 关键数字三形态：百分比 / 小数 / 带单位的三位以上数字（点位、金额、倍数）
+_TRACE_NUM_RE = re.compile(
+    r"(\d+(?:\.\d+)?\s*%"                              # 0.89% / 5 %
+    r"|\d+\.\d+"                                       # 3795.37（小数）
+    r"|\d[\d,]*(?:\.\d+)?\s*(?:亿|万|百万|千万|万亿|倍|点|元|港元|美元)"
+    r")")                                              # 214.3亿 / 3200点
+# 数字串归一：剥掉空格/百分号/逗号与单位词（长单位在前，避免"万"先吃掉"百万"）
+_UNIT_STRIP_RE = re.compile(r"[\s%,]|百万|千万|万亿|亿|万|倍|点|元|港元|美元")
+
+
+def _trace_numbers(text: str) -> list[str]:
+    """抽正文里的"数据引用"数字（返回裸数字串，去千分位/百分号）。"""
+    out: list[str] = []
+    for m in _TRACE_NUM_RE.finditer(text or ""):
+        seg = m.group(1)
+        # 日期豁免：数字落在日期形态里就不算数据引用
+        if _DATE_RE.search(text[max(0, m.start() - 6):m.end() + 6]):
+            continue
+        # 口语近似豁免："近5% / 约3倍 / 超过200亿"
+        if _TRACE_HEDGE_RE.search(text[max(0, m.start() - 3):m.start()]):
+            continue
+        num = _UNIT_STRIP_RE.sub("", seg)
+        if len(num) >= 2 and num not in out:
+            out.append(num)
+    return out
+
+
+def _result_numbers(text: str) -> set[str]:
+    """工具结果里出现过的全部数字串（含原始与去千分位两种形态）。"""
+    raw = set(re.findall(r"\d[\d,]*(?:\.\d+)?", text or ""))
+    out = set()
+    for n in raw:
+        plain = n.replace(",", "")
+        out.add(plain)
+        out.add(n)
+    return out
+
+
+def traceability_scan(session_id: str, body_text: str) -> list[str]:
+    """正文关键数字里**在本轮工具结果中找不到出处**的那些（哨兵用，不拦截）。
+
+    返回无出处的数字串列表；账本为空 / 正文没有关键数字 → 空列表（零成本路径）。
+    前缀匹配：数字串是某个结果数字的前缀且长度 ≥3 → 算有出处（3795.374 舍入成
+    "3795" 不算无出处）；反向（结果 3795、正文 37953）不算。
+    """
+    body = body_text or ""
+    nums = _trace_numbers(body)
+    if not nums:
+        return []
+    with _LOCK:
+        led = list(_LEDGER.get(str(session_id or ""), []))
+    if not led:
+        return []                    # 本轮没有任何工具结果：不评（无数据路径另有闸）
+    results = "\n".join(str(e.get("result") or "") for e in led)
+    # 注意：pool 为空**不能**跳过——工具返回了文本但一个数字都没有、而正文却满是
+    # 数字（"搜索结果都是定性描述，模型却报出 15% 误差"）恰恰是最该点名的编造形态。
+    # 自检实测：早先 `if not pool: return []` 会把这类整体放过（假阴性）。
+    pool = _result_numbers(results)
+    missing = []
+    for num in nums:
+        if num in pool:
+            continue
+        if len(num) >= 3 and any(r.startswith(num) for r in pool):
+            continue                 # 舍入前缀
+        missing.append(num)
+    return missing

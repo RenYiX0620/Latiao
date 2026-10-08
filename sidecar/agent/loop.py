@@ -2259,6 +2259,13 @@ class ThinAgentLoop:
                             logger.warning("[交付哨兵] 收口轮疑似碎片交付(%s, %d字): %r",
                                            _sent, len(body_text.strip()),
                                            body_text.strip()[:120])
+                        try:
+                            _miss = task_verify.traceability_scan(self.session_id, body_text)
+                            if _miss:
+                                logger.warning("[溯源哨兵] 收口轮 %d 个数字无出处: %s",
+                                               len(_miss), _miss[:8])
+                        except Exception:
+                            logger.debug("溯源哨兵异常（收口轮）", exc_info=True)
                         self._step_log("终答轮", f"已交付 {len(body_text)} 字")
                         # 收口轮已是最后一轮（不再重采）——机械校验若不过，就在交付时
                         # **明说没达标**，绝不把"已完成"留给用户自己发现（P1 反作弊/诚实）
@@ -2374,6 +2381,16 @@ class ThinAgentLoop:
                         _ft = (payload.get("text") or body_text).strip()
                         logger.warning("[交付哨兵] 疑似碎片交付(%s, %d字): %r",
                                        _sent, len(_ft), _ft[:120])
+                    # 溯源哨兵（2026-10-08）：正文关键数字查不到本轮工具出处 → 记
+                    # 日志观察（不拦截；观察期收误伤样本后再决定接入两级生效）
+                    try:
+                        _miss = task_verify.traceability_scan(
+                            self.session_id, payload.get("text") or body_text)
+                        if _miss:
+                            logger.warning("[溯源哨兵] %d 个数字无出处: %s",
+                                           len(_miss), _miss[:8])
+                    except Exception:
+                        logger.debug("溯源哨兵异常", exc_info=True)
                     self._step_log("交付",
                                    f"handled={payload.get('handled')} "
                                    f"events={len(payload.get('events', []))}")

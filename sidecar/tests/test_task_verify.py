@@ -267,3 +267,64 @@ async def test_loop_open_qa_unaffected():
     joined = json.dumps(events, ensure_ascii=False)
     assert "机械校验" not in joined and "不按「完成」交付" not in joined
     assert any("成交额" in (e.get("content") or "") for e in events)
+
+
+# ══ 数字溯源哨兵（2026-10-08）：先只记日志，观察误伤率后决定拦截 ═══════════
+
+def _seed_ledger(sid: str, result: str):
+    from agent import task_verify
+    task_verify.begin_turn(sid)
+    task_verify.note_tool(sid, "mx_query", {"query": "指数行情"}, result)
+
+
+def test_traceability_flags_fabricated_numbers():
+    """编造的数字必须被点名（引擎探测实证：零数据时编"误差 15-20%"）。"""
+    from agent import task_verify
+    sid = f"trace-fab-{time.time()}"
+    _seed_ledger(sid, "| 上证指数 | -0.89% | -214.3亿 |")   # 结果里只有这些数
+    body = "今天上证收跌 0.89%，主力净流出 214.3亿；据研报口径误差 15.6%，恢复需 3200点。"
+    missing = task_verify.traceability_scan(sid, body)
+    assert "0.89" not in missing, "结果里有的数不算无出处"
+    assert "15.6" in missing and "3200" in missing, f"编造的数必须点名: {missing}"
+
+
+def test_traceability_rounding_and_hedges_pass():
+    """舍入前缀（3795.374→3795）与口语近似（近5%）不算无出处。"""
+    from agent import task_verify
+    sid = f"trace-rnd-{time.time()}"
+    _seed_ledger(sid, "支撑位 3795.374 压力位 3980.2021 科创50 -4.98%")
+    body = "上证支撑位在 3795 附近，科创50 跌了接近 5%，压力位看 3980.2。"
+    assert task_verify.traceability_scan(sid, body) == [], \
+        "舍入/近似必须放行（这是观察期最重要的误伤面）"
+
+
+def test_traceability_empty_paths():
+    """账本为空 / 正文无关键数字 → 空列表（零成本路径，不误伤纯文字回复）。"""
+    from agent import task_verify
+    sid = f"trace-empty-{time.time()}"
+    task_verify.begin_turn(sid)                       # 无任何工具
+    assert task_verify.traceability_scan(sid, "今天上证收跌 0.89%") == []
+    _seed_ledger(sid, "| 指数 | -0.89% |")
+    assert task_verify.traceability_scan(sid, "今天大盘不好，注意风险。") == []
+
+
+def test_traceability_dates_not_numbers():
+    """日期（2026-10-08 / 10月8日）不算数据引用。"""
+    from agent import task_verify
+    sid = f"trace-date-{time.time()}"
+    _seed_ledger(sid, "| 涨跌幅 | -0.89% |")          # 结果里没有 2026/10/8
+    body = "2026-10-08 大盘收跌，10月8日成交清淡，跌幅 0.89%。"
+    assert task_verify.traceability_scan(sid, body) == []
+
+
+def test_traceability_text_only_tool_result_still_flags():
+    """工具返回纯文字（无数字）、正文却满是数字 → 全部算无出处（假阴性修复）。
+
+    自检实测抓到的漏洞：早先 `if not pool: return []` 会在"结果池为空"时整体
+    跳过——恰恰放过最典型的编造形态（搜索结果是定性描述，模型硬报出具体数字）。"""
+    from agent import task_verify
+    sid = f"trace-textonly-{time.time()}"
+    _seed_ledger(sid, "市场普遍关注新能源车销量，机构看法分歧较大。")   # 无任何数字
+    body = "该研报与官方数据误差高达 15%-20%，销量差 3.2万辆，股价已跌 8.5%。"
+    missing = task_verify.traceability_scan(sid, body)
+    assert "15" in missing and "3.2" in missing and "8.5" in missing, missing
