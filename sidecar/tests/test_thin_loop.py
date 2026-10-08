@@ -858,6 +858,8 @@ async def test_repeat_promise_after_nudge_forces_finalize():
     from tests.test_loop_scenarios import _StubEngine
 
     with FakeEngine() as engine:
+        # 先拿到一次成功的工具结果（= 有数据的现场：模型想再挖但数据已在手）
+        engine.push(engine.native_tool_response("list_dir", {"path": "."}))
         engine.push(engine.text_response("让我先查一下今天的最新行情数据～"))
         engine.push(engine.text_response(
             "让我再搜一下几个头部平台（Temu/Shein/TikTok Shop）的最新动态～"))
@@ -874,12 +876,51 @@ async def test_repeat_promise_after_nudge_forces_finalize():
             local_llm._engine = old
 
     texts = "".join(str(e.get("content", "")) for e in events if isinstance(e, dict))
-    # 第三次承诺之后必须转收口轮（请求里出现收口指令），而不是把它当终答交付
-    assert len(engine.requests) >= 4, f"应继续跑（催 2 次+收口轮），实际请求数 {len(engine.requests)}"
+    # 有数据时催 2 次；第三次承诺必须转收口轮（请求里出现收口指令），不当终答交付
+    assert len(engine.requests) >= 5, f"应继续跑（工具 1+催 2+收口 1），实际请求数 {len(engine.requests)}"
     last = json.dumps(engine.requests[-1], ensure_ascii=False)
     assert "收尾：数据已足够" in last, "最后一次请求应是收口轮（尾部带收口指令）"
     assert "根据刚才的目录输出" in texts, "收口轮应交付完整回答"
     assert not texts.rstrip().endswith("～"), texts[-200:]
+
+
+@pytest.mark.asyncio
+async def test_repeat_promise_without_data_uses_honest_finalize():
+    """无数据时多催一次，收口轮改用"如实说明"指令（2026-10-08 引擎探测回归）。
+
+    探测实证：把"刚承诺完 + 数据已足够"喂给本地 Hermes，它写了 872 字正文
+    （收口机制有效），但同一探测里**没有任何数据**时它会凭空编造具体细节
+    （"某研报引发暴跌、误差 15-20%"）且不会被任何闸门拦住。所以无数据路径
+    的收口指令必须说破"没有数据"，催的额度也放宽到 3 次（承诺多半是"我要
+    去查"，强行收口等于逼它无数据作答）。
+    """
+    import time as _t
+
+    import local_llm
+    from agent.loop import ThinAgentLoop
+    from tests.test_loop_scenarios import _StubEngine
+
+    with FakeEngine() as engine:
+        engine.push(engine.text_response("让我先查一下最新的数据～"))
+        engine.push(engine.text_response("让我再搜一下头部平台的最新动态～"))
+        engine.push(engine.text_response("让我换个来源再核对一下～"))
+        engine.push(engine.text_response("让我再看看有没有别的入口～"))
+        engine.push(engine.text_response("这次我没能取到数据，先说明这一点。"))
+        old = local_llm._engine
+        local_llm._engine = _StubEngine()
+        try:
+            events = await _collect(ThinAgentLoop(
+                MESSAGES, "fake-model", engine.url, HEADERS,
+                session_id=f"thin-esc-nd-{_t.time()}", access_mode="full").run())
+        finally:
+            local_llm._engine = old
+
+    texts = "".join(str(e.get("content", "")) for e in events if isinstance(e, dict))
+    assert len(engine.requests) >= 5, f"无数据应催 3 次再收口，实际请求数 {len(engine.requests)}"
+    last = json.dumps(engine.requests[-1], ensure_ascii=False)
+    assert "本轮没有取到任何数据" in last, "无数据收口必须用如实说明版指令"
+    assert "数据已足够" not in last, "无数据时不得声称数据已足够（诱发编造）"
+    assert "这次我没能取到数据" in texts
 
 
 def test_promise_regex_matches_incident_fragments():

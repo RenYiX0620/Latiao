@@ -951,7 +951,8 @@ class ThinAgentLoop:
         self._empty_gen_retry_used = False     # 引擎空生成重试（每 turn 一次）
         self._tool_rounds_no_answer = 0        # 连续工具轮（无实质正文交付）计数
         self._finalize_round = False           # 停滞闸门收口轮：无工具直接作答
-        self._plan_nudge_used = 0              # 空转闸门：只声明计划不行动的一次纠正
+        self._plan_nudge_used = 0              # 空转闸门：只声明计划不行动的纠正次数
+        self._turn_tool_ok = False             # 本轮是否拿到过成功的工具结果（升级档分叉）
         self._toolfail_nudge_used = 0          # 工具失败闸门：承诺碎片的一次纠正
         self._last_round_tool_failed = False   # 上一轮工具结果是否失败（承诺碎片闸的上下文）
         self._finalize_retry_used = False      # 终答轮空生成温度重采（一次）
@@ -1214,8 +1215,11 @@ class ThinAgentLoop:
             # 旧实现整体换用数据摘要视图，缓存代价极高（见 _append_tail_note 注释）；
             # 空正文/仍发工具调用的兜底不变：先用尾部提醒重采一次，仍空则退回
             # _collect_finalize_data 直接交付数据（见收口轮交付分支）。
-            body["messages"] = _append_tail_note(
-                body["messages"], _finalize_tail_directive(self.user_lang, self._tone))
+            # 2026-10-08：无数据收口换如实说明版——"数据已足够"在真没数据时会诱发
+            # 编造（本地引擎探测实证：凭空写出"某研报引发暴跌、误差 15-20%"）。
+            _fdir = (_finalize_tail_directive(self.user_lang, self._tone)
+                     if self._turn_tool_ok else _msg("finalize_no_data", self.user_lang))
+            body["messages"] = _append_tail_note(body["messages"], _fdir)
             body["parallel_tool_calls"] = False
             body["chat_template_kwargs"] = {"enable_thinking": False}
         if _is_custom_engine():
@@ -2259,32 +2263,38 @@ class ThinAgentLoop:
                                f"正文={len(body_text)}字 思考={len(reasoning)}字 "
                                f"工具调用={len(tool_calls)}")
 
+                # 催促额度：有数据时 2 次（催不动就基于数据收口）；无数据时 3 次
+                # （此时模型的承诺多半是"我要去查"——多给一次真正动手的机会，
+                # 因为强行收口等于逼它在没有数据的情况下作答）
+                _plan_cap = _PLAN_NUDGE_MAX if self._turn_tool_ok else _PLAN_NUDGE_MAX + 1
                 if (not tool_calls and not self._finalize_round
                         and _looks_like_plan_only(body_text, bool(self._active_tools()))
-                        and self._plan_nudge_used < _PLAN_NUDGE_MAX):
+                        and self._plan_nudge_used < _plan_cap):
                     # 空转闸门：只说了"我来/先调取"就收尾 → 要求真正行动或给出完整
                     # 答案（原为每 turn 一次；2026-10-08 16:13 实测催一次不够——
                     # 模型在 99% 缓存下 2.4s 又输出一句更具体的承诺，于是被当终答
-                    # 交付。改为最多催两次，仍不改则强制收口，见下一段）
+                    # 交付。改为可催 2-3 次，仍不改则强制收口，见下一段）
                     self._plan_nudge_used += 1
                     self.current_msgs.append(_note_msg(_msg("plan_nudge", self.user_lang)))
                     self._step_log("空转闸门",
                                    f"只有计划声明、无工具调用 → 要求直接行动"
-                                   f"（{self._plan_nudge_used}/{_PLAN_NUDGE_MAX}）")
+                                   f"（{self._plan_nudge_used}/{_plan_cap}）")
                     yield {"event": "heartbeat"}
                     continue
                 if (not tool_calls and not self._finalize_round
                         and _looks_like_plan_only(body_text, bool(self._active_tools()))):
                     # 空转闸门升级档：催促额度用尽仍是承诺 → 不给承诺留交付口，
-                    # 转收口轮"基于已有数据直接作答"。用确定性收尾替代再赌一轮——
-                    # 收口轮自带 junk→重采→数据兜底链（_finalize_body_is_junk），
-                    # 最差也只是"数据+如实说明"，不会再是一句轻飘飘的计划。
+                    # 转收口轮。用确定性收尾替代再赌一轮——收口轮自带 junk→重采→
+                    # 数据兜底链（_finalize_body_is_junk），最差也只是"数据+如实
+                    # 说明"，不会再是一句轻飘飘的计划。无数据时收口指令换如实
+                    # 说明版（见 _build_request），避免逼它编造。
                     self._finalize_round = True
                     if self.steps >= self.max_steps:
                         self.steps = self.max_steps - 1
+                    _what = "基于已有数据作答" if self._turn_tool_ok else "如实说明未取到数据"
                     self._step_log("空转闸门",
                                    f"催促 {self._plan_nudge_used} 次后仍是承诺 → "
-                                   f"强制收口，基于已有数据作答")
+                                   f"强制收口（{_what}）")
                     continue
                 if (not tool_calls and not self._finalize_round
                         and self._last_round_tool_failed
@@ -2552,6 +2562,8 @@ class ThinAgentLoop:
                     # 失败（Error/⛔/⏱/超时开头）置位，成功清除
                     self._last_round_tool_failed = _res.lstrip().startswith(
                         ("Error", "错误", "⛔", "⏱", "超时"))
+                    if not self._last_round_tool_failed:
+                        self._turn_tool_ok = True   # 本轮有数据（收口指令分流用）
                     if tname == "mx_query" and "Error" not in _res:
                         _clear_quota_marker("mx_query")
                     _round_results.append(_res)
