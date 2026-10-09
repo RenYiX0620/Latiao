@@ -243,13 +243,23 @@ def start_prepare(current_version: str) -> dict:
         # 复用已预下载的包仅当它就是 GitHub 当前最新版；否则重新下载
         remote = fetch_remote_manifest()
         remote_ver = str((remote or {}).get("version", ""))
-        if remote_ver and st.get("version", "") == remote_ver:
+        if not remote_ver:
+            # 拉不到远端清单（本机访问 GitHub 时好时坏，2026-10-09 实测）：已下完的
+            # 包就是当前可用的更新，**直接保留 done 返回**。早先这里不 return、落到
+            # 下方 worker：worker 开头把状态改成 checking，导致后面"保留既有 done"
+            # 的判断恒假 → 包明明下完了却被改写成 failed（用户更新 v0.3.73 时报
+            # "更新失败"的真因）。
+            return get_progress()
+        if st.get("version", "") == remote_ver:
             if not _is_newer(remote_ver, current_version or "0.0.0"):
                 with _state_lock:
                     _state.update({"status": "up_to_date", "version": remote_ver, "error": ""})
                     _save_state()
             return get_progress()
         # GitHub 有比已预下载更新的版本 → 继续走下方完整流程
+
+    # 进 worker 前的状态快照（worker 会把状态改成 checking，运行态读不到原值）
+    _entry_status = str(st.get("status", ""))
 
     def worker():
         try:
@@ -258,10 +268,10 @@ def start_prepare(current_version: str) -> dict:
                 _save_state()
             manifest = fetch_remote_manifest()
             if not manifest:
-                # 拉不到清单（网络失败）：保留既有 done 状态——
-                # 已预下载的包仍可用于本机安装，下次检查会重试
-                prev = _load_state()
-                if prev.get("status") != "done":
+                # 拉不到清单（网络失败）：保留既有 done 状态——已预下载的包仍可用于
+                # 本机安装，下次检查会重试。判据用**进 worker 前的快照**：
+                # 2026-10-09 实测读运行态（已被改成 checking）会让这个保护永远失效。
+                if _entry_status != "done":
                     with _state_lock:
                         _state.update({"status": "failed", "error": "无法获取更新清单"})
                         _save_state()

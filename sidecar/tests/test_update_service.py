@@ -101,6 +101,22 @@ class TestUpdateService(unittest.TestCase):
         self.assertEqual(st["status"], "up_to_date")
 
     @mock.patch("threading.Thread")
+    @mock.patch.object(us, "fetch_remote_manifest", return_value=None)
+    def test_prepare_done_survives_manifest_failure(self, mock_fetch, mock_thread):
+        """包已下完、但远端清单拉不到 → 状态必须保持 done（2026-10-09 用户实测）。
+
+        早先 done 分支拉不到远端时不 return、落到 worker；worker 开头把状态改成
+        checking，于是"保留既有 done"的判断恒假 → 包下完了却被写成 failed，
+        界面报"更新失败"（用户更新 v0.3.73 时正是这个链路）。"""
+        mock_thread.side_effect = lambda target=None, daemon=None: (
+            target(), mock.MagicMock())[1]
+        us._save_state({"status": "done", "version": "0.3.6",
+                        "url": "https://x/a.tar.gz", "signature": "s"})
+        st = us.start_prepare("0.3.4")
+        self.assertEqual(st["status"], "done",
+                         "拉不到远端清单时必须保留 done，不得改写成 failed")
+
+    @mock.patch("threading.Thread")
     @mock.patch.object(us, "_download_worker")
     @mock.patch.object(us, "fetch_remote_manifest")
     def test_prepare_starts_download_for_newer(self, mock_manifest, mock_dl, mock_thread):

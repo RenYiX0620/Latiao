@@ -70,6 +70,7 @@
     "updater": {
       "active": true,
       "endpoints": [
+        "http://127.0.0.1:8765/v1/update-latest.json",
         "https://github.com/RenYiX0620/Latiao/releases/latest/download/latest.json"
       ],
       "dialog": true,
