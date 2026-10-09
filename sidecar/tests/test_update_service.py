@@ -30,6 +30,12 @@ class TestUpdateService(unittest.TestCase):
         us.UPDATE_DIR = Path(self._tmp.name) / "update"
         us.STATE_FILE = us.UPDATE_DIR / "state.json"
         us._state.clear()
+        # 模块级下载线程引用必须每例复位（2026-10-09 实测）：前序用例把
+        # _download_thread 留成 mock 后，.is_alive() 恒真 → start_prepare 会在
+        # 最开头"已在跑"处直接返回，后面的状态机分支一条都进不去
+        # （单独跑绿、全量红）。
+        self._old_thread = us._download_thread
+        us._download_thread = None
         # 真实文件 IO（mkdir/write/replace）在 CI/tmp 环境偶发挂起 →
         # 状态机测试 mock 落盘层，仅验证内存状态流转
         self._io_patcher = mock.patch.object(us, "_save_state", lambda state=None: us._state.update(state or {}))
@@ -43,6 +49,7 @@ class TestUpdateService(unittest.TestCase):
         self._load_patcher.stop()
         us.UPDATE_DIR = self._old_dir
         us.STATE_FILE = self._old_state
+        us._download_thread = self._old_thread
         self._tmp.cleanup()
 
     def test_version_compare(self):
@@ -99,6 +106,25 @@ class TestUpdateService(unittest.TestCase):
         with mock.patch.object(us, "fetch_remote_manifest", return_value={"version": "0.3.4", "platforms": {}}):
             st = us.start_prepare("0.3.4")  # 当前已是 0.3.4
         self.assertEqual(st["status"], "up_to_date")
+
+    @mock.patch("threading.Thread")
+    def test_resume_selfheals_when_package_complete(self, mock_thread):
+        """下载残留下、目标包其实已完整 → 自愈为 done，不再白续 324MB（2026-10-09）。
+
+        现场：GitHub 下载第 1 次中断（11%）后进程退出，状态残留 downloading；
+        目标包已由官方渠道补齐（大小 == state.total）。旧逻辑下次启动会从 11%
+        续传——白下一整个 324MB。"""
+        mock_thread.side_effect = lambda target=None, daemon=None: (target(), mock.MagicMock())[1]
+        us.UPDATE_DIR.mkdir(parents=True, exist_ok=True)
+        pkg = us.UPDATE_DIR / "Latiao_0.3.6_x64-setup.exe"
+        pkg.write_bytes(b"x" * 100)                      # 完整包（大小 == total）
+        (us.UPDATE_DIR / "Latiao_0.3.6_x64-setup.exe.part").write_bytes(b"partial" * 5)
+        us._save_state({"status": "downloading", "version": "0.3.6", "total": 100,
+                        "url": "https://x/Latiao_0.3.6_x64-setup.exe"})
+        st = us.start_prepare("0.3.4")
+        self.assertEqual(st["status"], "done", "完整包在位时必须自愈为 done")
+        self.assertFalse((us.UPDATE_DIR / "Latiao_0.3.6_x64-setup.exe.part").exists(),
+                         ".part 残片应被清掉")
 
     @mock.patch("threading.Thread")
     @mock.patch.object(us, "fetch_remote_manifest", return_value=None)

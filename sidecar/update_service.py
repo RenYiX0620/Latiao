@@ -228,9 +228,28 @@ def start_prepare(current_version: str) -> dict:
             return get_progress()  # 已在跑
         url = st.get("url", "")
         if url:
+            # 自愈优先（2026-10-09）：目标包已**完整在位**（大小 == 上次记录的总大小）
+            # 就不续传——否则会往几十 MB 的残片里白续 324MB（用户实测：GitHub 下载
+            # 中断后进程退出，包其实已由别的方式补齐，下次启动却从 11% 重来）。
+            # .part 残片顺手清掉（它是本次下载的临时文件）。
+            _dest = UPDATE_DIR / url.split("/")[-1]
+            _total = int(st.get("total") or 0)
+            if _total and _dest.exists() and _dest.stat().st_size == _total:
+                _part = _dest.with_suffix(_dest.suffix + ".part")
+                try:
+                    if _part.exists():
+                        _part.unlink()
+                except OSError:
+                    logger.debug("清理 .part 残片失败", exc_info=True)
+                logger.info("更新包已在位且完整（%d 字节），跳过续传: %s",
+                            _total, _dest.name)
+                with _state_lock:
+                    _state.update({"status": "done", "downloaded": _total,
+                                   "error": "", "part_path": ""})
+                    _save_state()
+                return get_progress()
             logger.warning("检测到下载状态残留但 worker 已死，续传重启: %s", url.split("/")[-1])
             _ver = st.get("version", "")
-            _dest = UPDATE_DIR / url.split("/")[-1]
 
             def _resume_worker():
                 _download_worker(url, _dest, _ver)
