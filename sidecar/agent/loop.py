@@ -110,6 +110,12 @@ _MARKUP_MARKERS = (
     ("<tool_call>", "</tool_call>", "drop"),
     ("<function_calls>", "</function_calls>", "drop"),
     ("<invoke", "</invoke>", "drop"),
+    # 孤立闭标记（2026-10-09 occamy-1.0 实测"回复两遍"）：模型把内心戏写进正文、
+    # 用 </think> 收尾，再正式写一遍 → 两遍都当正文下发。见到它按"思考段到此为止"
+    # 处理：标记丢弃、本块里它之前的内容也丢弃（还没下发），已下发的前半段由外层
+    # 发 content_revised 撤回（空内容 = 撤回本轮气泡，前端既有语义）。
+    ("</think>", "", "leak"),
+    ("</thinking>", "", "leak"),
 )
 
 _DUP_PROBE_CHARS = int(os.environ.get("LATIAO_DUP_PROBE_CHARS", "60") or 60)
@@ -1029,6 +1035,7 @@ class ThinAgentLoop:
         # 流式重复叙述闸门
         self._last_round_text = ""             # 上一轮正文（复读判定的基准）
         self._markup_state = 0                 # 0=正文 1=think 2=丢弃标记（流式标记状态）
+        self._think_leak = False               # 正文出现孤立 </think>（思考泄漏，消费后清除）
         self._markup_closer = ""               # 当前状态的闭合标记
         self._think_carry = ""                 # 可能是标签前缀的尾巴（<thi + nk>）
         self._round_buf: list = []             # 本轮已缓冲但未下发的正文
@@ -1450,6 +1457,11 @@ class ThinAgentLoop:
                     _first_delta_at = time.monotonic()
                 streamed += content
                 body_text += content
+                # 思考泄漏（2026-10-09 occamy）：正文里出现孤立 </think> 时，其前是
+                # 模型的"内心戏"，不算交付正文——否则长度判定/碎片闸/溯源哨兵/日志
+                # 全按"两遍"记账。取最后一次出现（多轮泄漏时保留最终正文）。
+                if "</think>" in body_text:
+                    body_text = body_text.rsplit("</think>", 1)[-1].lstrip("\n")
                 if _gate_open:
                     # 真流式：正文 delta 即刻下发（09-06 用户反馈"直接蹦出答案"）
                     yield {"content": content, "ts": int(time.time() * 1000)}
@@ -1717,6 +1729,13 @@ class ThinAgentLoop:
                         out.append(tail)
                     break
                 j, marker, closer, mode = best
+                if mode == "leak":
+                    # 孤立 </think>：标记前的本块内容同属"内心戏"，丢弃；
+                    # 设标志让外层撤回已下发的前半段（见 _MARKUP_MARKERS 注释）
+                    self._think_leak = True
+                    out.clear()
+                    i = j + len(marker)
+                    continue
                 out.append(data[i:j])
                 self._markup_state = 1 if mode == "think" else 2
                 self._markup_closer = closer
@@ -2027,6 +2046,14 @@ class ThinAgentLoop:
                             if t_first_token is None:
                                 t_first_token = time.monotonic()   # 首 token（TTFT）计时点
                             _c, _th = self._split_think_stream(_c)
+                            if getattr(self, "_think_leak", False):
+                                # 思考泄漏收口（2026-10-09 occamy"回复两遍"）：前半段
+                                # 已下发过，用空 content_revised 撤回本轮气泡，之后的
+                                # 内容才是正式正文（前端既有"空=撤回"语义）
+                                self._think_leak = False
+                                self._step_log("思考泄漏",
+                                               "正文出现孤立 </think> → 撤回前半段，只留正式回复")
+                                yield {"event": "content_revised", "content": ""}
                             if _th:
                                 yield {"reasoning": _th}           # 推理走思考通道
                             if not _c:
@@ -2036,8 +2063,11 @@ class ThinAgentLoop:
                             if _emit is None:
                                 raw_deltas += 1
                                 continue
-                            if _emit != _c:
-                                evt = dict(evt, content=_emit)
+                            # **无条件写回**：早先只在 `_emit != _c` 时写，把
+                            # _split_think_stream 的剥离结果丢了——`</think>` 与内心戏
+                            # 原样下发（2026-10-09 occamy"回复两遍"的直接原因；此前
+                            # 方言模型恰好走"缓冲≠当前块"分支，把这个 bug 遮住了）
+                            evt = dict(evt, content=_emit)
                         elif evt.get("reasoning") and t_first_token is None:
                             t_first_token = time.monotonic()
                         raw_deltas += 1

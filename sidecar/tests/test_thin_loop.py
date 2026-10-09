@@ -1010,3 +1010,53 @@ def test_promise_regex_matches_incident_fragments():
     # 对照：含数据的真答案不该命中承诺信号
     real = "中天科技 收 12.34 元（+2.5%），领益智造 收 8.90 元\n| a | b |\n|---|---|"
     assert _DATA_SIGNAL_RE.search(real)
+
+
+# ── 思考泄漏（2026-10-09 occamy 实测"回复两遍"）─────────────────────────
+
+_OCCAMY_LEAK = ("（眼波流转，红唇微勾，指尖缓缓划过你的胸口）\n"
+                '"主人真是的……一开口就叫人家小坏蛋，坏死了～"\n'
+                "（却并没有反驳，反而站起身来，双手抓住领口两侧）\n"
+                "</think>\n"
+                "（眼波如水，红唇微勾，指尖在你胸口轻轻画着圈）\n"
+                '"主人真是的……一开口就叫我小坏蛋，真是坏死了呢～"\n'
+                "（微微俯身，让那对软玉更贴近你的脸庞）\n")
+
+
+@pytest.mark.asyncio
+async def test_think_leak_retracts_first_copy():
+    """孤立 </think> → 撤回前半段、只留正式回复（"回复两遍"的回归）。
+
+    occamy-1.0 把内心戏写进正文、用 </think> 收尾再写一遍正式版：前后两版都当
+    正文下发 → 用户看到两遍。修法：标记前的内容丢弃 + 空 content_revised 撤回
+    已显示的前半段；body_text 同步截断（判定/记账按一遍算）。"""
+    import local_llm
+    from agent.loop import ThinAgentLoop
+    from tests.fake_engine import FakeEngine
+    from tests.test_loop_scenarios import _StubEngine
+    with FakeEngine() as engine:
+        engine.push(engine.text_response(_OCCAMY_LEAK))
+        old = local_llm._engine
+        local_llm._engine = _StubEngine()
+        try:
+            events = await _collect(ThinAgentLoop(
+                MESSAGES, "fake-model", engine.url, HEADERS,
+                session_id=f"thin-leak-{time.time()}", access_mode="full").run())
+        finally:
+            local_llm._engine = old
+    # ① 必须出现一次"撤回"（空 content_revised）
+    revokes = [e for e in events if isinstance(e, dict)
+               and e.get("event") == "content_revised" and not str(e.get("content") or "")]
+    assert revokes, f"孤立 </think> 必须撤回前半段: {[e for e in events if isinstance(e, dict) and e.get('event')][:6]}"
+    # ② 撤回**之后**流出的内容只能是正式回复（前半段是已发过的，靠撤回清掉）
+    idx = next(i for i, e in enumerate(events) if isinstance(e, dict)
+               and e.get("event") == "content_revised"
+               and not str(e.get("content") or ""))
+    after = "".join(str(e.get("content", "")) for e in events[idx + 1:]
+                    if isinstance(e, dict) and not e.get("event"))
+    assert "指尖缓缓划过你的胸口" not in after, f"撤回后不该再出现内心戏: {after[:120]!r}"
+    # ③ 正式回复照常交付；标签本身不落地（无论分块与否）
+    assert "指尖在你胸口轻轻画着圈" in after, "正式回复必须照常交付"
+    streamed = "".join(str(e.get("content", "")) for e in events if isinstance(e, dict)
+                       and not e.get("event"))
+    assert "</think>" not in streamed
