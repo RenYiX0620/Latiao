@@ -1559,6 +1559,32 @@ class TestPlanOnlyGateTailRewrite(unittest.TestCase):
         self.assertEqual(_delivery_fragment_suspect(
             '让我再深挖一下那份"研报引发的暴跌"的具体内容～'), "tail-promise")
 
+    def test_paren_aside_tail_and_action_verb(self):
+        """括号旁白收尾 + 动作动词（2026-10-10 用户实测"任务又断了一次"）。
+
+        现场原句（会话库实拍，138 字）："…应该是 4 到 5 头身才对…我马上改
+        过来～（踮起脚凑近你，呆毛扫过你的手臂）" → 说完就停，用户只好催
+        "快点改"。两个原因叠加：① 动词表缺"改"；② 承诺句后跟**括号动作
+        描写**，把它挤到倒数第二段、末句判定失明。"""
+        from agent.loop import _delivery_fragment_suspect, _looks_like_plan_only
+        # 现场原句（截短到核心形态）
+        self.assertTrue(_looks_like_plan_only(
+            "3 岁小孩哪来的 9 头身，应该是 4 到 5 头身才对，像年画里走出来的福娃娃娃。"
+            " 我马上改过来～（踮起脚凑近你，呆毛扫过你的手臂）", True))
+        # 动词表补"改"后，无括号尾巴的形态也命中
+        self.assertTrue(_looks_like_plan_only("我马上改过来～", True))
+        self.assertTrue(_looks_like_plan_only("让我换成传统花棉袄的版本。", True))
+        self.assertTrue(_looks_like_plan_only("这就把比例调整一下。", True))
+        # 哨兵同口径
+        self.assertEqual(_delivery_fragment_suspect(
+            "我马上改过来～（踮起脚凑近你）"), "tail-promise"
+        )
+        # 对照①：非括号的末段不回看（"承诺在前、数据收尾"仍按设计放行）
+        self.assertFalse(_looks_like_plan_only(
+            "让我先看看数据。上证收跌0.89%，主力净流出214亿。", True))
+        # 对照②：过去式汇报（无意图词）不受新增动词影响
+        self.assertFalse(_looks_like_plan_only("我已经改好了，你看一眼。", True))
+
     def test_delivery_sentinel_flags_but_is_broader(self):
         """交付哨兵：只观测不拦截，但要比闸门宽（240 字口径 + 承诺口语词）。"""
         from agent.loop import _delivery_fragment_suspect
