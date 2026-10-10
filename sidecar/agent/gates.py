@@ -63,6 +63,34 @@ def _strip_nonprose_for_lang(t: str) -> str:
     return t
 
 
+# 用户"点名要另一种语言/双语"的词表（按用户语言反选）——命中则语言闸门让路
+_OTHER_LANG_WORDS = {
+    "zh": ("英文", "英语", "English", "english", "中英", "双语", "bilingual"),
+    "en": ("中文", "汉语", "Chinese", "chinese", "中英", "双语", "bilingual"),
+    "ja": ("英語", "英文", "English", "中国語", "中文", "バイリンガル"),
+    "ru": ("англ", "English", "китай", "中文", "двуязыч"),
+}
+# 否定语境（"不要英文/别用中文"）不算"点名要"
+_LANG_NEGATION_RE = re.compile(
+    r"(不要|别|不用|勿|无需|禁止)[^，。,.!?！？]{0,8}"
+    r"(英文|英语|中文|汉语|English|Chinese)", re.I)
+
+
+def _user_wants_other_lang(user_text: str, user_lang: str) -> bool:
+    """用户消息里**明确点名**了非用户语言的内容（英文版/双语等）→ 语言闸门让路。
+
+    2026-10-10 用户实测：要"中英文双版提示词"，英文提示词块字面占优 → 被判成
+    "模型漂移成英文" → 分块翻译半途失败 → "英文开头+中文主体"的拼接版替换掉了
+    用户已看到的完整版。**用户点名要哪种语言时，交付闸门只管字形不看意图就是
+    帮倒忙**——这类请求直接豁免，正文原样交付。
+    """
+    words = _OTHER_LANG_WORDS.get(user_lang or "zh", _OTHER_LANG_WORDS["zh"])
+    t = (user_text or "").lower()
+    if not any(w.lower() in t for w in words):
+        return False
+    return not _LANG_NEGATION_RE.search(user_text or "")
+
+
 def _reply_lang_mismatch(user_text: str, reply_text: str, user_lang: str = "") -> bool:
     """回复语言与用户语言明显不符（中文用户收到英文/英文占优回复）→ True。
 
@@ -72,6 +100,10 @@ def _reply_lang_mismatch(user_text: str, reply_text: str, user_lang: str = "") -
     股票名镶入）也命中（en>zh 即判，不要求 3 倍——此前 3 倍阈值放过 2.6 倍
     的漏网）；"NVIDIA涨5%"（字母 6 < 80）与中文为主的正常回答（汉字多于
     字母）不误伤。计数前剥离文件名/路径/代码（_strip_nonprose_for_lang）。"""
+    # 用户点名要英文/双语 → 不是漂移，豁免（2026-10-10 事故；详见
+    # _user_wants_other_lang 的注释）
+    if _user_wants_other_lang(user_text, user_lang or _detect_user_language(user_text)):
+        return False
     # 语言真值优先由调用方传入（与提示词同一口径）；未传才自检——避免
     # "判据同时充当指令与验收"导致的误触发（09-19：中文回答被拿去翻译成英文）
     user_lang = user_lang or _detect_user_language(user_text)
@@ -284,6 +316,19 @@ def _split_translation_chunks(text: str, limit: int = 600) -> list:
     return out or [text]
 
 
+def _join_translations(chunks: list, outs: list, original: str) -> str:
+    """分块翻译的拼接口径：**任一块没被改动（= 该块翻译失败、返回原文）就整体放弃**。
+
+    2026-10-10 用户实测事故：2511 字正文按 ~600 字分块，英文提示词块部分成功
+    部分失败 → 旧代码 `"".join(outs)` 产出"英文开头 + 中文主体"的混合文本，
+    还经 content_revised 替换掉了用户已看到的完整版（"任务结束后英文版变成
+    中英文混合"）。**宁可不翻，也不能交一个半翻的版本。**
+    """
+    if any(str(o) == str(c) for c, o in zip(chunks, outs, strict=False)):
+        return original
+    return "".join(outs)
+
+
 async def _force_translate(client, api_url: str, headers: dict, engine_model: str,
                            text: str, user_lang: str) -> str:
     """一轮强制翻译：把模型回复翻译成用户语言（本地引擎非流式单轮）。
@@ -298,8 +343,7 @@ async def _force_translate(client, api_url: str, headers: dict, engine_model: st
         outs = []
         for _ch in _chunks:
             outs.append(await _force_translate(client, api_url, headers, engine_model, _ch, user_lang))
-        joined = "".join(outs)
-        return joined if joined != text else text
+        return _join_translations(_chunks, outs, text)
     _tmsgs = [
         {"role": "system",
          "content": (f"你是翻译器。把用户提供的文本完整翻译成{lang_name}，"
