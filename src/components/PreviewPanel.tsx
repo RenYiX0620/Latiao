@@ -29,6 +29,23 @@ export function guessDeliverablePath(path: string): string {
   return path.replace(/\.(docx?|xlsx?|pptx?|pdf)\.py$/i, ".$1");
 }
 
+/** 服务端 preview 响应 → 前端渲染模式（纯函数，可单测）。
+ *
+ * 2026-10-10 用户实测「点审阅不显示」：文本类交付物（md/py/json/csv…）服务端返回
+ * `kind:"code"` + 正文、**没有 data_base64**——旧代码把它当 image/pdf 处理：
+ * `atob("")` 建出一个空 blob 并 `setMode("pdf")`，同时代码渲染分支要求 `!blobUrl`
+ * 被空 blob 挡死 → 整个预览栏一片空白。修法：先在此判定，`code` 走文本渲染。 */
+export function previewModeFor(
+  data: { status?: string; kind?: string; need_soffice?: boolean; message?: string } | null,
+): "code" | "image" | "pdf" | "soffice" | "error" {
+  if (!data || data.status !== "ok") return "error";
+  if (data.need_soffice) return "soffice";
+  const k = String(data.kind || "");
+  if (k === "code") return "code";
+  if (k === "image") return "image";
+  return "pdf";
+}
+
 async function openInSystem(path: string): Promise<void> {
   const { invoke } = await import("@tauri-apps/api/core");
   try {
@@ -53,6 +70,7 @@ const PreviewPanel = memo(function PreviewPanel({ item, onClose }: {
   const [needSoffice, setNeedSoffice] = useState(false);
   const [loadingOffice, setLoadingOffice] = useState(false);
   const [mode, setMode] = useState<"idle" | "code" | "pdf" | "image">("idle");
+  const [serverText, setServerText] = useState("");
   const [shownName, setShownName] = useState("");
 
   const kind = item ? kindOf(item.name || item.path) : "unknown";
@@ -61,6 +79,7 @@ const PreviewPanel = memo(function PreviewPanel({ item, onClose }: {
     setBlobUrl(null);
     setErr("");
     setNeedSoffice(false);
+    setServerText("");
     setMode("idle");
     if (!item) return;
     setShownName(item.name || item.path || "");
@@ -79,7 +98,8 @@ const PreviewPanel = memo(function PreviewPanel({ item, onClose }: {
         const target = isGenerator ? guessDeliverablePath(path) : path;
         const data = await sidecarFetch(`/v1/file/preview?path=${encodeURIComponent(target)}`);
         if (!alive) return;
-        if (data?.status !== "ok") {
+        const pmode = previewModeFor(data);
+        if (pmode === "error") {
           // 找不到真文档 → 回退显示脚本源码
           if (item.content != null) {
             setMode("code");
@@ -89,11 +109,18 @@ const PreviewPanel = memo(function PreviewPanel({ item, onClose }: {
           setErr(String(data?.message || t("cards.preview_fail")));
           return;
         }
-        if (data.need_soffice) {
+        if (pmode === "soffice") {
           setNeedSoffice(true);
           return;
         }
-        const serverKind = String(data.kind || "");
+        if (pmode === "code") {
+          // 文本类：服务端只回正文（无 blob）——直接走代码渲染；写入内容缺失时
+          // （如从历史恢复的记录）用服务端回读的正文兜底
+          setServerText(String((data as { text?: string })?.text || ""));
+          setMode("code");
+          setNeedSoffice(false);
+          return;
+        }
         const mime = String(data.mime || "application/octet-stream");
         const bin = atob(String(data.data_base64 || ""));
         const arr = new Uint8Array(bin.length);
@@ -101,7 +128,7 @@ const PreviewPanel = memo(function PreviewPanel({ item, onClose }: {
         const url = URL.createObjectURL(new Blob([arr], { type: mime }));
         revoked = url;
         setBlobUrl(url);
-        setMode(serverKind === "image" ? "image" : "pdf");
+        setMode(pmode);
         if (target !== path) {
           setShownName(target.split(/[\\/]/).pop() || item.name);
         }
@@ -167,7 +194,7 @@ const PreviewPanel = memo(function PreviewPanel({ item, onClose }: {
           </div>
         )}
         {!err && (mode === "code" || (kind === "code" && !blobUrl && !loadingOffice && !needSoffice)) && (
-          <pre className="preview-code">{item.content != null ? item.content : "…"}</pre>
+          <pre className="preview-code">{item.content || serverText || "…"}</pre>
         )}
         {!err && (kind === "image" || kind === "pdf") && !blobUrl && (
           <div className="preview-empty">
