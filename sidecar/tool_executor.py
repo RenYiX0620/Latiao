@@ -642,6 +642,18 @@ def _is_readonly_cmd(cmd: str) -> bool:
     first = tokens[0].rsplit("/", 1)[-1]
     if first not in _READONLY_CMD_WORDS:
         return False
+    # 带写/删副作用的 flag（find -delete/-exec/-fprint…）：降级路径同样拒
+    # （2026-10-11 修复：实测 `find . -delete` 在语义层与这里**都判只读**，
+    # 子代理可免确认删除。名单与 safety.rules 共用一份，避免漂移。）
+    try:
+        from safety.rules import READONLY_DANGER_FLAGS
+        if any(t in READONLY_DANGER_FLAGS for t in tokens[1:]):
+            return False
+    except Exception:
+        _danger = {"-delete", "-exec", "-execdir", "-ok", "-okdir",
+                   "-fprint", "-fprintf", "-fls"}
+        if any(t in _danger for t in tokens[1:]):
+            return False
     # 参数必须是简单选项/路径形态——拦截一切嵌套命令与引用花活
     if not all(_READONLY_ARG_RE.fullmatch(t) for t in tokens[1:]):
         return False

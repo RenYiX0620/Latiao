@@ -232,25 +232,32 @@ async def chat_completion(request: Request):
     # 不要在这里重新读取 cloud_config：上面的自动路由可能已为代码任务
     # 选中了云端模型，重新从 body 取值会把路由结果覆盖回 None → 又落回本地模型。
     _last_cloud_config.set(cloud_config)
-    # 兜底持久化：后台任务（cron/自动路由）读 config.json，看不到请求级配置。
-    # 前端启动同步可能因 sidecar 未就绪而失败，这里在首个真实请求时补写。
+    # 兜底持久化（2026-10-11 收紧为**只更新、不新增**）：后台任务（cron 等）读
+    # config.json，看不到请求级配置；前端启动同步若因 sidecar 未就绪失败，这里在
+    # 首个真实请求时补写。此前实现会把**任意请求体**里的条目 append 进 cloud_models
+    # ——任一能说这个 API 的进程都能往持久配置里塞 endpoint/key（10-11 覆盖事故的
+    # 放大器：测试夹具的假 cloud_config 就是这样写进用户真配置的）。现在只更新
+    # **已存在且 endpoint 一致**的条目；没有则日志提示走设置页，不再新增。
     if cloud_config and cloud_config.get("endpoint"):
         try:
             _cfg = {}
             if CONFIG_FILE.exists():
                 _cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-            _entry = {
-                "name": str(cloud_config.get("model", ""))[:100],
-                "endpoint": str(cloud_config["endpoint"])[:500],
-                "key": str(cloud_config.get("key", ""))[:500],
-                "protocol": str(cloud_config.get("protocol", "openai"))[:30],
-            }
-            _models = [m for m in _cfg.get("cloud_models", [])
-                       if not (m.get("name") == _entry["name"] and m.get("endpoint") == _entry["endpoint"])]
-            _models.append(_entry)
-            _cfg["cloud_models"] = _models[-10:]
-            CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-            save_config(_cfg)   # ⑤ 0600 + 原子写（唯一入口）
+            _ep = str(cloud_config["endpoint"])[:500]
+            _models = _cfg.get("cloud_models", []) or []
+            _hit = None
+            for m in _models:
+                if isinstance(m, dict) and str(m.get("endpoint", ""))[:500] == _ep:
+                    _hit = m
+                    break
+            if _hit is None:
+                logger.info("请求中的云端模型未在配置中（%s）：不新增条目，请到设置页添加",
+                            _ep[:80])
+            else:
+                _hit["key"] = str(cloud_config.get("key", ""))[:500]
+                _hit["protocol"] = str(cloud_config.get("protocol", "openai"))[:30]
+                CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+                save_config(_cfg)   # ⑤ 0600 + 原子写（唯一入口）
         except Exception:
             logger.debug("Failed to persist cloud_config on request", exc_info=True)
     use_stream = body.get("stream", False)

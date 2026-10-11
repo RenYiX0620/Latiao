@@ -318,6 +318,14 @@ _READONLY_COMMANDS = frozenset({
 })
 _GIT_READONLY = re.compile(r"^(log|status|diff|show|branch|remote|tag|blame)$")
 
+# 只读命令里带**写/删副作用**的 flag（2026-10-11 修复）：`find . -delete` 此前
+# 在语义层与本模块的降级正则路径**都判只读**（实测），子代理可免确认批量删除。
+# 与 tool_executor 共用同一份名单（那边 import 本常量），避免两处漂移。
+READONLY_DANGER_FLAGS = frozenset({
+    "-delete", "-exec", "-execdir", "-ok", "-okdir",
+    "-fprint", "-fprintf", "-fls",
+})
+
 
 def readonly_safe(cmd: str) -> bool:
     """全部调用都是单条简单只读命令才放行（否则 False，不 fail-open）。
@@ -337,6 +345,9 @@ def readonly_safe(cmd: str) -> bool:
     if inv.name == "git":
         return bool(inv.args and _GIT_READONLY.fullmatch(inv.args[0]))
     if inv.name not in _READONLY_COMMANDS:
+        return False
+    # 带副作用的 flag（find -delete/-exec/-fprint…）直接拒绝
+    if any(arg in READONLY_DANGER_FLAGS for arg in inv.args):
         return False
     if not is_safe_shape(inv.words, shape):
         return False
