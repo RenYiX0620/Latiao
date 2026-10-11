@@ -57,6 +57,44 @@ def _current_platform() -> str:
     return "linux-x86_64"
 
 
+def _fetch_expected_digest(version: str, asset_name: str) -> str:
+    """从 GitHub 权威接口取目标资产的 sha256（"sha256:<hex>"），取不到返回 ""。
+
+    2026-10-11 审计修复（更新链路的校验缺口）：包可能经镜像（gh-proxy/ghfast）
+    下载，此前**没有任何完整性校验**——坏镜像/中间人可换包且无人发现。而 GitHub
+    Releases API 对每个资产提供 `digest`（实测可用），这是权威源。GitHub 不可达
+    （国内常态）时返回空串，调用方按"未校验"如实标注，不假装校验过。
+    """
+    if not version or not asset_name:
+        return ""
+    v = version.lstrip("vV")
+    url = f"https://api.github.com/repos/RenYiX0620/Latiao/releases/tags/v{v}"
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Latiao/1.0", "Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(req, timeout=20, context=_ssl_context()) as resp:
+            data = json.loads(resp.read().decode("utf-8", "ignore"))
+        for a in (data.get("assets") or []):
+            if a.get("name") == asset_name:
+                return str(a.get("digest") or "")
+    except Exception:
+        logger.info("无法从 GitHub 取资产校验和（%s %s）——本次按未校验处理",
+                    v, asset_name)
+    return ""
+
+
+def _sha256_file(path: Path) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+    except OSError:
+        return ""
+    return "sha256:" + h.hexdigest()
+
+
 def _version_tuple(v: str) -> tuple:
     parts = re.findall(r"\d+", v or "")
     return tuple(int(p) for p in parts[:4]) or (0,)
@@ -198,12 +236,32 @@ def _download_worker(url: str, dest: Path, version: str) -> None:
                             _state["_last_flush"] = time.time()
                             _save_state()
             if part.stat().st_size >= total > 0:
-                # 下载完成：重命名为正式文件
+                # 下载完成：先校验（有权威校验和时）、再重命名为正式文件。
+                # 2026-10-11：包可能经镜像下载，未校验的包不得进入"可安装"状态；
+                # 校验和拿不到（GitHub 不可达）时按未校验放行并在状态里标注。
+                _exp = str(_state.get("expected_digest") or "")
+                if _exp:
+                    _got = _sha256_file(part)
+                    if _got != _exp:
+                        logger.error("更新包校验失败：期望 %s，实际 %s（已丢弃）",
+                                     _exp[:24], _got[:24])
+                        try:
+                            part.unlink()
+                        except OSError:
+                            pass
+                        with _state_lock:
+                            _state.update({"status": "failed", "integrity": "mismatch",
+                                           "error": "更新包校验失败（可能被镜像替换），已丢弃"})
+                            _save_state()
+                        return
+                    with _state_lock:
+                        _state["integrity"] = "verified"
                 os.replace(part, dest)
                 with _state_lock:
                     _state.update({"status": "done", "downloaded": total, "part_path": ""})
                     _save_state()
-                logger.info("更新包预下载完成: %s (%d 字节)", dest.name, total)
+                logger.info("更新包预下载完成: %s (%d 字节，校验=%s)",
+                            dest.name, total, _state.get("integrity", "unchecked"))
                 return
             raise RuntimeError(f"下载数据不足: {part.stat().st_size}/{total}")
         except Exception as e:
@@ -235,16 +293,38 @@ def start_prepare(current_version: str) -> dict:
             _dest = UPDATE_DIR / url.split("/")[-1]
             _total = int(st.get("total") or 0)
             if _total and _dest.exists() and _dest.stat().st_size == _total:
-                _part = _dest.with_suffix(_dest.suffix + ".part")
-                try:
-                    if _part.exists():
-                        _part.unlink()
-                except OSError:
-                    logger.debug("清理 .part 残片失败", exc_info=True)
-                logger.info("更新包已在位且完整（%d 字节），跳过续传: %s",
-                            _total, _dest.name)
-                with _state_lock:
-                    _state.update({"status": "done", "downloaded": _total,
+                # 自愈前也校验（2026-10-11）：大小对不等于内容对——镜像换包后
+                # 进程重启走进这里就会把坏包直接标 done。拿得到权威校验和就验；
+                # 验不过 → 删除坏包并继续走完整下载流程（而不是信任它）。
+                _exp = str(st.get("expected_digest") or "")
+                if _exp:
+                    _got = _sha256_file(_dest)
+                    if _got != _exp:
+                        logger.error("在位更新包校验失败（期望 %s，实际 %s）→ 删除重下",
+                                     _exp[:24], _got[:24])
+                        try:
+                            _dest.unlink()
+                        except OSError:
+                            pass
+                        with _state_lock:
+                            _state.update({"integrity": "mismatch", "total": 0,
+                                           "downloaded": 0})
+                            _save_state()
+                    else:
+                        with _state_lock:
+                            _state["integrity"] = "verified"
+                            _save_state()
+                if _dest.exists() and _dest.stat().st_size == _total:
+                    _part = _dest.with_suffix(_dest.suffix + ".part")
+                    try:
+                        if _part.exists():
+                            _part.unlink()
+                    except OSError:
+                        logger.debug("清理 .part 残片失败", exc_info=True)
+                    logger.info("更新包已在位且完整（%d 字节），跳过续传: %s",
+                                _total, _dest.name)
+                    with _state_lock:
+                        _state.update({"status": "done", "downloaded": _total,
                                    "error": "", "part_path": ""})
                     _save_state()
                 return get_progress()
@@ -309,9 +389,14 @@ def start_prepare(current_version: str) -> dict:
                 return
             url = entry["url"]
             dest = UPDATE_DIR / url.split("/")[-1]
+            # 校验和：GitHub 权威接口（可达时）。下载完成/已在位时用它验证，
+            # 防镜像换包；不可达则按"未校验"如实标注（不假装校验过）。
+            _digest = _fetch_expected_digest(remote_ver, dest.name)
             with _state_lock:
                 _state.update({"status": "downloading", "version": remote_ver,
                                "url": url, "signature": entry.get("signature", ""),
+                               "expected_digest": _digest,
+                               "integrity": "pending" if _digest else "unchecked",
                                # pub_date 透传：空串会让 tauri updater 的 RFC3339 解析直接失败
                                "pub_date": str(manifest.get("pub_date") or ""),
                                "downloaded": 0, "total": 0})

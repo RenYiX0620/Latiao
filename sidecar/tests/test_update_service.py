@@ -168,5 +168,65 @@ class TestUpdateService(unittest.TestCase):
         self.assertEqual(p["total"], 100)
 
 
+class TestDigestVerification(unittest.TestCase):
+    """更新包校验（2026-10-11 审计修复）：镜像可换包，下载/自愈都必须验。"""
+
+    def test_sha256_file_matches_hashlib(self):
+        import hashlib, tempfile
+        from pathlib import Path
+        import update_service as us
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / "x.bin"
+            f.write_bytes(b"hello world")
+            want = "sha256:" + hashlib.sha256(b"hello world").hexdigest()
+            self.assertEqual(us._sha256_file(f), want)
+
+    def test_fetch_digest_missing_version_returns_empty(self):
+        import update_service as us
+        self.assertEqual(us._fetch_expected_digest("", "a.tar.gz"), "")
+
+    def test_download_verifies_and_rejects_tampered_part(self):
+        """下载完成时校验不过 → failed + integrity=mismatch + 坏包删除。"""
+        import tempfile
+        from pathlib import Path
+        import update_service as us
+
+        class _Resp:
+            def __init__(self, body): self._b = body; self._done = False
+            def read(self, n=-1):
+                if self._done or not self._b:
+                    return b""          # 读完必须返回空，否则下载循环永不结束
+                self._done = True
+                return self._b
+            def getheader(self, k, d=None): return str(len(self._b))
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        with tempfile.TemporaryDirectory() as d:
+            dest = Path(d) / "pkg.tar.gz"
+            part = dest.with_suffix(dest.suffix + ".part")
+            calls = {"n": 0}
+            def _open(req, timeout=None, context=None):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    return _Resp(b"tampered-bytes")     # 第一次喂坏内容
+                raise RuntimeError("stop")               # 之后立即失败
+            orig_open = us.urllib.request.urlopen
+            orig_sleep = us.time.sleep
+            us.urllib.request.urlopen = _open
+            us.time.sleep = lambda s: None               # 跳过退避，测试不空转 36s
+            us._state.clear()
+            us._state.update({"expected_digest": "sha256:" + "0" * 64})
+            try:
+                us._download_worker("https://x/pkg.tar.gz", dest, "0.3.9")
+            finally:
+                us.urllib.request.urlopen = orig_open
+                us.time.sleep = orig_sleep
+            self.assertEqual(us._state.get("status"), "failed")
+            self.assertEqual(us._state.get("integrity"), "mismatch")
+            self.assertFalse(part.exists(), "坏包必须删除")
+            self.assertFalse(dest.exists())
+
+
 if __name__ == "__main__":
     unittest.main()

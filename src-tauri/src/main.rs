@@ -431,10 +431,48 @@ fn open_path(path: String) -> Result<(), String> {
         return Err("empty path".into());
     }
     // 只允许绝对路径，拒绝穿越片段——避免把 webview 来的相对路径/命令行塞进 open
-    if !std::path::Path::new(&path).is_absolute() || path.contains("..") {
+    let p = std::path::Path::new(&path);
+    if !p.is_absolute() || path.contains("..") {
         return Err("path must be absolute and without ..".into());
     }
+    // 可执行载体不入系统打开器（2026-10-11 审计修复）：`open` 会**启动** .app 包
+    // 与 .command 脚本，xdg-open/explorer 对可执行文件同理——模型诱导路径 +
+    // 一次"打开"即代码执行。这里是打开文件，不是启动程序。
+    if let Some(ext) = p.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()) {
+        const BAD_EXT: [&str; 8] = ["app", "command", "scpt", "workflow",
+                                    "terminal", "action", "applescript", "jar"];
+        if BAD_EXT.contains(&ext.as_str()) {
+            return Err("refusing to open an executable bundle/script".into());
+        }
+        if cfg!(unix) && ext == "sh" && is_executable(p) {
+            return Err("refusing to open an executable script".into());
+        }
+    }
+    // macOS 的 .app 是目录（带扩展名但 is_dir）；上面的扩展名判已覆盖目录形态。
+    if p.is_dir() {
+        // 目录：仅当它明显是可执行包时拒绝（普通目录允许在 Finder 中显示）
+        if p.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("app")).unwrap_or(false) {
+            return Err("refusing to open an application bundle".into());
+        }
+    } else if cfg!(unix) && is_executable(p) {
+        // 可执行位 + 非文档扩展：拒绝（防"写个二进制再打开"）
+        let ext_ok = p.extension().and_then(|e| e.to_str())
+            .map(|e| matches!(e.to_ascii_lowercase().as_str(),
+                              "pdf" | "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" |
+                              "md" | "txt" | "csv" | "json" | "docx" | "xlsx" | "pptx" |
+                              "doc" | "xls" | "ppt" | "mp4" | "mov" | "mp3" | "wav" | "html"))
+            .unwrap_or(false);
+        if !ext_ok {
+            return Err("refusing to open an executable file".into());
+        }
+    }
     open_with_system(&path)
+}
+
+#[cfg(unix)]
+fn is_executable(p: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(p).map(|m| m.permissions().mode() & 0o111 != 0).unwrap_or(false)
 }
 
 fn open_with_system(path: &str) -> Result<(), String> {
@@ -469,22 +507,38 @@ fn classify_stale_pid(pid: i32) -> StalePidState {
     }
     #[cfg(unix)]
     {
+        // 双重验证（2026-10-11 审计修复）：此前只看 `ps -o comm=`，里面含
+        // "python"/"latiao" 就判"自家"→ 用户自己的 python 进程（脚本/venv/
+        // Jupyter…）都可能被当残留杀掉。判定的正确口径是**看可执行文件本身**
+        // （命令行第一个 token 的 basename），不做全行子串匹配——实测教训：
+        // 任何参数里提到 local-ai-os 的进程（编辑器、shell 包装行、构建命令）
+        // 都会被宽规则命中。
+        //   A) 可执行 basename 就是我们的产品：local-ai-os / Latiao（Tauri 二进制）
+        //   B) 解释器路径落在我们的 sidecar 目录（".*/sidecar/python/bin/python3*"）
+        //      且脚本参数是 main.py
         match Command::new("ps")
-            .args(["-p", &pid.to_string(), "-o", "comm="])
+            .args(["-p", &pid.to_string(), "-o", "command="])
             .output()
         {
             // 进程不存在时 ps 退出码非 0、stdout 为空 —— 这是"已死"，不是"不是自家"
             Ok(out) => {
-                let comm = String::from_utf8_lossy(&out.stdout).to_lowercase();
-                if comm.trim().is_empty() {
-                    StalePidState::Gone
-                } else if comm.contains("python")
-                    || comm.contains("sidecar")
-                    || comm.contains("latiao")
-                {
+                let cmd = String::from_utf8_lossy(&out.stdout);
+                let cmd = cmd.trim().to_lowercase();
+                if cmd.is_empty() {
+                    return StalePidState::Gone;
+                }
+                let first = cmd.split_whitespace().next().unwrap_or("");
+                let first_base = first.rsplit('/').next().unwrap_or(first);
+                let exe_is_ours = first_base == "local-ai-os"
+                    || first_base == "latiao"
+                    || first_base == "latiao.exe"
+                    || first_base.starts_with("local-ai-os ");
+                let py_in_our_sidecar = first.contains("/sidecar/python/bin/")
+                    && cmd.contains("main.py");
+                if exe_is_ours || py_in_our_sidecar {
                     StalePidState::Ours
                 } else {
-                    StalePidState::NotOurs
+                    StalePidState::NotOurs   // 名字像 python 但不是我们的 → 绝不杀
                 }
             }
             Err(_) => StalePidState::Gone,
@@ -500,10 +554,11 @@ fn classify_stale_pid(pid: i32) -> StalePidState {
                 let line = String::from_utf8_lossy(&out.stdout).to_lowercase();
                 if line.trim().is_empty() || line.contains("no tasks") {
                     StalePidState::Gone
-                } else if line.contains("python")
-                    || line.contains("sidecar")
-                    || line.contains("latiao")
+                } else if line.contains("local-ai-os")
+                    || line.contains("latiao.exe")
+                    || (line.contains("python") && line.contains("main.py"))
                 {
+                    // Windows 同样要求"产品名"或"python + main.py"组合，不用裸 python 定罪
                     StalePidState::Ours
                 } else {
                     StalePidState::NotOurs
