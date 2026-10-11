@@ -28,8 +28,20 @@ _PERM_RANK = {"readonly": 0, "files": 1, "network": 2, "shell": 3}
 _FORBIDDEN_CALLS = {
     "eval", "exec", "compile", "__import__",
     "os.system", "os.popen", "os.execv", "os.execve", "os.spawnv",
-    "pty.spawn", "importlib.import_module", "globals", "locals",
+    "pty.spawn", "importlib.import_module", "globals", "locals", "vars",
+    # 2026-10-11 审计修复：反射入口本身也拒（`getattr(os,"system")` 这类把
+    # 调用名动态化的写法，是 Call-name 黑名单的经典绕过；下面再对字符串参数
+    # 做一层判定，双保险）
+    "getattr", "setattr", "delattr",
 }
+# getattr(x, "名") 的字符串参数命中这些名字 = 动态构造危险调用
+_DANGEROUS_ATTR_NAMES = {
+    "system", "popen", "eval", "exec", "__import__", "import_module",
+    "call", "run", "Popen", "check_output", "spawn", "spawnv", "execv", "execve",
+}
+# 导入别名解析：`import os as o; o.system(...)` 也要能对上名单
+_MODULE_ALIASES = ("os", "subprocess", "pty", "importlib", "builtins")
+
 _SHELL_HINTS = ("subprocess", "pty", "os.system", "os.popen", "shutil")
 _NET_HINTS = ("requests", "httpx", "socket", "urllib", "aiohttp", "websocket")
 _FILE_HINTS = ("open", "pathlib", "shutil", "os.remove", "os.rename", "os.makedirs")
@@ -55,8 +67,45 @@ def validate_plugin_code(code: str) -> dict:
     assigned = set()
     has_execute = False
     used_names: set[str] = set()
+    # 导入别名表（`import os as o` → o→os）与字符串拼接节点（"os"+"."+"system" 那种）
+    _aliases: dict[str, str] = {}
+    _strcat_nodes: set[int] = set()
     for node in ast.walk(tree):
-        if isinstance(node, ast.Assign):
+        if isinstance(node, (ast.BinOp, ast.JoinedStr)):
+            # 拼接/f-string 里出现动态属性名 → 一起禁（无法静态求值就别赌）
+            segs = []
+            if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+                for side in (node.left, node.right):
+                    if isinstance(side, ast.Constant) and isinstance(side.value, str):
+                        segs.append(side.value)
+            elif isinstance(node, ast.JoinedStr):
+                for v in node.values:
+                    if isinstance(v, ast.Constant) and isinstance(v.value, str):
+                        segs.append(v.value)
+            joined = "".join(segs)
+            if any(dn in joined for dn in ("system", "popen", "eval", "exec",
+                                           "import", "Popen", "spawn", "call")):
+                errors.append("禁止的动态构造：拼接/f-string 里出现可执行入口名")
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            if isinstance(node, ast.Import):
+                for al in node.names:
+                    root = (al.name or "").split(".")[0]
+                    local = al.asname or root
+                    if root in _MODULE_ALIASES:
+                        _aliases[local] = root
+            elif node.module:                     # from subprocess import run as r
+                root = node.module.split(".")[0]
+                for al in node.names:
+                    if root in _MODULE_ALIASES:
+                        _aliases[al.asname or al.name] = root
+        elif isinstance(node, ast.Assign):
+            # x = os.system 这类别名赋值
+            if isinstance(node.value, ast.Attribute) and isinstance(node.value.value, ast.Name):
+                src = node.value.value.id
+                if src in ("os", "subprocess", "pty", "builtins", "importlib"):
+                    for tgt in node.targets:
+                        if isinstance(tgt, ast.Name):
+                            _aliases[tgt.id] = src
             for tgt in node.targets:
                 if isinstance(tgt, ast.Name):
                     assigned.add(tgt.id)
@@ -64,6 +113,16 @@ def validate_plugin_code(code: str) -> dict:
             has_execute = True
         elif isinstance(node, ast.Name):
             used_names.add(node.id)
+            # 函数别名赋值 `x = os.system; x("id")`：x 在别名表里且未被合法调用名
+            # 直接命中时，按"动态别名间接执行"处理（2026-10-11 审计修复）
+            if node.id in _aliases and _aliases[node.id] in ("subprocess", "pty"):
+                errors.append(f"禁止的调用：{node.id}()（动态别名间接执行）")
+            elif node.id in _aliases and _aliases[node.id] in ("os", "builtins", "importlib") \
+                    and node.id not in ("os", "builtins", "importlib"):
+                # os.system 之类的赋值别名：名字不在名单但指向危险模块的函数
+                _f = node.id
+                if _f not in _FORBIDDEN_CALLS:
+                    errors.append(f"禁止的别名引用：{_f}（指向 {_aliases[_f]} 的可执行入口）")
         elif isinstance(node, ast.Attribute):
             base = node.value.id if isinstance(node.value, ast.Name) else ""
             if base:
@@ -73,11 +132,35 @@ def validate_plugin_code(code: str) -> dict:
             if isinstance(fn, ast.Name):
                 if fn.id in _FORBIDDEN_CALLS:
                     errors.append(f"禁止的调用：{fn.id}()（绕过权限体系）")
+                elif fn.id in _aliases and _aliases[fn.id] in ("subprocess", "pty"):
+                    errors.append(f"禁止的调用：{fn.id}()（动态别名间接执行）")
             elif isinstance(fn, ast.Attribute):
                 base = fn.value.id if isinstance(fn.value, ast.Name) else ""
                 full = f"{base}.{fn.attr}" if base else fn.attr
                 if full in _FORBIDDEN_CALLS:
                     errors.append(f"禁止的调用：{full}()（绕过权限体系）")
+                # 别名词表解析：`import os as o; o.system()` / `x = os.system; x()`
+                elif base in _aliases and _aliases[base] in ("os", "subprocess", "pty"):
+                    real = f"{_aliases[base]}.{fn.attr}"
+                    if real in _FORBIDDEN_CALLS or fn.attr in ("system", "popen", "Popen", "call", "run"):
+                        errors.append(f"禁止的调用：{full}()（别名指向 {real}）")
+                # builtins.eval / builtins.__import__
+                elif base == "builtins" and (fn.attr in _FORBIDDEN_CALLS or fn.attr in ("eval", "exec", "__import__")):
+                    errors.append(f"禁止的调用：{full}()（builtins 反射）")
+            # getattr(x, "危险名") 字符串参数判定（含拼接后拼接节点）
+            if isinstance(fn, ast.Name) and fn.id == "getattr" and len(node.args) >= 2:
+                _arg2 = node.args[1]
+                _name_val = ""
+                if isinstance(_arg2, ast.Constant) and isinstance(_arg2.value, str):
+                    _name_val = _arg2.value
+                elif isinstance(_arg2, (ast.BinOp, ast.JoinedStr)):
+                    _parts = []
+                    for sub in ast.walk(_arg2):
+                        if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                            _parts.append(sub.value)
+                    _name_val = "".join(_parts)
+                if _name_val and _name_val in _DANGEROUS_ATTR_NAMES:
+                    errors.append(f'禁止的反射调用：getattr(..., "{_name_val}")（绕过调用名单）')
 
     for need in ("NAME", "DEFINITION", "PERMISSION"):
         if need not in assigned:

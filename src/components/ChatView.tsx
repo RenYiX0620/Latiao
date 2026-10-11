@@ -381,10 +381,19 @@ export default memo(function ChatView({
                     <div className="msg-bubble assistant">
                       <ReactMarkdown remarkPlugins={[remarkGfm]} components={
                         {
-                          code: ({ inline, className, children, ...props }: { inline?: boolean; className?: string; children?: React.ReactNode }) =>
-                            inline
+                          // react-markdown v10 移除了 `inline` prop（源码里已无此字段，
+                          // 2026-10-11 核实）——旧写法读到的 inline 恒为 undefined，
+                          // 行内 `code` 被当围栏代码块渲染（多出行号块/高亮框）。
+                          // 现在按官方 v10 语义判定：有 language-* 类名 = 围栏代码块；
+                          // 无类名且内容不含换行 = 行内代码（缩进代码块含换行，仍走块渲染）。
+                          code: ({ className, children, ...props }: { className?: string; children?: React.ReactNode }) => {
+                            const lang = (className || "").replace("language-", "");
+                            const text = String(children ?? "");
+                            const isInline = !className && !text.includes("\n");
+                            return isInline
                               ? <code className={className} {...props}>{children}</code>
-                              : <CodeBlock language={(className || "").replace("language-", "")}>{String(children)}</CodeBlock>,
+                              : <CodeBlock language={lang}>{text}</CodeBlock>;
+                          },
                           a: ({ href, children }: { href?: string; children?: React.ReactNode }) => (
                             <a href={href} onClick={(e) => { e.preventDefault(); if (href) openUrl(href); }}>{children}</a>
                           ),
