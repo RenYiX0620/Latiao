@@ -36,7 +36,7 @@ class DualFakeEngine:
     def start(self) -> str:
         import uvicorn
         from fastapi import FastAPI
-        from fastapi.responses import StreamingResponse, JSONResponse
+        from fastapi.responses import JSONResponse, StreamingResponse
 
         app = FastAPI()
         self.app = app
@@ -81,6 +81,7 @@ class DualFakeEngine:
 
 def _start_app() -> str:
     import uvicorn
+
     import api_routes  # noqa: F401
     import main  # noqa: F401  (构建 app; api_routes.app 即主应用)
     # 全量套件下其它测试模块可能已把 AUTH_TOKEN 设成自己的值——

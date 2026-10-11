@@ -59,6 +59,7 @@ def enabled() -> bool:
     if raw is None:
         try:
             import json as _json
+
             from config import CONFIG_FILE
             if CONFIG_FILE.exists():
                 cfg = _json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
@@ -159,13 +160,31 @@ def stop() -> None:
                     pass
             _proc = None
         else:
-            # 不是本进程启的（例如上一轮遗留）：按端口清理
+            # 不是本进程启的（例如上一轮遗留）：按端口清理。
+            # 2026-10-11：只杀本引擎形态的进程（llama-server 跑 --embeddings），
+            # 认不出就不杀——旧实现 SIGTERM 该端口任意监听者，自定义端口撞上
+            # 无关服务即误杀。
             try:
                 out = subprocess.run(["lsof", "-nP", f"-iTCP:{EMBED_PORT}", "-sTCP:LISTEN", "-t"],
                                      capture_output=True, text=True, timeout=5).stdout.split()
                 for pid in out:
                     try:
-                        os.kill(int(pid), signal.SIGTERM)
+                        pid_i = int(pid)
+                    except (ValueError, TypeError):
+                        continue
+                    if pid_i == os.getpid():
+                        continue
+                    try:
+                        cmd = subprocess.run(["ps", "-p", str(pid_i), "-o", "command="],
+                                             capture_output=True, text=True, timeout=3).stdout.lower()
+                    except Exception:
+                        continue
+                    if not any(k in cmd for k in ("llama-server", "llama_server", "mlx_lm",
+                                                  "latiao", "local-ai-os", "gguf", "embed")):
+                        logger.warning("端口 %s 被非嵌入服务占用（pid=%s），不杀", EMBED_PORT, pid_i)
+                        continue
+                    try:
+                        os.kill(pid_i, signal.SIGTERM)
                     except (ValueError, ProcessLookupError, PermissionError):
                         continue
             except Exception:

@@ -5,8 +5,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from agent_loop import _build_chat_messages, _detect_user_language, _progress_tail
 from agent.context import detect_language_decision as _detect_lang_decision
+from agent_loop import _build_chat_messages, _detect_user_language, _progress_tail
 
 
 class TestDetectUserLanguage(unittest.TestCase):
@@ -209,6 +209,7 @@ def test_translation_request_disables_thinking():
     """翻译请求必须关思考：实测开思考时 6867 字推理吃掉 55s（客户端超时 60s），
     关掉后同一段文本 6.4s。这条用源码断言钉住，防止有人把开关删了。"""
     import pathlib
+
     import agent.gates as gates
     src = pathlib.Path(gates.__file__).read_text("utf-8")
     idx = src.index("_tb = {\"model\": engine_model")
@@ -232,6 +233,7 @@ def test_language_requirement_is_the_last_line(monkeypatch, tmp_path):
     """
     monkeypatch.setenv("LATIAO_TEST_PROGRESS_DIR", str(tmp_path / ".local-ai-os"))
     import importlib
+
     import config
     importlib.reload(config)
     import agent.prompt_build as PB
@@ -246,6 +248,7 @@ def test_language_requirement_is_the_last_line(monkeypatch, tmp_path):
 def test_language_requirement_follows_user_language(monkeypatch, tmp_path):
     monkeypatch.setenv("LATIAO_TEST_PROGRESS_DIR", str(tmp_path / ".local-ai-os"))
     import importlib
+
     import config
     importlib.reload(config)
     import agent.prompt_build as PB

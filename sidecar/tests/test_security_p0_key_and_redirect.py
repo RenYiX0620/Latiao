@@ -39,6 +39,7 @@ def prod_progress(tmp_path, monkeypatch):
     config.CONFIG_FILE 留成真机路径。
     """
     import importlib
+
     import config as config_mod
     session_dir = os.environ.get("LATIAO_TEST_PROGRESS_DIR") or str(tmp_path)
     monkeypatch.setenv("LATIAO_TEST_PROGRESS_DIR", str(tmp_path))
@@ -102,6 +103,7 @@ def test_key_not_leaked_to_foreign_endpoint(prod_progress):
     _write_cfg(prod_progress, [{"name": "my-model", "endpoint": "https://legit.example.com/v1",
                                 "key": "sk-SECRET", "protocol": "openai"}])
     import importlib
+
     import agent.routing as routing
     importlib.reload(routing)
     got = routing._lookup_cloud_key({"name": "my-model", "endpoint": "https://evil.example.com",
@@ -114,6 +116,7 @@ def test_key_returned_for_matching_endpoint(prod_progress):
     _write_cfg(prod_progress, [{"name": "my-model", "endpoint": "https://legit.example.com/v1",
                                 "key": "sk-SECRET", "protocol": "openai"}])
     import importlib
+
     import agent.routing as routing
     importlib.reload(routing)
     got = routing._lookup_cloud_key({"name": "my-model",
@@ -127,6 +130,7 @@ def test_key_not_returned_by_name_only_when_endpoint_missing(prod_progress):
     _write_cfg(prod_progress, [{"name": "my-model", "endpoint": "https://legit.example.com/v1",
                                 "key": "sk-SECRET", "protocol": "openai"}])
     import importlib
+
     import agent.routing as routing
     importlib.reload(routing)
     got = routing._lookup_cloud_key({"name": "my-model", "model": "my-model"})

@@ -46,6 +46,9 @@ async def create_cron_job(request: Request):
         "schedule": body.get("schedule", "0 9 * * *"),
         "task": body.get("task", "新建任务"),
         "action": body.get("action", "notify"),  # notify | execute
+        # 工具档：无人值守默认只读（2026-10-11）。需要写/执行的任务由创建方显式
+        # 提升到 confirm/auto_edit/full——不再默认 full 自动放行。
+        "access_mode": body.get("access_mode", "read_only"),
         "enabled": body.get("enabled", True),
         "created_at": datetime.now().isoformat(),
     }

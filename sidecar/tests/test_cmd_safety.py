@@ -89,8 +89,8 @@ class TestAccessDefaultsConfirm(unittest.TestCase):
     """权限默认档必须为 confirm（审计 P0-1：此前三处默认 full）。"""
 
     def test_loop_defaults_confirm(self):
-        from agent_loop import _handle_tool_execution
         from agent.loop import ThinAgentLoop
+        from agent_loop import _handle_tool_execution
         self.assertEqual(
             inspect.signature(ThinAgentLoop.__init__).parameters["access_mode"].default,
             "confirm")
@@ -103,7 +103,9 @@ class TestAccessDefaultsConfirm(unittest.TestCase):
 class TestSessionCancelRegistry(unittest.TestCase):
     def test_cancel_lifecycle(self):
         from agent_loop import (
-            _request_session_cancel, _clear_session_cancel, _session_cancel_requested,
+            _clear_session_cancel,
+            _request_session_cancel,
+            _session_cancel_requested,
         )
         sid = "sess-test"
         _clear_session_cancel(sid)
@@ -115,7 +117,9 @@ class TestSessionCancelRegistry(unittest.TestCase):
 
     def test_other_session_unaffected(self):
         from agent_loop import (
-            _request_session_cancel, _clear_session_cancel, _session_cancel_requested,
+            _clear_session_cancel,
+            _request_session_cancel,
+            _session_cancel_requested,
         )
         _request_session_cancel("sess-a")
         self.assertFalse(_session_cancel_requested("sess-b"))

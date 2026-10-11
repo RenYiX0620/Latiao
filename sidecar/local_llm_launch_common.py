@@ -4,9 +4,9 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
-import logging
 logger = logging.getLogger("latiao-sidecar")
 
 _ENGINE_ENV_PREFIXES = ("DYLD_", "LD_", "MTL_", "GGML_", "OMP_", "CUDA_", "VK_", "HF_", "MLX_")

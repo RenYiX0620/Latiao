@@ -3,9 +3,9 @@
 _resolve_api_target / _get_best_cloud_config：决定这一轮打到本地引擎还是云端、
 用哪份协议头。它依赖 config.json（CONFIG_FILE 仍归枢纽），所以按惰性导入取用。
 """
+import json
 import logging
 
-import json
 import local_llm
 
 logger = logging.getLogger("latiao-sidecar")   # 与 agent_loop 同名：日志格式不变

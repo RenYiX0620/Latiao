@@ -438,9 +438,16 @@ fn open_path(path: String) -> Result<(), String> {
     // 可执行载体不入系统打开器（2026-10-11 审计修复）：`open` 会**启动** .app 包
     // 与 .command 脚本，xdg-open/explorer 对可执行文件同理——模型诱导路径 +
     // 一次"打开"即代码执行。这里是打开文件，不是启动程序。
+    // 2026-10-11 全盘审查 H4：原名单是 macOS 视角（8 项），Windows 的
+    // .exe/.bat/.cmd/.ps1/.vbs/.msi 全放行——explorer 会执行它们。补全。
     if let Some(ext) = p.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()) {
-        const BAD_EXT: [&str; 8] = ["app", "command", "scpt", "workflow",
-                                    "terminal", "action", "applescript", "jar"];
+        const BAD_EXT: [&str; 22] = [
+            // macOS 载体
+            "app", "command", "scpt", "workflow", "terminal", "action", "applescript",
+            // Windows 可执行/脚本载体（explorer 会启动它们）
+            "exe", "bat", "cmd", "com", "ps1", "psm1", "vbs", "vbe", "wsf", "wsh",
+            "msi", "msp", "scr", "pif", "jar",
+        ];
         if BAD_EXT.contains(&ext.as_str()) {
             return Err("refusing to open an executable bundle/script".into());
         }

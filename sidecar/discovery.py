@@ -50,6 +50,7 @@ def _load_gh_token() -> str:
         return tok
     try:
         import json as _json
+
         from config import CONFIG_FILE
         if CONFIG_FILE.exists():
             cfg = _json.loads(CONFIG_FILE.read_text(encoding="utf-8"))

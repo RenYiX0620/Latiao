@@ -4,19 +4,18 @@
 不依赖 tokenizer 的路径；精确计数（vocab_only / tokenizers）在实现时用真机
 实测校验过（GGUF 与 MLX 两路计数一致，误差 0）。
 """
-from unittest import mock
-import time
 import json
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import agent.tool_exec as TE  # noqa: E402  （工具执行簇 2026-09-23 拆出：patch 面在此）
-
 import context_stats as cs
 import local_llm_probe
 
@@ -163,7 +162,7 @@ class TestUsageAndCache(unittest.TestCase):
         self.assertEqual(after, before + 5000)
 
     def test_rolling_average_and_cap(self):
-        for i in range(cs.CACHE_SAMPLES + 5):
+        for _ in range(cs.CACHE_SAMPLES + 5):
             cs.record_usage(self.SESSION, None, {"prompt_n": 50, "cache_n": 50})   # 50/(50+50)
         st = cs.stats(self.SESSION)
         self.assertEqual(st["cache_samples"], cs.CACHE_SAMPLES)
@@ -236,7 +235,7 @@ class TestInfoSaturation(unittest.TestCase):
 
     def test_repeat_scores_low_gain(self):
         # 真实形态：换个 query 重搜，返回的仍是同一批快讯（内容重复、仅顺序/措辞不同）
-        from agent.loop import _info_points, _info_gain, _INFO_GAIN_RATIO
+        from agent.loop import _INFO_GAIN_RATIO, _info_gain, _info_points
         base = ("美股三大指数涨跌不一，道指跌0.18%报51682.64点，纳指涨0.39%报26522.55点，"
                 "标普500涨0.17%报7650.5点。半导体板块走强，闪迪涨近11%。")
         reordered = ("标普500涨0.17%报7650.5点；纳指涨0.39%报26522.55点；道指跌0.18%报51682.64点。"
@@ -245,7 +244,7 @@ class TestInfoSaturation(unittest.TestCase):
         self.assertLess(gain, _INFO_GAIN_RATIO)      # 同批数据复述 → 低增量（实测 12%）
 
     def test_new_topic_scores_high_gain(self):
-        from agent.loop import _info_points, _info_gain
+        from agent.loop import _info_gain, _info_points
         seen = _info_points("道指跌0.18%报51682.64点，纳指涨0.39%")
         gain, _new = _info_gain("苹果发布新款芯片，出货量同比增长23%，营收120亿美元", seen)
         self.assertGreater(gain, 0.5)
@@ -373,7 +372,7 @@ class TestBoundedToolExecution(unittest.TestCase):
         self.assertIn("No such directory", search_files("/definitely/not/here", "*.md"))
 
     def test_tool_timeout_table(self):
-        from agent_loop import _tool_timeout_for, _TOOL_TIMEOUT_DEFAULT
+        from agent_loop import _TOOL_TIMEOUT_DEFAULT, _tool_timeout_for
         self.assertLessEqual(_tool_timeout_for("search_files"), 30)
         self.assertLessEqual(_tool_timeout_for("tavily_search"), 60)
         self.assertEqual(_tool_timeout_for("no_such_tool"), _TOOL_TIMEOUT_DEFAULT)
@@ -383,6 +382,7 @@ class TestToolTimeoutWrapper(unittest.TestCase):
 
     def test_timeout_returns_result_not_raise(self):
         import asyncio
+
         import agent_loop
         from agent_loop import _handle_tool_execution
 
@@ -528,7 +528,8 @@ class TestHeadStabilityAcrossTurns(unittest.TestCase):
 
     def test_head_stable_from_first_turn(self):
         """本地引擎：**从第 1 轮起**头部就固定（工具表=整套），不随措辞变化。"""
-        import local_llm, context_stats as cs
+        import context_stats as cs
+        import local_llm
         local_llm._engine._active_backend = "llama-cpp-native"
         heads, names = [], []
         for q in ("你好呀", "分析周五A股大盘走势", "帮我写个 python 脚本存文件",
@@ -545,7 +546,8 @@ class TestHeadStabilityAcrossTurns(unittest.TestCase):
         用户实测的 0% 就出在这里：旧实现每轮按措辞重算工具表（14↔12 交替）→ 头部
         每轮都变 → 混合/线性注意力模型无法复用。新实现只增不减，饱和后即稳定。
         """
-        import local_llm, context_stats as cs
+        import context_stats as cs
+        import local_llm
         local_llm._engine._active_backend = "llama-cpp-native"
         for q in ("分析周五A股大盘走势", "你好呀", "帮我写个 python 脚本存文件",
                   "读一下 README.md", "我心情不错"):
@@ -615,7 +617,8 @@ class TestCustomEngine(unittest.TestCase):
     """路线 A：custom_engine 配置（第三方 fork 引擎当辣条本地后端）。"""
 
     def setUp(self):
-        import pathlib as _pl, os
+        import os
+        import pathlib as _pl
         self.tmp = tempfile.TemporaryDirectory()
         self.bin = _pl.Path(self.tmp.name) / "their-llama-server"
         self.bin.write_text("#!/bin/sh\n")
@@ -665,6 +668,7 @@ class TestCustomEngine(unittest.TestCase):
 
     def test_missing_binary_or_disable_flag(self):
         import os
+
         from local_llm import _custom_engine_spec
         self._write({"custom_engine": {"enabled": True, "binary": "/nope/llama-server"}})
         self.assertEqual(_custom_engine_spec("/x.gguf"), {})          # 二进制不存在 → 忽略
@@ -674,6 +678,7 @@ class TestCustomEngine(unittest.TestCase):
 
     def test_env_overrides_config(self):
         import os
+
         from local_llm import _custom_engine_spec
         self._write({"custom_engine": {"binary": "/nope/x"}})
         os.environ["LATIAO_CUSTOM_ENGINE_BIN"] = str(self.bin)
@@ -745,7 +750,7 @@ class TestGgufPrecheck(unittest.TestCase):
         return str(path)
 
     def test_flags_private_quant_type(self):
-        from local_llm import _gguf_scan, _gguf_precheck
+        from local_llm import _gguf_precheck, _gguf_scan
         with tempfile.TemporaryDirectory() as tmp:
             path = self._gguf(tmp, 142, [5120, 248320], 4096)
             scan = _gguf_scan(path)
@@ -773,6 +778,7 @@ class TestGgufPrecheck(unittest.TestCase):
 
     def test_garbage_file_fails_open(self):
         import pathlib as _pl
+
         from local_llm import _gguf_precheck, _gguf_scan
         with tempfile.TemporaryDirectory() as tmp:
             path = _pl.Path(tmp) / "x.gguf"
@@ -786,6 +792,7 @@ class TestParallelToolSafety(unittest.TestCase):
 
     def test_mx_query_not_parallel(self):
         import inspect
+
         from agent import loop as L
         src = inspect.getsource(L.ThinAgentLoop.run)
         start = src.index("_SAFE_PARALLEL_TOOLS")
@@ -798,6 +805,7 @@ class TestCustomEngineTarget(unittest.TestCase):
 
     def test_gguf_file_and_directory(self):
         import pathlib as _pl
+
         from local_llm import _custom_engine_target
         with tempfile.TemporaryDirectory() as tmp:
             d = _pl.Path(tmp)
@@ -810,7 +818,9 @@ class TestCustomEngineTarget(unittest.TestCase):
             self.assertEqual(_custom_engine_target(str(bad))[0], "err")
 
     def test_mlx_pack_directory(self):
-        import pathlib as _pl, json
+        import json
+        import pathlib as _pl
+
         from local_llm import _custom_engine_target
         with tempfile.TemporaryDirectory() as tmp:
             d = _pl.Path(tmp)
@@ -829,8 +839,8 @@ class TestShortMessageNoInjection(unittest.TestCase):
     上个会话的半导体板块 —— 因为注入块贴在最后一条用户消息尾部，权重最高）。"""
 
     def setUp(self):
+        import agent.prompt_build as PB  # _build_chat_messages 的规范模块（2026-09-23 拆出）
         import agent_loop as A
-        import agent.prompt_build as PB     # _build_chat_messages 的规范模块（2026-09-23 拆出）
         self.A, self.PB = A, PB
         # monkeypatch 面必须跟着代码搬：_build_chat_messages 现在在 prompt_build 里
         # 按自己的全局名查这些符号，改 agent_loop 的同名属性不会再生效
@@ -865,7 +875,8 @@ class TestUsIndexRouting(unittest.TestCase):
     """美股指数识别（09-20）：道指/标普/纳指/罗素 要能识别，A股/个股不能误判。"""
 
     def _targets(self, q):
-        import sys, pathlib as _pl
+        import pathlib as _pl
+        import sys
         sys.path.insert(0, str(_pl.Path(__file__).resolve().parents[1]))
         sys.path.insert(0, str(_pl.Path(__file__).resolve().parents[1] / "plugins"))
         from plugins.ak_finance import _us_index_targets
@@ -885,7 +896,8 @@ class TestMultiCustomEngines(unittest.TestCase):
     """同一模型家族多个包（GGUF→fork 引擎、MLX→自带运行时）各用各的 binary（09-20）。"""
 
     def setUp(self):
-        import pathlib as _pl, os
+        import os
+        import pathlib as _pl
         self.tmp = tempfile.TemporaryDirectory()
         self.a = _pl.Path(self.tmp.name) / "fork-llama-server"
         self.b = _pl.Path(self.tmp.name) / "mlx-shim.sh"
@@ -909,6 +921,7 @@ class TestMultiCustomEngines(unittest.TestCase):
 
     def test_picks_entry_by_match(self):
         import json
+
         from local_llm import _custom_engine_spec
         self.cfg.write_text(json.dumps({"custom_engine": [
             {"enabled": True, "binary": str(self.a), "name": "fork", "match": "PQ2_0"},
@@ -922,6 +935,7 @@ class TestMultiCustomEngines(unittest.TestCase):
 
     def test_single_object_still_works(self):
         import json
+
         from local_llm import _custom_engine_spec
         self.cfg.write_text(json.dumps({"custom_engine": {
             "enabled": True, "binary": str(self.a), "name": "solo"}}), encoding="utf-8")
@@ -933,7 +947,8 @@ class TestMlxRejectReason(unittest.TestCase):
     把"需要自带运行时"的包（Prism Bonsai MLX，无视觉塔）说成"多模态 MLX-VLM"。"""
 
     def _mk(self, files: dict) -> str:
-        import json, pathlib as _pl
+        import json
+        import pathlib as _pl
         d = _pl.Path(tempfile.mkdtemp())
         for name, content in files.items():
             f = d / name.replace("__", "/")
@@ -981,7 +996,9 @@ class TestMaxTokensAndLengthRetry(unittest.TestCase):
         self.assertEqual(_resolve_max_tokens("x", local=True, override=32768), 32768)  # 配置优先
 
     def test_custom_engine_max_tokens_from_config(self):
-        import json, pathlib as _pl
+        import json
+        import pathlib as _pl
+
         import agent_loop as A
         from agent.context import _custom_engine_max_tokens
         old = A.CONFIG_FILE
@@ -1042,7 +1059,7 @@ class TestProcessNarrationFold(unittest.TestCase):
     """工具轮过程叙述折叠（09-19：关思考后推理倒进正文，实测单轮 11171 字）。"""
 
     def test_long_narration_folded(self):
-        from agent.loop import _trim_process_narration, _ROUND_CONTENT_MAX
+        from agent.loop import _ROUND_CONTENT_MAX, _trim_process_narration
         long_text = "The search results are messy. Let me analyze: " * 300
         out = _trim_process_narration(long_text)
         self.assertLess(len(out), _ROUND_CONTENT_MAX + 120)
@@ -1172,6 +1189,7 @@ class TestLocalizedMessages(unittest.TestCase):
 
     def test_en_and_ru_have_no_han(self):
         import re
+
         from agent.messages import MESSAGES
         for key, table in MESSAGES.items():
             for lang in ("en", "ru"):
@@ -1293,6 +1311,7 @@ class TestFinalizeDigestLanguage(unittest.TestCase):
 
     def test_no_chinese_forced_for_english_user(self):
         import re
+
         from agent.loop import _build_finalize_digest
         msgs = [{"role": "user", "content": "analyze friday us stocks"}]
         ask = _build_finalize_digest(msgs, lang="en")[-1]["content"]
@@ -1322,6 +1341,7 @@ class TestPromptCacheFriendly(unittest.TestCase):
     def test_compaction_skips_mid_turn(self):
         """轮内不压缩（steps>1 直接返回）——mid-turn 改写历史会打掉前缀缓存。"""
         import inspect
+
         from agent.plugins import builtin
         src = inspect.getsource(builtin.setup_compaction)
         self.assertIn('getattr(loop, "steps", 0) > 1', src)

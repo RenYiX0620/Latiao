@@ -29,8 +29,9 @@ def test_session_id_stable_and_sanitized():
 
 # ── 飞书消息解析 ──
 def test_extract_text_from_feishu_message():
-    from channels.feishu import _extract_text
     import json
+
+    from channels.feishu import _extract_text
     msg = {"message_type": "text",
            "content": json.dumps({"text": "帮我记一笔：9月29日 打车 38 元"})}
     assert _extract_text(msg) == "帮我记一笔：9月29日 打车 38 元"
@@ -71,6 +72,7 @@ def test_feishu_degrades_without_sdk(monkeypatch):
 async def test_inbound_validates_required_fields():
     from fastapi import FastAPI
     from starlette.testclient import TestClient
+
     import api_routes_channels as m
     app = FastAPI()
     app.include_router(m.router)
@@ -83,10 +85,11 @@ async def test_inbound_validates_required_fields():
 
 @pytest.mark.asyncio
 async def test_inbound_calls_bridge(monkeypatch):
-    import channels_bridge as cb
     from fastapi import FastAPI
     from starlette.testclient import TestClient
+
     import api_routes_channels as m
+    import channels_bridge as cb
 
     async def _fake(channel, chat_id, text, agent="latiao"):
         return f"[{channel}/{chat_id}] 收到：{text}"

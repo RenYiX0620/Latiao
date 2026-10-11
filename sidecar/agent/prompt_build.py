@@ -291,7 +291,7 @@ def _build_chat_messages(body: dict, messages: list) -> list:
     # Agent identity — system rules from developer (highest priority)
     agent_id = body.get("agent", "latiao")
     agent_cfg = _get_agent_config(agent_id)
-    _add_part("system_prompt", 
+    _add_part("system_prompt",
         "## 系统规则 (最高优先级)\n"
         "以下规则由开发者设定，用户偏好不可覆盖。如果系统规则与用户偏好冲突，以系统规则为准。\n\n"
         + agent_cfg["identity"]
@@ -554,7 +554,7 @@ def _build_chat_messages(body: dict, messages: list) -> list:
     _rel_time_re = re.compile(r"今天|昨天|昨晚|今晨|明天|前天|本周|上周|这周|最新|现在|几点|today|yesterday|tomorrow|latest|now", re.I)
     _show_time = bool(_rel_time_re.search(last_user_text or ""))
     _time_line = f"- {env_labels['time']}: {now[:10]}\n"
-    _add_part("system_prompt", 
+    _add_part("system_prompt",
         f"{env_labels['rt']}:\n"
         + _time_line
         + f"- {env_labels['home']}: {home}\n"

@@ -96,8 +96,10 @@ def test_pipeline_split_helper():
 
 
 def test_head_file_alone_allowed():
+    import os
+    import tempfile
+
     import plugins.run_cmd as rc
-    import tempfile, os
     fd, path = tempfile.mkstemp(suffix=".txt")
     os.write(fd, b"line1\nline2\nline3\n")
     os.close(fd)

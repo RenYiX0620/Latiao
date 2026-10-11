@@ -92,7 +92,12 @@ def test_guard_tool_result_scrubs_int():
 
 
 def test_us_rt_targets_and_blacklist():
-    from plugins.ak_finance import _STALE_SINA_US, _us_index_targets, _us_rt_targets, _US_RT_KW
+    from plugins.ak_finance import (
+        _STALE_SINA_US,
+        _US_RT_KW,
+        _us_index_targets,
+        _us_rt_targets,
+    )
 
     # 「美股现在」必须命中三大指数（此前匹配不到 → 掉进网页搜索 → int_ 假源）
     idx = _us_index_targets("美股现在是啥情况")

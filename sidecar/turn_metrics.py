@@ -113,7 +113,7 @@ def list_turns(session_id: str = "", limit: int = 50) -> list[dict]:
             "budget", "by_source", "ended_reason")
     out = []
     for r in rows:
-        d = dict(zip(keys, r))
+        d = dict(zip(keys, r, strict=False))
         try:
             d["by_source"] = json.loads(d.get("by_source") or "{}")
         except (TypeError, ValueError):

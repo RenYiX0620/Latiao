@@ -46,8 +46,8 @@ def test_cancel_marks_running_subtasks_and_cancels_task():
 
 
 def test_request_session_cancel_also_cancels_subtasks():
-    from agent.session_events import _clear_session_cancel, _request_session_cancel
     import agent.subagent as sa
+    from agent.session_events import _clear_session_cancel, _request_session_cancel
 
     sa._SUBTASKS.clear()
     sa._SUBTASK_CANCEL_HANDLES.clear()
@@ -64,7 +64,9 @@ def test_request_session_cancel_also_cancels_subtasks():
 
 def test_child_session_cancel_follows_parent():
     from agent.session_events import (
-        _clear_session_cancel, _request_session_cancel, _session_cancel_requested,
+        _clear_session_cancel,
+        _request_session_cancel,
+        _session_cancel_requested,
     )
     _clear_session_cancel("sess_d")
     _request_session_cancel("sess_d")

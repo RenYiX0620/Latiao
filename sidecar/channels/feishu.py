@@ -36,6 +36,7 @@ def _read_cfg() -> dict:
     """读 config.json 的 channels.feishu 段。"""
     try:
         import json as _json
+
         from config import CONFIG_FILE
         if not CONFIG_FILE.exists():
             return {}

@@ -121,8 +121,8 @@ TEST_BUDGET = 1000
 
 
 async def _run_with_seeded_usage(monkeypatch, budget: int, seeded: int):
-    from tests.fake_engine import FakeEngine
     from agent.loop import ThinAgentLoop
+    from tests.fake_engine import FakeEngine
 
     monkeypatch.setenv("LATIAO_TURN_TOKEN_BUDGET", str(budget))
     sid = f"costloop-{time.time_ns()}"
@@ -176,8 +176,9 @@ async def test_single_step_overshoot_still_warns(monkeypatch):
 @pytest.mark.asyncio
 async def test_subagent_credit_lands_in_same_turn():
     """子代理开销与父会话本轮归因在同一把锁内完成（审计⑨：此前可能落到下一轮）。"""
-    import context_stats as cs
     import time as _t
+
+    import context_stats as cs
     parent, sub = f"race-{_t.time_ns()}", f"race-{_t.time_ns()}:s"
     cs.begin_turn(parent)
     cs.record_usage(sub, {"prompt_tokens": 700, "completion_tokens": 30},

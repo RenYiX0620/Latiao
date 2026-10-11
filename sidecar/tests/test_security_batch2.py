@@ -102,6 +102,7 @@ def test_all_four_spawn_sites_use_whitelist():
 def test_write_seal_blocks_auto_loaded_paths(rel, monkeypatch, tmp_path):
     monkeypatch.setenv("LATIAO_TEST_PROGRESS_DIR", str(tmp_path / ".local-ai-os"))
     import importlib
+
     import config
     importlib.reload(config)
     import cmd_safety
@@ -115,6 +116,7 @@ def test_write_seal_blocks_auto_loaded_paths(rel, monkeypatch, tmp_path):
 def test_write_seal_allows_normal_paths(monkeypatch, tmp_path):
     monkeypatch.setenv("LATIAO_TEST_PROGRESS_DIR", str(tmp_path / ".local-ai-os"))
     import importlib
+
     import config
     importlib.reload(config)
     import cmd_safety
@@ -141,6 +143,7 @@ def test_write_seal_allows_normal_paths(monkeypatch, tmp_path):
 def test_cmd_write_seal_blocks_protected_targets(tpl, monkeypatch, tmp_path):
     monkeypatch.setenv("LATIAO_TEST_PROGRESS_DIR", str(tmp_path / ".local-ai-os"))
     import importlib
+
     import config
     importlib.reload(config)
     import cmd_safety
@@ -163,6 +166,7 @@ def test_cmd_write_seal_blocks_protected_targets(tpl, monkeypatch, tmp_path):
 def test_cmd_write_seal_allows_normal_targets(tpl, monkeypatch, tmp_path):
     monkeypatch.setenv("LATIAO_TEST_PROGRESS_DIR", str(tmp_path / ".local-ai-os"))
     import importlib
+
     import config
     importlib.reload(config)
     import cmd_safety

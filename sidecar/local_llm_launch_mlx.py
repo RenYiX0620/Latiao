@@ -4,21 +4,22 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 import collections
+import logging
 import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
+
 from cmd_safety import child_env
+from local_llm_launch_common import _ENGINE_ENV_PREFIXES
 from local_llm_probe import (
     _mlx_arch_supported,
     _mlx_reject_reason,
     _resolve_mlx_path,
 )
-from local_llm_launch_common import _ENGINE_ENV_PREFIXES
 
-import logging
 logger = logging.getLogger("latiao-sidecar")
 
 

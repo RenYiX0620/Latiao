@@ -5,9 +5,9 @@
 Chrome/Dokobot 扩展/bridge，开箱即用；代价是无登录态（读不了需登录的页面）。
 未安装时返回明确的安装指引。
 """
+import json
 import os
 import re
-import json
 import urllib.parse
 
 # 浏览器二进制固定装在应用数据目录——不依赖会被系统定期清理的
@@ -100,9 +100,9 @@ def _url_block_reason(url: str) -> str | None:
     （2026-09-24 复查发现），必须在请求层逐个校验真正要连的目标。
     """
     try:
-        from urllib.parse import urlparse
         import ipaddress
         import socket
+        from urllib.parse import urlparse
         if urlparse(url).scheme not in ("http", "https"):
             return None                      # data:/blob:/about: 不上网
         host = urlparse(url).hostname or ""

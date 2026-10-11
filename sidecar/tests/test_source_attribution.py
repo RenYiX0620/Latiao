@@ -16,7 +16,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import context_stats as cs  # noqa: E402
-import turn_metrics as tm   # noqa: E402
+import turn_metrics as tm  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -143,9 +143,9 @@ async def test_loop_records_subagent_source_end_to_end():
     """循环集成：子代理身份跑一回合，引擎报的 token 落进**父会话**的 subagent 桶。"""
     import agent.context as agent_context
     import local_llm
+    from agent.loop import ThinAgentLoop
     from tests.fake_engine import FakeEngine, _sse
     from tests.test_loop_scenarios import _StubEngine
-    from agent.loop import ThinAgentLoop
 
     parent = f"p-{time.time_ns()}"
     sub = f"{parent}:sub1"

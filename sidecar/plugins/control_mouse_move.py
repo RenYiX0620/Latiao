@@ -20,7 +20,8 @@ DEFINITION = {
 
 
 def execute(args: dict) -> str:
-    import sys, os as _os
+    import os as _os
+    import sys
     _d = _os.path.dirname(_os.path.abspath(__file__))
     if _d not in sys.path: sys.path.insert(0, _d)
     import _control_mouse_common as mc

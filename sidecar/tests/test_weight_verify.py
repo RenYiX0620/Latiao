@@ -13,8 +13,6 @@ import sys
 import threading
 from pathlib import Path
 
-import pytest
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 os.environ.setdefault("LATIAO_AUTH_TOKEN", "wverify-token")
 
@@ -22,6 +20,7 @@ os.environ.setdefault("LATIAO_AUTH_TOKEN", "wverify-token")
 def _downloader(tmp_path, monkeypatch):
     monkeypatch.setenv("LATIAO_TEST_PROGRESS_DIR", str(tmp_path))
     import importlib
+
     import config as cfg_mod
     importlib.reload(cfg_mod)
     import local_llm_download as m

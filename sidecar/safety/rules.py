@@ -26,8 +26,8 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 try:  # tree-sitter 为可选依赖：缺失时语义层不可用，调用方会记录并回退正则层
-    from tree_sitter import Language, Parser
     import tree_sitter_bash
+    from tree_sitter import Language, Parser
 
     _LANGUAGE = Language(tree_sitter_bash.language())
     _TS_AVAILABLE = True

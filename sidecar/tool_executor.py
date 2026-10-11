@@ -29,6 +29,12 @@ logger = logging.getLogger("latiao-sidecar")
 CURRENT_TOOL_SESSION: contextvars.ContextVar[str] = contextvars.ContextVar(
     "latiao_tool_session", default="")
 
+# 当前工具调用方的工具白名单（None = 不限制）。delegate_task 派生子代理时
+# 要把它作为 parent_whitelist 传下去（2026-10-11 深审 Medium：parent_whitelist
+# 参数存在但**从没人传**，受限父会话仍能生出全量工具的子代理）。
+CURRENT_TOOL_WHITELIST: contextvars.ContextVar[frozenset | None] = contextvars.ContextVar(
+    "latiao_tool_whitelist", default=None)
+
 
 def _tool_cancel_requested() -> bool:
     """当前工具所属会话是否已被要求停止（停止键 / 客户端断流）。"""
@@ -98,7 +104,7 @@ def _run_cancellable(tokens: list, timeout: float,
                     proc.communicate(timeout=2)
                 except Exception:
                     pass
-                raise subprocess.TimeoutExpired(tokens, timeout)
+                raise subprocess.TimeoutExpired(tokens, timeout) from None
 
 
 def __getattr__(name: str):
@@ -253,7 +259,9 @@ def write_file(path: str, content: str) -> str:
     # 敏感目录/文件名清单统一走 cmd_safety 单点（此前这里是另一份内联拷贝，
     # 与插件侧的 5 项清单漂移 —— 2026-09-24 复查修复）
     from cmd_safety import (
-        _BLOCKED_DIR_SUBSTRINGS, sensitive_write_block, sensitive_write_name_block,
+        _BLOCKED_DIR_SUBSTRINGS,
+        sensitive_write_block,
+        sensitive_write_name_block,
     )
     if any(s in _rp for s in _BLOCKED_DIR_SUBSTRINGS):
         return f"⛔ Blocked: 不允许访问敏感目录 - {_rp}"
@@ -291,6 +299,7 @@ def list_dir(path: str) -> str:
 def _run_pipeline(left: str, right: str, timeout: int) -> str:
     import shlex as _shlex
     import subprocess as _sp
+
     from cmd_safety import child_env, split_stderr_redirect, stderr_target
     # 管道两侧各自的 stderr 重定向（`A 2>&1 | grep x` / `A | B 2>/dev/null`）
     left, _lm = split_stderr_redirect(left)
@@ -332,8 +341,12 @@ def run_cmd(cmd: str) -> str:
         return "错误：命令为空（可能只包含注释行）"
     # 引号外的 shell 操作符才拦（引号内是脚本内容，shell=False 不会解释）
     from cmd_safety import (
-        find_unsupported_shell_op, split_pipeline, split_stderr_redirect,
-        split_stdout_redirect, stderr_target, unsupported_op_message,
+        find_unsupported_shell_op,
+        split_pipeline,
+        split_stderr_redirect,
+        split_stdout_redirect,
+        stderr_target,
+        unsupported_op_message,
     )
     # 尾部 stderr 重定向（2>&1 / 2>/dev/null）：有精确等价，先剥离并记模式
     _stderr_mode = ""
@@ -446,7 +459,7 @@ _SEARCH_EXCLUDE_DIRS = frozenset({
     ".lmstudio", "Library", "node_modules", ".git", ".cache", "__pycache__",
     "site-packages", ".venv", "venv", ".Trash", ".npm", ".cargo", ".rustup",
     "Applications", ".zcode", ".cursor", ".vscode", ".docker", ".gradle", ".m2",
-    ".ollama", ".cache", "Photos Library.photoslibrary", "Movies", "Music",
+    ".ollama", "Photos Library.photoslibrary", "Movies", "Music",
 })
 _SEARCH_MAX_RESULTS = int(os.environ.get("LATIAO_SEARCH_MAX_RESULTS", "200") or 200)
 _SEARCH_MAX_DEPTH = int(os.environ.get("LATIAO_SEARCH_MAX_DEPTH", "6") or 6)
@@ -666,10 +679,18 @@ def _is_readonly_cmd(cmd: str) -> bool:
 # delegate 机制已迁至 agent/subagent.py（Stage 5 子代理一等公民）；
 # 这里保留兼容导入（api_routes/tests 的既有引用不变）。
 from agent.subagent import (  # noqa: F401
-    _SUBTASKS, _SUBTASK_EVENTS, _SUBTASK_SEQ, _SUBTASK_TASKS,
-    _SUBAGENT_TOOLS, _prune_subtasks, _delegate_task,
-    _delegate_task_bg, _delegate_task_fg, _run_subtask_bg,
-    _subtask_snapshot,)
+    _SUBAGENT_TOOLS,
+    _SUBTASK_EVENTS,
+    _SUBTASK_SEQ,
+    _SUBTASK_TASKS,
+    _SUBTASKS,
+    _delegate_task,
+    _delegate_task_bg,
+    _delegate_task_fg,
+    _prune_subtasks,
+    _run_subtask_bg,
+    _subtask_snapshot,
+)
 
 # ── Fallback OpenAI Function Calling tool definitions ──
 

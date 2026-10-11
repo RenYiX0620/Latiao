@@ -9,8 +9,8 @@ from datetime import datetime
 
 import httpx
 
-from config import SUBAGENT_MODEL
 from capability_registry import USER_SKILLS_DIR
+from config import SUBAGENT_MODEL
 from db import _db_write_lock
 
 logger = logging.getLogger(__name__)

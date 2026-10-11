@@ -51,8 +51,8 @@ async def test_three_distinct_queries_are_coverage_not_saturation():
     """同一轮 3 次不同 mx_query = 覆盖查询，不得被当成饱和而强制收口。"""
     import agent.context as agent_context
     import local_llm
-    from tests.test_loop_scenarios import _StubEngine
     from agent.loop import ThinAgentLoop
+    from tests.test_loop_scenarios import _StubEngine
 
     queries = ["上证指数 主力资金净流入 今日", "北证50 涨跌幅",
                "半导体板块,人工智能板块,新能源板块 今日涨跌幅"]
@@ -85,8 +85,8 @@ async def test_second_call_cap_no_longer_forces_finalize_alone():
     """同轮 3 次检索（计数达上限）+ 增量高 → 仍不得收口；这是原 bug 的最小复现。"""
     import agent.context as agent_context
     import local_llm
+    from agent.loop import _INFO_GAIN_RATIO, _SEARCH_TOOL_REPEAT_LIMIT, ThinAgentLoop
     from tests.test_loop_scenarios import _StubEngine
-    from agent.loop import ThinAgentLoop, _INFO_GAIN_RATIO, _SEARCH_TOOL_REPEAT_LIMIT
 
     assert _SEARCH_TOOL_REPEAT_LIMIT == 3, "本用例假定重复上限为 3"
     queries = [f"指标{i} 查询" for i in range(_SEARCH_TOOL_REPEAT_LIMIT)]

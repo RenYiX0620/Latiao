@@ -16,7 +16,6 @@ import time
 import uuid
 from datetime import datetime
 
-
 from config import PROGRESS_DIR
 from db import _db_write_lock, _get_db
 
@@ -219,7 +218,14 @@ def _cron_matches(cron_expr: str, now: datetime) -> bool:
             return False
         # Day-of-week: cron uses 0-7 (0=Sunday, 7=Sunday), Python uses 0=Monday
         py_wday = (now.weekday() + 1) % 7  # Convert to cron DOW (0=Sun)
-        return _cron_field_matches(dow, py_wday, now.weekday())
+        if _cron_field_matches(dow, py_wday, now.weekday()):
+            return True
+        # 7 是周日的另一种写法（cron 惯例）：周日当天 value=0，`7` 与 `5-7` 这类
+        # 范围都匹配不上（2026-10-11 深审 High：校验允许 0-7，但 7 永不触发）。
+        # 周日时再用 7 试一次，让 `7`、`5-7`、`6-7` 都能正确落到周日。
+        if py_wday == 0 and _cron_field_matches(dow, 7, now.weekday()):
+            return True
+        return False
     except Exception:
         logger.warning("Cron match check failed", exc_info=True)
         return False
@@ -333,20 +339,23 @@ async def _execute_cron_job(job: dict, force_local: bool = False):
     turn_metrics 里也完全不可见。
 
     现在只保留 cron 特有的四件事：**模型选择**（本地优先 / 云端 / 429 回退本地）、
-    **工具白名单**（`_cron_tool_whitelist`）、**工具档位**（job.access_mode，默认 full =
-    与原行为一致；无人值守时建议显式设 read_only）、**结果落库与事件**。执行、记账、
-    闸门、交付兜底全部交给唯一循环。
+    **工具白名单**（`_cron_tool_whitelist`）、**工具档位**（job.access_mode）、
+    **结果落库与事件**。执行、记账、闸门、交付兜底全部交给唯一循环。
+
+    工具档默认 **read_only**（2026-10-11 深审 Critical：此前默认 full，无人值守时
+    confirm 级工具被自动放行——定时任务在没人看着的时候拥有最高自主权）。需要写
+    文件/执行命令的任务请在创建时**显式**设 access_mode=confirm/auto_edit/full。
     """
+    import local_llm as _llm
     from agent.context import _normalize_access
     from agent.loop import ThinAgentLoop
     from agent.prompt_build import _build_chat_messages
     from agent_loop import _get_best_cloud_config, _resolve_api_target
-    import local_llm as _llm
     from main import SUBAGENT_MODEL
 
     task = job.get("task", "")
     action = job.get("action", "notify")
-    access_mode = _normalize_access(job.get("access_mode") or "full")
+    access_mode = _normalize_access(job.get("access_mode") or "read_only")
     logger.info("Cron job triggered: %s — %s（工具档 %s）", task[:60], action, access_mode)
 
     # ── 模型选择（保持原语义）──

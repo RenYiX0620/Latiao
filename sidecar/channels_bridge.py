@@ -81,8 +81,8 @@ async def run_channel_turn(channel: str, chat_id: str, text: str, *,
     session_id = channel_session_id(channel, chat_id)
     history = _load_history(session_id)
     try:
-        from api_routes import _resolve_api_target
         from agent_loop import _build_chat_messages
+        from api_routes import _resolve_api_target
         protocol, api_url, headers, is_local = await _resolve_api_target(None)
         # 通道提示走一条 frontend system 消息（_build_chat_messages 会把前端 system
         # 并入系统提示）——不新增 body 字段，避免"字段没人读、静默失效"。

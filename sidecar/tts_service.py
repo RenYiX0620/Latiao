@@ -20,8 +20,8 @@ import logging
 import shutil
 import time
 from pathlib import Path
-from urllib.parse import quote
 from typing import Optional, Tuple
+from urllib.parse import quote
 
 import httpx
 
@@ -150,7 +150,8 @@ def _pitch_shift(audio: bytes, factor: float) -> bytes:
     sr = _wav_sample_rate(audio)
     if sr <= 0:
         return audio
-    import subprocess, tempfile
+    import subprocess
+    import tempfile
     try:
         with tempfile.TemporaryDirectory(prefix="latiao-tts-pitch-") as d:
             src, dst = Path(d) / "in.wav", Path(d) / "out.wav"

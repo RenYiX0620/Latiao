@@ -45,7 +45,7 @@ def _cos(a: list[float], b: list[float]) -> float:
     s = 0.0
     na = 0.0
     nb = 0.0
-    for x, y in zip(a, b):
+    for x, y in zip(a, b, strict=False):
         s += x * y
         na += x * x
         nb += y * y
@@ -117,7 +117,7 @@ def ensure_vectors(allow_cold_start: bool = True, max_batches: int = 200) -> int
             break                       # 服务不可用 / 半截结果：下次再来
         try:
             with _db_write_lock:
-                for (rid, _t, _c, _m), v in zip(rows, vecs):
+                for (rid, _t, _c, _m), v in zip(rows, vecs, strict=False):
                     conn.execute("UPDATE learnings SET embedding = ?, embedding_model = ? WHERE id = ?",
                                  (_pack(v), emb.MODEL_ID, rid))
                 conn.commit()
@@ -125,7 +125,7 @@ def ensure_vectors(allow_cold_start: bool = True, max_batches: int = 200) -> int
             logger.warning("写入语义向量失败", exc_info=True)
             break
         with _lock:
-            for (rid, _t, _c, _m), v in zip(rows, vecs):
+            for (rid, _t, _c, _m), v in zip(rows, vecs, strict=False):
                 _vectors[rid] = (v, emb.MODEL_ID)
         done += len(vecs)
     if done:
@@ -322,6 +322,7 @@ def judge_enabled() -> bool:
         return raw.strip().lower() not in ("0", "false", "no", "off")
     try:
         import json as _json
+
         from config import CONFIG_FILE
         if CONFIG_FILE.exists():
             cfg = _json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
@@ -345,6 +346,7 @@ def judge_relevance(question: str, candidates: list[tuple[str, str]]) -> set[str
         return set()
     try:
         import httpx
+
         from config import SUBAGENT_MODEL
         from local_llm import get_api_url
     except Exception:

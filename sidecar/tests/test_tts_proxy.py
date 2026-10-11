@@ -294,7 +294,9 @@ def test_status_reports_enabled_and_availability(tmp_path, monkeypatch):
 
 # ── 音高（变调后处理）────────────────────────────────────────────
 def _sine_wav(path, freq=440.0, secs=1.0, sr=24000):
-    import math, wave, struct
+    import math
+    import struct
+    import wave
     with wave.open(str(path), "wb") as w:
         w.setnchannels(1); w.setsampwidth(2); w.setframerate(sr)
         w.writeframes(b"".join(struct.pack("<h", int(12000 * math.sin(2 * math.pi * freq * i / sr)))

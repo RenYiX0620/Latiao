@@ -1,4 +1,5 @@
-from cmd_safety import child_env   # ④ 子进程 env 白名单
+from cmd_safety import child_env  # ④ 子进程 env 白名单
+
 #!/usr/bin/env python3
 """mx_query - 妙想金融数据查询工具"""
 import re

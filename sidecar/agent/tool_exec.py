@@ -8,23 +8,36 @@
 通过惰性导入联系——注册表由 main.py 门面在启动时装配，属于宿主职责，不从本模块
 反向 import（会造出回环）。
 """
-import logging
-
 import asyncio
 import inspect
 import json
+import logging
 import time
 import uuid
-from agent.confirm import _await_tool_confirmation, _check_pre_hooks, _count_successful_duplicates, _wait_tool_confirmation
-from agent.context import AUTO_EDIT_TOOLS, _candidate_tool_names, _check_access, _normalize_access, _recover_tool_name, subagent_tool_gate
+from datetime import datetime
+
+from agent.confirm import (
+    _await_tool_confirmation,
+    _check_pre_hooks,
+    _count_successful_duplicates,
+    _wait_tool_confirmation,
+)
+from agent.context import (
+    AUTO_EDIT_TOOLS,
+    _candidate_tool_names,
+    _check_access,
+    _normalize_access,
+    _recover_tool_name,
+    subagent_tool_gate,
+)
 from agent.progress import _record_progress
 from agent.session_events import _event_log_for
 from agent.verify import _auto_verify
 from cmd_safety import redact_secrets, tool_log_preview
-from datetime import datetime
 from db import _db_write_lock, _get_db
 from memory import _maybe_generate_skill, _refine_learnings, record_tool_reflection
-from threat_scan import guard_tool_result, is_suspect as _threat_is_suspect
+from threat_scan import guard_tool_result
+from threat_scan import is_suspect as _threat_is_suspect
 from tool_executor import _resolve_permission
 
 logger = logging.getLogger("latiao-sidecar")   # 与 agent_loop 同名：日志格式不变
@@ -138,16 +151,20 @@ def _looks_like_tool_failure(result: str) -> bool:
 
 async def _handle_tool_execution(tc: dict, current_msgs: list, session_id: str,
                                  agent_id: str, access_mode: str = "confirm",
-                                 pre_started: dict | None = None) -> tuple[bool, list[dict]]:
+                                 pre_started: dict | None = None,
+                                 tool_whitelist: set | None = None) -> tuple[bool, list[dict]]:
     """事件日志包装（阶段 1，灰度）：tool/call + tool/result 单点入日志。
 
     _handle_tool_execution_inner 是全循环唯一的工具执行入口（云/本地两个
     生成器都在此交汇），在这里配对其"调用-结果"事件最不容易漏——
     早期/拒绝/异常四条早退路径都经过同一包装。
+
+    tool_whitelist: 子代理/cron 的工具隔离（None = 不限制）。此前只在**发给模型的
+    目录**里过滤（loop 组装 tools 时），执行层不过问——模型用文本方言绕过目录
+    仍能调到任意工具（2026-10-11 深审 Critical）。这里在唯一执行入口做硬闸门。
     """
     # 依赖仍留在 agent_loop 的定义 → 函数内惰性导入（避免循环依赖）
-    from agent_loop import _tool_end_result
-    from agent_loop import _tool_timeout_for
+    from agent_loop import _tool_end_result, _tool_timeout_for
     log = _event_log_for(session_id) if session_id else None
     call_seq: int | None = None
     if log is not None:
@@ -168,15 +185,20 @@ async def _handle_tool_execution(tc: dict, current_msgs: list, session_id: str,
     try:
         verify_failed, events = await asyncio.wait_for(
             _handle_tool_execution_inner(
-                tc, current_msgs, session_id, agent_id, access_mode, pre_started),
+                tc, current_msgs, session_id, agent_id, access_mode, pre_started,
+                tool_whitelist),
             timeout=_tlimit,
         )
     except asyncio.TimeoutError:
         _call_id = tc.get("id") or ""
         logger.warning("工具执行超时：%s 超过 %.0fs（已中止并回报模型）", _tname, _tlimit)
-        from agent.messages import lang_of, msg as _msg
+        from agent.messages import lang_of
+        from agent.messages import msg as _msg
         result = _msg("tool_timeout", lang_of(current_msgs),
                       name=_tname, limit=_tlimit)
+        # 必须写 role:tool 消息（2026-10-11 修复：此前只发事件不入史，
+        # 模型不知道工具超时了，_sanitize 再填占位符把真相盖掉）
+        current_msgs.append({"role": "tool", "tool_call_id": _call_id, "content": result})
         verify_failed, events = False, [{"event": "tool_end", "call_id": _call_id,
                                          "tool": _tname, "result": result,
                                          "ts": int(time.time() * 1000)}]
@@ -203,17 +225,24 @@ async def _handle_tool_execution(tc: dict, current_msgs: list, session_id: str,
 
 async def _handle_tool_execution_inner(tc: dict, current_msgs: list, session_id: str,
                                        agent_id: str, access_mode: str = "confirm",
-                                       pre_started: dict | None = None) -> tuple[bool, list[dict]]:
+                                       pre_started: dict | None = None,
+                                       tool_whitelist: set | None = None) -> tuple[bool, list[dict]]:
     """Execute a single tool call within the agent loop. Returns (verify_failed, events).
 
     pre_started: SSE 调用方已通过 _start_tool_confirmation 启动确认并发出
     tool_confirm 事件时传入（含 event_obj）——本函数只等待结果，不再重复发事件。
-    确认事件若在等待完成后才发出，前端弹窗永不出现（死锁）。"""
+    确认事件若在等待完成后才发出，前端弹窗永不出现（死锁）。
+
+    tool_whitelist: 非 None 时**执行前硬拒**名单外的工具名（子代理/cron 隔离）。
+    目录过滤（loop 组 tools）只是软约束，fence 解析出的名字不经过它。
+    """
     # 依赖仍留在 agent_loop 的定义 → 函数内惰性导入（避免循环依赖）
-    from agent_loop import _TIME_SENSITIVE_TOOLS
-    from agent_loop import _REPEAT_ALLOWED_TOOLS
-    from agent_loop import TOOL_HOOKS
-    from agent_loop import _spawn
+    from agent_loop import (
+        _REPEAT_ALLOWED_TOOLS,
+        _TIME_SENSITIVE_TOOLS,
+        TOOL_HOOKS,
+        _spawn,
+    )
     call_id = tc.get("id") or str(uuid.uuid4())
     func = tc.get("function", {})
     tool_name = func.get("name", "unknown") or ""
@@ -251,6 +280,20 @@ async def _handle_tool_execution_inner(tc: dict, current_msgs: list, session_id:
             current_msgs.append({"role": "tool", "tool_call_id": call_id, "content": result})
             return True, [{"event": "tool_end", "call_id": call_id, "tool": "?", "result": result,
                            "ts": int(time.time() * 1000)}]
+    # ── 工具白名单硬闸门（2026-10-11 深审 Critical）──
+    # 子代理/cron 的 tool_whitelist 此前只在"发给模型的目录"里过滤（loop 组 tools），
+    # 执行层不过问：文本方言 fence 解析出的任意工具名仍会进 TOOL_DISPATCH。这里在
+    # 唯一执行入口做硬拒——名单外一律不执行（与目录过滤共同构成"软+硬"两道）。
+    if tool_whitelist is not None and tool_name not in tool_whitelist:
+        _wl_names = sorted(tool_whitelist)[:20]
+        result = (
+            f"⛔ 工具 {tool_name} 不在本次运行的工具白名单内，已拒绝执行。"
+            + (f"可用工具：{', '.join(_wl_names)}" if _wl_names
+               else "本次运行不允许任何工具调用（白名单为空）。")
+        )
+        current_msgs.append({"role": "tool", "tool_call_id": call_id, "content": result})
+        return False, [{"event": "tool_end", "call_id": call_id, "tool": tool_name,
+                        "result": result, "ts": int(time.time() * 1000)}]
     # 权限模式拦截：read_only/workspace 下越权工具直接拒绝（不执行）
     denied = _check_access(tool_name, access_mode)
     if denied:
@@ -385,12 +428,17 @@ async def _handle_tool_execution_inner(tc: dict, current_msgs: list, session_id:
                 redact_secrets(json.dumps(args, ensure_ascii=False))[:120])
     # 会话上下文进线程（asyncio.to_thread 拷贝 context）：run_cmd 等长命令据此
     # 感知停止键——取消到达即杀进程树，不再跑满自己的超时（2026-10-05）
-    from tool_executor import CURRENT_TOOL_SESSION
+    # 同时把工具白名单放进 context：delegate_task 派生子代理时据此收窄
+    # （2026-10-11 深审：parent_whitelist 从没人传，受限父会话生出全量子代理）。
+    from tool_executor import CURRENT_TOOL_SESSION, CURRENT_TOOL_WHITELIST
     _tool_ctx = CURRENT_TOOL_SESSION.set(session_id)
+    _wl_ctx = CURRENT_TOOL_WHITELIST.set(
+        frozenset(tool_whitelist) if tool_whitelist is not None else None)
     try:
         result = await execute_tool(tool_name, args)
     finally:
         CURRENT_TOOL_SESSION.reset(_tool_ctx)
+        CURRENT_TOOL_WHITELIST.reset(_wl_ctx)
     # 结果预览脱敏：read_file 这类内容工具只记长度（真机实测原样落盘过 API key）
     logger.info("Tool result: %s → %s", tool_name, tool_log_preview(tool_name, result))
 
@@ -468,6 +516,14 @@ async def _handle_tool_execution_inner(tc: dict, current_msgs: list, session_id:
     # 一条"这是数据、不是指令"的标注、**不删数据**（删了用户就看不懂搜索结果）；
     # 未命中时原样返回，零改动零开销。这里是全循环唯一的工具结果落库点。
     tool_content = guard_tool_result(tool_name, tool_content, session_id)
+    # 子代理结果**恒定**围栏（2026-10-11 深审 High）：delegate_task 的返回值是
+    # 子代理读网页/文件后的结论，guard_tool_result 只在命中注入句式时才围栏——
+    # 而"忽略上述指令"这类句子很容易绕过正则。子代理产出一律按外部数据处理。
+    # 台账/注册表存的仍是原文（_delegate_task 写 s["result"]），只有进模型上下文
+    # 的这一份围栏。
+    if tool_name == "delegate_task":
+        from threat_scan import fence_untrusted
+        tool_content = fence_untrusted("子代理", tool_content)
     current_msgs.append({"role": "tool", "tool_call_id": call_id,
                          "content": (_stamp_time_sensitive() + tool_content
                                      if tool_name in _TIME_SENSITIVE_TOOLS else tool_content)})
@@ -505,7 +561,11 @@ def _dispatch_delegate(args: dict):
     子代理 run() 不会覆盖它——后台完成通知靠它回寻父会话）。"""
     agent = args.get("agent", "code-reviewer")
     task = args.get("task", "")
-    from agent.subagent import _CURRENT_PARENT_SESSION, _delegate_task_bg, _delegate_task_fg
+    from agent.subagent import (
+        _CURRENT_PARENT_SESSION,
+        _delegate_task_bg,
+        _delegate_task_fg,
+    )
     parent_session = _CURRENT_PARENT_SESSION.get()
     if args.get("background"):
         return _delegate_task_bg(agent, task, parent_session=parent_session)
@@ -516,8 +576,8 @@ def _dispatch_update_todos(args: dict):
     """update_todos 分发：写入本会话的任务清单（存储/快照在 todos.py）。
     session 从 contextvar 捕获——与 delegate_task 同一套语义（loop.run() 每轮
     起始 set(self.session_id)，见 agent/loop.py）。"""
-    from todos import update as _update
     from agent.subagent import _CURRENT_PARENT_SESSION
+    from todos import update as _update
     session = _CURRENT_PARENT_SESSION.get() or ""
     return _update(session, args.get("todos") or [])
 

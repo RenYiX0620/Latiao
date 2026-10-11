@@ -15,9 +15,9 @@ matching, custom-permission state, shared constants, and facade re-exports so
 """
 from __future__ import annotations
 
-import sys
 import re
 import secrets
+import sys
 import time
 
 if __name__ == "__main__":
@@ -69,7 +69,6 @@ import logging
 import os
 import sys
 from collections import deque
-
 from contextlib import asynccontextmanager
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
@@ -137,10 +136,13 @@ from agent_loop import (  # noqa: F401 — 门面 re-export：保持 main.xxx �
     _strip_native_tool_calls,
     execute_tool,
 )
-from config import PROGRESS_DIR
+
 # SUBAGENT_MODEL 在本文件里没用到，但**是对外 re-export**（测试与 cron 走 `from main import`）。
 # 别被 ruff 的"未用导入"删掉：删了它们会在别处 ImportError。
-from config import SUBAGENT_MODEL  # noqa: F401
+from config import (
+    PROGRESS_DIR,
+    SUBAGENT_MODEL,  # noqa: F401
+)
 from cron import _cron_loop, _seed_default_cron
 from db import _init_db
 from identity import _create_default_identity
@@ -368,6 +370,7 @@ async def lifespan(app: FastAPI):
     # GitHub 生态抓取：启动后台线程（首启全量；24h 内增量跳过），不阻塞启动
     try:
         import threading
+
         from discovery import run_discovery
         def _discovery_worker():
             try:
@@ -419,6 +422,7 @@ async def lifespan(app: FastAPI):
         import embedding_service as _emb
         if _emb.available():
             import threading as _th
+
             import semantic as _sem
             _th.Thread(target=_sem.warmup, name="semantic-warmup", daemon=True).start()
             logger.info("语义检索已启用（模型 %s；预热中）", _emb.MODEL_ID)
@@ -446,12 +450,22 @@ async def lifespan(app: FastAPI):
         while True:
             try:
                 from starlette.concurrency import run_in_threadpool
+
                 import db
                 await run_in_threadpool(db.prune_tool_calls)
                 # ⑦（09-23）：反思保留 + learnings 超限淘汰（与工具历史同一轮里做）
                 await run_in_threadpool(db.prune_reflections)
                 await run_in_threadpool(db.prune_learnings)
                 await run_in_threadpool(db.prune_injections)
+                # 2026-10-11：memory 表（cron 产出全文）与会话表兜底清理——
+                # 此前两者都只增不减（prune_sessions 写好了但从没人调用）。
+                # 默认 memory 180 天、会话保留 1000 个（MAX_SESSIONS），均保守。
+                await run_in_threadpool(db.prune_memory)
+                try:
+                    import sessions as _sess
+                    await run_in_threadpool(_sess.prune_sessions)
+                except Exception:
+                    logger.debug("会话清理失败（不影响其它清理）", exc_info=True)
                 # 每轮指标保留期（2026-09-29）：一行一轮，默认 180 天
                 import turn_metrics as _tm
                 await run_in_threadpool(_tm.prune)
@@ -487,6 +501,7 @@ async def lifespan(app: FastAPI):
         而积压可能很大（实测 13.8GB）——启动就清，用户立刻看到磁盘回血。"""
         try:
             from starlette.concurrency import run_in_threadpool
+
             import update_service as _us
             await run_in_threadpool(_us.cleanup_old_packages)
         except Exception:
@@ -590,6 +605,10 @@ async def _hot_reload_extensions() -> dict:
     重新注册 MCP 工具——刚装完的扩展立即可用，无需重启（此前只写磁盘
     配置，插件/MCP 工具要重启才生效）。"""
     import agent_loop
+
+    # 1) 能力表同步：技能三来源 + 工具注册表（prune 清理已卸载扩展的能力行）
+    import capability_registry
+
     # fallback 定义实际在 tool_executor（此前误 import tool_system，从未触发过
     # 直至生态安装路径真正调用才暴露）
     from tool_executor import (
@@ -598,8 +617,6 @@ async def _hot_reload_extensions() -> dict:
         _FALLBACK_TOOLS,
     )
     from tool_system import load_plugins
-    # 1) 能力表同步：技能三来源 + 工具注册表（prune 清理已卸载扩展的能力行）
-    import capability_registry
     capability_registry.sync_skills()
     capability_registry.sync_tools(agent_loop.TOOLS, agent_loop.TOOL_PERMISSIONS,
                                    agent_loop.TOOL_DISPATCH, prune=True)
@@ -636,7 +653,8 @@ if __name__ == "__main__":
     # ── 防双实例：已有 sidecar 监听 8765 时直接退出 ──
     # 两个 sidecar 同时管理引擎 = 双份模型加载（内存 95% 尖峰）+ 状态互踩。
     # 应用正常重启由 Rust 端先 kill 旧进程，这里拦的是绕过应用的手动启动。
-    import socket, time as _time
+    import socket
+    import time as _time
     _port = int(os.environ.get("LATIAO_PORT", "8765"))
     _dup = False
     for _try in range(3):

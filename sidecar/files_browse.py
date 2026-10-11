@@ -37,9 +37,9 @@ async def files_browse(path: str = Query(default="")):
     try:
         p = p.resolve()
     except Exception:
-        raise HTTPException(status_code=400, detail="路径无效")
+        raise HTTPException(status_code=400, detail="路径无效") from None
     if not p.is_dir():
-        raise HTTPException(status_code=400, detail="不是目录")
+        raise HTTPException(status_code=400, detail="不是目录") from None
     # 范围限制：必须在某个模型根之内（家目录是其中一个根，故家目录下均可浏览）
     _allowed = False
     for rp, _label in roots:
@@ -65,7 +65,7 @@ async def files_browse(path: str = Query(default="")):
     try:
         children = list(p.iterdir())
     except PermissionError:
-        raise HTTPException(status_code=403, detail="无权限访问该目录")
+        raise HTTPException(status_code=403, detail="无权限访问该目录") from None
     entries = []
     for child in children:
         if child.name.startswith("."):

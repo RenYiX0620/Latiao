@@ -3,12 +3,12 @@
 工具执行后的自检：回读文件 / 语法检查 / 语义层扫描（semgrep 可选）。与执行器解耦——
 它只吃 (tool_name, args, result)，吐一段给模型看的验证文本。
 """
-import logging
-
 import asyncio
+import logging
 import re
-from cmd_safety import child_env
 from pathlib import Path
+
+from cmd_safety import child_env
 
 logger = logging.getLogger("latiao-sidecar")   # 与 agent_loop 同名：日志格式不变
 

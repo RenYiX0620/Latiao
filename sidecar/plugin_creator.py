@@ -39,6 +39,13 @@ _DANGEROUS_ATTR_NAMES = {
     "system", "popen", "eval", "exec", "__import__", "import_module",
     "call", "run", "Popen", "check_output", "spawn", "spawnv", "execv", "execve",
 }
+# 拼接/f-string 动态构造检测（2026-10-11 误报修复）：只认**词边界**的危险入口名，
+# 不做子串匹配——否则 "execute the task"、"call back"、"important" 这类描述文案
+# 会被误判成构造 exec/call/import（实测误伤正常插件）。
+_DANGEROUS_CONSTRUCT_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:__import__|import_module|system|popen|Popen|eval|exec|"
+    r"spawn|spawnv|execv|execve|check_output)(?![A-Za-z0-9_])"
+)
 # 导入别名解析：`import os as o; o.system(...)` 也要能对上名单
 _MODULE_ALIASES = ("os", "subprocess", "pty", "importlib", "builtins")
 
@@ -72,7 +79,10 @@ def validate_plugin_code(code: str) -> dict:
     _strcat_nodes: set[int] = set()
     for node in ast.walk(tree):
         if isinstance(node, (ast.BinOp, ast.JoinedStr)):
-            # 拼接/f-string 里出现动态属性名 → 一起禁（无法静态求值就别赌）
+            # 拼接/f-string 里出现动态属性名 → 一起禁（无法静态求值就别赌）。
+            # 2026-10-11：用**词边界**匹配——旧的子串匹配把
+            # `"execute " + "the task"`（描述文案）误判成构造 exec，
+            # `"call" + "back"` 同理（实测误伤正常插件）。
             segs = []
             if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
                 for side in (node.left, node.right):
@@ -83,8 +93,7 @@ def validate_plugin_code(code: str) -> dict:
                     if isinstance(v, ast.Constant) and isinstance(v.value, str):
                         segs.append(v.value)
             joined = "".join(segs)
-            if any(dn in joined for dn in ("system", "popen", "eval", "exec",
-                                           "import", "Popen", "spawn", "call")):
+            if _DANGEROUS_CONSTRUCT_RE.search(joined):
                 errors.append("禁止的动态构造：拼接/f-string 里出现可执行入口名")
         elif isinstance(node, (ast.Import, ast.ImportFrom)):
             if isinstance(node, ast.Import):

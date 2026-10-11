@@ -270,7 +270,8 @@ class TestStatusShape(unittest.TestCase):
     """status() 必须是 dict（09-19 回归：一次全文件正则把它改成返回元组 → /v1/onboarding 500）。"""
 
     def setUp(self):
-        import tempfile, pathlib as _pl
+        import pathlib as _pl
+        import tempfile
         self.tmp = _pl.Path(tempfile.mkdtemp(prefix="onb-status-"))
         self._dirs = (onboarding.PROGRESS_DIR, onboarding.STATE_FILE, identity.PROGRESS_DIR)
         onboarding.PROGRESS_DIR = self.tmp

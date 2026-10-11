@@ -652,6 +652,7 @@ def _custom_engine_max_tokens() -> int:
     """custom_engine.max_tokens（config.json）：第三方引擎需要的生成长度上限。"""
     try:
         import json
+
         from agent_loop import CONFIG_FILE
         cfg = json.loads(CONFIG_FILE.read_text("utf-8")).get("custom_engine") or {}
         return int(cfg.get("max_tokens") or 0)

@@ -23,11 +23,11 @@ import json
 import logging
 import os
 import re
+import shutil
+import tempfile
 import threading
 import time
 import uuid
-import shutil
-import tempfile
 import zipfile
 from pathlib import Path
 
@@ -716,7 +716,7 @@ def list_market_sources() -> list[dict]:
     """市场源列表：内置 + 用户添加。"""
     state = _load_sources()
     user_sources = state.get("sources", [])
-    builtin = [s for s in DEFAULT_SOURCES]
+    builtin = list(DEFAULT_SOURCES)
     user_keys = {s.get("url") for s in user_sources}
     for b in builtin:
         if b["url"] in user_keys:
@@ -863,8 +863,11 @@ def install_github_item(repo: str, skill_path: str = "", kind: str = "openclaw-s
     调用方（市场清单）若声明 expect_sha256 则必须一致；最后由用户确认时回传摘要
     （confirm_install），保证"下载的内容"与"确认安装的内容"是同一份字节。
     """
-    from adapters import (install_openclaw_skill, install_claude_plugin,
-                          parse_github_repo)
+    from adapters import (
+        install_claude_plugin,
+        install_openclaw_skill,
+        parse_github_repo,
+    )
     repo = parse_github_repo(repo)
     if not repo:
         return {"status": "error", "message": f"无法识别仓库: {repo!r}"}

@@ -21,8 +21,8 @@ import sys
 from pathlib import Path
 
 from cmd_safety import child_env
-from local_llm_engine import EngineProcess
 from local_llm_download import ModelDownloader
+from local_llm_engine import EngineProcess
 from local_llm_probe import (  # noqa: F401 — 旧导入路径 re-export
     IS_APPLE_SILICON,
     IS_MAC,
@@ -32,16 +32,16 @@ from local_llm_probe import (  # noqa: F401 — 旧导入路径 re-export
     _config_file,
     _custom_engine_spec,
     _custom_engine_target,
-    _gguf_architecture,
-    _read_config,
-    _resolve_mlx_path,
+    _detect_model_bits,
+    _fix_tokenizer_alias,
     _ggml_type_label,
+    _gguf_architecture,
     _gguf_precheck,
     _gguf_scan,
     _mlx_arch_supported,
     _mlx_reject_reason,
-    _detect_model_bits,
-    _fix_tokenizer_alias,
+    _read_config,
+    _resolve_mlx_path,
     _ssl_ctx,
 )
 

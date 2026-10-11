@@ -5,12 +5,15 @@
 from __future__ import annotations
 
 import collections
+import logging
 import os
 import subprocess
 import threading
 import time
 from pathlib import Path
+
 from cmd_safety import child_env
+from local_llm_launch_common import _ENGINE_ENV_PREFIXES, find_mmproj_for
 from local_llm_probe import (
     _GGML_TYPE_SUSPECT,
     _auto_cache_type,
@@ -18,9 +21,7 @@ from local_llm_probe import (
     _gguf_architecture,
     _gguf_scan,
 )
-from local_llm_launch_common import _ENGINE_ENV_PREFIXES, find_mmproj_for
 
-import logging
 logger = logging.getLogger("latiao-sidecar")
 
 # 引擎 stderr 落盘上限（超过就从头截断重来，不做多份轮转——排障只看近期）

@@ -7,8 +7,8 @@
 - 11:03 空闲引擎挂起，首次探活失败还要等 60s 窗口才处置
 - 11:04 搜索成功但模型只回 192 字符收场（短回答重试只在"工具失败"时触发）
 """
-import unittest
 import time
+import unittest
 
 
 class _FakeEngine:
@@ -70,6 +70,7 @@ class TestIdleEngineFastDispose(unittest.TestCase):
 
     def test_idle_engine_disposed_fast(self):
         import time
+
         from local_llm_engine import EngineProcess as LocalLLMEngine  # 拆分后引擎类
         eng = LocalLLMEngine.__new__(LocalLLMEngine)
         eng.server_port = 1235
@@ -149,7 +150,9 @@ class TestConnectErrorRecoveryRace(unittest.TestCase):
     def _run_stream_error(self, engine, api_url="http://127.0.0.1:1235/v1/chat/completions",
                           client=None):
         import asyncio
+
         import httpx
+
         import agent_loop
         import local_llm
         original = getattr(local_llm, "_engine", None)
@@ -296,6 +299,7 @@ class TestHealthProbeUsesRealModel(unittest.TestCase):
     def test_probe_sends_real_model_id(self):
         import json
         import urllib.request
+
         from local_llm_engine import EngineProcess as LocalLLMEngine  # 拆分后引擎类
         eng = LocalLLMEngine.__new__(LocalLLMEngine)
         eng.server_port = 1235
@@ -441,6 +445,7 @@ class TestStagnationCounterWired(unittest.TestCase):
 
     def test_danger_rule_blocks_tool(self):
         import asyncio
+
         from agent_loop import _handle_tool_execution
         from main import _custom_permissions
         _custom_permissions.append({"tool": "list_dir", "permission": "danger"})
@@ -458,6 +463,7 @@ class TestStagnationCounterWired(unittest.TestCase):
 
     def test_deny_rule_blocks_tool(self):
         import asyncio
+
         from agent_loop import _handle_tool_execution
         from main import _custom_permissions
         _custom_permissions.append({"tool": "list_dir", "permission": "deny"})
@@ -526,8 +532,9 @@ class TestFullModeSkipsConfirmation(unittest.TestCase):
 
     def _run_tool(self, access_mode):
         import asyncio
-        import tempfile
         import os
+        import tempfile
+
         from agent_loop import _handle_tool_execution
         tmp = tempfile.mkdtemp()
         target = os.path.join(tmp, "out.txt")
@@ -537,7 +544,7 @@ class TestFullModeSkipsConfirmation(unittest.TestCase):
             calls["n"] += 1
             return False, [{"event": "tool_confirm", "call_id": call_id}]
 
-        import agent.tool_exec as TE   # 确认等待的调用方（2026-09-23 拆出）
+        import agent.tool_exec as TE  # 确认等待的调用方（2026-09-23 拆出）
         original = TE._await_tool_confirmation
         TE._await_tool_confirmation = fake_confirm
         try:
@@ -599,6 +606,7 @@ class TestEngineStateRestoreValidation(unittest.TestCase):
 
     def setUp(self):
         import tempfile
+
         from local_llm_engine import EngineProcess as LocalLLMEngine  # 拆分后引擎类
         self._tmp = tempfile.TemporaryDirectory()
         LocalLLMEngine._engine_state_file = (
@@ -629,6 +637,7 @@ class TestEngineStateRestoreValidation(unittest.TestCase):
 
     def test_real_path_restored(self):
         import os
+
         from local_llm_engine import EngineProcess as LocalLLMEngine  # 拆分后引擎类
         real = os.path.join(self._tmp.name, "m.gguf")
         open(real, "w").close()

@@ -371,7 +371,7 @@ def build_handbook(top_per_section: int = 25) -> dict:
     conn.close()
 
     buckets: dict[str, list] = {k: [] for k, _, _ in _SECTIONS}
-    for rid, topic, content, conf, stype, hit, created in rows:
+    for _rid, topic, content, conf, stype, hit, created in rows:
         stype = stype or "refined"
         if stype == "preference" and (topic or "").startswith("intent:"):
             continue  # 意图类偏好已并入 preferences 表展示

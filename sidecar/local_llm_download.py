@@ -581,19 +581,27 @@ class ModelDownloader:
                             self._save_download_state()
                     else:
                         with self._dl_lock:
-                            self._downloads[model_id] = {"status": "done", "progress": 100, "path": path,
-                                                         "message": f"已缓存（{_v.get('reason', '')}）", "model_id": model_id}
+                            # merge 而非整体替换（2026-10-11 修复：verify_cached_model
+                            # 刚写入的 weight_hashes 缓存被 `= {...}` 覆盖 → 每次都丢，
+                            # 20GB 重哈希照旧发生）。保留 weight_hashes 与分块字段。
+                            _prev = self._downloads.get(model_id) or {}
+                            _new = {"status": "done", "progress": 100, "path": path,
+                                    "message": f"已缓存（{_v.get('reason', '')}）", "model_id": model_id}
+                            for k, v in _prev.items():
+                                if k not in _new:
+                                    _new[k] = v
+                            self._downloads[model_id] = _new
                             self._save_download_state()
                         return {"status": "ok", "model_id": model_id, "path": path, "message": "模型已缓存"}
 
         with self._dl_lock:
             # paused 重下：保留原有分块记录（merge 而非整体覆盖），避免丢 chunk、
-            # 遗留孤儿 .part 文件
+            # 遗留孤儿 .part 文件；weight_hashes 同理保留（否则校验缓存每次都丢）
             prev = self._downloads.get(model_id) or {}
             new_info = {"status": "downloading", "progress": 0, "path": "", "message": "准备下载...",
                         "model_id": model_id, "speed_bps": 0, "eta_seconds": 0, "downloaded_bytes": 0}
             if prev.get("status") == "paused":
-                for k in ("chunk_paths", "chunk_ranges", "total_bytes", "epoch"):
+                for k in ("chunk_paths", "chunk_ranges", "total_bytes", "epoch", "weight_hashes"):
                     if k in prev:
                         new_info[k] = prev[k]
             self._downloads[model_id] = new_info

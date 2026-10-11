@@ -1,8 +1,8 @@
 """本地引擎传输层（host）：串行锁、引擎忙注册、健康验证、流封装与恢复。"""
 import asyncio
+import logging
 import os
 import time
-import logging
 import weakref
 from contextlib import asynccontextmanager
 from pathlib import Path

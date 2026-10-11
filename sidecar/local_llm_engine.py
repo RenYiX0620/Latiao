@@ -412,7 +412,12 @@ class EngineProcess:
     @staticmethod
     def _probe_port(port: int, timeout: float = 5) -> bool:
         """Check if a model server is listening on this port.
-        Uses TCP connect first (fast), then HTTP GET /v1/models as confirmation."""
+
+        必须**真的像** OpenAI 兼容引擎才认（2026-10-11 深审 Medium：旧实现
+        TCP 通就 return True，把任意监听者认领成引擎 → 对话内容发给陌生进程）。
+        MLX 的 /v1/models 可能返回空 body，但 HTTP 层要能应答；应答不了就是
+        不认识的服务，不认领。
+        """
         import socket
         # Fast check: is anything listening?
         try:
@@ -420,16 +425,16 @@ class EngineProcess:
             sock.close()
         except Exception:
             return False
-        # Confirm it's an OpenAI-compatible server
+        # Confirm it's an OpenAI-compatible server（失败 = 不认领，绝不降级成
+        # "端口活着就算数"——那等于把对话交给任意本地监听者）
         try:
             urllib.request.urlopen(
                 f"http://127.0.0.1:{port}/v1/models", timeout=timeout,
             )
             return True
         except Exception:
-            # /v1/models may return empty body on some servers (MLX) —
-            # the TCP connect above already confirmed the port is alive
-            return True
+            logger.debug("端口 %d 有监听但不是 OpenAI 兼容引擎，不认领", port)
+            return False
 
     def mark_engine_suspect(self):
         """Agent 层发现引擎行为异常（空响应/流被中断后残留线程）时调用，
@@ -616,8 +621,42 @@ class EngineProcess:
         return False
 
     @staticmethod
+    def _pid_is_our_engine(pid: int) -> bool:
+        """端口占用者是不是我们自己的推理引擎（2026-10-11 深审 Medium）。
+
+        `_kill_port` 旧实现 SIGKILL 该端口的**任何**监听者——用户自定义端口撞上
+        无关服务（数据库/开发服务器）就是误杀。只认 llama-server / mlx_lm /
+        python 跑引擎这几种形态；认不出就不杀（宁可留着端口占用，不杀无辜进程）。
+        """
+        try:
+            import psutil  # noqa: F401  # 可选依赖，缺了走 lsof 兜底
+        except Exception:
+            pass
+        try:
+            r = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
+                               capture_output=True, text=True, timeout=3)
+            cmd = (r.stdout or "").strip().lower()
+        except Exception:
+            return False
+        if not cmd:
+            return False
+        # 2026-10-11 收紧：只认**可执行名/路径段**里的引擎标识，不做任意子串
+        # （`gguf`/`latiao` 子串会把无关进程（打开过 GGUF 文件的编辑器等）误判成
+        # 自己的引擎并杀掉）。按空白/路径切词后精确比对可执行名。
+        tokens = [t for t in cmd.replace("\\", "/").replace("=", " ").split()
+                  if t]
+        _binaries = {"llama-server", "llama_server", "llama-server.exe",
+                     "mlx_lm.server", "mlx-lm", "gguf"}
+        _path_markers = ("/local-ai-os/", "/latiao/", "\\local-ai-os\\", "\\latiao\\")
+        return any(t in _binaries for t in tokens) or any(m in cmd for m in _path_markers)
+
+    @staticmethod
     def _kill_port(port: int):
-        """Kill any process listening on the given port."""
+        """Kill the engine process listening on the given port.
+
+        2026-10-11：先验进程身份（_pid_is_our_engine），认不出就不杀——
+        旧实现对端口上任何监听者 SIGKILL，自定义端口撞上无关服务即误杀。
+        """
         if platform.system() == "Windows":
             try:
                 result = subprocess.run(
@@ -630,7 +669,7 @@ class EngineProcess:
                     if len(parts) >= 4 and parts[3] == "LISTENING" \
                             and parts[1].rstrip(":").endswith(f":{port}"):
                         pid = parts[-1]
-                        if pid.isdigit():
+                        if pid.isdigit() and EngineProcess._pid_is_our_engine(int(pid)):
                             subprocess.run(["taskkill", "/F", "/PID", pid],
                                            capture_output=True, timeout=10)
             except Exception:
@@ -650,6 +689,9 @@ class EngineProcess:
                 if pid and pid.isdigit():
                     if int(pid) == my_pid:
                         continue  # 保险带：绝不能杀自己
+                    if not EngineProcess._pid_is_our_engine(int(pid)):
+                        logger.warning("端口 %s 被非本引擎进程占用（pid=%s），不杀", port, pid)
+                        continue
                     try:
                         logger.warning(" killing pid=%s on port %s", pid, port)
                         os.kill(int(pid), 9)

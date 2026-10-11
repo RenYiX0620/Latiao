@@ -174,8 +174,8 @@ async def run_sub_agent(agent_type: str, task: str, *, task_id: str | None = Non
                         parent_session: str = "", depth: int = 0,
                         parent_whitelist: set | None = None) -> str:
     """运行子代理：同一 ThinAgentLoop 的受限实例，返回最终文本结果。"""
-    from agent_loop import AGENT_PROFILES, _last_cloud_config, _resolve_api_target
     from agent.loop import ThinAgentLoop
+    from agent_loop import AGENT_PROFILES, _last_cloud_config, _resolve_api_target
     from main import SUBAGENT_MODEL
 
     if not task.strip():
@@ -248,8 +248,16 @@ async def run_sub_agent(agent_type: str, task: str, *, task_id: str | None = Non
 # ── 前台/后台入口（签名与注册表契约与旧实现逐字段兼容）────────────
 async def _delegate_task(agent_type: str, task: str, task_id: str | None = None,
                          parent_session: str = "", depth: int = 0) -> str:
+    # parent_whitelist 从执行上下文取（2026-10-11 修复：参数存在但从没人传，
+    # 受限父会话仍能生出全量工具的子代理）。tool_exec 在派发前 set 该 contextvar。
+    try:
+        from tool_executor import CURRENT_TOOL_WHITELIST
+        _parent_wl = CURRENT_TOOL_WHITELIST.get(None)
+    except Exception:
+        _parent_wl = None
     result = await run_sub_agent(agent_type, task, task_id=task_id,
-                                 parent_session=parent_session, depth=depth)
+                                 parent_session=parent_session, depth=depth,
+                                 parent_whitelist=_parent_wl)
     if task_id and task_id in _SUBTASKS:
         s = _SUBTASKS[task_id]
         s["result"] = result

@@ -161,8 +161,9 @@ def test_office_to_pdf_cached(tmp_path, monkeypatch):
 
 
 def test_office_to_pdf_missing_soffice(tmp_path, monkeypatch):
-    import api_routes_media as m
     import pytest
+
+    import api_routes_media as m
     src = tmp_path / "a.docx"
     src.write_bytes(b"x")
     monkeypatch.setattr(m, "_find_soffice", lambda: None)
@@ -183,6 +184,7 @@ def test_preview_office_needs_soffice_flag(client, headers, tmp_path, monkeypatc
 def test_write_file_docx_text_becomes_real_word():
     """.docx + 文本 = 直接生成合法 Word（不再是 .docx.py 脚本）。"""
     import zipfile
+
     import plugins.write_file as wf
     dest = Path("/tmp/latiao-ut-report.docx")
     out = wf.execute({"path": str(dest), "content": "# 标题\n正文"})
@@ -193,6 +195,7 @@ def test_write_file_docx_text_becomes_real_word():
 def test_write_file_xlsx_markdown_tables_become_real_excel(tmp_path):
     """.xlsx + Markdown 表格 = 真 Excel；多表 → 多工作表，# 标题作表名。"""
     from openpyxl import load_workbook
+
     import plugins.write_file as wf
     dest = tmp_path / "行情.xlsx"
     md = (
@@ -212,6 +215,7 @@ def test_write_file_xlsx_markdown_tables_become_real_excel(tmp_path):
 
 def test_write_file_xlsx_tsv(tmp_path):
     from openpyxl import load_workbook
+
     import plugins.write_file as wf
     dest = tmp_path / "tsv.xlsx"
     out = wf.execute({"path": str(dest), "content": "a\tb\n1\t2"})
@@ -235,6 +239,7 @@ def test_preview_sniffs_zip_as_office(tmp_path, monkeypatch):
     # 不按 .py 走代码；应按 office
     # 但扩展是 .py，嗅探后 ext 变 .docx 再进 office 分支
     from fastapi.testclient import TestClient
+
     import main as mi
     mi.AUTH_TOKEN = "preview-token"
     c = TestClient(mi.app, raise_server_exceptions=False)
@@ -247,9 +252,10 @@ def test_preview_sniffs_zip_as_office(tmp_path, monkeypatch):
 
 def test_resolve_deliverable_strips_gen_prefix(tmp_path):
     """`生成A股分析报告.py` 旁有 `A股分析报告.docx` 时必须解析到 docx。"""
-    import zipfile
-    import api_routes_media as m
     import io
+    import zipfile
+
+    import api_routes_media as m
     doc = tmp_path / "A股分析报告_2026-09-24.docx"
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as z:

@@ -50,8 +50,8 @@ def _round(body) -> list[str]:
 async def _run(monkeypatch, budget: int):
     import agent.context as agent_context
     import local_llm
-    from tests.test_loop_scenarios import _StubEngine
     from agent.loop import ThinAgentLoop
+    from tests.test_loop_scenarios import _StubEngine
 
     monkeypatch.setenv("LATIAO_TURN_TOKEN_BUDGET", str(budget))
     with FakeEngine() as engine:

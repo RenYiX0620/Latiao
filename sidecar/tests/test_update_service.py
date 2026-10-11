@@ -178,8 +178,10 @@ class TestDigestVerification(TestUpdateService):
 
 
     def test_sha256_file_matches_hashlib(self):
-        import hashlib, tempfile
+        import hashlib
+        import tempfile
         from pathlib import Path
+
         import update_service as us
         with tempfile.TemporaryDirectory() as d:
             f = Path(d) / "x.bin"
@@ -195,6 +197,7 @@ class TestDigestVerification(TestUpdateService):
         """下载完成时校验不过 → failed + integrity=mismatch + 坏包删除。"""
         import tempfile
         from pathlib import Path
+
         import update_service as us
 
         class _Resp:

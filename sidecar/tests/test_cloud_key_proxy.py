@@ -24,10 +24,10 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 def _patch_cfg(monkeypatch, tmp_path):
     """CONFIG_FILE 在多处导入时绑定，测试必须钉到同一个临时文件。"""
-    import main  # noqa: F401 — 先拉起完整路由图，避免 api_routes_admin↔main 循环导入
-    import api_routes_admin
     import agent_loop
+    import api_routes_admin
     import config as config_mod
+    import main  # noqa: F401 — 先拉起完整路由图，避免 api_routes_admin↔main 循环导入
     cfg_path = tmp_path / "config.json"
     monkeypatch.setattr(config_mod, "CONFIG_FILE", cfg_path)
     monkeypatch.setattr(agent_loop, "CONFIG_FILE", cfg_path)

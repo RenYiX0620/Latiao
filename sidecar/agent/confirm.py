@@ -5,11 +5,11 @@
 配套：_confirm_bypassed（哪些档位免确认）、_count_successful_duplicates（同参重复守卫）、
 _check_pre_hooks（工具前钩子拒绝）。
 """
-import logging
-
 import asyncio
 import json
+import logging
 import os
+
 from agent.context import AUTO_EDIT_TOOLS, _normalize_access
 
 logger = logging.getLogger("latiao-sidecar")   # 与 agent_loop 同名：日志格式不变

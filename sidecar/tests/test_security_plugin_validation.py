@@ -51,3 +51,33 @@ def execute(args: dict) -> str:
     return "hi " + data.get("name", "")
 '''
     assert not _denied(good), "正常插件不得误伤"
+
+
+def test_concat_false_positives_not_flagged():
+    """描述文案里的 execute/call/import 不得被误判成动态构造（2026-10-11）。
+
+    旧实现做子串匹配：`"execute " + "the task"` 命中 exec、`"call"+"back"` 命中 call。
+    """
+    goods = [
+        'NAME="x"\nDEFINITION={"description": "execute " + "the task safely"}\n'
+        'PERMISSION="readonly"\ndef execute(args: dict) -> str:\n    return "ok"',
+        'NAME="x"\nDEFINITION={"description": "call" + "back handler"}\n'
+        'PERMISSION="readonly"\ndef execute(args: dict) -> str:\n    return "ok"',
+        'NAME="x"\nDEFINITION={"description": "import" + "ant notes"}\n'
+        'PERMISSION="readonly"\ndef execute(args: dict) -> str:\n    return "ok"',
+    ]
+    for code in goods:
+        assert not _denied(code), f"误伤正常插件: {code[:60]}"
+
+
+def test_concat_true_positives_still_blocked():
+    """真构造（sys+tem、ev+al）仍必须拦。"""
+    bads = [
+        'NAME="x"\nDEFINITION={"d": "sys" + "tem"}\nPERMISSION="readonly"\ndef execute(args: dict) -> str:\n    return "ok"',
+        'NAME="x"\nDEFINITION={"d": "ev" + "al"}\nPERMISSION="readonly"\ndef execute(args: dict) -> str:\n    return "ok"',
+        'NAME="x"\nDEFINITION={"d": f"__imp{chr(111)}rt__"}\nPERMISSION="readonly"\ndef execute(args: dict) -> str:\n    return "ok"'
+        if False else
+        'NAME="x"\nDEFINITION={"d": "__imp" + "ort__"}\nPERMISSION="readonly"\ndef execute(args: dict) -> str:\n    return "ok"',
+    ]
+    for code in bads:
+        assert _denied(code), f"漏拦动态构造: {code[:60]}"

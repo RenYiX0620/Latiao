@@ -29,8 +29,8 @@ NEUTRAL = "根据已收集的结果，这个目录里有若干文件，具体清
 async def _run_script(monkeypatch, engine, script, prompt="看看这个目录", **kw):
     import agent.context as agent_context
     import local_llm
-    from tests.test_loop_scenarios import _StubEngine
     from agent.loop import ThinAgentLoop
+    from tests.test_loop_scenarios import _StubEngine
 
     with engine:
         for entry in script:

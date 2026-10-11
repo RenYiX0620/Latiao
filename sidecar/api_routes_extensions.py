@@ -11,7 +11,6 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
-
 logger = logging.getLogger("latiao-sidecar")
 
 from http_json import _json_body  # noqa: E402 — 唯一定义
@@ -118,6 +117,7 @@ async def api_extensions_install(request: Request):
     if not source:
         return {"status": "error", "message": "source required"}
     from starlette.concurrency import run_in_threadpool
+
     from extension_manager import stage_install
     return await run_in_threadpool(stage_install, source, sha256, label)
 
@@ -130,6 +130,7 @@ async def api_extensions_install_confirm(request: Request):
     digest = str(body.get("sha256", "")).strip()
     label = str(body.get("label", "")).strip()
     from starlette.concurrency import run_in_threadpool
+
     from extension_manager import confirm_install
     result = await run_in_threadpool(confirm_install, pending_id, digest, label)
     if isinstance(result, dict) and result.get("status") == "ok":
@@ -203,6 +204,7 @@ async def api_marketplace(url: str = Query(default="")):
     """读取市场清单（默认官方市场；可选 url 覆盖）。"""
     try:
         from starlette.concurrency import run_in_threadpool
+
         from extension_manager import get_marketplace_cached
         # 走预热缓存：命中即秒回；miss 才线程池拉取（不阻塞事件循环）
         return await run_in_threadpool(get_marketplace_cached, url)
@@ -242,6 +244,7 @@ async def api_market_all():
     """聚合所有源的条目：官方 marketplace + 生态源实时发现（线程池）。"""
     try:
         from starlette.concurrency import run_in_threadpool
+
         from extension_manager import fetch_all_markets
         return await run_in_threadpool(fetch_all_markets)
     except Exception as e:
@@ -252,6 +255,7 @@ async def api_market_all():
 async def api_market_discover(url: str = Query(default="")):
     """发现任意 GitHub 仓库的可安装内容（格式自动识别）。"""
     from starlette.concurrency import run_in_threadpool
+
     from adapters import discover_auto
     if not url.strip():
         return {"status": "error", "message": "url 参数不能为空"}
@@ -291,8 +295,9 @@ async def api_update_latest_json():
     免鉴权：updater 插件请求不带自定义 token（main._check_auth 豁免）。
     无更新时返回 204 No Content——updater 在版本比较之前就查找
     platforms 条目，返回空 platforms 的 JSON 会直接报错。"""
-    import update_service
     from starlette.responses import Response
+
+    import update_service
     manifest = await asyncio.to_thread(
         update_service.get_tauri_manifest, update_service.current_app_version())
     if manifest is None:
@@ -303,8 +308,9 @@ async def api_update_latest_json():
 @router.get("/v1/update-file")
 async def api_update_file():
     """流式返回本地安装包给 updater（本地回环，无断流可能）。免鉴权。"""
-    import update_service
     from starlette.responses import FileResponse
+
+    import update_service
     path = await asyncio.to_thread(update_service.get_update_file_path)
     if not path:
         raise HTTPException(status_code=404, detail="update package not ready")
@@ -324,6 +330,7 @@ async def api_market_discovered():
 async def api_market_discover_refresh():
     """触发一轮强制全量抓取（后台线程，立即返回进度）。"""
     import threading
+
     from discovery import run_discovery
     # 用后台线程跑（抓取 3-5 分钟），不阻塞请求；结果写索引，前端可轮询 discovered
     def _worker():
@@ -361,6 +368,7 @@ async def api_extensions_install_github(request: Request):
         return {"status": "error", "message": f"该来源已被封锁，拒绝安装：{repo}"}
     try:
         from starlette.concurrency import run_in_threadpool
+
         from extension_manager import install_github_item
         result = await run_in_threadpool(install_github_item, repo, skill_path, kind,
                                          expect_sha256)

@@ -3,9 +3,9 @@ import logging
 import os
 import re
 import sqlite3
+import threading
 import time
 from datetime import datetime
-import threading
 
 from config import PROGRESS_DIR
 
@@ -273,6 +273,7 @@ def reflections_retention_days() -> int:
     if raw is None:
         try:
             import json as _json
+
             from config import CONFIG_FILE
             if CONFIG_FILE.exists():
                 cfg = _json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
@@ -293,6 +294,7 @@ def learnings_max() -> int:
     if raw is None:
         try:
             import json as _json
+
             from config import CONFIG_FILE
             if CONFIG_FILE.exists():
                 cfg = _json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
@@ -449,4 +451,59 @@ def prune_tool_calls(retention_days: int | None = None, vacuum: bool = True) -> 
         logger.debug("wal_checkpoint 失败（不影响清理结果）", exc_info=True)
     if deleted:
         logger.info("工具历史清理：保留 %d 天，删除 %d 行，剩余 %d 行", days, deleted, kept)
+    return {"days": days, "deleted": deleted, "kept": kept}
+
+
+# ── memory 表（cron 产出等）的保留策略（2026-10-11）────────────────
+# 为什么需要：每次 cron 跑完把**完整报告正文**写进 memory（type='cron_job'），
+# 只增不减——长跑后 memory.db 会涨到几百 MB（对照 reflections/tool_calls 的
+# 同款策略）。默认 180 天（与 reflections 同），可配 memory.cron_retention_days。
+DEFAULT_MEMORY_RETENTION_DAYS = 180
+
+
+def memory_retention_days() -> int:
+    """memory 表保留天数：环境变量 > config.json memory.cron_retention_days > 180。<=0 关闭。"""
+    raw = os.environ.get("LATIAO_MEMORY_RETENTION_DAYS")
+    if raw is None:
+        try:
+            import json as _json
+
+            from config import CONFIG_FILE
+            if CONFIG_FILE.exists():
+                cfg = _json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+                section = cfg.get("memory") if isinstance(cfg, dict) else None
+                if isinstance(section, dict) and section.get("cron_retention_days") is not None:
+                    raw = str(section.get("cron_retention_days"))
+        except Exception:
+            raw = None
+    try:
+        return int(raw) if raw is not None else DEFAULT_MEMORY_RETENTION_DAYS
+    except (TypeError, ValueError):
+        return DEFAULT_MEMORY_RETENTION_DAYS
+
+
+def prune_memory(retention_days: int | None = None) -> dict:
+    """按天清理 memory 表（cron 产出/其他 type 统一按 created_at 淘汰）。"""
+    days = memory_retention_days() if retention_days is None else int(retention_days)
+    if days <= 0:
+        return {"days": days, "deleted": 0, "kept": -1, "skipped": "retention disabled"}
+    conn = _get_db()
+    deleted = 0
+    with _db_write_lock:
+        try:
+            cur = conn.execute(
+                "DELETE FROM memory WHERE created_at != '' AND created_at < datetime('now', ?)",
+                (f"-{days} days",),
+            )
+            deleted = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+            conn.commit()
+        except Exception:
+            logger.warning("memory 表清理失败", exc_info=True)
+            return {"days": days, "deleted": 0, "kept": -1, "skipped": "error"}
+        try:
+            kept = conn.execute("SELECT count(*) FROM memory").fetchone()[0]
+        except Exception:
+            kept = -1
+    if deleted:
+        logger.info("memory 表清理：保留 %d 天，删除 %d 行，剩余 %d 行", days, deleted, kept)
     return {"days": days, "deleted": deleted, "kept": kept}

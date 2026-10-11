@@ -37,6 +37,7 @@ def anon(tmp_path, monkeypatch):
     monkeypatch.delenv("LATIAO_ANON_USAGE", raising=False)
     monkeypatch.delenv("LATIAO_ANON_ENDPOINT", raising=False)
     import importlib
+
     import config as config_mod
     importlib.reload(config_mod)
     import anon_usage as anon_mod

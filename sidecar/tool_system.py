@@ -227,9 +227,9 @@ def _md_to_docx_zip(text: str) -> bytes:
 
     支持：# 标题 1–3 级、- / * 列表、空行分段、**粗体**（无样式近似为正文）。
     """
-    import zipfile
     import io
     import re as _re2
+    import zipfile
 
     def esc(s: str) -> str:
         return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
@@ -331,8 +331,8 @@ def _docx_cjk_font() -> str:
 
 def _apply_fonts(run, cjk: str) -> None:
     """中文字体必须落到 w:eastAsia —— 只设 font.name 对中文不生效（走主题字体）。"""
-    from docx.oxml.ns import qn
     from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
     run.font.name = _DOCX_LATIN_FONT
     rPr = run._element.get_or_add_rPr()
     rFonts = rPr.find(qn("w:rFonts"))
@@ -355,11 +355,12 @@ def _md_to_docx(text: str) -> bytes | None:
     """Markdown → 带完整样式的 .docx（python-docx）。库缺失返回 None，由调用方降级。"""
     try:
         import io
+
         from docx import Document
-        from docx.shared import Pt, Cm, RGBColor
         from docx.enum.text import WD_ALIGN_PARAGRAPH
-        from docx.oxml.ns import qn
         from docx.oxml import OxmlElement
+        from docx.oxml.ns import qn
+        from docx.shared import Cm, Pt, RGBColor
     except ImportError:
         return None
 
@@ -521,12 +522,19 @@ def _md_to_pdf(text: str) -> bytes | None:
     """Markdown → PDF（reportlab）。库缺失返回 None；样式沿用 _style_profile 的语言档案。"""
     try:
         import io
-        from reportlab.lib.pagesizes import A4
-        from reportlab.lib.units import cm
+
         from reportlab.lib import colors
-        from reportlab.lib.styles import ParagraphStyle
         from reportlab.lib.enums import TA_CENTER, TA_RIGHT
-        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import ParagraphStyle
+        from reportlab.lib.units import cm
+        from reportlab.platypus import (
+            Paragraph,
+            SimpleDocTemplate,
+            Spacer,
+            Table,
+            TableStyle,
+        )
     except ImportError:
         return None
 
@@ -856,11 +864,11 @@ import subprocess
 # 安全不变量单点定义（破坏/混淆/白名单/敏感路径），
 # fallback 与 seed 共用同一模块，消除三处漂移（审计 P0）。
 from cmd_safety import (
-    child_env,
     DESTRUCTIVE_PATTERNS,
     OBFUSCATION_PATTERNS,
     SAFE_CMD_RE,
     check_cmd_with_script,
+    child_env,
     stderr_target,
 )
 
@@ -904,6 +912,7 @@ def _reject_shell_operators(cmd: str) -> str | None:
 def _run_pipeline(left: str, right: str, timeout: int) -> str:
     import shlex as _shlex
     import subprocess as _sp
+
     from cmd_safety import child_env, split_stderr_redirect, stderr_target
     # 管道两侧各自的 stderr 重定向（`A 2>&1 | grep x` / `A | B 2>/dev/null`）
     left, _lm = split_stderr_redirect(left)
@@ -1529,6 +1538,13 @@ def load_plugins(fallback_tools, fallback_dispatch, fallback_permissions):
 
     # ── 已安装扩展（~/.local-ai-os/extensions/<name>/<version>/plugin.py）──
     # 与内置插件同构加载；重名时先加载者赢（内置插件优先）。
+    #
+    # 权限取**更严者**（2026-10-11 深审：permissions_map 此前只做镜像校验、
+    # 未接线到生产翻译路径）：plugin.py 自称的 PERMISSION 与 manifest 声明的
+    # permissions（readonly/files/network/shell）各说各话，作者把 manifest 写成
+    # shell 而 PERMISSION 写 safe 就能免确认。现在 manifest 经
+    # permissions_map.plugin_perm_to_tool_level 翻译后取最严，不再信任单侧声明。
+    _ext_manifest_perms: dict[str, str] = {}
     try:
         from extension_manager import active_extension_dirs
         for ext_dir in active_extension_dirs():
@@ -1539,6 +1555,21 @@ def load_plugins(fallback_tools, fallback_dispatch, fallback_permissions):
                 mod = _load_py(f, f"{ext_dir.parent.name}_{ext_dir.name}")
                 if mod is not None:
                     plugins.append(mod)
+                    # manifest permissions → 工具危险级（最严的一条）
+                    try:
+                        from extension_manager import _read_manifest
+                        from permissions_map import plugin_perm_to_tool_level
+                        _mf = _read_manifest(ext_dir) or {}
+                        _perms = _mf.get("permissions") or []
+                        _rank = {"safe": 0, "confirm": 1, "danger": 2, "deny": 3}
+                        _level = "safe"
+                        for _p in _perms:
+                            _l = plugin_perm_to_tool_level(_p)
+                            if _rank.get(_l, 3) > _rank.get(_level, 0):
+                                _level = _l
+                        _ext_manifest_perms[getattr(mod, "NAME", "")] = _level
+                    except Exception:
+                        logger.debug("扩展 manifest 权限翻译失败: %s", ext_dir, exc_info=True)
             except Exception:
                 logger.warning("Failed to load extension plugin %s", f, exc_info=True)
     except Exception:
@@ -1549,6 +1580,7 @@ def load_plugins(fallback_tools, fallback_dispatch, fallback_permissions):
     permissions = {}
     hooks = {}
 
+    _LEVEL_RANK = {"safe": 0, "confirm": 1, "danger": 2, "deny": 3}
     for mod in plugins:
         name = mod.NAME
         if name in dispatch:
@@ -1557,7 +1589,13 @@ def load_plugins(fallback_tools, fallback_dispatch, fallback_permissions):
             continue
         tools.append(mod.DEFINITION)
         dispatch[name] = mod.execute
-        permissions[name] = mod.PERMISSION
+        _p = str(getattr(mod, "PERMISSION", "safe") or "safe")
+        # manifest 与自称取更严（deny 最严）；manifest 未声明时用自称值
+        _mp = _ext_manifest_perms.get(name)
+        if _mp is not None and _LEVEL_RANK.get(_mp, 3) > _LEVEL_RANK.get(_p, 0):
+            logger.info("工具 %s 权限收紧：%s → %s（manifest 声明更严）", name, _p, _mp)
+            _p = _mp
+        permissions[name] = _p
         if hasattr(mod, "HOOKS") and isinstance(mod.HOOKS, dict):
             hooks[name] = mod.HOOKS
 

@@ -29,6 +29,7 @@ SEED = {
 def app_client(tmp_path, monkeypatch):
     monkeypatch.setenv("LATIAO_TEST_PROGRESS_DIR", str(tmp_path))
     import importlib
+
     import config as cfg_mod
     importlib.reload(cfg_mod)
     target = Path(str(cfg_mod.CONFIG_FILE))

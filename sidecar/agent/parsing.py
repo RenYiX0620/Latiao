@@ -1,10 +1,10 @@
 """解析层：SSE delta 行、原生/围栏工具调用解析、kv 参数、循环调试日志。"""
 import json
+import logging
 import os
 import re
 import tempfile
 import uuid
-import logging
 
 logger = logging.getLogger("latiao-sidecar")
 

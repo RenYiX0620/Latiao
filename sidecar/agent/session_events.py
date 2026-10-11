@@ -9,8 +9,8 @@
 无关；而取消语义是并行改造后最容易被误改的一处（子会话要跟着父会话取消）。
 """
 import logging
-
 import threading
+
 from loop_state import turn_state_for
 from session_log import SessionLog
 

@@ -95,6 +95,7 @@ def test_read_block_allows_env_templates_and_normal_files():
 def media_client(tmp_path, monkeypatch):
     monkeypatch.setenv("LATIAO_TEST_PROGRESS_DIR", str(tmp_path / "prog"))
     import importlib
+
     import config as cfg_mod
     importlib.reload(cfg_mod)
     import main as m

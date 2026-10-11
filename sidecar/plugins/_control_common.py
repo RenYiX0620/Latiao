@@ -1,4 +1,5 @@
-from cmd_safety import child_env   # ④ 子进程 env 白名单
+from cmd_safety import child_env  # ④ 子进程 env 白名单
+
 #!/usr/bin/env python3
 """控制类工具共享逻辑（私有模块，带 _ 前缀不会被当作插件加载）。"""
 import os
@@ -107,7 +108,7 @@ def kill_by_name(pattern: str) -> str:
             return (f"⛔ 匹配到 {len(targets)} 个同名进程（{pattern!r}），为防误杀已拒绝。"
                     f"请用 pid 精确终止：" + ", ".join(p for p, _ in targets[:10]))
         killed = 0
-        for p, comm in targets:
+        for p, _comm in targets:
             try:
                 os.kill(int(p), 15)
                 killed += 1

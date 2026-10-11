@@ -382,6 +382,7 @@ class TestPlanConfirmationGate(unittest.TestCase):
 
     def test_plan_confirm_emits_event_and_blocks(self):
         import asyncio
+
         import agent_loop
 
         async def run():
@@ -407,6 +408,7 @@ class TestPlanConfirmationGate(unittest.TestCase):
         现在改成局部 import + 调用方传 lang；这里用 timeout=0.05 真跑一次超时路径。
         """
         import asyncio
+
         import agent_loop
 
         async def run():
@@ -421,6 +423,7 @@ class TestPlanConfirmationGate(unittest.TestCase):
 
     def test_plan_confirm_approve(self):
         import asyncio
+
         import agent_loop
 
         async def run():
@@ -456,6 +459,7 @@ class TestConfirmEventTiming(unittest.TestCase):
 
     def test_tool_confirm_event_available_before_wait(self):
         import asyncio
+
         import agent_loop
 
         async def run():
@@ -478,6 +482,7 @@ class TestConfirmEventTiming(unittest.TestCase):
 
     def test_plan_confirm_event_available_before_wait(self):
         import asyncio
+
         import agent_loop
 
         async def run():
@@ -567,6 +572,7 @@ class TestSingleFlight:
 
     def test_claim_and_release(self):
         import time
+
         from api_routes import _running_turns
         sid = "sf-test-session"
         _running_turns[sid] = time.time()
@@ -577,6 +583,7 @@ class TestSingleFlight:
     def test_stale_entry_can_be_told_apart(self):
         """带时间戳的意义：能判断"开始多久"，超龄即可自愈放行（不再永久锁死）。"""
         import time
+
         from api_routes import _running_turns
         sid = "sf-test-stale"
         _running_turns[sid] = time.time() - 999
@@ -589,7 +596,12 @@ class TestConfirmationWait:
 
     def test_infinite_wait_approved(self):
         import asyncio
-        from agent_loop import _pending_confirmations, _pending_lock, _wait_tool_confirmation
+
+        from agent_loop import (
+            _pending_confirmations,
+            _pending_lock,
+            _wait_tool_confirmation,
+        )
 
         async def runner():
             event = asyncio.Event()
@@ -606,7 +618,12 @@ class TestConfirmationWait:
 
     def test_explicit_timeout_still_pauses(self):
         import asyncio
-        from agent_loop import _pending_confirmations, _pending_lock, _wait_tool_confirmation
+
+        from agent_loop import (
+            _pending_confirmations,
+            _pending_lock,
+            _wait_tool_confirmation,
+        )
 
         async def runner():
             event = asyncio.Event()
@@ -629,6 +646,7 @@ class TestLanguageEnsure:
 
     def test_translate_failure_returns_short_hint(self, monkeypatch):
         import asyncio
+
         import agent_loop
 
         async def _fail(*a, **k):
@@ -645,6 +663,7 @@ class TestLanguageEnsure:
 
     def test_translate_success_returns_translation(self, monkeypatch):
         import asyncio
+
         import agent_loop
 
         async def _ok(*a, **k):
@@ -659,6 +678,7 @@ class TestLanguageEnsure:
 
     def test_language_already_ok_passthrough(self):
         import asyncio
+
         import agent_loop
         delivered = asyncio.run(agent_loop._ensure_final_language(
             None, "http://x", {}, "model", "中文回答", "中文用户"

@@ -11,7 +11,6 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import agent.tool_exec as TE  # noqa: E402  （工具执行簇 2026-09-23 拆出：patch 面在此）
-
 from plugins import _control_common as cc
 from plugins import _control_mouse_common as mc
 
@@ -178,6 +177,7 @@ class TestConfirmFlowIntegration(unittest.TestCase):
 
     def test_confirm_control_tool_approve_executes(self):
         import asyncio
+
         import agent_loop
 
         async def run():
@@ -202,6 +202,7 @@ class TestConfirmFlowIntegration(unittest.TestCase):
 
     def test_confirm_control_tool_deny_blocks(self):
         import asyncio
+
         import agent_loop
 
         async def run():

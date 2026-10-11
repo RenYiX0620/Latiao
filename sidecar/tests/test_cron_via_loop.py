@@ -124,11 +124,16 @@ async def test_cron_tool_whitelist_excludes_delegate_and_is_capped(monkeypatch, 
 async def test_cron_access_mode_comes_from_job(monkeypatch, patched):
     _patch_target(monkeypatch)
     fake = _patch_loop(monkeypatch)
+    await cron._execute_cron_job(_job(access_mode="full"))
+    assert fake.instances[0].access_mode == "full", "无人值守应当能显式提到 full"
+    fake.instances.clear()
     await cron._execute_cron_job(_job(access_mode="read_only"))
     assert fake.instances[0].access_mode == "read_only", "无人值守应当能显式锁成只读"
     fake.instances.clear()
+    # 默认档＝read_only（2026-10-11 深审 Critical：此前默认 full，confirm 级工具
+    # 在没人看着时被自动放行）。需要写的任务由创建方显式提升档位。
     await cron._execute_cron_job(_job())
-    assert fake.instances[0].access_mode == "full", "默认档＝原行为（full），不静默收紧"
+    assert fake.instances[0].access_mode == "read_only", "默认档必须是 read_only，不得默认 full"
 
 
 @pytest.mark.asyncio
@@ -138,7 +143,7 @@ async def test_cron_records_turn_metrics(monkeypatch, patched):
     import turn_metrics as tm
     j = _job()
     await cron._execute_cron_job(j)
-    rows = [r for r in tm.list_turns(f"cron:{j['id']}", limit=5)]
+    rows = list(tm.list_turns(f"cron:{j['id']}", limit=5))
     assert rows, "定时任务的开销必须可查（审计①：此前完全不可见）"
     assert rows[0]["ended_reason"] == "cron"
 

@@ -82,8 +82,8 @@ def test_stop_allowed_when_idle_and_on_empty_body(client, monkeypatch):
 
 
 def test_busy_helper_defaults_to_zero_on_broken_snapshot(monkeypatch):
-    import api_routes_cron_local as local_routes
     import agent.transport as transport
+    import api_routes_cron_local as local_routes
     monkeypatch.setattr(transport, "stream_gate_snapshot",
                         lambda: (_ for _ in ()).throw(RuntimeError("boom")))
     assert local_routes._busy_local_turns() == 0
@@ -108,6 +108,7 @@ def test_subagents_endpoint_filters_by_session(monkeypatch):
 def test_bg_result_ttl_cleanup(monkeypatch):
     """已投递/过期的后台结果通知要出队（旧实现永不出队 → 无限增长）。"""
     import time as _t
+
     from agent import subagent as sa
     monkeypatch.setattr(sa, "_PENDING_BG_RESULTS", {}, raising=False)
     monkeypatch.setattr(sa, "_BG_RESULT_TTL", 10.0, raising=False)

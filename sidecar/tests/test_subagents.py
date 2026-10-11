@@ -45,8 +45,9 @@ class TestExploreAgentRegistration(unittest.TestCase):
 
 class TestSubtaskRegistry(unittest.TestCase):
     def test_snapshot_contains_activity_fields(self):
-        from tool_executor import _subtask_snapshot, _delegate_task_bg
         import asyncio
+
+        from tool_executor import _delegate_task_bg, _subtask_snapshot
 
         async def run():
             return await _delegate_task_bg("code-reviewer", "检查 foo.py 的安全性")

@@ -21,8 +21,8 @@ os.environ.setdefault("LATIAO_AUTH_TOKEN", "cancel-paths-token")
 
 def test_run_cmd_killed_on_session_cancel():
     """停止键要杀掉正在跑的命令，而不是等它跑满 300s 超时。"""
-    from tool_executor import run_cmd, CURRENT_TOOL_SESSION
-    from agent.session_events import _request_session_cancel, _clear_session_cancel
+    from agent.session_events import _clear_session_cancel, _request_session_cancel
+    from tool_executor import CURRENT_TOOL_SESSION, run_cmd
 
     sid = f"cmdcancel-{time.time()}"
     _clear_session_cancel(sid)
@@ -43,7 +43,7 @@ def test_run_cmd_killed_on_session_cancel():
 
 def test_run_cmd_without_cancel_still_works():
     """正控：没有取消时命令照常执行并返回输出（证明杀进程逻辑不误伤）。"""
-    from tool_executor import run_cmd, CURRENT_TOOL_SESSION
+    from tool_executor import CURRENT_TOOL_SESSION, run_cmd
 
     sid = f"cmdnocancel-{time.time()}"
     tok = CURRENT_TOOL_SESSION.set(sid)
@@ -58,7 +58,7 @@ def test_run_cmd_without_cancel_still_works():
 async def test_queue_wait_responds_to_cancel(monkeypatch):
     """排队等引擎槽位期间按停止 → 立刻放弃排队（TurnCancelled），不等到放行。"""
     import agent.transport as T
-    from agent.session_events import _request_session_cancel, _clear_session_cancel
+    from agent.session_events import _clear_session_cancel, _request_session_cancel
 
     sid = f"qcancel-{time.time()}"
     _clear_session_cancel(sid)
@@ -87,7 +87,7 @@ async def test_queue_wait_responds_to_cancel(monkeypatch):
 async def test_engine_wait_loop_responds_to_cancel(monkeypatch):
     """等引擎重载期间按停止 → 放弃等待（不再睡满 5s×72 的重载窗口）。"""
     import agent.transport as T
-    from agent.session_events import _request_session_cancel, _clear_session_cancel
+    from agent.session_events import _clear_session_cancel, _request_session_cancel
 
     sid = f"ecancel-{time.time()}"
     _clear_session_cancel(sid)

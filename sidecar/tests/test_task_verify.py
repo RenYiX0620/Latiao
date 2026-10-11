@@ -225,8 +225,8 @@ def test_rewriting_test_without_red_to_green_is_ok(tmp_path):
 # ── 循环集成：两级生效（第一次提示重采 → 第二次交回用户）──
 @pytest.mark.asyncio
 async def test_loop_nudges_then_hands_back(tmp_path):
-    from tests.fake_engine import FakeEngine
     from agent.loop import ThinAgentLoop
+    from tests.fake_engine import FakeEngine
 
     # 判据来自工具账本、**与正文措辞无关**：写出的 .json 是半截的（结构下限不过）
     broken = tmp_path / "报告.json"
@@ -252,8 +252,8 @@ async def test_loop_nudges_then_hands_back(tmp_path):
 @pytest.mark.asyncio
 async def test_loop_open_qa_unaffected():
     """开放问答（无产出型工具）→ 验证器返回 None，交付不受影响。"""
-    from tests.fake_engine import FakeEngine
     from agent.loop import ThinAgentLoop
+    from tests.fake_engine import FakeEngine
 
     async def _collect(agen):
         return [c async for c in agen]

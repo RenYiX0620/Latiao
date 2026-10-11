@@ -23,32 +23,32 @@ from starlette.concurrency import run_in_threadpool
 import cron
 import local_llm
 from agent_loop import (
+    _THINK_FENCE_RE,
     CONFIG_FILE,
     _build_chat_messages,
+    _clear_session_cancel,
     _deduplicate_response,
+    _event_log_for,
     _extract_last_user_text,
     _last_cloud_config,
     _local_llm_serialized,
     _local_llm_stream,
     _pending_confirmations,
     _pending_lock,
-    _clear_session_cancel,
-    _event_log_for,
     _request_session_cancel,
     _resolve_api_target,
-    _THINK_FENCE_RE,
 )
 from config import save_config
-from onboarding import pending_question_suffix as _onboarding_suffix
+from loop_state import turn_state_for
 from main import (
     SUBAGENT_MODEL,
     _log_buffer,
     app,
 )
-from loop_state import turn_state_for
 from memory import (
     get_recent_learnings_for_ui,
 )
+from onboarding import pending_question_suffix as _onboarding_suffix
 
 logger = logging.getLogger("latiao-sidecar")
 
@@ -63,6 +63,7 @@ _running_turns: dict[str, float] = {}
 
 # 已处理确认的 LRU（双击去重：第二次点击不再误报"确认已过期"）
 import collections as _collections
+
 # 注解是字符串、运行时不会求值，但名字得能解析：这里导入的是 _collections，
 # 写成 "collections.deque" 会让任何求值注解的工具（get_type_hints 等）炸掉。
 _recently_confirmed: "_collections.deque[str]" = _collections.deque(maxlen=200)
@@ -505,7 +506,7 @@ async def chat_completion(request: Request):
         # 现在与 SSE 路径共用唯一循环：消费生成器 → 拼接正文 → 按 chat.completion 返回。
         # 2026-10-05：按轮缓冲（RoundTextAccumulator）——content_revised 的
         # 折叠/撤回语义在这里等价生效，不再把撤回的重复叙述拼进返回。
-        from agent.loop import ThinAgentLoop, RoundTextAccumulator
+        from agent.loop import RoundTextAccumulator, ThinAgentLoop
         _acc = RoundTextAccumulator()
         try:
             _ns_loop = ThinAgentLoop(
@@ -674,8 +675,8 @@ def _engine_gate_snapshot() -> dict:
 @app.get("/v1/heartbeat")
 async def heartbeat(session_id: str = Query(default="", description="只返回该会话的子任务")):
     """Unified polling endpoint: returns downloads, LLM status, and learnings in one call."""
-    from tool_executor import _subtask_snapshot
     from todos import snapshot as _todos_snapshot
+    from tool_executor import _subtask_snapshot
     return {
         "status": "ok",
         "downloads": await run_in_threadpool(local_llm.get_all_downloads),
@@ -758,13 +759,13 @@ async def cancel_chat(request: Request):
 
 
 # ── 路由已按域拆出 ──
+from api_routes_admin import router as _admin_router  # noqa: E402
+from api_routes_channels import router as _channels_router  # noqa: E402
+from api_routes_cron_local import router as _cron_local_router  # noqa: E402
+from api_routes_extensions import router as _extensions_router  # noqa: E402
 from api_routes_media import (  # noqa: E402
     router as _media_router,
 )
-from api_routes_admin import router as _admin_router  # noqa: E402
-from api_routes_cron_local import router as _cron_local_router  # noqa: E402
-from api_routes_extensions import router as _extensions_router  # noqa: E402
-from api_routes_channels import router as _channels_router  # noqa: E402
 
 app.include_router(_media_router)
 app.include_router(_admin_router)

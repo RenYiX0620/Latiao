@@ -74,6 +74,7 @@ def test_engine_log_is_persisted_and_ready_logged():
 # ── 行为测试（不碰真引擎：用假 client / 假流驱动）─────────────────────
 
 import asyncio  # noqa: E402
+
 import pytest  # noqa: E402
 
 

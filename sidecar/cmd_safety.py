@@ -98,6 +98,11 @@ _SENSITIVE_READERS = ("cat", "head", "tail", "type", "find", "findstr")
 # 避免两处清单各自漂移。
 _APP_REGISTRY_FILES = ("permissions.json", "agents.json", "skills.json")
 
+# 身份文件（identity.IDENTITY_FILES 的镜像）：全文会进系统提示且带"一律照做"语义，
+# 改它 = 跨会话改写人格/工作规则（2026-10-11 深审 High）。与注册表同级保护，
+# 修改只走设置页 / 身份意图通道。两份写路径共用，避免漂移。
+IDENTITY_FILE_NAMES = ("identity.md", "soul.md", "agents.md", "user.md")
+
 
 def reject_sensitive_read(cmd: str) -> str | None:
     """读取类命令命中敏感路径时返回拒绝文案，否则 None。"""
@@ -749,7 +754,7 @@ def check_cmd(cmd: str) -> str | None:
     """
     global _WARNED_TS_MISSING
     try:
-        from safety.rules import analyze, decide, Verdict
+        from safety.rules import Verdict, analyze, decide
         a = analyze(cmd)
         if a.ts_available:
             decision = decide(cmd)
@@ -814,6 +819,15 @@ def sensitive_write_block(path: str) -> str | None:
         for d in _app_data_dirs():
             if _rp.startswith(d + os.sep):
                 return f"⛔ 不允许改写安全配置（{_base}）—— 走设置界面: {_rp}"
+    # 身份文件直通系统提示（prompt_build 会以"除与上方系统规则冲突外一律照做"
+    # 注入 IDENTITY/SOUL/AGENTS/USER.md 全文）——2026-10-11 深审 High：它们不在
+    # 任何密封名单里，一次被批准的 write_file 即可跨会话改写"你是谁/工作规则"。
+    # 修改走设置页 / 身份意图通道（identity._apply_*），不走工具与命令。
+    if _base in IDENTITY_FILE_NAMES:
+        for d in _app_data_dirs():
+            if _rp.startswith(d + os.sep):
+                return (f"⛔ 不允许改写身份文件（{_base}）—— 它会进系统提示、跨会话生效。"
+                        f"如需修改请走设置界面或直接说「改名叫X/语气改成Y」: {_rp}")
     # 应用配置含凭据（云端 key / Tavily key），且改它等于改安全开关；走设置界面
     if _base.startswith("config.json"):
         for d in _app_data_dirs():
@@ -859,6 +873,10 @@ def _protected_write_target(tok: str) -> str | None:
         # 注册表文件与 config.json 同级保护：命令路径此前漏了 permissions/agents/skills.json，
         # `cp` 一次就能把确认门持久关掉（2026-09-24 复查实测 check_cmd 放行）。
         if _base in _APP_REGISTRY_FILES and rp.startswith(d + os.sep):
+            return rp
+        # 身份文件：与工具路径同一份名单（2026-10-11）——`cp`/`tee`/`echo >` 不得
+        # 改写 IDENTITY/SOUL/AGENTS/USER.md，它们直通系统提示。
+        if _base in IDENTITY_FILE_NAMES and rp.startswith(d + os.sep):
             return rp
         if _base.startswith("config.json") and rp.startswith(d + os.sep):
             return rp

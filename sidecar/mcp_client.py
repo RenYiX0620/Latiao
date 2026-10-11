@@ -16,7 +16,7 @@ import re
 
 import httpx
 
-from cmd_safety import child_env   # ④ 子进程 env 白名单（MCP server 是第三方代码）
+from cmd_safety import child_env  # ④ 子进程 env 白名单（MCP server 是第三方代码）
 
 logger = logging.getLogger("latiao-sidecar")
 
@@ -141,14 +141,14 @@ class MCPClient:
         try:
             await asyncio.wait_for(self._proc.stdin.drain(), timeout=timeout)
         except asyncio.TimeoutError:
-            raise MCPError(f"MCP {self.name}: 发送超时")
+            raise MCPError(f"MCP {self.name}: 发送超时") from None
         frame = await self._read_frame(timeout)
         if frame is None:
             return None
         try:
             return json.loads(frame)
         except json.JSONDecodeError:
-            raise MCPError(f"MCP {self.name}: 响应非 JSON")
+            raise MCPError(f"MCP {self.name}: 响应非 JSON") from None
 
     async def _read_frame(self, timeout: float) -> bytes | None:
         """读取一帧响应（循环处理响应的字节流）。
@@ -192,9 +192,9 @@ class MCPClient:
             try:
                 chunk = await asyncio.wait_for(self._proc.stdout.read(65536), timeout=max(0.1, remain))
             except asyncio.TimeoutError:
-                raise MCPError(f"MCP {self.name}: 读取超时")
+                raise MCPError(f"MCP {self.name}: 读取超时") from None
             if not chunk:
-                raise MCPError(f"MCP {self.name}: 进程已退出")
+                raise MCPError(f"MCP {self.name}: 进程已退出") from None
             self._read_buf += chunk
 
     async def _http_request(self, msg: dict, timeout: float) -> dict | None:

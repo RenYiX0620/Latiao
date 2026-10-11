@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """dokobot_search - 走真实浏览器的联网搜索（Dokobot）。"""
 import sys as _sys
+
 _sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent))
-from _dokobot_common import dokobot_bin, run, _NOT_INSTALLED
+from _dokobot_common import _NOT_INSTALLED, dokobot_bin, run
 
 NAME = "dokobot_search"
 PERMISSION = "safe"

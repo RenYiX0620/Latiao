@@ -86,6 +86,7 @@ def test_truncate_leaves_short_content_alone():
 
 def _run_compaction_hook(current_msgs, *, is_local=True, user_lang="zh"):
     import asyncio
+
     from agent.core import Scope
     from agent.plugins import builtin
 

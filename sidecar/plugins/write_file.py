@@ -58,9 +58,9 @@ def _md_to_docx_zip(text: str) -> bytes:
 
     支持：# 标题 1–3 级、- / * 列表、空行分段、**粗体**（无样式近似为正文）。
     """
-    import zipfile
     import io
     import re as _re2
+    import zipfile
 
     def esc(s: str) -> str:
         return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
@@ -162,8 +162,8 @@ def _docx_cjk_font() -> str:
 
 def _apply_fonts(run, cjk: str) -> None:
     """中文字体必须落到 w:eastAsia —— 只设 font.name 对中文不生效（走主题字体）。"""
-    from docx.oxml.ns import qn
     from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
     run.font.name = _DOCX_LATIN_FONT
     rPr = run._element.get_or_add_rPr()
     rFonts = rPr.find(qn("w:rFonts"))
@@ -186,11 +186,12 @@ def _md_to_docx(text: str) -> bytes | None:
     """Markdown → 带完整样式的 .docx（python-docx）。库缺失返回 None，由调用方降级。"""
     try:
         import io
+
         from docx import Document
-        from docx.shared import Pt, Cm, RGBColor
         from docx.enum.text import WD_ALIGN_PARAGRAPH
-        from docx.oxml.ns import qn
         from docx.oxml import OxmlElement
+        from docx.oxml.ns import qn
+        from docx.shared import Cm, Pt, RGBColor
     except ImportError:
         return None
 
@@ -352,12 +353,19 @@ def _md_to_pdf(text: str) -> bytes | None:
     """Markdown → PDF（reportlab）。库缺失返回 None；样式沿用 _style_profile 的语言档案。"""
     try:
         import io
-        from reportlab.lib.pagesizes import A4
-        from reportlab.lib.units import cm
+
         from reportlab.lib import colors
-        from reportlab.lib.styles import ParagraphStyle
         from reportlab.lib.enums import TA_CENTER, TA_RIGHT
-        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import ParagraphStyle
+        from reportlab.lib.units import cm
+        from reportlab.platypus import (
+            Paragraph,
+            SimpleDocTemplate,
+            Spacer,
+            Table,
+            TableStyle,
+        )
     except ImportError:
         return None
 

@@ -5,11 +5,11 @@ import subprocess
 # 安全不变量单点定义（破坏/混淆/白名单/敏感路径），
 # fallback 与 seed 共用同一模块，消除三处漂移（审计 P0）。
 from cmd_safety import (
-    child_env,
     DESTRUCTIVE_PATTERNS,
     OBFUSCATION_PATTERNS,
     SAFE_CMD_RE,
     check_cmd_with_script,
+    child_env,
     stderr_target,
 )
 
@@ -53,6 +53,7 @@ def _reject_shell_operators(cmd: str) -> str | None:
 def _run_pipeline(left: str, right: str, timeout: int) -> str:
     import shlex as _shlex
     import subprocess as _sp
+
     from cmd_safety import child_env, split_stderr_redirect, stderr_target
     # 管道两侧各自的 stderr 重定向（`A 2>&1 | grep x` / `A | B 2>/dev/null`）
     left, _lm = split_stderr_redirect(left)

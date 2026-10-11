@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import re
+import subprocess
 import uuid
 
 import httpx
@@ -15,10 +16,12 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from starlette.concurrency import run_in_threadpool
 
 import local_llm
-from config import PROGRESS_DIR, save_config
-from config import CONFIG_FILE  # 与 agent_loop.CONFIG_FILE 同路径；走 config 避免枢纽 import
+from config import (
+    CONFIG_FILE,  # 与 agent_loop.CONFIG_FILE 同路径；走 config 避免枢纽 import
+    PROGRESS_DIR,
+    save_config,
+)
 from db import MEMORY_DB, _db_write_lock, _get_db
-import subprocess
 from identity import IDENTITY_FILES
 from memory import _extract_learnings_heuristic, _retrieve_preferences
 from onboarding import complete as _onboarding_complete

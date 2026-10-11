@@ -131,6 +131,7 @@ def _stub_background(monkeypatch, A):
 def test_subagent_execution_layer_denies(monkeypatch):
     """端到端：执行层对 subagent 档直接拒绝，且不进入确认流程。"""
     import asyncio
+
     import agent_loop as A
 
     # 必须桩掉真实执行：否则测试会真去跑命令（首次写这个测试时 echo 命令
@@ -160,6 +161,7 @@ def test_subagent_execution_layer_denies(monkeypatch):
 def test_subagent_execution_layer_allows_readonly(monkeypatch):
     """只读命令仍能跑通执行层（不因闸门误伤）。"""
     import asyncio
+
     import agent_loop as A
 
     async def _fake_exec(tool_name, args):

@@ -603,10 +603,17 @@ const [timeFilter, setTimeFilter] = useState("all");
                   .replace(/[\u{1F50D}\u{1F4CB}\u{1F4CA}\u{26A1}\u{1F4C8}]|\s*\(记录到记忆库\)/gu, "")
                   .trim().slice(0, 20)} ${ev.ts.slice(5, 16).replace("T", " ")}`;
               const sess = { ...s, name, messages: [{ id: msgId(), role: "assistant" as const, content, ts: Date.now() }], lastActive: Date.now() };
-              // 新会话插到列表顶部并切换到聊天页，确保用户立刻看得到
+              // 新会话插到列表顶部。**不强制切走**（2026-10-11 深审 High：此前
+              // setCurrentIdx(0)+切视图会在用户正打字/正在跑别的会话时把输入框
+              // 抢到 cron 会话上，下一条消息发进错会话）。仅当输入框为空且没有
+              // 任何会话在跑时才自动切过去看结果。
               setSessionsRef.current((prev) => [sess, ...prev]);
-              setCurrentIdxRef.current(0);
-              setActiveViewRef.current("chat");
+              const _busy = Object.values(processingRef.current || {}).some(Boolean);
+              const _draft = (inputApiRef.current?.getText() ?? "").trim();
+              if (!_busy && !_draft) {
+                setCurrentIdxRef.current(0);
+                setActiveViewRef.current("chat");
+              }
             }
           }
         } else {
@@ -786,13 +793,15 @@ const [timeFilter, setTimeFilter] = useState("all");
     const assistantPlaceholder: Message = { id: msgId(), role: "assistant", content: "", ts: Date.now() };
     setMessagesFor(session.id, (prev) => [...prev, assistantPlaceholder]);
 
+    // controller 声明在 try 外：finally 里要按"还是不是自己的"决定是否清引用
+    // （stop→resend 时旧流的 finally 不得抹掉新流的 controller）
+    const controller = new AbortController();
     try {
       const apiMessages = buildApiMessages(session, userMsg, accessMode === "plan", lang);
       const opts: Record<string, unknown> = { agent: activeAgent, sessionId: session.id };
       if (session.selectedModel) opts.model = session.selectedModel;
       if (cloudCfgPre) opts.cloudConfig = { key: cloudCfgPre.key, endpoint: cloudCfgPre.endpoint, protocol: cloudCfgPre.protocol || "openai" };
 
-      const controller = new AbortController();
       abortControllersRef.current[session.id] = controller;
       const finalText = await streamChat(apiMessages, opts, controller.signal);
       // 自动朗读：只在整轮成功结束时念一次正文。报错（❌ 开头）和用户中止的都不念。
@@ -805,23 +814,31 @@ const [timeFilter, setTimeFilter] = useState("all");
       const errText = String((e as { message?: string })?.message ?? e ?? "");
       const aborted = (e as { name?: string })?.name === "AbortError"
         || /resource id .* is invalid/i.test(errText);
-      setMessagesFor(session.id, (prev) => {
-        const msgs = [...prev];
-        const last = msgs[msgs.length - 1];
-        if (last?.role === "assistant") {
-          if (aborted) {
-            // User pressed Stop: keep whatever was already generated instead of
-            // overwriting it with an error. Drop only a still-empty placeholder.
-            if (last.content) msgs[msgs.length - 1] = { ...last, content: `${last.content}\n\n${t("app.stopped_suffix")}` };
-            else msgs.pop();
-          } else {
-            msgs[msgs.length - 1] = { ...last, content: `❌ ${e}` };
+      // 只有"令牌还是自己"才改消息（2026-10-11 深审：stop→resend 时旧流的
+      // catch 会把 ❌/stopped 盖到**新回合**的占位上，新回复被吞掉）
+      if (turnIdsRef.current[session.id] === myTurn) {
+        setMessagesFor(session.id, (prev) => {
+          const msgs = [...prev];
+          const last = msgs[msgs.length - 1];
+          if (last?.role === "assistant") {
+            if (aborted) {
+              // User pressed Stop: keep whatever was already generated instead of
+              // overwriting it with an error. Drop only a still-empty placeholder.
+              if (last.content) msgs[msgs.length - 1] = { ...last, content: `${last.content}\n\n${t("app.stopped_suffix")}` };
+              else msgs.pop();
+            } else {
+              msgs[msgs.length - 1] = { ...last, content: `❌ ${e}` };
+            }
           }
-        }
-        return msgs;
-      });
+          return msgs;
+        });
+      }
     } finally {
-      abortControllersRef.current[session.id] = null;
+      // 只有 controller 还是自己的才清（2026-10-11 深审：旧流 finally 无条件
+      // null 会把刚设好的新 controller 抹掉，导致 Stop 无法中止新流）
+      if (abortControllersRef.current[session.id] === controller) {
+        abortControllersRef.current[session.id] = null;
+      }
       // 只有"令牌还是自己"才清处理中标记（见上面 myTurn）：打断后立刻重发时，
       // 旧流的收尾不能把新回合的标记清掉（红停止键永不恢复的旧根因）
       if (turnIdsRef.current[session.id] === myTurn) {

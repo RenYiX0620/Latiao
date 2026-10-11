@@ -134,7 +134,7 @@ class TestStripRepeatTail(unittest.TestCase):
     """复读截断后裁尾：保留首次出现部分，无重复不动。"""
 
     def test_repeat_tail_trimmed(self):
-        from agent_loop import _strip_repeat_tail, _detect_text_loop
+        from agent_loop import _detect_text_loop, _strip_repeat_tail
         text = ("今日大盘低开高走，上证指数收于 3961.32 点，涨幅 0.5%，量能温和放大。"
                 "创业板指涨 1.2%，半导体板块领涨，主力净流入明显。"
                 "创业板指涨 1.2%，半导体板块领涨，主力净流入明显。"

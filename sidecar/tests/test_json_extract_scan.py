@@ -1,4 +1,4 @@
-"""raw_decode 扫描式 JSON 提取（_extract_first_json_object）与三处方言接线验收。
+r"""raw_decode 扫描式 JSON 提取（_extract_first_json_object）与三处方言接线验收。
 
 2026-10-04 借 EnSIMem 复现包 llm.py 的手法（raw_decode 位置扫描）替换
 贪婪/非贪婪正则。每条方言接线都配一个"旧逻辑必红"的病例：

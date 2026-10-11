@@ -15,38 +15,25 @@
 import asyncio
 import datetime
 import json
+import logging
 import os
 import re
 import time
 import uuid
-import logging
 from pathlib import Path
 
 import httpx
 
-from agent.core import Scope
-from agent.transport import (
-    _is_local_llm_url,
-    _local_llm_stream,
-    TurnCancelled,
-)
-from agent.parsing import (
-    _parse_delta_line,
-    _parse_prompt_tool_calls,
-)
-from agent.text_quality import (
-    _GenerationLoopError,
-    _detect_text_loop,
-    _strip_repeat_tail,
-)
-from agent.messages import msg as _msg
+from agent import task_verify
 from agent.context import (
-    detect_language_decision,
+    _NATIVE_LEAN_PROMPT,
+    _custom_engine_max_tokens,
     _ensure_market_tools,
     _extract_last_user_text,
     _filter_tools_by_access,
     _inject_thinking_disabled,
     _is_chat_query,
+    _is_custom_engine,
     _is_light_query,
     _local_native_tools_ok,
     _maybe_add_inline_file_note,
@@ -55,13 +42,26 @@ from agent.context import (
     _resolve_max_tokens,
     _sanitize_tool_messages,
     _strip_transient_reminders,
-
-    _is_custom_engine,
-    _custom_engine_max_tokens,)
+    detect_language_decision,
+)
+from agent.core import Scope
 from agent.gates import _build_local_tools_prompt
-from agent.context import _NATIVE_LEAN_PROMPT
+from agent.messages import msg as _msg
+from agent.parsing import (
+    _parse_delta_line,
+    _parse_prompt_tool_calls,
+)
 from agent.plugins.builtin import setup_all
-from agent import task_verify
+from agent.text_quality import (
+    _detect_text_loop,
+    _GenerationLoopError,
+    _strip_repeat_tail,
+)
+from agent.transport import (
+    TurnCancelled,
+    _is_local_llm_url,
+    _local_llm_stream,
+)
 
 logger = logging.getLogger("latiao-sidecar")
 
@@ -1390,7 +1390,7 @@ class ThinAgentLoop:
                         if silent < stall:
                             yield ": keepalive\n\n"
                             continue
-                        raise TimeoutError(f"模型输出停滞超 {stall}s")
+                        raise TimeoutError(f"模型输出停滞超 {stall}s") from None
                     if item is _END:
                         return
                     if isinstance(item, BaseException):
@@ -1917,10 +1917,14 @@ class ThinAgentLoop:
                        f"is_local={self.is_local} access={self.access_mode} "
                        f"mode={mode} 消息={len(self.current_msgs)}")
         # 空闲期完成的后台子代理：结果通知在本轮启动时注入上下文（一次性）
+        # 结果恒定围栏（2026-10-11 深审 High）：子代理读过网页/文件，结论以 user
+        # 角色进历史时无信任边界——网页里的"忽略上述指令"可借子代理之口下达。
         _bg_notes = claim_bg_results(self.session_id)
         if _bg_notes:
+            from threat_scan import fence_untrusted
             _note_text = "\n\n".join(
-                f"【后台子代理通知】{n['agent']} 已完成任务「{n['task']}」，结果：\n{n['result']}"
+                f"【后台子代理通知】{n['agent']} 已完成任务「{n['task']}」，结果：\n"
+                f"{fence_untrusted('子代理', n['result'])}"
                 for n in _bg_notes)
             self.current_msgs.append(_note_msg(_note_text, label="【后台通知】"))
             self._step_log("后台通知注入", f"{len(_bg_notes)} 条")
@@ -2553,7 +2557,11 @@ class ThinAgentLoop:
                                     if (tc.get("function") or {}).get("name")])
 
                 # 工具执行：错误即结果（共享执行器含确认/事件/溯源）
-                from agent_loop import _confirm_bypassed, _handle_tool_execution, _start_tool_confirmation
+                from agent_loop import (
+                    _confirm_bypassed,
+                    _handle_tool_execution,
+                    _start_tool_confirmation,
+                )
                 from tool_executor import _resolve_permission
                 if any(not (tc.get("function") or {}).get("name") for tc in tool_calls):
                     self.parallel_disabled = True
@@ -2600,37 +2608,43 @@ class ThinAgentLoop:
                 if _all_delegate and len(tool_calls) >= 2:
                     import asyncio as _aio
                     import uuid as _uuid
+
                     from agent.subagent import _CURRENT_PARENT_SESSION as _cps
                     _cps.set(self.session_id)
                     for tc in tool_calls:
                         if not tc.get("id"):
                             tc["id"] = str(_uuid.uuid4())
 
-                    async def _run_delegate(tc):
-                        targs = json.loads(tc.get("function", {}).get("arguments", "{}") or "{}")
-                        from agent.subagent import _delegate_task_fg, _delegate_task_bg
-                        if targs.get("background"):
-                            return await _delegate_task_bg(
-                                targs.get("agent", "code-reviewer"), targs.get("task", ""))
-                        return await _delegate_task_fg(
-                            targs.get("agent", "code-reviewer"), targs.get("task", ""))
-
+                    # 2026-10-11 全盘审查 Critical：本快路径此前**直接**调
+                    # _delegate_task_bg/_fg，完全不进 _handle_tool_execution_inner
+                    # —— tool_whitelist 硬闸门、_check_access、确认流、fence_untrusted
+                    # 全部旁路（这是第二条工具执行入口）。改为与安全并行路径同构：
+                    # 统一走唯一执行入口，闸门/围栏/记账一处生效。
                     self._step_log("并行委派", f"{len(tool_calls)} 个子代理并发启动")
                     _t_del = time.monotonic()
-                    _outs = await _aio.gather(*[_run_delegate(tc) for tc in tool_calls])
+                    _del_results = await _aio.gather(*[
+                        _handle_tool_execution(
+                            tc, self.current_msgs, self.session_id, "latiao",
+                            self.access_mode, tool_whitelist=self.tool_whitelist)
+                        for tc in tool_calls
+                    ])
                     try:
                         import context_stats
                         context_stats.record_tool_time(self.session_id, time.monotonic() - _t_del)
                     except Exception:
                         logger.debug("记录子代理耗时失败", exc_info=True)
-                    for tc, out in zip(tool_calls, _outs):
-                        self.current_msgs.append({"role": "tool",
-                                                  "tool_call_id": tc.get("id"),
-                                                  "content": out})
+                    for _vf, _evts in _del_results:
+                        for evt in _evts:
+                            yield evt
+                    _del_outs = []
+                    for _vf, _evts in _del_results:
+                        _r = next((str(e.get("result", "")) for e in _evts
+                                   if isinstance(e, dict) and "result" in e), "")
+                        _del_outs.append(_r)
                     yield {"content": "\n\n".join(
-                        f"🧩 子代理 {i+1}/{len(_outs)}：{(out or '').strip()[:400]}"
-                        for i, out in enumerate(_outs))}
-                    self._step_log("并行委派完成", f"{len(_outs)} 个结果已回灌")
+                        f"🧩 子代理 {i+1}/{len(_del_outs)}：{(out or '').strip()[:400]}"
+                        for i, out in enumerate(_del_outs))}
+                    self._step_log("并行委派完成", f"{len(_del_outs)} 个结果已回灌")
                     continue
 
                 # ── 安全只读工具同轮并行（09-07 提速实验）────────────────
@@ -2654,7 +2668,7 @@ class ThinAgentLoop:
                     _safe_results = await _aio2.gather(*[
                         _handle_tool_execution(
                             tc, self.current_msgs, self.session_id, "latiao",
-                            self.access_mode)
+                            self.access_mode, tool_whitelist=self.tool_whitelist)
                         for tc in tool_calls
                     ])
                     for _vf, _evts in _safe_results:
@@ -2665,7 +2679,7 @@ class ThinAgentLoop:
                             if isinstance(_e, dict) and "result" in _e:
                                 self._maybe_quota_hint(str(_e.get("result")))
                     # mx_query 成功 → 清除当日限额标记（换 Key 后自纠正）
-                    for _tc, (_vf, _evts) in zip(tool_calls, _safe_results):
+                    for _tc, (_vf, _evts) in zip(tool_calls, _safe_results, strict=False):
                         if ((_tc.get("function") or {}).get("name") == "mx_query"):
                             _rr = next((str(e.get("result", "")) for e in _evts
                                         if isinstance(e, dict) and "result" in e), "")
@@ -2724,7 +2738,8 @@ class ThinAgentLoop:
                     _t_tool = time.monotonic()
                     verify_failed, events = await _handle_tool_execution(
                         tc, self.current_msgs, self.session_id, "latiao",
-                        self.access_mode, pre_started=pre)
+                        self.access_mode, pre_started=pre,
+                        tool_whitelist=self.tool_whitelist)
                     try:
                         import context_stats
                         context_stats.record_tool_time(self.session_id, time.monotonic() - _t_tool)

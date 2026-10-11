@@ -3,8 +3,8 @@
 覆盖：状态迁移、重入拒绝、停止幂等与原因先行、end_turn 幂等与
 completed→aborted 修正、无活动 no-op、并发不变式。
 """
-import unittest
 import threading
+import unittest
 
 import pytest
 
@@ -117,6 +117,7 @@ class TestStaleTurnSelfHeal(unittest.TestCase):
 
     def test_stale_turn_is_force_ended_and_new_turn_allowed(self):
         import time
+
         from loop_state import Phase
         st = self._state("stale-1")
         tok = st.begin_turn()

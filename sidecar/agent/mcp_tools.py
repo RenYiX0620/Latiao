@@ -6,7 +6,6 @@
 """
 import logging
 
-
 # MCP 是否已加载（本模块的缓存标记——重构时它曾留在 agent_loop，
 # 导致 global 引用落到别的模块、启动即 NameError，2026-09-23 实测抓到）
 _MCP_LOADED = False
@@ -15,12 +14,10 @@ logger = logging.getLogger("latiao-sidecar")   # 与 agent_loop 同名：日志�
 
 async def _load_mcp_tools() -> None:
     # 依赖仍留在 agent_loop 的定义 → 函数内惰性导入（避免循环依赖）
-    from agent_loop import TOOLS
-    from agent_loop import TOOL_PERMISSIONS
-    from agent_loop import TOOL_DISPATCH
+    from agent_loop import TOOL_DISPATCH, TOOL_PERMISSIONS, TOOLS
     """扫描启用扩展的 mcpServers 声明，把远程工具并入 TOOLS/DISPATCH。"""
     try:
-        from extension_manager import active_extension_dirs, _read_manifest
+        from extension_manager import _read_manifest, active_extension_dirs
         from mcp_client import get_mcp_client
         for ext_dir in active_extension_dirs():
             manifest = _read_manifest(ext_dir) or {}
