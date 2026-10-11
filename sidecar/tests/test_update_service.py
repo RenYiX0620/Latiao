@@ -168,8 +168,14 @@ class TestUpdateService(unittest.TestCase):
         self.assertEqual(p["total"], 100)
 
 
-class TestDigestVerification(unittest.TestCase):
-    """更新包校验（2026-10-11 审计修复）：镜像可换包，下载/自愈都必须验。"""
+class TestDigestVerification(TestUpdateService):
+    """更新包校验（2026-10-11 审计修复）：镜像可换包，下载/自愈都必须验。
+
+    继承 TestUpdateService 的 setUp（UPDATE_DIR/STATE_FILE 重定向 + 落盘 mock）
+    ——**这是我上一版犯过的错**：独立写一个不隔离的测试类，直接落盘到真机
+    state.json，把假状态写进用户更新目录（用户随后看到"下载中 天文数字%"）。
+    """
+
 
     def test_sha256_file_matches_hashlib(self):
         import hashlib, tempfile

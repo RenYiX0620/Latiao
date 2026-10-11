@@ -49,8 +49,12 @@ async function pollPreDownload(
       const p = data?.progress || {};
       const total = p.total || 0;
       const downloaded = p.downloaded || 0;
-      if (p.status === "downloading" && total > 0) {
-        const pct = Math.floor((downloaded / total) * 100);
+      // 脏值防护（2026-10-11 实测事故）：状态文件被写脏时（total=0 而
+      // downloaded 有值）百分比会算成天文数字并卡在"正在下载"——后端已加
+      // 护栏，这里再保一道：任何越界/无意义的进度都不渲染，宁可不显示。
+      const sane = total > 0 && downloaded >= 0 && downloaded <= total * 2;
+      if (p.status === "downloading" && sane) {
+        const pct = Math.min(100, Math.floor((downloaded / total) * 100));
         const mb = (downloaded / 1024 / 1024).toFixed(0);
         const mbt = (total / 1024 / 1024).toFixed(0);
         onProgress("update.downloading", { version: p.version, pct, mb, mbt });

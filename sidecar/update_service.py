@@ -23,8 +23,35 @@ from pathlib import Path
 
 logger = logging.getLogger("latiao-sidecar")
 
-UPDATE_DIR = Path.home() / ".local-ai-os" / "update"
-STATE_FILE = UPDATE_DIR / "state.json"
+_IMPORT_TIME_PROGRESS_DEFAULT = str(Path.home() / ".local-ai-os" / "update")
+_IMPORT_TIME_STATE_DEFAULT = Path.home() / ".local-ai-os" / "update" / "state.json"
+UPDATE_DIR = Path(_IMPORT_TIME_PROGRESS_DEFAULT)
+STATE_FILE = Path(_IMPORT_TIME_STATE_DEFAULT)
+
+
+def _state_paths() -> tuple[Path, Path]:
+    """当前应使用的 (更新目录, 状态文件)——**调用时解析**（2026-10-11 修复）。
+
+    原因：此前 UPDATE_DIR/STATE_FILE 在导入时**冻结**成真机路径——测试把
+    `LATIAO_TEST_PROGRESS_DIR` 指到临时目录并 reload config 也改不动它们，
+    于是多个测试模块在"以为已隔离"的情况下写进了用户的真 state.json
+    （实测：前端随后显示"正在下载 … 天文数字%"）。现在：
+      - 测试若显式设过模块属性（不复等于导入时默认值）→ 尊重它的覆盖；
+      - 否则跟随 config.PROGRESS_DIR 现算现用。
+    """
+    global UPDATE_DIR, STATE_FILE
+    try:
+        from config import PROGRESS_DIR as _pd
+        default_dir = Path(str(_pd)) / "update"
+    except Exception:
+        default_dir = Path.home() / ".local-ai-os" / "update"
+    if str(UPDATE_DIR) != _IMPORT_TIME_PROGRESS_DEFAULT or STATE_FILE != _IMPORT_TIME_STATE_DEFAULT:
+        return UPDATE_DIR, STATE_FILE          # 测试显式覆盖过 → 用它
+    UPDATE_DIR = default_dir
+    STATE_FILE = default_dir / "state.json"
+    return UPDATE_DIR, STATE_FILE
+
+
 GITHUB_LATEST = "https://github.com/RenYiX0620/Latiao/releases/latest/download/latest.json"
 
 # GitHub 直连在国内常 <50KB/s（09-07 事故：214MB 要 95 分钟）。镜像加速：
@@ -111,8 +138,9 @@ def _load_state() -> dict:
             return _state
     # 文件 IO 在锁外（防止写盘慢时阻塞其他线程的锁获取）
     try:
-        if STATE_FILE.exists():
-            data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        _udir, _sfile = _state_paths()
+        if _sfile.exists():
+            data = json.loads(_sfile.read_text(encoding="utf-8"))
             with _state_lock:
                 if not _state:
                     _state = data
@@ -129,29 +157,53 @@ def _save_state() -> None:
         snapshot = {k: v for k, v in _state.items()
                     if isinstance(v, (str, int, float, bool, list))}
     try:
-        UPDATE_DIR.mkdir(parents=True, exist_ok=True)
-        tmp = STATE_FILE.with_suffix(".tmp")
+        _udir, _sfile = _state_paths()
+        _udir.mkdir(parents=True, exist_ok=True)
+        tmp = _sfile.with_suffix(".tmp")
         tmp.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(STATE_FILE)
+        tmp.replace(_sfile)
     except Exception:
         logger.warning("update state save failed", exc_info=True)
 
 
 def get_progress() -> dict:
-    """当前预下载状态（前端轮询）。"""
+    """当前预下载状态（前端轮询）。附**脏状态护栏**（2026-10-11 实测事故）。
+
+    状态文件可能被写脏（实测：测试把 total=14、part_path 指向已删临时目录的
+    假状态写进真文件）——前端照它算就显示「正在下载 … 天文数字%（断线自动
+    续传）」且永远不会完成。这里做自相矛盾检测：downloading 但没有有效的
+    part_path / total，或进度超过总量 2 倍时，按 idle 上报并复位落盘状态
+    （下一次检查更新会干净地重新开始），不再让脏值进入 UI。
+    """
     st = _load_state()
     out = {
         "status": st.get("status", "idle"),
         "version": st.get("version", ""),
-        "downloaded": st.get("downloaded", 0),
-        "total": st.get("total", 0),
+        "downloaded": int(st.get("downloaded") or 0),
+        "total": int(st.get("total") or 0),
+        "part_path": st.get("part_path", ""),
+        "integrity": st.get("integrity", "unchecked"),
         "error": st.get("error", ""),
     }
     if out["status"] == "downloading":
-        # 实时字节数从 .part 文件读（下载线程每秒刷状态，这里读文件更准）
         part = st.get("part_path", "")
-        if part and os.path.exists(part):
+        part_ok = bool(part) and os.path.exists(part)
+        if part_ok:
+            # 实时字节数从 .part 文件读（下载线程每秒刷状态，这里读文件更准）
             out["downloaded"] = os.path.getsize(part)
+        # 脏状态判据（只认**真实矛盾**，别误伤"刚开始、total 未算出"的合法态）：
+        #   a) 声明有 part 文件、文件却不在 → 状态残留（事故形态）
+        #   b) 有 part 在、但总量为 0 或进度超出总量 2 倍 → 数字自相矛盾
+        _dirty = (bool(part) and not part_ok) or (
+            part_ok and (out["total"] <= 0 or out["downloaded"] > out["total"] * 2))
+        if _dirty:
+            logger.warning("更新状态自相矛盾（total=%s part=%r 存在=%s）→ 复位为 idle",
+                           out["total"], str(part)[:80], part_ok)
+            with _state_lock:
+                _state.update({"status": "idle", "downloaded": 0, "total": 0,
+                               "part_path": "", "error": "", "integrity": "unchecked"})
+                _save_state()
+            out.update({"status": "idle", "downloaded": 0, "total": 0, "part_path": ""})
     return out
 
 
@@ -290,7 +342,7 @@ def start_prepare(current_version: str) -> dict:
             # 就不续传——否则会往几十 MB 的残片里白续 324MB（用户实测：GitHub 下载
             # 中断后进程退出，包其实已由别的方式补齐，下次启动却从 11% 重来）。
             # .part 残片顺手清掉（它是本次下载的临时文件）。
-            _dest = UPDATE_DIR / url.split("/")[-1]
+            _dest = _state_paths()[0] / url.split("/")[-1]
             _total = int(st.get("total") or 0)
             if _total and _dest.exists() and _dest.stat().st_size == _total:
                 # 自愈前也校验（2026-10-11）：大小对不等于内容对——镜像换包后
@@ -388,7 +440,7 @@ def start_prepare(current_version: str) -> dict:
                     _save_state()
                 return
             url = entry["url"]
-            dest = UPDATE_DIR / url.split("/")[-1]
+            dest = _state_paths()[0] / url.split("/")[-1]
             # 校验和：GitHub 权威接口（可达时）。下载完成/已在位时用它验证，
             # 防镜像换包；不可达则按"未校验"如实标注（不假装校验过）。
             _digest = _fetch_expected_digest(remote_ver, dest.name)
@@ -436,7 +488,7 @@ def get_tauri_manifest(current_version: str) -> dict | None:
     url = st.get("url", "")
     if not url:
         return None
-    dest = UPDATE_DIR / url.split("/")[-1]
+    dest = _state_paths()[0] / url.split("/")[-1]
     if not dest.exists():
         return None
     return {
@@ -458,5 +510,5 @@ def get_update_file_path() -> Path | None:
     url = st.get("url", "")
     if not url:
         return None
-    dest = UPDATE_DIR / url.split("/")[-1]
+    dest = _state_paths()[0] / url.split("/")[-1]
     return dest if dest.exists() else None

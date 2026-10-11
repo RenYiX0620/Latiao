@@ -32,6 +32,13 @@ def pytest_configure(config):
             shutil.copy2(_REAL_CONFIG, _SESSION_BACKUP)
     except OSError:
         pass
+    # 真机更新状态同样备份（守卫源；见文件下方 _guard_real_update_state）
+    try:
+        _REAL_UPDATE_STATE.parent.mkdir(parents=True, exist_ok=True)
+        if _REAL_UPDATE_STATE.exists():
+            shutil.copy2(_REAL_UPDATE_STATE, _UPDATE_STATE_BACKUP)
+    except OSError:
+        pass
 
 
 def _real_config_digest() -> str:
@@ -47,6 +54,47 @@ def pytest_sessionstart(session):
 
 
 import pytest  # noqa: E402
+
+# 真机更新状态（与 config 同级的"测试可污染的生产文件"）：2026-10-11 实测被
+# 一个没走隔离夹具的测试类写进假状态（total=14、part 指向测试临时目录）——
+# 用户随后看到"正在下载新版本 … 天文数字%（断线自动续传）"且永远不会完成。
+_REAL_UPDATE_STATE = Path.home() / ".local-ai-os" / "update" / "state.json"
+_UPDATE_STATE_BACKUP = Path(tempfile.gettempdir()) / "latiao-pytest-update-state-backup.json"
+
+
+def _update_state_digest() -> str:
+    import hashlib
+    try:
+        return hashlib.md5(_REAL_UPDATE_STATE.read_bytes()).hexdigest()
+    except OSError:
+        return "(missing)"
+
+
+@pytest.fixture(autouse=True)
+def _guard_real_update_state():
+    """每次用例前后核对真机 update/state.json：被测试改写 → 还原 + 该用例失败。
+
+    为什么需要：update_service 的 STATE_FILE 在**导入时**绑定到 PROGRESS_DIR，
+    而夹具的重定向只改模块属性、救不了"直接调全局落盘路径"的测试；漏一个就会
+    把假状态写进用户更新目录（已真实发生过一次）。
+    """
+    before = _update_state_digest()
+    existed_before = _UPDATE_STATE_BACKUP.exists()
+    yield
+    after = _update_state_digest()
+    if after != before:
+        try:
+            if existed_before:
+                shutil.copy2(_UPDATE_STATE_BACKUP, _REAL_UPDATE_STATE)
+            elif _REAL_UPDATE_STATE.exists():
+                _REAL_UPDATE_STATE.unlink()
+        except OSError:
+            pass
+        raise AssertionError(
+            f"测试改写了真机 update/state.json（{before} → {after}）！已还原；"
+            "请让该测试走 tests/test_update_service.py 的隔离夹具（重定向 "
+            "update_service.STATE_FILE/UPDATE_DIR 并 mock 落盘）。"
+        )
 
 
 @pytest.fixture(autouse=True)
