@@ -564,6 +564,26 @@ async def get_reflections(limit: int = Query(default=20, ge=1, le=100)):
 
 # ── 统一能力模型（capability registry）：工具与技能一套 API ──
 
+def _env_health() -> dict:
+    """运行环境健康信号（2026-10-11 审计：把静默降级变成可查询的事实）。
+
+    tree-sitter 语义层缺失时命令安检会 fail-open 回退正则（有意取舍：升级不能
+    瘫痪现网）——但它此前只在日志里留一行 warning，用户与 UI 都不知道自己正跑在
+    降级模式。这里把状态挂进 /v1/capabilities 的 health 字段（前端已消费该端点，
+    后续可在界面展示）。
+    """
+    notes: list[str] = []
+    semantic_ok = False
+    try:
+        from safety.rules import analyze
+        semantic_ok = bool(analyze("ls").ts_available)
+    except Exception:
+        semantic_ok = False
+    if not semantic_ok:
+        notes.append("命令语义层不可用（tree-sitter 未安装）：命令安检降级为正则层")
+    return {"semantic_layer": semantic_ok, "degraded": bool(notes), "notes": notes}
+
+
 @router.get("/v1/capabilities")
 async def get_capabilities(request: Request):
     """统一能力列表：kind=tool|skill 过滤（默认全部）。工具与技能合并管理。"""
@@ -574,7 +594,7 @@ async def get_capabilities(request: Request):
     # tavily 提示：前端在 capabilities 里看到 tavily_search 时展示 key 配置区
     for c in capabilities:
         c["has_api_key"] = None
-    return {"status": "ok", "capabilities": capabilities}
+    return {"status": "ok", "capabilities": capabilities, "health": _env_health()}
 
 
 @router.post("/v1/capabilities/{name}/toggle")

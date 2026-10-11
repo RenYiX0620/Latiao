@@ -27,6 +27,114 @@ class ModelDownloader:
             self._downloads.pop(model_id, None)
             self._save_download_state()
 
+    # ── 权重完整性校验（2026-10-11 审计修复）──────────────────────────
+    # 此前 GGUF/权重下载**无任何校验**——坏文件直接喂进 C++ 解析器。
+    # 现按 HF 的 LFS etag（= 文件 sha256，与 huggingface_hub 自身 blob 校验同源，
+    # 本机实测确认）校验下载结果，并做 GGUF 魔数检查。
+    #
+    # **能力边界（诚实标注，勿夸大）**：etag 与文件可能来自**同一个** HF_ENDPOINT
+    # （镜像场景），因此"恶意镜像把文件与元数据一起换掉"在验证上自洽、抓不到。
+    # 它真正防的是：**下载损坏/截断**（20GB 文件最常见的故障，哈希必然不匹配）、
+    # 传输中途篡改、以及"同一文件两次拉取内容不一致"（复用已核验的 etag 复验即可
+    # 发现）。要防住镜像换包，需要独立于镜像的权威摘要（上游可达时 etag 即来自
+    # huggingface.co，那时这层就是真防线）。
+
+    def _hf_sha256(self, repo_id: str, filename: str) -> str:
+        """取 HF 侧对该文件的 sha256（LFS etag），拿不到返回 ""。"""
+        try:
+            from huggingface_hub import get_hf_file_metadata, hf_hub_url
+            md = get_hf_file_metadata(hf_hub_url(repo_id, filename), timeout=30)
+            etag = str(getattr(md, "etag", "") or "").strip().strip('"').lower()
+            if len(etag) == 64 and all(c in "0123456789abcdef" for c in etag):
+                return etag
+        except Exception:
+            logger.info("取 HF 校验和失败（%s/%s）——按降级校验处理", repo_id, filename)
+        return ""
+
+    @staticmethod
+    def _sha256_of(path) -> str:
+        import hashlib
+        h = hashlib.sha256()
+        try:
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(8 * 1024 * 1024), b""):
+                    h.update(chunk)
+        except OSError:
+            return ""
+        return h.hexdigest()
+
+    def _verify_weight_file(self, repo_id: str, path) -> dict:
+        """校验单个权重文件。返回 {ok, reason, mode}；mode ∈ verified/magic-only/failed。"""
+        p = Path(path)
+        if not p.exists() or p.stat().st_size <= 0:
+            return {"ok": False, "reason": "文件不存在或为空", "mode": "failed"}
+        if p.suffix.lower() == ".gguf":
+            try:
+                with open(p, "rb") as f:
+                    if f.read(4) != b"GGUF":
+                        return {"ok": False,
+                                "reason": "GGUF 魔数不符（文件被替换或损坏）",
+                                "mode": "failed"}
+            except OSError as e:
+                return {"ok": False, "reason": f"读取失败: {e}", "mode": "failed"}
+        exp = self._hf_sha256(repo_id, p.name)
+        if not exp:
+            return {"ok": True, "reason": "HF 未提供 etag，仅做魔数校验",
+                    "mode": "magic-only", "etag": ""}
+        got = self._sha256_of(p)
+        if got != exp:
+            return {"ok": False,
+                    "reason": f"sha256 不匹配（期望 {exp[:16]}…，实际 {got[:16]}…）",
+                    "mode": "failed", "etag": exp}
+        return {"ok": True, "reason": "与 HF etag 一致", "mode": "verified", "etag": exp}
+
+    def verify_cached_model(self, model_id: str, path: str) -> dict:
+        """启动/加载前对已缓存权重做校验（缓存命中才跳过重算）。
+
+        返回 {ok, verified, reason}；ok=False 时调用方应删除坏文件并要求重下。
+        缓存口径（2026-10-11 修正）：记录的是 **{文件: {etag, size, mtime}}** 三元
+        组——只比 etag 会让"核验完成后文件被替换"蒙混过关（测试当场抓到的缺陷）。
+        文件大小或 mtime 一变就强制重算本地 sha256；20GB 的哈希只在必要时算。
+        """
+        try:
+            p = Path(path)
+            files = [f for f in p.rglob("*")
+                     if f.is_file() and f.suffix.lower() in (".gguf", ".safetensors")]
+            if not files:
+                return {"ok": True, "verified": False, "reason": "无权重文件可校验"}
+            rec = (self._downloads.get(model_id) or {}).get("weight_hashes") or {}
+            verified_any = False
+            for f in files:
+                exp = self._hf_sha256(model_id, f.name)
+                key = str(f)
+                try:
+                    st = f.stat()
+                    cur = {"etag": exp, "size": st.st_size, "mtime": int(st.st_mtime)}
+                except OSError:
+                    cur = {}
+                cached = rec.get(key)
+                if (exp and isinstance(cached, dict)
+                        and cached.get("etag") == exp
+                        and cached.get("size") == cur.get("size")
+                        and cached.get("mtime") == cur.get("mtime")):
+                    verified_any = True
+                    continue                      # 期望值未变且文件未被改动 → 跳过重算
+                res = self._verify_weight_file(model_id, f)
+                if not res["ok"]:
+                    logger.error("权重校验失败 %s: %s", f.name, res["reason"])
+                    return {"ok": False, "verified": False,
+                            "reason": f"{f.name}: {res['reason']}"}
+                if res["mode"] == "verified" and exp:
+                    rec[key] = {"etag": exp, "size": cur.get("size"),
+                                "mtime": cur.get("mtime")}
+                    verified_any = True
+                with self._dl_lock:
+                    self._downloads.setdefault(model_id, {})["weight_hashes"] = rec
+                    self._save_download_state()
+            return {"ok": True, "verified": verified_any, "reason": "校验通过"}
+        except Exception as e:
+            logger.warning("权重校验异常（按放行继续）: %s", e)
+            return {"ok": True, "verified": False, "reason": f"校验异常: {e}"}
 
     """HF 模型下载：启停/暂停/恢复/取消 + 本地状态落盘。"""
 
@@ -357,6 +465,29 @@ class ModelDownloader:
                             os.unlink(sp)
                     dl_info.pop("chunk_ranges", None)
                     dl_info.pop("chunk_paths", None)
+                    # 校验合并后的权重（2026-10-11）：etag 权威核对，不匹配即拒绝。
+                    # 此前这里直接进"已下载"——镜像偷换的 GGUF 会原样喂进解析器。
+                    _v = self._verify_weight_file(model_id, dest_path)
+                    dl_info["verify_mode"] = _v["mode"]
+                    dl_info["message"] = f"已校验：{_v['reason']}"
+                    if not _v["ok"]:
+                        logger.error("权重校验失败，删除并以错误收尾: %s", _v["reason"])
+                        try:
+                            dest_path.unlink()
+                        except OSError:
+                            pass
+                        raise Exception(f"权重校验失败：{_v['reason']}（已删除，请重试下载）")
+                    if _v["mode"] == "verified" and _v.get("etag"):
+                        # 存三元组（etag+size+mtime）：下次启动只在"期望 etag 未变
+                        # 且文件未被改动"时跳过重算（只存 etag 会放过事后替换）
+                        try:
+                            _st = dest_path.stat()
+                            _meta = {"etag": _v["etag"], "size": _st.st_size,
+                                     "mtime": int(_st.st_mtime)}
+                        except OSError:
+                            _meta = {"etag": _v["etag"]}
+                        dl_info.setdefault("weight_hashes", {})[str(dest_path)] = _meta
+                    self._save_download_state()
                 else:
                     # Single-threaded fallback for small files or servers without Range support
                     dl_info["message"] = f"正在下载 {filename} ({total_size/(1024**3):.1f}GB)..."
@@ -438,10 +569,22 @@ class ModelDownloader:
                 model_files = [f for f in files if f.suffix in (".safetensors", ".gguf", ".bin", ".json")]
                 if model_files:
                     path = str(snap)
+                    # 命中缓存先校验（2026-10-11）：缓存文件可能损坏或被替换——
+                    # 校验不过则丢弃记录、继续走完整下载流程（不信任坏权重）。
                     with self._dl_lock:
-                        self._downloads[model_id] = {"status": "done", "progress": 100, "path": path, "message": "已缓存", "model_id": model_id}
-                    self._save_download_state()
-                    return {"status": "ok", "model_id": model_id, "path": path, "message": "模型已缓存"}
+                        self._downloads.setdefault(model_id, {})
+                    _v = self.verify_cached_model(model_id, path)
+                    if not _v.get("ok"):
+                        logger.error("缓存权重校验失败，改为重新下载: %s", _v.get("reason"))
+                        with self._dl_lock:
+                            self._downloads.pop(model_id, None)
+                            self._save_download_state()
+                    else:
+                        with self._dl_lock:
+                            self._downloads[model_id] = {"status": "done", "progress": 100, "path": path,
+                                                         "message": f"已缓存（{_v.get('reason', '')}）", "model_id": model_id}
+                            self._save_download_state()
+                        return {"status": "ok", "model_id": model_id, "path": path, "message": "模型已缓存"}
 
         with self._dl_lock:
             # paused 重下：保留原有分块记录（merge 而非整体覆盖），避免丢 chunk、

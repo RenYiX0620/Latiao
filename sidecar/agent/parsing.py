@@ -91,7 +91,7 @@ def _salvage_tool_args(args_str: str) -> dict:
 
 
 def _extract_first_json_object(text: str) -> dict | None:
-    """从混杂文本提取第一个可解析的 JSON 对象（raw_decode 位置扫描，非正则）。
+    r"""从混杂文本提取第一个可解析的 JSON 对象（raw_decode 位置扫描，非正则）。
 
     标准解析器按真正的 JSON 语法切界：字符串里的花括号、嵌套对象、对象前后
     的杂物（寒暄、`</think>` 残留、围栏碎片）都不影响；贪婪 `\{.*\}` 在
