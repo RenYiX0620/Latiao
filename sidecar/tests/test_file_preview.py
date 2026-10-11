@@ -39,12 +39,45 @@ def test_preview_rejects_relative_and_dotdot(client, headers):
         assert r.json()["status"] == "error"
 
 
-def test_preview_blocks_secrets(client, headers, tmp_path):
-    f = tmp_path / "config.json"
-    f.write_text('{"key":"sk-xxx"}', encoding="utf-8")
-    r = client.get("/v1/file/preview", params={"path": str(f)}, headers=headers)
-    assert r.json()["status"] == "error"
+def test_preview_blocks_secrets(client, headers, tmp_path, monkeypatch):
+    """敏感预览拦截（2026-10-11 判据升级：与 read_file/upload 共用同一份）。
 
+    语义变化：此前按**子串**匹配 config.json（`tsconfig.json` 也被误伤）；
+    现在按路径精确——只在辣条自己的数据目录里拦 config.json。真密钥场景
+    （.env 家族 / .netrc / shell 启动脚本）由共用判据统一覆盖。
+    """
+    # ① .env 家族（旧黑名单漏掉的）——现在必须拦
+    envf = tmp_path / ".env"
+    envf.write_text("SECRET=sk-xxx", encoding="utf-8")
+    r = client.get("/v1/file/preview", params={"path": str(envf)}, headers=headers)
+    assert r.json()["status"] == "error", ".env 预览必须被拦"
+
+    # ② 辣条自身数据目录的 config.json —— 拦（密钥真身）
+    import config as cfg_mod
+    monkeypatch.setenv("LATIAO_TEST_PROGRESS_DIR", str(tmp_path / "prog"))
+    import importlib
+    importlib.reload(cfg_mod)
+    appcfg = Path(str(cfg_mod.CONFIG_FILE))
+    appcfg.parent.mkdir(parents=True, exist_ok=True)
+    appcfg.write_text('{"cloud_models":[{"key":"sk-real"}]}', encoding="utf-8")
+    r = client.get("/v1/file/preview", params={"path": str(appcfg)}, headers=headers)
+    assert r.json()["status"] == "error", "辣条自身 config.json 必须被拦"
+
+    # ③ shell 启动脚本（旧黑名单完全没有的类别）——拦
+    zshrc = tmp_path / ".zshrc"
+    zshrc.write_text("export MX_APIKEY=xxx", encoding="utf-8")
+    r = client.get("/v1/file/preview", params={"path": str(zshrc)}, headers=headers)
+    assert r.json()["status"] == "error", ".zshrc 预览必须被拦"
+
+    # ④ 对照：用户项目里的普通 config.json 不再误伤（tsconfig.json 同族）
+    proj = tmp_path / "myproject"
+    proj.mkdir()
+    pcfg = proj / "config.json"
+    pcfg.write_text('{"name":"demo"}', encoding="utf-8")
+    r = client.get("/v1/file/preview", params={"path": str(pcfg)}, headers=headers)
+    assert r.json()["status"] == "ok", "用户项目的 config.json 不该被误伤"
+
+    # ⑤ 私钥仍拦（原有用例保持）
     ssh = tmp_path / ".ssh"
     ssh.mkdir()
     k = ssh / "id_rsa"

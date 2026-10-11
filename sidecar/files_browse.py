@@ -24,7 +24,12 @@ def _model_roots() -> list[tuple[str, str]]:
 
 @app.get("/v1/files/browse")
 async def files_browse(path: str = Query(default="")):
-    """列出目录内容。默认从模型目录根开始。"""
+    """列出目录内容。默认从模型目录根开始。
+
+    访问范围（2026-10-11 第三轮审计修复）：此前 resolve 后直接 iterdir，
+    任意目录都能列；现在限定在"模型根 + 家目录"之内，且拒绝密钥/凭据类目录
+    （用 sensitive_read_block 的目录名单，读与列共用一份判据）。
+    """
     roots = [(p, label) for p, label in _model_roots() if os.path.isdir(p)]
     if not path:
         path = roots[0][0] if roots else str(Path.home())
@@ -35,6 +40,28 @@ async def files_browse(path: str = Query(default="")):
         raise HTTPException(status_code=400, detail="路径无效")
     if not p.is_dir():
         raise HTTPException(status_code=400, detail="不是目录")
+    # 范围限制：必须在某个模型根之内（家目录是其中一个根，故家目录下均可浏览）
+    _allowed = False
+    for rp, _label in roots:
+        try:
+            _rrp = Path(rp).expanduser().resolve()
+        except Exception:
+            continue
+        if p == _rrp or _rrp in p.parents:
+            _allowed = True
+            break
+    if not _allowed:
+        raise HTTPException(status_code=403, detail="该目录不在可浏览范围内")
+    # 敏感目录（密钥/凭据）不列
+    try:
+        from cmd_safety import sensitive_read_block
+        _blk = sensitive_read_block(str(p))
+        if _blk:
+            raise HTTPException(status_code=403, detail="该目录受保护")
+    except HTTPException:
+        raise
+    except Exception:
+        pass
     try:
         children = list(p.iterdir())
     except PermissionError:

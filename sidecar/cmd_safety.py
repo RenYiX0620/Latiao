@@ -124,6 +124,44 @@ _BLOCKED_FILE_NAMES = (".env", "id_rsa", "id_ed25519", "id_ecdsa", "known_hosts"
 _ENV_FAMILY_RE = re.compile(r"^\.env(\.[\w.-]+)?$", re.IGNORECASE)
 _ENV_TEMPLATE_SUFFIXES = (".example", ".sample", ".template", ".dist", ".defaults", ".md")
 
+# ── 登录即执行 / 下次启动即加载的路径（2026-10-11 第三轮审计修复）────
+# 此前 write_file 能写穿 ~/.zshrc（实测）、~/Library/LaunchAgents/*.plist（实测）、
+# crontab、git hooks——写入一次 = 下次登录/下次提交即执行，是比 extensions 更直接的
+# 持久化 RCE 通道。写侧（sensitive_write_block）与读侧（sensitive_read_block）
+# 共用这一份清单，避免两处漂移（2026-09-24 的老教训）。
+_SHELL_INIT_BASENAMES = frozenset({
+    ".zshrc", ".bashrc", ".profile", ".zprofile", ".zshenv", ".bash_profile",
+    ".bash_login", ".bash_logout", ".zlogin", ".zlogout", ".inputrc", ".cshrc", ".tcshrc",
+})
+_SHELL_INIT_DIRS = ("/etc/zsh", "/etc/bash", "/etc/profile.d", "/etc/profile")
+_AUTOEXEC_DIR_SUBSTRINGS = (
+    "/Library/LaunchAgents", "/Library/LaunchDaemons",
+    "/.config/autostart",            # Linux 桌面自启
+    "/.config/systemd/user",         # systemd 用户单元
+    "/etc/cron.d", "/etc/cron.daily", "/etc/cron.hourly",
+    "/etc/cron.weekly", "/etc/cron.monthly", "/var/at/tabs",
+)
+_AUTOEXEC_BASENAME_SUFFIXES = (".desktop", ".service")
+
+def _is_autoload_path(rp: str) -> str | None:
+    """登录/自启即加载的路径 → 拒绝原因（None = 不在名单）。三个消费者共用。"""
+    norm = rp.replace(os.sep, "/")
+    base = os.path.basename(rp).lower()
+    if base in _SHELL_INIT_BASENAMES:
+        return "shell 启动脚本（下次开终端即执行）"
+    for d in _SHELL_INIT_DIRS:
+        if norm == d or norm.startswith(d + "/"):
+            return "系统级 shell 初始化目录（所有终端会话都会加载）"
+    for sub in _AUTOEXEC_DIR_SUBSTRINGS:
+        if sub in norm:
+            return "开机/登录自启目录（下次登录即执行）"
+    if base.endswith(_AUTOEXEC_BASENAME_SUFFIXES) and (
+            "/.config/" in norm or "/LaunchAgents" in norm):
+        return "自启项文件（下次登录即执行）"
+    if norm.endswith("/.git/hooks") or "/.git/hooks/" in norm:
+        return "git 钩子（下次 git 操作即执行）"
+    return None
+
 
 def _app_data_dir() -> str:
     """辣条自身的数据目录（config.json 所在处）。取不到时退回默认位置。"""
@@ -159,13 +197,18 @@ def sensitive_read_block(path: str) -> str | None:
     """工具路径读文件前的敏感判定：返回拒绝文案或 None（放行）。
 
     拦截范围：密钥/凭据目录、密钥文件名、`.env` 家族（模板除外）、
-    辣条自身目录下的 `config.json`（含 .bak 备份，里面有云端与 Tavily key）。
+    辣条自身目录下的 `config.json`（含 .bak 备份，里面有云端与 Tavily key）、
+    以及 shell 启动脚本/自启目录（2026-10-11 补：那里常有 export 的密钥，
+    且是"读出来就能外传"的高价值目标）。
     """
     if not path:
         return None
     _rp = os.path.realpath(str(path))
     if any(s in _rp for s in _BLOCKED_DIR_SUBSTRINGS):
         return f"⛔ 不允许访问敏感目录 - {_rp}"
+    _auto = _is_autoload_path(_rp)
+    if _auto:
+        return f"⛔ 不允许读取{_auto} - {_rp}"
     base = os.path.basename(_rp)
     low = base.lower()
     if low in _BLOCKED_FILE_NAMES:
@@ -362,12 +405,14 @@ def split_pipeline(cmd: str) -> tuple[str, str] | None:
     return left, right
 
 
-def split_stdout_redirect(cmd: str) -> tuple[str, str, bool] | None:
-    """解析**末尾**的 `> path` / `>> path`（引号外、单一目标）。
+def _stdout_redirect_target(cmd: str) -> tuple[str, str, bool] | None:
+    """扫描 `> path` / `>> path`（引号外、单一目标）→ (head, target, append)。
 
-    shell=False 没有 shell 重定向，但 stdout 写文件可以等价实现，
-    不必整条拒绝。返回 (命令体, 目标路径, append)；无法安全解析则 None。
-    复杂形态（2>&1、多段重定向、带管道的尾部）不解析，仍走拒绝。
+    **只做解析、不做安全判定**（2026-10-11 重构）：此前安全判定混在
+    split_stdout_redirect 的返回值里（被拒 = 返回 None），而 reject_sensitive_write
+    要靠解析结果生成用户可见的拒绝文案——两个消费者拿同一个 None 却想要不同语义，
+    修 ① 时因此出现"split 拦住了但 check_cmd 放行且没有任何提示"的自相矛盾。
+    现在解析归解析、判定归判定，两边各查各的。
     """
     in_single = in_double = False
     hits: list[tuple[int, str]] = []
@@ -412,11 +457,23 @@ def split_stdout_redirect(cmd: str) -> tuple[str, str, bool] | None:
         return None
     if head.count('"') % 2 or head.count("'") % 2:
         return None
-    # 敏感写路径不许经重定向落盘
-    denied = reject_sensitive_write(target)
-    if denied:
-        return None  # 交给上层按「含 >」拒绝，并给出提示
     return head, target, op == ">>"
+
+
+def split_stdout_redirect(cmd: str) -> tuple[str, str, bool] | None:
+    """解析**末尾**的 `> path` / `>> path`（引号外、单一目标）。
+
+    shell=False 没有 shell 重定向，但 stdout 写文件可以等价实现，
+    不必整条拒绝。返回 (命令体, 目标路径, append)；无法安全解析则 None
+    （含**目标受保护**的情况——上层按「含 >」拒绝并给提示）。
+    """
+    parsed = _stdout_redirect_target(cmd)
+    if parsed is None:
+        return None
+    # 敏感写路径不许经重定向落盘（判定只在这里做一次；解析见上方独立函数）
+    if _protected_write_target(parsed[1]):
+        return None
+    return parsed
 
 
 def _strip_one_stderr_tail(cmd: str) -> tuple[str, str]:
@@ -589,8 +646,67 @@ def extract_inline_code(cmd: str) -> str | None:
     return None
 
 
+def _looks_like_path_str(s: str) -> bool:
+    """字符串是否值得按"路径"审查（过滤噪声：`"a/b"`、`"1+1"` 这类不查）。"""
+    if not s or len(s) > 512:
+        return False
+    s = s.strip()
+    if not s or "\n" in s:
+        return False
+    if s.startswith(("/", "~")):
+        return True
+    if "/" in s:
+        return True
+    if s in _SHELL_INIT_BASENAMES or s in _BLOCKED_FILE_NAMES:
+        return True
+    return False
+
+
+def _inline_path_audit(code: str) -> str | None:
+    """内联代码/脚本的**路径审查**（2026-10-11 第四轮修复）。
+
+    背景：解释器内联代码此前只过"形状黑名单 + 禁止调用名单"——它看代码长什么
+    样，不看代码碰什么路径。实测 `python3 -c "open('/x/config.json').read()"`
+    与拼字符串变体全部放行，而同一条路径的传统形态（cat/cp）被拦——同一件事
+    两种写法两种结局，且解释器能把路径在运行期拼出来，黑名单永远追不上。
+    修法：AST 抽字符串字面量 → 逐个过**已有**的读/写封印判据
+    （sensitive_read_block / sensitive_write_block），路径形态与内联形态同判据。
+    非法语法/非 Python 代码返回 None（交给上层既有黑名单处理，不重复兜底）。
+    """
+    import ast
+    try:
+        tree = ast.parse(code)
+    except (SyntaxError, ValueError):
+        return None
+    lits: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            lits.append(node.value)
+        elif isinstance(node, ast.JoinedStr):          # f-string 的静态片段
+            for v in node.values:
+                if isinstance(v, ast.Constant) and isinstance(v.value, str):
+                    lits.append(v.value)
+    seps = ("/", os.sep, "\\")
+    for s in lits:
+        if not _looks_like_path_str(s):
+            continue
+        cands = [s]
+        # 相对路径按"有分隔符"与"当前工作目录"两种口径解析，两种都查
+        if s.startswith("~"):
+            cands.append(os.path.expanduser(s))
+        elif not s.startswith("/"):
+            if any(k in s for k in seps):
+                cands.append(os.path.join(os.getcwd(), s))
+            cands.append(os.path.expanduser("~/" + s))
+        for cand in cands:
+            hit = sensitive_read_block(cand) or sensitive_write_block(cand)
+            if hit:
+                return (f"⛔ Blocked: 代码中引用了受保护的路径（内联/脚本路径审查）: {cand}")
+    return None
+
+
 def check_inline_code(code: str) -> str | None:
-    """审查解释器内联源码（与脚本文件同一套黑名单 + Python AST 禁调用）。"""
+    """审查解释器内联源码（黑名单 + Python AST 禁调用 + 路径审查）。"""
     if not code or not code.strip():
         return "⛔ Blocked: 内联代码为空"
     if len(code) > 8000:
@@ -615,7 +731,9 @@ def check_inline_code(code: str) -> str | None:
                 return f"⛔ Blocked: 内联代码含禁止调用，拒绝执行: {'; '.join(sec)}"
         except Exception:
             return "⛔ Blocked: 内联代码无法静态解析，拒绝执行"
-    return None
+    # 路径审查（2026-10-11）：代码里引用的路径过读/写封印判据——拼字符串
+    # 变体（'.../x/'+'config.json'）也能被 AST 字面量捕获
+    return _inline_path_audit(code)
 
 
 def check_cmd(cmd: str) -> str | None:
@@ -676,6 +794,13 @@ def sensitive_write_block(path: str) -> str | None:
         return None
     _rp = os.path.realpath(str(path))
     _norm = _rp.replace(os.sep, "/")
+    # 登录/自启即执行（2026-10-11 第三轮审计修复）：~/.zshrc、LaunchAgents、
+    # crontab、git hooks 此前全部可写穿——比 extensions 更直接的持久化 RCE
+    # 通道（实测 write_file 写穿 .zshrc 与 plist）。
+    _auto = _is_autoload_path(_rp)
+    if _auto:
+        return (f"⛔ 不允许写入{_auto}: {_rp}。"
+                "如需修改，请自己编辑或把内容写到普通文件后手动应用")
     for d in _app_data_dirs():
         for sub in ("extensions", "skills"):
             _dir = f"{d}{os.sep}{sub}"
@@ -722,6 +847,10 @@ def _protected_write_target(tok: str) -> str | None:
     if not tok or tok.startswith("-"):
         return None
     rp = os.path.realpath(os.path.abspath(os.path.expanduser(tok)))
+    # 登录/自启即执行的路径（2026-10-11 第三轮审计修复）：此前 `.zshrc`、
+    # LaunchAgents、crontab、git hooks 全部可经命令写穿（`cp`/`tee`/`echo >`）。
+    if _is_autoload_path(rp):
+        return rp
     for d in _app_data_dirs():
         for sub in ("extensions", "skills"):
             if rp == f"{d}{os.sep}{sub}" or rp.startswith(f"{d}{os.sep}{sub}{os.sep}"):
@@ -737,8 +866,30 @@ def _protected_write_target(tok: str) -> str | None:
 
 
 def reject_sensitive_write(cmd: str) -> str | None:
-    """命令写入自动加载目录/安全配置时返回拒绝文案，否则 None。"""
+    """命令写入自动加载目录/安全配置时返回拒绝文案，否则 None。
+
+    2026-10-11 安全审计修复（实测成立的两个缺陷叠加）：
+    ① **只读动词白名单短路**——echo/printf 等为"看目录"而设的白名单在函数开头
+       `return None`，重定向形态下目标根本没被检查（cp/tee/sed -i 因不在名单反而
+       拦得住，同一路径两种结局）；
+    ② **裸路径不着检查**——`reject_sensitive_write(目标路径)` 是 split_stdout_redirect
+       的内部调用形态，而裸路径经 shlex.split 是**单个 token**，循环从 tokens[1:]
+       开始 → 目标自己永远不被检查（这条让 ① 的修复在上层重定向路径里失效）。
+    修法：先解析重定向目标检查；动词是路径形态时也检查 tokens[0]；再做白名单短路。
+    """
     import shlex
+    # ① 重定向目标先查（不管动词是什么）——echo/printf 写受保护路径必须拦。
+    #    用**纯解析**函数（不查安全），命中就给拒绝文案；split_stdout_redirect
+    #    自己的封印判定只负责让上层按「含 >」拒绝，两者语义不再混用。
+    try:
+        _parsed = _stdout_redirect_target(cmd)
+    except Exception:
+        _parsed = None
+    if _parsed is not None:
+        hit = _protected_write_target(_parsed[1])
+        if hit:
+            return (f"⛔ 不允许用命令写入自动加载目录/配置（写进去的代码会被执行、"
+                    f"配置含 API 密钥）: {hit}")
     try:
         tokens = shlex.split(cmd)
     except ValueError:
@@ -746,6 +897,24 @@ def reject_sensitive_write(cmd: str) -> str | None:
     if not tokens:
         return None
     verb = os.path.basename(tokens[0]).lower()
+    # ②b awk 的写目标是它自己的语法（print > "file"），不是路径 token——
+    # 2026-10-11 实测 `awk 'BEGIN{print "x" > "~/.local-ai-os/permissions.json"}'`
+    # 放行（同一目标用 echo/printf 写就被拦）。这里解析 awk 程序里的重定向目标。
+    if verb in ("awk", "gawk", "mawk", "nawk"):
+        for tok in tokens[1:]:
+            if tok.startswith("-"):
+                continue
+            for m in re.finditer(r">>?\s*\"([^\"]{1,512})\"", tok):
+                hit = _protected_write_target(os.path.expanduser(m.group(1)))
+                if hit:
+                    return (f"⛔ 不允许用命令写入自动加载目录/配置（写进去的代码会被执行、"
+                            f"配置含 API 密钥）: {hit}")
+    # ② 裸路径形态（split_stdout_redirect 的内部调用）：tokens[0] 本身就是目标
+    if "/" in tokens[0] or tokens[0].startswith("~"):
+        hit = _protected_write_target(tokens[0])
+        if hit:
+            return (f"⛔ 不允许用命令写入自动加载目录/配置（写进去的代码会被执行、"
+                    f"配置含 API 密钥）: {hit}")
     if verb in _READ_ONLY_VERBS:
         return None
     for tok in tokens[1:]:
@@ -837,6 +1006,10 @@ def check_script_content(script_path: str) -> str | None:
         except Exception:
             # AST 不可用/语法失败 → fail-closed（内容审查是唯一防线时不能放行）
             return f"⛔ Blocked: 脚本无法静态解析，拒绝执行: {rp}"
+        # 路径审查（2026-10-11）：脚本里引用的路径同样过读/写封印判据
+        path_denied = _inline_path_audit(body)
+        if path_denied:
+            return path_denied
     return None
 
 

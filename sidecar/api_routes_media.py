@@ -175,6 +175,15 @@ async def upload_local(request: Request):
     translate = bool(body.get("translate", True))
     if not path or not os.path.isfile(path):
         return JSONResponse({"status": "error", "message": f"文件不存在: {path}"}, status_code=400)
+    # 敏感读保护（2026-10-11 第三轮审计修复）：此前无任何检查，读 config.json
+    # 就能把云端 key/Tavily key 送进对话上下文。与 read_file 走同一份判据。
+    try:
+        from cmd_safety import sensitive_read_block
+        _blk = sensitive_read_block(path)
+        if _blk:
+            return JSONResponse({"status": "error", "message": _blk}, status_code=403)
+    except Exception:
+        logger.debug("upload_local 敏感读判定失败（按放行继续）", exc_info=True)
     try:
         size = os.path.getsize(path)
         if size > MAX_UPLOAD_SIZE:
@@ -402,13 +411,23 @@ async def file_preview(path: str = Query(..., description="绝对路径")):
     try:
         if not p.is_absolute() or not p.is_file():
             return {"status": "error", "message": "not a file"}
-        low = str(p).lower()
-        blocked_names = ("config.json", "id_rsa", "id_ed25519", "credentials",
-                         "shadow", "sudoers", "secrets")
-        if any(n in low for n in (".ssh", ".aws", ".gnupg", "/etc/shadow", "/etc/sudoers")):
-            return {"status": "error", "message": "blocked"}
-        if any(n in p.name.lower() for n in blocked_names):
-            return {"status": "error", "message": "blocked"}
+        # 敏感读判定与 read_file/upload_local 共用同一份（2026-10-11 第三轮审计
+        # 修复：此前这里自带一份黑名单，漏 .env 家族、无扩展名身份文件与 shell
+        # 启动脚本——而"预览＝把内容发给模型"，漏一个就是一条泄露路径）。
+        try:
+            from cmd_safety import sensitive_read_block
+            _blk = sensitive_read_block(str(p))
+            if _blk:
+                return {"status": "error", "message": "blocked"}
+        except Exception:
+            # 兜底：判据模块故障时退回旧黑名单，别把保护整体失效
+            low = str(p).lower()
+            blocked_names = ("config.json", "id_rsa", "id_ed25519", "credentials",
+                             "shadow", "sudoers", "secrets", ".env", ".netrc")
+            if any(n in low for n in (".ssh", ".aws", ".gnupg", "/etc/shadow", "/etc/sudoers")):
+                return {"status": "error", "message": "blocked"}
+            if any(n in p.name.lower() for n in blocked_names):
+                return {"status": "error", "message": "blocked"}
     except OSError:
         return {"status": "error", "message": "invalid path"}
 
