@@ -451,7 +451,12 @@ fn open_path(path: String) -> Result<(), String> {
         if BAD_EXT.contains(&ext.as_str()) {
             return Err("refusing to open an executable bundle/script".into());
         }
-        if cfg!(unix) && ext == "sh" && is_executable(p) {
+        // 解释器脚本（.sh）：**编译期**门控（2026-10-11 Windows 构建事故）——
+        // 此处曾写 `cfg!(unix) && ... is_executable(...)`：`cfg!` 只是运行时
+        // 常量，被门控函数在非 unix 目标上**依然参与类型检查** → Windows 报
+        // E0425 cannot find function。必须用 #[cfg(unix)] 属性整段排除。
+        #[cfg(unix)]
+        if ext == "sh" && is_executable(p) {
             return Err("refusing to open an executable script".into());
         }
     }
@@ -461,8 +466,10 @@ fn open_path(path: String) -> Result<(), String> {
         if p.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("app")).unwrap_or(false) {
             return Err("refusing to open an application bundle".into());
         }
-    } else if cfg!(unix) && is_executable(p) {
-        // 可执行位 + 非文档扩展：拒绝（防"写个二进制再打开"）
+    }
+    // 可执行位 + 非文档扩展：拒绝（防"写个二进制再打开"）。编译期门控同上。
+    #[cfg(unix)]
+    if !p.is_dir() && is_executable(p) {
         let ext_ok = p.extension().and_then(|e| e.to_str())
             .map(|e| matches!(e.to_ascii_lowercase().as_str(),
                               "pdf" | "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" |
