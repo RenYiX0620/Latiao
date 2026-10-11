@@ -234,5 +234,75 @@ class TestDigestVerification(TestUpdateService):
             self.assertFalse(dest.exists())
 
 
+class TestCleanupOldPackages(TestUpdateService):
+    """旧包清理（2026-10-11）：实测堆了 43 个包 13.8GB 且无清理机制。
+
+    只清**可再生的下载缓存**：更早版本的整包与孤儿 .part。必须保住：
+    状态引用的包（安装要用）、版本最高者（状态丢失时兜底）、签名文件、
+    backup/ 之类的非缓存目录。
+    """
+
+    def _make(self, name, size=100):
+        f = us.UPDATE_DIR / name
+        f.write_bytes(b"x" * size)
+        return f
+
+    def test_removes_older_keeps_newest_and_backup(self):
+        us.UPDATE_DIR.mkdir(parents=True, exist_ok=True)
+        self._make("Latiao_0.3.10_aarch64.app.tar.gz")
+        self._make("Latiao_0.3.50_aarch64.app.tar.gz")
+        newest = self._make("Latiao_0.3.77_aarch64.app.tar.gz")
+        (us.UPDATE_DIR / "Latiao_0.3.77_aarch64.app.tar.gz.sig").write_text("sig")
+        (us.UPDATE_DIR / "backup").mkdir(exist_ok=True)
+        (us.UPDATE_DIR / "backup" / "user-snapshot").mkdir(exist_ok=True)
+        us._state.clear()
+        us._state.update({"status": "done",
+                          "url": "https://x/v0.3.77/Latiao_0.3.77_aarch64.app.tar.gz"})
+        r = us.cleanup_old_packages()
+        left = {p.name for p in us.UPDATE_DIR.iterdir()}
+        assert newest.name in left, "最新包必须保留"
+        assert "Latiao_0.3.10_aarch64.app.tar.gz" not in left
+        assert "Latiao_0.3.50_aarch64.app.tar.gz" not in left
+        assert (us.UPDATE_DIR / "Latiao_0.3.77_aarch64.app.tar.gz.sig").exists()
+        assert (us.UPDATE_DIR / "backup" / "user-snapshot").exists(), "用户文件目录不得动"
+        assert r["freed_bytes"] >= 200
+
+    def test_keeps_referenced_package_even_if_not_newest(self):
+        """状态引用的是旧包（装着没装完的场景）→ 也必须保留。"""
+        us.UPDATE_DIR.mkdir(parents=True, exist_ok=True)
+        ref = self._make("Latiao_0.3.70_aarch64.app.tar.gz")
+        self._make("Latiao_0.3.77_aarch64.app.tar.gz")
+        us._state.clear()
+        us._state.update({"status": "downloading",
+                          "url": "https://x/v0.3.70/Latiao_0.3.70_aarch64.app.tar.gz"})
+        us.cleanup_old_packages()
+        left = {p.name for p in us.UPDATE_DIR.iterdir()}
+        assert ref.name in left, "状态引用的包必须保留"
+
+    def test_state_lost_keeps_newest_by_version(self):
+        """状态复位过（无 url）→ 用版本号兜底，别把最新包删了。"""
+        us.UPDATE_DIR.mkdir(parents=True, exist_ok=True)
+        self._make("Latiao_0.3.10_aarch64.app.tar.gz")
+        newest = self._make("Latiao_0.3.77_aarch64.app.tar.gz")
+        us._state.clear()
+        r = us.cleanup_old_packages()
+        left = {p.name for p in us.UPDATE_DIR.iterdir()}
+        assert newest.name in left, f"无状态时必须保最新: {r}"
+
+    def test_removes_orphan_part_keeps_live_one(self):
+        us.UPDATE_DIR.mkdir(parents=True, exist_ok=True)
+        live = self._make("Latiao_0.3.77_aarch64.app.tar.gz.part")
+        orphan = self._make("Latiao_0.3.50_aarch64.app.tar.gz.part")
+        us._state.clear()
+        us._state.update({"status": "downloading",
+                          "url": "https://x/v0.3.77/Latiao_0.3.77_aarch64.app.tar.gz",
+                          "part_path": str(live)})
+        us.cleanup_old_packages()
+        left = {p.name for p in us.UPDATE_DIR.iterdir()}
+        assert live.name in left, "正在续传的 .part 必须保留"
+        # 孤儿（正式包不在、状态也不引用）应被清掉
+        assert orphan.name not in left
+
+
 if __name__ == "__main__":
     unittest.main()

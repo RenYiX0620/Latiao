@@ -314,6 +314,11 @@ def _download_worker(url: str, dest: Path, version: str) -> None:
                     _save_state()
                 logger.info("更新包预下载完成: %s (%d 字节，校验=%s)",
                             dest.name, total, _state.get("integrity", "unchecked"))
+                # 下完就清历史包（2026-10-11）：旧版本整包只有占磁盘的价值
+                try:
+                    cleanup_old_packages(keep_name=dest.name)
+                except Exception:
+                    logger.debug("下载后清理旧包失败（不影响更新）", exc_info=True)
                 return
             raise RuntimeError(f"下载数据不足: {part.stat().st_size}/{total}")
         except Exception as e:
@@ -512,3 +517,71 @@ def get_update_file_path() -> Path | None:
         return None
     dest = _state_paths()[0] / url.split("/")[-1]
     return dest if dest.exists() else None
+
+
+# ── 旧包清理（2026-10-11）────────────────────────────────────────────
+# 实测：更新目录堆了 43 个历史包、约 13.8GB，且没有任何清理机制——每次检查
+# 更新都会保留下载过的整包，越堆越大。这里只清理**可再生的下载缓存**：
+#   - 更早版本的 *.app.tar.gz / *.exe（安装包，可随时重下）
+#   - 孤儿 *.part（中断的临时文件）
+# **保留**：当前状态引用的包（安装它要用）、版本号最高者（状态丢时的兜底——
+# 用户可能刚下完还没安装）、state.json、backup/ 等一切非下载缓存的目录。
+
+_PKG_SUFFIXES = (".tar.gz", ".exe", ".dmg")
+
+
+def _pkg_version_key(name: str) -> tuple:
+    m = re.search(r"Latiao_(\d+)\.(\d+)\.(\d+)", name or "")
+    return tuple(int(x) for x in m.groups()) if m else (0, 0, 0)
+
+
+def cleanup_old_packages(keep_name: str = "") -> dict:
+    """删除历史更新包，只留最新一个 + 状态引用的那个。返回清理摘要。"""
+    udir, _sfile = _state_paths()
+    removed: list[str] = []
+    freed = 0
+    kept: list[str] = []
+    try:
+        st = _load_state()
+        ref = (st.get("url") or "").split("/")[-1]      # 当前状态引用的包名
+        pkgs = [p for p in udir.glob("Latiao_*")
+                if p.is_file() and p.name.endswith(_PKG_SUFFIXES)]
+        # 要保留的名字集合：状态引用的 + 版本最高者（+ 调用方指定）
+        keep = {n for n in (ref, keep_name) if n}
+        if not keep:
+            # 状态里没有引用（或复位过）→ 以版本号最高者兜底，别把最新包删了
+            versioned = [p for p in pkgs if _pkg_version_key(p.name) > (0, 0, 0)]
+            if versioned:
+                keep.add(max(versioned, key=lambda p: (_pkg_version_key(p.name),
+                                                       p.stat().st_mtime)).name)
+        for p in sorted(pkgs, key=lambda p: (_pkg_version_key(p.name), p.stat().st_mtime)):
+            if p.name in keep:
+                kept.append(p.name)
+                continue
+            try:
+                sz = p.stat().st_size
+                p.unlink()
+                freed += sz
+                removed.append(p.name)
+            except OSError:
+                logger.debug("清理旧更新包失败: %s", p.name, exc_info=True)
+        # 孤儿 .part（正式包不在位、且状态也不再引用的残片；可随时重下）
+        for part in list(udir.glob("*.part")):
+            base = part.name[:-5]
+            base_pkg_exists = (udir / base).exists() and base.endswith(_PKG_SUFFIXES)
+            if base_pkg_exists:
+                continue                      # 正式包在位 → 残片是本次下载残留，删
+            if base == (ref or ""):
+                continue                      # 状态还指着它 → 留给续传
+            try:
+                part.unlink()
+                removed.append(part.name)
+            except OSError:
+                pass
+    except Exception:
+        logger.warning("旧更新包清理异常（不影响更新）", exc_info=True)
+    if removed:
+        logger.info("更新包清理：删除 %d 个（释放 %.1f GB），保留 %s",
+                    len(removed), freed / (1024 ** 3),
+                    ", ".join(kept) or "（无）")
+    return {"removed": removed, "freed_bytes": freed, "kept": kept}

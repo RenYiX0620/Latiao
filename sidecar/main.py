@@ -469,15 +469,34 @@ async def lifespan(app: FastAPI):
                     await run_in_threadpool(_anon.send_if_due)
                 except Exception:
                     logger.debug("匿名数据上报跳过", exc_info=True)
+                # 更新包清理（2026-10-11）：历史整包只有占磁盘的价值（实测堆到
+                # 13.8GB）。启动首轮就会跑到，清掉除最新一个之外的全部。
+                try:
+                    import update_service as _us
+                    await run_in_threadpool(_us.cleanup_old_packages)
+                except Exception:
+                    logger.debug("更新包清理跳过", exc_info=True)
             except Exception:
                 logger.warning("工具历史清理任务失败", exc_info=True)
             await asyncio.sleep(24 * 3600)
 
     prune_task = asyncio.create_task(_prune_loop())
+
+    async def _cleanup_update_packages_once():
+        """启动即清一次历史更新包（2026-10-11）：每日循环要等 24h 才轮到，
+        而积压可能很大（实测 13.8GB）——启动就清，用户立刻看到磁盘回血。"""
+        try:
+            from starlette.concurrency import run_in_threadpool
+            import update_service as _us
+            await run_in_threadpool(_us.cleanup_old_packages)
+        except Exception:
+            logger.debug("启动清理更新包跳过", exc_info=True)
+
+    cleanup_task = asyncio.create_task(_cleanup_update_packages_once())
     yield
     # 正常退出（应用关窗/托盘退出，Rust 端发 SIGTERM）：停掉本地模型引擎，
     # 释放显存/内存。sidecar 单独重启走 detach+SIGKILL，不会经过这里。
-    for _t in (cron_task, catchup_task, prune_task):
+    for _t in (cron_task, catchup_task, prune_task, cleanup_task):
         _t.cancel()
     try:
         from local_llm import shutdown_engine
