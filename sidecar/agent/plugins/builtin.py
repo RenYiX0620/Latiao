@@ -29,6 +29,10 @@ def setup_fastpath(scope):
             return body
         body.pop("tools", None)
         body["chat_template_kwargs"] = {"enable_thinking": False}
+        # 日志诚实化（2026-10-11）：快车道会顶掉用户的"开启"档——登记来源，
+        # 请求构建日志会打出"思考=关（快车道）"，不再是无痕覆盖。
+        if hasattr(loop, "note_thinking_off"):
+            loop.note_thinking_off("快车道")
         return body
 
     scope.waterfall("request").register(request_hook, order=10, name="fastpath")
@@ -65,6 +69,11 @@ def setup_assists(scope):
         # 辅助 2：语言交付闸门（本地引擎英文漂移）——正文已实时流出，
         # 用 content_revised 整体替换（前端把最后一条回答替换为译文）
         if _reply_lang_mismatch(payload["user_text"], text, payload.get("user_lang", "")):
+            try:
+                import anon_usage
+                anon_usage.note("gate_lang")
+            except Exception:
+                logger.debug("anon_usage 语言闸门记账失败", exc_info=True)
             try:
                 async with httpx.AsyncClient(timeout=httpx.Timeout(60)) as c2:
                     translated = await _force_translate(

@@ -1071,7 +1071,12 @@ class TestChunkedTranslation(unittest.TestCase):
         self.assertEqual(len(_split_translation_chunks("很短的一段话。")), 1)
 
 class TestThinkingLevelRespected(unittest.TestCase):
-    """思考档位跟随用户选择（09-19：此前 steps>1 一律关思考 → 推理倒进正文）。"""
+    """思考两档（2026-10-11 改制：关闭 / 开启）。
+
+    背景：四档时代"高"与"最高"逐字节相同（用户实测"切了没用"）。现在：
+    off = 真不思考；其余（max/high/low 兼容旧前端）= 开启 + 请求级思考预算
+    （实测 b11118：预算有效但非硬上限，不设预算会饿死正文 → 定 4000）。
+    """
 
     def _body(self, level, steps):
         from agent.loop import ThinAgentLoop
@@ -1079,54 +1084,74 @@ class TestThinkingLevelRespected(unittest.TestCase):
                              "http://127.0.0.1:9/v1/chat/completions", {}, "s-th",
                              thinking_level=level)
         loop.steps = steps
-        return loop._build_request("m").get("chat_template_kwargs", {})
+        return loop._build_request("m")
 
-    def test_high_keeps_thinking_after_tools(self):
-        self.assertTrue(self._body("high", 2).get("enable_thinking"))
+    def test_on_keeps_thinking_after_tools(self):
+        body = self._body("max", 2)
+        self.assertTrue(body["chat_template_kwargs"].get("enable_thinking"))
 
-    def test_max_keeps_thinking_after_tools(self):
-        self.assertTrue(self._body("max", 2).get("enable_thinking"))
+    def test_on_carries_reasoning_budget(self):
+        """开启档必须带请求级思考预算（这是两档制里"开"的实质）。"""
+        from agent.loop import _THINK_BUDGET_TOKENS
+        body = self._body("max", 1)
+        self.assertEqual(body.get("reasoning_budget_tokens"), _THINK_BUDGET_TOKENS)
+        self.assertGreater(_THINK_BUDGET_TOKENS, 0)
 
-    def test_off_stays_off(self):
-        self.assertIs(self._body("off", 1).get("enable_thinking"), False)
-        self.assertIs(self._body("off", 2).get("enable_thinking"), False)
+    def test_legacy_levels_map_to_on(self):
+        """旧前端/旧 localStorage 的 low/high 一律按"开"处理，不报错、不静默变关。"""
+        for legacy in ("low", "high"):
+            body = self._body(legacy, 2)
+            self.assertTrue(body["chat_template_kwargs"].get("enable_thinking"), legacy)
+            self.assertIn("reasoning_budget_tokens", body, legacy)
+
+    def test_off_stays_off_and_has_no_budget(self):
+        for steps in (1, 2):
+            body = self._body("off", steps)
+            self.assertIs(body["chat_template_kwargs"].get("enable_thinking"), False)
+            self.assertNotIn("reasoning_budget_tokens", body)
 
     def test_truncation_retry_still_forces_off(self):
         from agent.loop import ThinAgentLoop
         loop = ThinAgentLoop([{"role": "user", "content": "写个长回答"}], "m",
                              "http://127.0.0.1:9/v1/chat/completions", {}, "s-th2",
-                             thinking_level="high")
+                             thinking_level="max")
         loop.steps = 2
         loop._force_thinking_off_next = True          # 截断重试轮
         self.assertIs(loop._build_request("m")["chat_template_kwargs"]["enable_thinking"], False)
+        # 日志诚实化：用户档位是"开"却被重试顶掉 → 必须登记来源
+        self.assertIn("截断重试", loop.thinking_off_reasons)
 
-class TestThinkingLowLevel(unittest.TestCase):
-    """低档（09-19 新增）：规划轮与作答轮开思考、工具轮关闭——兼顾"想清楚"与"别每轮想几分钟"。"""
+class TestCloudThinkingLevel(unittest.TestCase):
+    """云端档位（2026-10-11 接通）：此前云端请求完全不读档位，四个档零效果。"""
 
-    def _body(self, level, steps, prev_tools):
+    def _cloud_body(self, level, model="gpt-5-mini"):
         from agent.loop import ThinAgentLoop
-        loop = ThinAgentLoop([{"role": "user", "content": "分析周五美股走势"}], "m",
-                             "http://127.0.0.1:9/v1/chat/completions", {}, "s-low",
-                             thinking_level=level)
-        loop.steps = steps
-        loop._last_round_had_tools = prev_tools
-        return loop._build_request("m").get("chat_template_kwargs", {}).get("enable_thinking")
+        loop = ThinAgentLoop([{"role": "user", "content": "你好"}], model,
+                             "https://api.example.com/v1/chat/completions", {}, "s-cl",
+                             thinking_level=level, is_local=False)
+        return loop._build_request(model)
 
-    def test_low_keeps_thinking_on(self):
-        # 低档=思考开着+限长（关思考既不省时、又把英文推理倒进正文，09-19 实测）
-        self.assertTrue(self._body("low", 1, False))
-        self.assertTrue(self._body("low", 2, True))
+    def test_off_disables_for_openai_reasoners(self):
+        self.assertEqual(self._cloud_body("off", "o3-mini").get("reasoning_effort"), "none")
 
-    def test_low_caps_tool_round_output(self):
-        """低档=限长：工具轮单轮输出受限（速度唯一直接杠杆是少生成 token）。"""
-        from agent.loop import ThinAgentLoop, _LOW_MAX_TOKENS
-        loop = ThinAgentLoop([{"role": "user", "content": "分析周五美股走势"}], "m",
-                             "http://127.0.0.1:9/v1/chat/completions", {}, "s-lowcap",
-                             thinking_level="low")
-        loop.steps = 2
-        self.assertEqual(loop._build_request("m")["max_tokens"], _LOW_MAX_TOKENS)
-        loop.steps = 1                                     # 首轮规划不限长
-        self.assertGreater(loop._build_request("m")["max_tokens"], _LOW_MAX_TOKENS)
+    def test_off_disables_for_anthropic(self):
+        self.assertEqual(self._cloud_body("off", "claude-sonnet-4").get("thinking"),
+                         {"type": "disabled"})
+
+    def test_off_marks_forced_reasoning_models(self):
+        self.assertTrue(self._cloud_body("off", "deepseek-reasoner").get("_thinking_unsupported"))
+
+    def test_on_requests_high_effort(self):
+        self.assertEqual(self._cloud_body("max", "gpt-5-mini").get("reasoning_effort"), "high")
+
+    def test_on_does_not_inflate_max_tokens(self):
+        """旧实现把 max_tokens 一律抬到 18432——对上限 8k 的模型会 400；现已移除。"""
+        body = self._cloud_body("max", "deepseek-reasoner")
+        self.assertNotIn("reasoning_effort", body)     # deepseek 系不认该字段
+        self.assertLessEqual(int(body.get("max_tokens") or 0), 12288)
+
+class TestSearchToolSaturation(unittest.TestCase):
+    """搜索工具第 3 次调用触发饱和收口（从原云端档位类中拆出，避免类名冲突）。"""
 
     def test_same_search_tool_third_call_saturates(self):
         from agent.loop import ThinAgentLoop
@@ -1136,14 +1161,6 @@ class TestThinkingLowLevel(unittest.TestCase):
         self.assertFalse(loop._note_tool_counts(call))
         self.assertFalse(loop._note_tool_counts(call))
         self.assertTrue(loop._note_tool_counts(call))      # 第 3 次 → 饱和收口
-
-    def test_high_and_max_always_on_after_tools(self):
-        self.assertTrue(self._body("high", 2, True))
-        self.assertTrue(self._body("max", 2, True))
-
-    def test_off_never_on(self):
-        self.assertIs(self._body("off", 1, False), False)
-        self.assertIs(self._body("off", 2, True), False)
 
 class TestLocalizedMessages(unittest.TestCase):
     """运行时提示四语齐备（09-19 审计：这些提示原为中文写死，英文/日文/俄文用户会看到中文）。"""

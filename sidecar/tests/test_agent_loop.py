@@ -353,10 +353,24 @@ class TestThinkingInjection(unittest.TestCase):
         self.assertNotIn("thinking", body)
         self.assertNotIn("reasoning_effort", body)
 
-    def test_max_raises_budget(self):
+    def test_on_sets_high_effort_for_openai_reasoners(self):
+        """两档制（2026-10-11）："开启"档给推理系模型显式 high effort。
+
+        旧版 `test_max_raises_budget` 断言 max_tokens 被抬到 18432——已移除：
+        对 max_tokens 上限不足 16k 的模型（deepseek 系 8192）会直接 400，
+        输出上限由 _resolve_max_tokens 按模型名负责。
+        """
+        import agent_loop
+        body = agent_loop._inject_thinking_disabled({"model": "o3-mini"}, "o3-mini", "max")
+        self.assertEqual(body.get("reasoning_effort"), "high")
+        self.assertNotIn("max_tokens", body)   # 不再由本函数改写生成长度
+
+    def test_on_deepseek_gets_no_effort_field(self):
+        """DeepSeek 不认 reasoning_effort——不写无效字段，也不抬 max_tokens。"""
         import agent_loop
         body = agent_loop._inject_thinking_disabled({"model": "deepseek-chat", "max_tokens": 4096}, "deepseek-chat", "max")
-        self.assertGreaterEqual(body["max_tokens"], 18432)
+        self.assertNotIn("reasoning_effort", body)
+        self.assertEqual(body["max_tokens"], 4096)
 
 
 if __name__ == "__main__":

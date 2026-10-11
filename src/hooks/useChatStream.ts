@@ -50,7 +50,7 @@ export interface ChatStreamDeps {
   processingRef: { current: Record<string, boolean> };
   reflectionMode: "off" | "light" | "deep";
   accessMode: "read_only" | "confirm" | "auto_edit" | "plan" | "full";
-  thinkingLevel: "off" | "low" | "high" | "max";
+  thinkingLevel: "off" | "max";
 }
 
 export function useChatStream(deps: ChatStreamDeps) {

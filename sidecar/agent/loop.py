@@ -45,6 +45,7 @@ from agent.context import (
     _ensure_market_tools,
     _extract_last_user_text,
     _filter_tools_by_access,
+    _inject_thinking_disabled,
     _is_chat_query,
     _is_light_query,
     _local_native_tools_ok,
@@ -127,9 +128,13 @@ _DUP_HOLD_SECS = float(os.environ.get("LATIAO_DUP_HOLD_MS", "150") or 150) / 100
 
 
 _ROUND_CONTENT_MAX = int(os.environ.get("LATIAO_ROUND_CONTENT_MAX", "1200") or 1200)
-# 低档（=限长档）：工具轮单轮输出上限。速度唯一直接杠杆是"少生成 token"——
-# 09-19 实测：低档若只关思考，token 总量不变（只是从思考倒进正文），耗时不变。
-_LOW_MAX_TOKENS = int(os.environ.get("LATIAO_LOW_MAX_TOKENS", "2048") or 2048)
+# 思考预算（2026-10-11 两档改制）："开启"档发给本地引擎的请求级推理预算上限。
+# 实测（Occamy + b11118，同题五组）：预算是真参数但**不是硬上限**——实测超出
+# 2.5~3.5 倍才被强制收口；而"不限"会把 max_tokens 全吃在思考里、正文一个字
+# 写不出来（预算 8192/不限 两组均 思考 4~5k 字、正文 0 字、finish=length）。
+# 4000 的实测表现：思考充分且正文正常产出（1200 档已验证同理，4000 留 2.5 倍
+# 余量）。截断重试（_needs_length_retry → _force_thinking_off_next）仍是兜底。
+_THINK_BUDGET_TOKENS = int(os.environ.get("LATIAO_THINK_BUDGET_TOKENS", "4000") or 4000)
 _SEARCH_TOOL_REPEAT_LIMIT = int(os.environ.get("LATIAO_SEARCH_TOOL_REPEAT", "3") or 3)
 
 
@@ -461,6 +466,19 @@ def _needs_length_retry(finish_reason, native_calls, empty_body: bool,
     if finish_reason != "length" or retry_used:
         return False
     return bool(native_calls) or empty_body
+
+
+def _anon_note(key: str) -> None:
+    """匿名使用数据计数（2026-10-11）：失败一律吞掉——闸门路径绝不能因记账炸。
+
+    只在闸门真正触发时调用；模块内部还会再查一次开关（LATIAO_ANON_USAGE /
+    config privacy.anonymous_usage），关掉时这里是空操作。
+    """
+    try:
+        import anon_usage
+        anon_usage.note(key)
+    except Exception:
+        logger.debug("anon_usage note(%r) 失败", key, exc_info=True)
 
 
 def _delivery_fragment_suspect(text: str) -> str:
@@ -1003,6 +1021,9 @@ class ThinAgentLoop:
         self._plan_injected = False
         self._len_retry_used = False           # max-tokens 截断重试（每轮一次）
         self._force_thinking_off_next = False  # 截断重试轮强制关思考
+        # 思考被强制关闭的原因链（2026-10-11 日志诚实化）：插件（快车道）与截断
+        # 重试都会覆盖用户的档位选择，此前日志只打"思考=关"看不出是谁关的。
+        self.thinking_off_reasons: list[str] = []
         self._recent_sigs: list[str] = []      # 重复同参调用检测（结构信号）
         self._repeat_reminders = 0             # 提醒注入计数（≤3 次/turn）
         self._gen_retry_used = False           # 复读/截断的确定性打破重试（每 turn 一次）
@@ -1144,6 +1165,20 @@ class ThinAgentLoop:
         except Exception:
             logger.debug("重试记账失败", exc_info=True)
 
+    def note_thinking_off(self, reason: str) -> None:
+        """登记"本轮思考被谁强制关掉"（供插件与重试路径调用）。
+
+        日志诚实化（2026-10-11）：快车道/截断重试/收口轮都会顶掉用户的档位选择，
+        此前只打"思考=关"，用户与排查都看不出是档位没生效还是被覆盖。
+        """
+        try:
+            self.thinking_off_reasons.append(str(reason))
+        except Exception:
+            pass
+
+    def _thinking_off_reason(self) -> str:
+        return self.thinking_off_reasons[-1] if self.thinking_off_reasons else ""
+
     # ── 请求组装（request waterfall 之前的宿主编排）──────────
     def _build_request(self, engine_model: str) -> dict:
         import local_llm  # 懒加载：与文件内其它用法一致，避免模块级循环依赖
@@ -1191,6 +1226,17 @@ class ThinAgentLoop:
             body["tools"] = [dict(t) for t in tools]
             if self.parallel_disabled:
                 body["parallel_tool_calls"] = False
+            # 思考档位（2026-10-11 接通）：云端此前完全不读档位——四个档在云端
+            # 零效果，用户设了"关闭"照样思考。这里接上按模型族的官方开关
+            # （Anthropic thinking / o 系 reasoning_effort=none / 强制思考模型
+            # 打 _thinking_unsupported 标记）。故障兜底：注入失败按原 body 发，
+            # 绝不因档位逻辑打断请求。
+            try:
+                _inject_thinking_disabled(
+                    body, self.model,
+                    "off" if (self.thinking_level or "").lower() == "off" else "max")
+            except Exception:
+                logger.debug("云端思考档位注入失败（按原请求继续）", exc_info=True)
             # OpenAI 兼容端点要显式声明才在流式响应里回传 usage（缓存命中率来源）；
             # Anthropic 风格端点（/v1/messages）不接受该字段，按 URL 判别。
             if self.api_url.rstrip("/").endswith("/chat/completions"):
@@ -1231,22 +1277,21 @@ class ThinAgentLoop:
                 "\n\n📏 思考预算（长输入）：请先简短思考（≤300 字），然后立刻在正文"
                 "写出完整分析——关键数字和结论必须写进正文。")
         body["frequency_penalty"] = 0.6
-        # 思考档位：尊重用户在界面的选择（关闭/高/最高）——09-19 修正：此前
-        # `steps > 1` 一律强制关闭，等于用户的档位只在第一回合有效；关掉思考后
-        # 模型把英文推理倒进正文（单轮上万字过程文本、逐字复读、交付英文）。
+        # 思考档位（2026-10-11 两档改制：关闭 / 开启）：此前四档里"高"和"最高"
+        # 逐字节相同（都落 else 分支），"低"只管工具轮限长——用户实测"切了没用"。
+        # 现在：off = 真不思考；其余（max/high/low，兼容旧前端与旧 localStorage）
+        # = 开启 + 请求级思考预算。预算让"开启"这一档真的给足预算，又不至于把
+        # max_tokens 全吃在思考里（实测：不限会导致正文 0 字，见 _THINK_BUDGET_TOKENS）。
         _lvl = (self.thinking_level or "high").lower()
         if _lvl == "off" or self._force_thinking_off_next:
             body["chat_template_kwargs"] = {"enable_thinking": False}
-        elif _lvl == "low":
-            # 低档：思考照开（推理走思考通道，正文才干净），但下方对工具后续轮限长——
-            # 09-19 实测：只关思考并不省时（推理倒进正文，token 量不变），且交付变英文
-            body["chat_template_kwargs"] = {"enable_thinking": True}
+            if self._force_thinking_off_next and _lvl != "off":
+                # 用户的档位是"开"却被截断重试顶掉——记来源，日志才能说清楚
+                self.note_thinking_off("截断重试")
         else:
             body["chat_template_kwargs"] = {"enable_thinking": True}
-        if _lvl == "low" and self.steps > 1:
-            # 低档：首轮不限长（规划要充分），工具后续轮限长——少生成 token 是唯一直接
-            # 提速杠杆（每轮 1.5–3.5 分钟 → 几十秒）；超限时现有截断重试会兜一次
-            body["max_tokens"] = min(int(body.get("max_tokens") or _LOW_MAX_TOKENS), _LOW_MAX_TOKENS)
+            if _THINK_BUDGET_TOKENS > 0:
+                body["reasoning_budget_tokens"] = _THINK_BUDGET_TOKENS
         if self.parallel_disabled:
             body["parallel_tool_calls"] = False
         # MLX 引擎（mlx_lm.server）同样只在 include_usage 时才回传 usage（含 cached_tokens）；
@@ -1284,6 +1329,8 @@ class ThinAgentLoop:
             body["messages"] = _append_tail_note(body["messages"], _fdir)
             body["parallel_tool_calls"] = False
             body["chat_template_kwargs"] = {"enable_thinking": False}
+            if (self.thinking_level or "").lower() != "off":
+                self.note_thinking_off("收口轮")
         if _is_custom_engine():
             # 第三方 fork 引擎（如 Prism/Bonsai）：**最后**统一去掉我们的采样参数，
             # 让引擎按模型自带默认采样（GGUF 元数据 general.sampling.*）。我们默认的
@@ -2023,19 +2070,28 @@ class ThinAgentLoop:
                 _folded_n = _fold_old_tool_results(self.current_msgs)
                 if _folded_n:
                     self._step_log("工具输出回收", f"折叠 {_folded_n} 条旧工具结果")
+                    _anon_note("ctx_fold")
                 body = self._build_request(engine_model)
                 tools_n = len(body.get("tools") or [])
                 chars = sum(len(str(m.get("content") or "")) for m in body.get("messages", []))
                 self._step_log("请求构建",
                                f"model={body.get('model')} 消息={len(body.get('messages', []))} "
-                               f"字符={chars} tools={tools_n} "
-                               f"思考={'关' if (body.get('chat_template_kwargs') or {}).get('enable_thinking') is False else '开'}")
+                               f"字符={chars} tools={tools_n}")
                 # request waterfall：fastpath（快车道）等插件改写请求
                 body_keys_before = sorted(body.keys())
                 body = await self.scope.run_waterfall("request", body)
                 if sorted(body.keys()) != body_keys_before:
                     self._step_log("request 插件改写",
                                    f"键变化 {body_keys_before} → {sorted(body.keys())}")
+                # 思考状态在**所有覆盖之后**报告（2026-10-11 诚实化）：此前打在
+                # waterfall 之前，快车道把思考关掉也不会体现在这行日志里。
+                _think_on = (body.get("chat_template_kwargs") or {}).get("enable_thinking") is not False
+                if _think_on:
+                    _think_state = "开"
+                else:
+                    _reason = self._thinking_off_reason()
+                    _think_state = f"关（{_reason}）" if _reason else "关"
+                self._step_log("思考档位", _think_state)
                 t_sample = time.monotonic()
                 self._round_buf = []
                 self._round_buf_t0 = 0.0
@@ -2340,11 +2396,13 @@ class ThinAgentLoop:
                             logger.warning("[交付哨兵] 收口轮疑似碎片交付(%s, %d字): %r",
                                            _sent, len(body_text.strip()),
                                            body_text.strip()[:120])
+                            _anon_note("gate_fragment")
                         try:
                             _miss = task_verify.traceability_scan(self.session_id, body_text)
                             if _miss:
                                 logger.warning("[溯源哨兵] 收口轮 %d 个数字无出处: %s",
                                                len(_miss), _miss[:8])
+                                _anon_note("gate_trace")
                         except Exception:
                             logger.debug("溯源哨兵异常（收口轮）", exc_info=True)
                         self._step_log("终答轮", f"已交付 {len(body_text)} 字")
@@ -2382,6 +2440,7 @@ class ThinAgentLoop:
                     self._step_log("空转闸门",
                                    f"只有计划声明、无工具调用 → 要求直接行动"
                                    f"（{self._plan_nudge_used}/{_plan_cap}）")
+                    _anon_note("gate_idle_nudge")
                     yield {"event": "heartbeat"}
                     continue
                 if (not tool_calls and not self._finalize_round
@@ -2398,6 +2457,7 @@ class ThinAgentLoop:
                     self._step_log("空转闸门",
                                    f"催促 {self._plan_nudge_used} 次后仍是承诺 → "
                                    f"强制收口（{_what}）")
+                    _anon_note("gate_force_final")
                     continue
                 if (not tool_calls and not self._finalize_round
                         and self._last_round_tool_failed
@@ -2462,6 +2522,7 @@ class ThinAgentLoop:
                         _ft = (payload.get("text") or body_text).strip()
                         logger.warning("[交付哨兵] 疑似碎片交付(%s, %d字): %r",
                                        _sent, len(_ft), _ft[:120])
+                        _anon_note("gate_fragment")
                     # 溯源哨兵（2026-10-08）：正文关键数字查不到本轮工具出处 → 记
                     # 日志观察（不拦截；观察期收误伤样本后再决定接入两级生效）
                     try:
@@ -2470,6 +2531,7 @@ class ThinAgentLoop:
                         if _miss:
                             logger.warning("[溯源哨兵] %d 个数字无出处: %s",
                                            len(_miss), _miss[:8])
+                            _anon_note("gate_trace")
                     except Exception:
                         logger.debug("溯源哨兵异常", exc_info=True)
                     self._step_log("交付",

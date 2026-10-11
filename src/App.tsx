@@ -181,10 +181,13 @@ const [timeFilter, setTimeFilter] = useState("all");
   const localVoicesShown = localVoicesForLang(ttsLocalVoices, ttsLocalVoiceLangs, lang, ttsLocalVoice);
 
   // 权限模式五档（从保守到放手）：read_only / confirm / auto_edit / plan / full
-  // 思考强度三档（🧠 选择器）：off / high(默认) / max
-  const [thinkingLevel, setThinkingLevel] = useState<"off" | "low" | "high" | "max">(
-    () => (localStorage.getItem("latiao_thinking") as "off" | "low" | "high" | "max") || "high"
-  );
+  // 思考两档（2026-10-11 改制）：off（真不思考）/ max（开启，给足思考预算）。
+  // 旧版的 low/high/max 一律迁移为 max（开），只有 off 保持关——老用户不会
+  // 升级后开场变成"关思考"。
+  const [thinkingLevel, setThinkingLevel] = useState<"off" | "max">(() => {
+    const saved = localStorage.getItem("latiao_thinking");
+    return saved === "off" ? "off" : "max";
+  });
   useEffect(() => { localStorage.setItem("latiao_thinking", thinkingLevel); }, [thinkingLevel]);
 
   const [accessMode, setAccessMode] = useState<"read_only" | "confirm" | "auto_edit" | "plan" | "full">(() => {
@@ -303,6 +306,23 @@ const [timeFilter, setTimeFilter] = useState("all");
   const [autoLaunch, setAutoLaunch] = useState(() => localStorage.getItem("latiao_auto_launch") === "true");
   const [autoStartGateway, setAutoStartGateway] = useState(() => localStorage.getItem("latiao_auto_gateway") !== "false");
   const [anonymousData, setAnonymousData] = useState(() => localStorage.getItem("latiao_anonymous_data") !== "false");
+  // 匿名使用数据（2026-10-11 由假开关转真）：localStorage 仍是本地主存储，
+  // 但每次 sidecar 就绪/开关变化都把总闸推给后端（config.json
+  // privacy.anonymous_usage 才是收集侧真正读的开关）。没这一步开关就只改前端。
+  useEffect(() => {
+    if (sidecarStatus !== "online") return;
+    void (async () => {
+      try {
+        const { authFetch } = await import("./utils/api");
+        await authFetch("/v1/settings/anonymous-data", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ enabled: anonymousData }),
+          signal: AbortSignal.timeout(4000),
+        });
+      } catch { /* sidecar 未就绪/重启中：下次状态翻转时再同步 */ }
+    })();
+  }, [sidecarStatus, anonymousData]);
   const [autoCheckUpdate, setAutoCheckUpdate] = useState(() => localStorage.getItem("latiao_auto_check_update") !== "false");
   const [recentLearnings, setRecentLearnings] = useState<{topic: string; content: string; confidence: number}[]>([]);
   const [agentPhase, setAgentPhase] = useState<string>("");

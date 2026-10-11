@@ -406,7 +406,7 @@ _ANTHROPIC_HINTS = ("claude", "anthropic")
 
 
 def _inject_thinking_disabled(body: dict, model: str, level: str = "high") -> dict:
-    """思考强度三档（对应前端 🧠 选择器）：off / high(默认) / max。
+    """思考档位注入（2026-10-11 起为两档：off / 开(其余值)）。
 
     按模型族正确设置（此前 off 只写 Anthropic 字段 `thinking`，DeepSeek/OpenAI
     忽略该字段 → 用户设"关闭思考"无效）：
@@ -415,6 +415,11 @@ def _inject_thinking_disabled(body: dict, model: str, level: str = "high") -> di
     - deepseek-chat 等非推理: 无需字段（本来就不思考）
     - deepseek-reasoner:  API 层面强制思考、不提供开关 —— 不设无效字段，
       返回 body 并带 _thinking_unsupported 标记，前端据此提示
+
+    "开启"档：给能收敛 effort 的推理系发 reasoning_effort=high；**不再抬
+    max_tokens**——旧实现一律抬到 18432，对 max_tokens 上限不足 16k 的模型
+    （如 deepseek 系 8192）会直接 400。云端各家的输出上限交给调用方的
+    _resolve_max_tokens（按模型名区分）负责，这里只做"思考相关"字段。
     """
     m = (model or "").lower()
     body["_thinking_level"] = level
@@ -426,13 +431,11 @@ def _inject_thinking_disabled(body: dict, model: str, level: str = "high") -> di
         elif any(h in m for h in ("o1", "o3", "o4", "gpt-5")) or "reasoner" in m or "r1" in m:
             body["reasoning_effort"] = "none"
         # 其他非推理模型：不设字段（默认不思考）
-    elif level == "max":
-        # 长推理预算：高于常规推理预算（12288）约 1.5 倍
-        body.setdefault("max_tokens", 12288)
-        if isinstance(body.get("max_tokens"), int) and body["max_tokens"] < 18432:
-            body["max_tokens"] = 18432
-        # OpenAI 兼容推理模型支持 reasoning_effort（DeepSeek 不认则该字段忽略）
-        if "deepseek" not in m and "o1" not in m and "o3" not in m:
+    else:
+        # 开启档：给认 reasoning_effort 的模型要 high effort。DeepSeek 系不认该
+        # 字段（忽略即可：其 reasoner 本来就在思考、chat 系本来就不思考）；
+        # o 系 / gpt-5 / 其他 OpenAI 兼容推理模型正是该字段的目标用户。
+        if "deepseek" not in m:
             body["reasoning_effort"] = "high"
     return body
 
