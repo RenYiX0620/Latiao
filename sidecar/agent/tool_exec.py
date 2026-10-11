@@ -373,6 +373,13 @@ async def _handle_tool_execution_inner(tc: dict, current_msgs: list, session_id:
 
     # ── Execute + Post-hooks ──
     events.append({"event": "tool_start", "call_id": call_id, "tool": tool_name, "args": args, "ts": int(time.time() * 1000)})
+    # 匿名使用数据（2026-10-11）：工具名也不记——只记"发生了一次工具调用"。
+    # 失败与否在结果判定之后补记（tool_errors），见下方 _looks_like_tool_failure 处。
+    try:
+        import anon_usage
+        anon_usage.note("tool_calls")
+    except Exception:
+        logger.debug("anon_usage 工具记账失败", exc_info=True)
     # 参数预览也要脱敏：run_cmd 的 token、api key 常出现在参数里（09-23）
     logger.info("Tool executing: %s %s", tool_name,
                 redact_secrets(json.dumps(args, ensure_ascii=False))[:120])
@@ -418,6 +425,13 @@ async def _handle_tool_execution_inner(tc: dict, current_msgs: list, session_id:
     verify_failed = bool(verify_report and "❌" in verify_report)
     if not verify_failed and _looks_like_tool_failure(result):
         verify_failed = True
+    if verify_failed:
+        # 匿名使用数据：只记"工具失败"发生的次数（哪个工具、什么错都不记）
+        try:
+            import anon_usage
+            anon_usage.note("tool_errors")
+        except Exception:
+            logger.debug("anon_usage 失败计数跳过", exc_info=True)
 
     # 反思链路唯一入口：生成文案 + 诚实 was_useful + 真失败提升为 learning（⑧）
     reflection_note = record_tool_reflection(session_id, tool_name, args, result)

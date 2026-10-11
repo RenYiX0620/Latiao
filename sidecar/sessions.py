@@ -55,6 +55,14 @@ def save_session(session_id: str, name: str = "", selected_model: str = "",
         with _db_write_lock:
             row = conn.execute("SELECT created_at FROM sessions WHERE id = ?", (sid,)).fetchone()
             created = row[0] if row else _now()
+            if row is None:
+                # 匿名使用数据（2026-10-11）：只记"新会话"这个计数（会话 ID/名称
+                # 一律不记）。快照保存每次消息都跑，所以必须用"首次插入"做判据。
+                try:
+                    import anon_usage
+                    anon_usage.note("sessions_started")
+                except Exception:
+                    logger.debug("anon_usage 会话记账失败", exc_info=True)
             conn.execute(
                 """INSERT INTO sessions(id, name, selected_model, last_active, created_at,
                                         updated_at, message_count, preview)

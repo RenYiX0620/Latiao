@@ -68,6 +68,22 @@ import collections as _collections
 _recently_confirmed: "_collections.deque[str]" = _collections.deque(maxlen=200)
 
 
+def _reflection_eligible(mode: str, full_text: str, is_local: bool) -> bool:
+    """输出反思的触发判据（纯函数，单独可测）。
+
+    off → 永不；light → 仅云端模型 + 长输出（>800 字）；deep → 所有模型的长输出。
+    口径与设置页文案逐字一致（"轻度：云端模型长输出（>800字）自查 1 轮；
+    重度：所有长任务输出自查 2 轮"）——文案说会在什么情况下生效，就必须是这里。
+    """
+    if mode not in ("light", "deep"):
+        return False
+    if len((full_text or "").strip()) <= 800:
+        return False
+    if mode == "light" and is_local:
+        return False
+    return True
+
+
 def _record_turn_metrics(session_id: str, model: str, is_local: bool, reason: str) -> None:
     """每轮指标落库的唯一入口（SSE 层与非流式分支共用，失败只记日志）。"""
     try:
@@ -76,6 +92,14 @@ def _record_turn_metrics(session_id: str, model: str, is_local: bool, reason: st
                                  ended_reason=reason)
     except Exception:
         logger.debug("turn_metrics 落库失败", exc_info=True)
+    # 匿名使用数据（2026-10-11）：只记结束原因（completed/error/aborted）计数，
+    # 不记模型名、不记内容。开关关或模块故障 → 静默跳过。
+    try:
+        import anon_usage
+        anon_usage.note("turns_error" if reason == "error" else
+                        "turns_aborted" if reason == "aborted" else "turns")
+    except Exception:
+        logger.debug("anon_usage 记账失败", exc_info=True)
 
 
 async def _logged_agent_turn(session_id: str, messages: list, inner,
@@ -280,13 +304,48 @@ async def chat_completion(request: Request):
                     # 首启引导兜底：本地小模型服从性不稳，实测会把该问的问题换成寒暄
                     # （22:40 9B 把"语气"那一问丢了）——模型没问出来就由后端在流末尾补上。
                     _turn_text: list[str] = []
+                    _turn_tool_results: list[str] = []
                     async for event in _run_agent(protocol, api_url, headers, is_local, model):
                         if isinstance(event, dict) and event.get("content"):
                             _turn_text.append(str(event["content"]))
+                        # 工具结果收集：输出反思的"数字溯源核查"要拿它做比对基准
+                        # （报告里的数字在会话工具结果里找不到出处 → 反思时逐项核实）
+                        if (isinstance(event, dict) and event.get("event") == "tool_end"
+                                and event.get("result")):
+                            _turn_tool_results.append(str(event["result"]))
                         yield f"data: {json.dumps(event)}\n\n"
                     _onb_suffix = _onboarding_suffix("".join(_turn_text))
                     if _onb_suffix:
                         yield f"data: {json.dumps({'content': _onb_suffix}, ensure_ascii=False)}\n\n"
+                    # ── 输出反思（2026-10-11 接回）──
+                    # 这块能力在 2026-08 薄循环转正（1aa3f61）时被拆掉：前端一直
+                    # 监听 reflection_revised 事件（收得到就整体替换最后一条回答并
+                    # 加"已自查修正"角标），但后端 _reflect_output 从此零调用，
+                    # 设置页的 off/light/deep 档位成了假开关。这里按设置页文案的口径接回：
+                    #   light：仅云端模型 + 长输出（>800 字）→ 自查 1 轮
+                    #   deep ：所有模型的长输出 → 自查 2 轮（本地会明显变慢，UI 已警示）
+                    # 修正只在"确实改动了"时下发；失败保持原文（_reflect_output 内已兜底）。
+                    _full_text = "".join(_turn_text)
+                    if _reflection_eligible(_reflection_mode, _full_text, is_local):
+                        try:
+                            from agent.reflection import _reflect_output
+                            async with httpx.AsyncClient() as _rc:
+                                _revised, _changed = await _reflect_output(
+                                    _full_text, model, api_url, headers,
+                                    _reflection_mode, _rc,
+                                    tool_outputs=_turn_tool_results)
+                            if _changed and _revised.strip():
+                                logger.info(
+                                    "输出反思（%s）：%d → %d 字，已替换交付正文",
+                                    _reflection_mode, len(_full_text), len(_revised))
+                                try:
+                                    import anon_usage as _anon
+                                    _anon.note("gate_reflection")
+                                except Exception:
+                                    pass
+                                yield f"data: {json.dumps({'event': 'reflection_revised', 'content': _revised}, ensure_ascii=False)}\n\n"
+                        except Exception:
+                            logger.warning("输出反思失败（保持原文交付）", exc_info=True)
                     yield "data: [DONE]\n\n"
                 except (GeneratorExit, asyncio.CancelledError):
                     # 客户端断流/取消：立刻置位会话取消，主循环与子代理在其下一步停

@@ -901,3 +901,32 @@ async def get_session_progress(session_id: str = Query(default="")):
     return {"status": "ok", "sessions": sessions}
 
 
+
+
+# ── 匿名使用数据（2026-10-11）：开关读写 + 本机状态 ──────────────────
+# 背景：设置页的开关此前只写 localStorage、全项目零消费方（假开关）。
+# 现在开关状态必须同步到后端（config.json privacy.anonymous_usage，总闸），
+# 并由这里把"本机攒了多少条 / 是否配了上报地址"如实回给设置页。
+
+@router.get("/v1/settings/anonymous-data")
+async def get_anonymous_data_status():
+    """本机匿名数据状态（设置页展示：收集条数、是否外发）。"""
+    try:
+        import anon_usage
+        return {"status": "ok", **anon_usage.status()}
+    except Exception as e:
+        logger.warning("匿名数据状态读取失败", exc_info=True)
+        return {"status": "error", "message": str(e)}
+
+
+@router.post("/v1/settings/anonymous-data")
+async def set_anonymous_data(request: Request):
+    """开关总闸：写 config.json privacy.anonymous_usage（前端 localStorage 并存）。"""
+    body = await _json_body(request)
+    enabled = bool(body.get("enabled"))
+    try:
+        import anon_usage
+        return anon_usage.set_enabled(enabled)
+    except Exception as e:
+        logger.warning("匿名数据开关写入失败", exc_info=True)
+        return {"status": "error", "message": str(e)}

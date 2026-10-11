@@ -461,6 +461,14 @@ async def lifespan(app: FastAPI):
                     await run_in_threadpool(_emb.maybe_stop_idle)
                 except Exception:
                     pass
+                # 匿名使用数据（2026-10-11）：每 24h 最多一次上报；没配
+                # endpoint 或开关关 → 空操作（数据只留本机）。放线程池，
+                # 网络慢/离线不阻塞事件循环。
+                try:
+                    import anon_usage as _anon
+                    await run_in_threadpool(_anon.send_if_due)
+                except Exception:
+                    logger.debug("匿名数据上报跳过", exc_info=True)
             except Exception:
                 logger.warning("工具历史清理任务失败", exc_info=True)
             await asyncio.sleep(24 * 3600)
