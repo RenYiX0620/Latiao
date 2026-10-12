@@ -134,16 +134,30 @@ async def test_thin_error_as_result_model_self_corrects():
 
 
 @pytest.mark.asyncio
-async def test_thin_light_query_fast_path():
+async def test_chat_query_no_longer_takes_a_fast_lane():
+    """闲聊快车道已移除（2026-10-12 用户拍板）：思考只留关/开两态。
+
+    旧契约（本用例前身 test_thin_light_query_fast_path）：短闲聊被插件剥掉
+    tools 并强制 enable_thinking=False。新契约：闲聊与任务一视同仁——第 1 轮
+    走思考轮（无工具表 + 名字清单，见 test_thinking_first.py），思考是否开启
+    只由用户的"思考档位"决定，没有任何旁路替用户关掉它。
+    """
     from agent.loop import ThinAgentLoop
+    from agent.plugins.builtin import BUILTIN_PLUGINS
+    # 移除护栏：谁把快车道加回来，这里先红
+    assert "fastpath" not in BUILTIN_PLUGINS, "闲聊快车道已按用户拍板移除"
+
     with FakeEngine() as engine:
         engine.push(engine.text_response("收到，一切正常！有什么需要帮忙的吗？"))
         events = await _collect(ThinAgentLoop(
             [{"role": "user", "content": "测试"}], "fake-model", engine.url, HEADERS,
             session_id=f"thin-t4-{time.time()}", access_mode="full").run())
         body = engine.requests[0]
-        assert "tools" not in body or not body.get("tools"), "快车道不携带 tools"
-        assert (body.get("chat_template_kwargs") or {}).get("enable_thinking") is False
+        assert not (body.get("tools") or []), "闲聊消息同样走思考轮（不下发工具表）"
+        assert "本轮先思考规划" in json.dumps(body, ensure_ascii=False), \
+            "思考轮注入工具名字清单"
+        assert (body.get("chat_template_kwargs") or {}).get("enable_thinking") is not False, \
+            "不得再有'闲聊强制关思考'的旁路——思考只由档位决定"
         texts = [e.get("content", "") for e in events if "content" in e]
         assert any("收到" in t for t in texts), events
 

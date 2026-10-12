@@ -1,7 +1,13 @@
-"""内置插件：薄循环的既有能力表达为 scope 注册（fastpath/assists/planning/compaction）。
+"""内置插件：薄循环的既有能力表达为 scope 注册（assists/planning/compaction）。
 
 每个插件 = setup(scope) -> None，向容器注册 waterfall 钩子。
 启用条件在钩子内部自检（引擎能力/档位），保持 Scope 通用。
+
+闲聊快车道（原 fastpath 插件：短闲聊剥工具 + 强制关思考）**2026-10-12 按用户
+拍板移除**——思考档位只留"关/开"两态，开的时候所有消息一视同仁走思考轮
+（详见 agent/loop.py `_thinking_first_round`）。历史事实：它自 2026-09-19 起
+在真机就从未生效过（`last_user_text` 含框架追加的语气/语言尾巴，"短输入 ≤24 字"
+判据永不成立；sidecar.log 2026-09-23→10-12 共 15920 行里"快车道"出现 0 次）。
 """
 import logging
 import uuid
@@ -9,33 +15,12 @@ import uuid
 import httpx
 
 from agent.context import (
-    _is_light_query,
     _normalize_access,
     _slim_history_for_local,
 )
 from agent.gates import _final_answer_extraction, _force_translate, _reply_lang_mismatch
 
 logger = logging.getLogger("latiao-sidecar")
-
-
-# ══ fastpath：闲聊快车道（request 钩子）══════════════════════════════
-def setup_fastpath(scope):
-    """本地引擎 + 闲聊短消息：不挂工具、关思考——秒级直达（27B 实测 1.3s）。"""
-    async def request_hook(body, ctx):
-        loop = ctx.get_service("loop") if ctx is not None else None
-        if loop is None or not getattr(loop, "is_local", False):
-            return body
-        if not _is_light_query(loop.last_user_text, loop.current_msgs):
-            return body
-        body.pop("tools", None)
-        body["chat_template_kwargs"] = {"enable_thinking": False}
-        # 日志诚实化（2026-10-11）：快车道会顶掉用户的"开启"档——登记来源，
-        # 请求构建日志会打出"思考=关（快车道）"，不再是无痕覆盖。
-        if hasattr(loop, "note_thinking_off"):
-            loop.note_thinking_off("快车道")
-        return body
-
-    scope.waterfall("request").register(request_hook, order=10, name="fastpath")
 
 
 # ══ assists：弱模型辅助（deliver 钩子，仅本地引擎）══════════════════
@@ -345,8 +330,9 @@ def setup_compaction(scope, *, local_threshold=18000, cloud_threshold=80000):
     scope.waterfall("pre_step").register(pre_step_hook, order=20, name="compaction")
 
 
+# 快车道（fastpath）已于 2026-10-12 移除（用户拍板）：思考只留关/开两态，
+# 开的时候没有"闲聊例外"。git 历史里的 setup_fastpath 可作参考，不要盲加回来。
 BUILTIN_PLUGINS = {
-    "fastpath": setup_fastpath,
     "assists": setup_assists,
     "planning": setup_planning,
     "compaction": setup_compaction,

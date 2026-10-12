@@ -5,7 +5,7 @@
   工具即结束。无 nudge 链、无停滞计数、无 200 字闸门。
 - 错误即结果：工具失败的结构化错误文本回填上下文，由模型自纠。
 - 一切机制皆插件：本循环只消费 scope 的 waterfall（pre_step/request/
-  deliver）与工具目录；快车道/弱模型辅助/规划门/压缩全部是插件
+  deliver）与工具目录；弱模型辅助/规划门/压缩全部是插件（闲聊快车道已于 2026-10-12 移除）
   （agent/plugins/builtin.py）。
 - steer：新消息入队，step 边界/交付后认领（不再取消）。
 - 门控（2026-09-23 校正）：曾有过 `LATIAO_AGENT_LOOP_V3=1` 门控与 v1 旧循环，
@@ -1062,8 +1062,8 @@ class ThinAgentLoop:
         self._plan_injected = False
         self._len_retry_used = False           # max-tokens 截断重试（每轮一次）
         self._force_thinking_off_next = False  # 截断重试轮强制关思考
-        # 思考被强制关闭的原因链（2026-10-11 日志诚实化）：插件（快车道）与截断
-        # 重试都会覆盖用户的档位选择，此前日志只打"思考=关"看不出是谁关的。
+        # 思考被强制关闭的原因链（2026-10-11 日志诚实化）：截断重试/收口轮/云端禁用
+        # 都会覆盖用户的档位选择，此前日志只打"思考=关"看不出是谁关的。
         self.thinking_off_reasons: list[str] = []
         self._recent_sigs: list[str] = []      # 重复同参调用检测（结构信号）
         self._repeat_reminders = 0             # 提醒注入计数（≤3 次/turn）
@@ -1298,7 +1298,7 @@ class ThinAgentLoop:
     def note_thinking_off(self, reason: str) -> None:
         """登记"本轮思考被谁强制关掉"（供插件与重试路径调用）。
 
-        日志诚实化（2026-10-11）：快车道/截断重试/收口轮都会顶掉用户的档位选择，
+        日志诚实化（2026-10-11）：截断重试/收口轮都会顶掉用户的档位选择，
         此前只打"思考=关"，用户与排查都看不出是档位没生效还是被覆盖。
         """
         try:
@@ -2225,14 +2225,14 @@ class ThinAgentLoop:
                 self._step_log("请求构建",
                                f"model={body.get('model')} 消息={len(body.get('messages', []))} "
                                f"字符={chars} tools={tools_n}")
-                # request waterfall：fastpath（快车道）等插件改写请求
+                # request waterfall：插件改写请求（内置钩子现只剩空集，扩展可挂）
                 body_keys_before = sorted(body.keys())
                 body = await self.scope.run_waterfall("request", body)
                 if sorted(body.keys()) != body_keys_before:
                     self._step_log("request 插件改写",
                                    f"键变化 {body_keys_before} → {sorted(body.keys())}")
                 # 思考状态在**所有覆盖之后**报告（2026-10-11 诚实化）：此前打在
-                # waterfall 之前，快车道把思考关掉也不会体现在这行日志里。
+                # waterfall 之前，插件把思考关掉也不会体现在这行日志里。
                 _think_on = (body.get("chat_template_kwargs") or {}).get("enable_thinking") is not False
                 if _think_on:
                     _think_state = "开"
