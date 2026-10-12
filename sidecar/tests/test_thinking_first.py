@@ -18,6 +18,33 @@ os.environ.setdefault("LATIAO_AUTH_TOKEN", "thinkfirst-token")
 _URL = "http://127.0.0.1:9/v1/chat/completions"   # 不可达即可：这些断言只看请求体
 
 
+@pytest.fixture(autouse=True)
+def _native_tools_on():
+    """本文件断言的是**原生工具形态**（请求体里带 tools 数组）。
+
+    CI 是 Linux 且只装轻量依赖集，`_local_native_tools_ok()` 因没有本地引擎返回
+    False → 走围栏路径（工具说明进尾部、请求里**没有** tools 键）→ 断言全线失败
+    （2026-10-12 v0.3.79 的 CI 红，本机因为有真引擎在跑而"侥幸"绿）。与
+    test_thin_loop 同款：显式覆盖成原生，让断言与"本机有没有引擎"解耦。
+    """
+    import agent.context as agent_context
+    old = agent_context._LOCAL_NATIVE_TOOLS_OVERRIDE
+    agent_context._LOCAL_NATIVE_TOOLS_OVERRIDE = True
+    yield
+    agent_context._LOCAL_NATIVE_TOOLS_OVERRIDE = old
+
+
+def _exec_tool_names() -> set:
+    """执行阶段应有的工具**名字集合**（不写死数量）。
+
+    数量随环境变：CI 的轻量依赖集会让某个工具注册不进来（实测本机 32、CI 31），
+    平台差异不该让断言红——比较集合，而不是比较个数。
+    """
+    body = _loop("off")._build_request("m")
+    assert isinstance(body.get("tools"), list), "off 档必须走原生路径（带 tools 数组）"
+    return {t["function"]["name"] for t in body["tools"]}
+
+
 def _loop(level="max", text="帮我查一下贵州茅台今天的股价。"):
     from agent.loop import ThinAgentLoop
     loop = ThinAgentLoop([{"role": "user", "content": text}], "m", _URL, {}, "s-tf1",
@@ -44,7 +71,8 @@ def test_execution_phase_restores_full_tool_table():
     loop = _loop("max")
     loop.steps = 2
     body = loop._build_request("m")
-    assert len(body.get("tools") or []) == 32
+    assert isinstance(body.get("tools"), list)
+    assert {t["function"]["name"] for t in body["tools"]} == _exec_tool_names()
     assert "本轮先思考规划" not in _sysmsg(body)
 
 
@@ -56,7 +84,8 @@ def test_round2_gets_tools_without_any_tool_success():
     assert loop._thinking_first_round() is True
     loop.steps = 2
     assert loop._thinking_first_round() is False
-    assert len(loop._build_request("m").get("tools") or []) == 32
+    _names = {t["function"]["name"] for t in loop._build_request("m").get("tools") or []}
+    assert _names == _exec_tool_names()
 
 
 def test_plan_gate_not_blind_in_thinking_round():
@@ -69,6 +98,42 @@ def test_plan_gate_not_blind_in_thinking_round():
     plan = "好的，我这就用 mx_query 帮你查一下贵州茅台的实时股价～"
     assert _looks_like_plan_only(plan, loop._plan_gate_has_tools()) is True
     assert _looks_like_plan_only(plan, False) is False   # 旧口径的失明现场
+
+
+def test_platform_independence_controls(monkeypatch):
+    """正控：忠实模拟 CI 的两个平台条件，断言仍然成立。
+
+    CI 是 Linux + 轻量依赖集：① 没有本地引擎 → 能力探测为假（走围栏路径、请求里
+    没有 tools 键）；② 某个工具注册不进来（本机 32 个、CI 31 个）。2026-10-12
+    v0.3.79 的 CI 就是被这两点弄红的。注意模拟方式：**不能**直接替换
+    `_local_native_tools_ok`（那会连覆盖层一起绕过，覆盖层正是要验证的机制）——
+    而是把 `local_llm._engine` 换成无后端桩，让真实探测函数自己返回假。
+    """
+    import agent.context as agent_context
+    import agent.loop as _L
+    import agent_loop as _A
+    import local_llm
+
+    class _NoEngine:          # 模拟 CI：没有本地引擎
+        _active_backend = ""
+        backend = ""
+
+    monkeypatch.setattr(local_llm, "_engine", _NoEngine(), raising=False)
+    # ① 模拟条件本身生效：覆盖层关掉时，探测为假（这正是 CI 的处境）
+    monkeypatch.setattr(agent_context, "_LOCAL_NATIVE_TOOLS_OVERRIDE", None)
+    assert _L._local_native_tools_ok() is False, "模拟条件没生效（探测仍为真）"
+    # ② 覆盖层在场（autouse fixture 的语义）→ 断言不受引擎影响
+    monkeypatch.setattr(agent_context, "_LOCAL_NATIVE_TOOLS_OVERRIDE", True)
+    body = _loop("off")._build_request("m")
+    assert isinstance(body.get("tools"), list) and body["tools"], \
+        "能力探测为假时也必须走原生路径（覆盖层生效）"
+    # ③ 工具注册表少一个 → 按名字比集合，仍然一致
+    monkeypatch.setattr(_A, "TOOLS", [t for t in _A.TOOLS
+                                      if (t.get("function") or {}).get("name") != "screen_capture"])
+    body2 = _loop("off")._build_request("m")
+    assert isinstance(body2.get("tools"), list)
+    assert {t["function"]["name"] for t in body2["tools"]} == _exec_tool_names(), \
+        "工具集合少一个也要与基线一致（按名字比，不按个数）"
 
 
 def test_statement_plan_leak_flagged_with_positive_and_negative_controls():
@@ -93,7 +158,8 @@ def test_statement_plan_leak_flagged_with_positive_and_negative_controls():
 def test_off_level_never_gated():
     """关闭档：首轮就带全套工具（旧行为不变）。"""
     body = _loop("off")._build_request("m")
-    assert len(body.get("tools") or []) == 32
+    assert isinstance(body.get("tools"), list)
+    assert {t["function"]["name"] for t in body["tools"]} == _exec_tool_names()
     assert "本轮先思考规划" not in _sysmsg(body)
 
 
@@ -101,7 +167,8 @@ def test_env_switch_disables_the_gate(monkeypatch):
     """LATIAO_THINKING_FIRST=0：整体回退旧行为（回退阀）。"""
     monkeypatch.setenv("LATIAO_THINKING_FIRST", "0")
     body = _loop("max")._build_request("m")
-    assert len(body.get("tools") or []) == 32
+    assert isinstance(body.get("tools"), list)
+    assert {t["function"]["name"] for t in body["tools"]} == _exec_tool_names()
     monkeypatch.delenv("LATIAO_THINKING_FIRST")
 
 
@@ -141,7 +208,9 @@ async def test_two_phase_plan_then_execute_end_to_end():
             agent_context._LOCAL_NATIVE_TOOLS_OVERRIDE = None
 
         assert not (engine.requests[0].get("tools") or []), "思考轮不下发工具表"
-        assert len(engine.requests[1].get("tools") or []) == 32, "执行轮恢复工具表"
+        _r1 = engine.requests[1].get("tools") or []
+        assert isinstance(_r1, list) and _r1, "执行轮恢复工具表"
+        assert {t["function"]["name"] for t in _r1} == _exec_tool_names()
         assert any(e.get("event") == "tool_start" and e.get("tool") == "list_dir"
                    for e in events), events
         assert any(e.get("event") == "content_revised" and not e.get("content")
