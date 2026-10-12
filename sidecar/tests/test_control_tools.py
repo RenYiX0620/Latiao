@@ -113,14 +113,22 @@ class TestMouseCommon(unittest.TestCase):
 
 class TestFlowTools(unittest.TestCase):
     def test_wait_clamps(self):
+        """钳制到 [0,120]。断言用 call_args_list 过滤（2026-10-12 修复 flake）。
+
+        原断言读 `m.call_args`（**最后一次**调用）却假设全进程只有自己在调
+        asyncio.sleep——其它测试残留的后台任务偶尔把自己的 sleep 撞进 mock
+        窗口，就变成 0.1 != 0.0 的随机红（CI 与全量各复现过一次）。
+        正确口径：这次调用**必须在**收到的调用列表里，别人的调用不参与判定。
+        """
         import asyncio
         spec = importlib_util("plugins/control_wait.py")
         with mock.patch("asyncio.sleep") as m:
             r = asyncio.run(spec.execute({"seconds": 999}))
             self.assertIn("已等待 120.0", r)
+            self.assertIn(mock.call(120), m.call_args_list)
         with mock.patch("asyncio.sleep") as m:
             asyncio.run(spec.execute({"seconds": -5}))
-            self.assertEqual(m.call_args[0][0], 0.0)
+            self.assertIn(mock.call(0), m.call_args_list)
 
     def test_wait_invalid(self):
         import asyncio
