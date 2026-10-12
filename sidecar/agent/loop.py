@@ -32,15 +32,16 @@ from agent.context import (
     _extract_last_user_text,
     _filter_tools_by_access,
     _inject_thinking_disabled,
-    _is_chat_query,
     _is_custom_engine,
     _is_light_query,
+    _knowledge_injection_ok,
     _local_native_tools_ok,
     _maybe_add_inline_file_note,
     _merge_system_messages,
     _normalize_access,
     _resolve_max_tokens,
     _sanitize_tool_messages,
+    _strip_tail_wrapper,
     _strip_transient_reminders,
     detect_language_decision,
 )
@@ -1030,12 +1031,14 @@ class ThinAgentLoop:
         # is_local 由路由层显式传入（v1 同口径）；未传时按 URL 推导兜底
         self.is_local = _is_local_llm_url(api_url) if is_local is None else bool(is_local)
         self.current_msgs: list = _strip_transient_reminders([dict(m) for m in messages])
-        self.last_user_text = _extract_last_user_text(self.current_msgs)
+        # 用户原话 = 剥掉框架追加的尾巴块（语气/语言/时间；见 _strip_tail_wrapper）。
+        # 请求里那份**不剥**——模型需要读那些指令，剥的只是"按原话判定"的输入。
+        self.last_user_text = _strip_tail_wrapper(_extract_last_user_text(self.current_msgs))
         _maybe_add_inline_file_note(self.current_msgs, self.last_user_text)
         # 语言真值：本回合只算一次（含历史交叉校验），下方所有消费点统一取用。
         # 旧实现各处各自调用、按字母数判定，"你的SOUL.md是什么"被判成英文用户，
         # 导致提示词/语言锚/翻译方向全按英文走（09-19 根因）。
-        _hist = [m.get("content") for m in self.current_msgs
+        _hist = [_strip_tail_wrapper(m.get("content")) for m in self.current_msgs
                  if m.get("role") == "user" and isinstance(m.get("content"), str)]
         if _hist and _hist[-1] == self.last_user_text:
             _hist = _hist[:-1]
@@ -2080,8 +2083,9 @@ class ThinAgentLoop:
             # 注入的"相关学习"会成为唯一可答的素材 → 答非所问（实测：只发一个字，
             # 它讲起了"电脑速度看 CPU 和内存"）。检索本来就是按消息做的，短消息的
             # 语义匹配也基本是噪声。
-            _lq = (self.last_user_text or "").strip()
-            _notes_ok = len(_lq) >= 6 and not _is_chat_query(_lq)
+            # 护栏判定读**用户原话**（last_user_text 已在 __init__ 剥掉框架尾巴；
+            # 09-20 加的这道护栏此前因尾巴污染从未生效——见 _knowledge_injection_ok）
+            _notes_ok = _knowledge_injection_ok(self.last_user_text)
             if self.last_user_text and _notes_ok:
                 # ② 查询窗口：指代类问题（"上次那个风电项目"）要把上一轮用户消息
                 # 一起编码；④ 带上会话 id 供注入日志/标签回流

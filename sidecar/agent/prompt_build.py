@@ -16,6 +16,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from agent.context import (
+    _TAIL_MARK,
     _extract_last_user_text,
     _get_localized_text,
     _inject_image,
@@ -716,6 +717,9 @@ def _build_chat_messages(body: dict, messages: list) -> list:
             })
         _tail_text += _lang_note or ""
         if _tail_text:
+            # 前置稳定标记：判定侧靠它剥离（_strip_tail_wrapper）——模型照样读到
+            # 下面这些指令，但"用户原话"的判定不能再被它们污染（2026-10-12）。
+            _tail_text = _TAIL_MARK + _tail_text
             non_system_msgs = list(non_system_msgs)
             non_system_msgs[-1] = {
                 **non_system_msgs[-1],

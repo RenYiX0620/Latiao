@@ -20,6 +20,29 @@ def _extract_last_user_text(messages: list) -> str:
     return ""
 
 
+# ── 尾部附加块：分隔标记与剥离（2026-10-12）────────────────────────────
+# prompt_build 会把"当前时间 / 行情时间锚 / 语气 / 语言"这些**系统附加**的
+# 内容追加到最后一条用户消息尾部（为了保住前缀缓存，见那儿的注释）。问题：
+# 循环里所有"按用户原话判定"的规则都读这条消息的原文，于是全被这截尾巴污染——
+#   · 闲聊快车道（≤24 字的短输入）从 2026-09-23 起一次都没生效过；
+#   · "短消息/寒暄不做知识注入"护栏同样失效（'哈喽' 变成 137 字，被注入 3 条
+#     随机学习；库里还因此混进了 1 条"框架自己的语气尾巴"被学成知识）。
+# 修法：加一个稳定标记，判定侧统一剥掉标记之后的内容。模型**仍然能看到**这些
+# 指令（它们在请求里原样保留）——两者是不同的问题：模型要读它，判定不该读它。
+_TAIL_MARK = "\n\n【系统附加信息，非用户原话】"
+
+
+def _strip_tail_wrapper(text: str) -> str:
+    """剥掉尾部附加块，返回用户原话（无标记时原样返回）。
+
+    只认 `_TAIL_MARK` 这一个标记——它与 prompt_build 的追加处共用同一个常量，
+    不存在"提示词改了标记、剥离器还在找旧标记"的漂移。
+    """
+    if not isinstance(text, str) or not text:
+        return text or ""
+    return text.split(_TAIL_MARK, 1)[0].rstrip()
+
+
 # ═══════════════════════════════════════════════════════
 #  Dynamic Tool Filtering: intent-based tool selection
 # ═══════════════════════════════════════════════════════
@@ -697,6 +720,22 @@ def _is_chat_query(text: str) -> bool:
     if not t:
         return True
     return any(m in t for m in _CHAT_MARKERS)
+
+
+def _knowledge_injection_ok(user_text: str) -> bool:
+    """知识注入的短消息护栏（2026-09-20 事故）：短消息/寒暄不做注入。
+
+    事故形态：用户只发一个字（"嗯"）+ 弱模型时，注入的"相关学习"成了唯一可答的
+    素材——它讲起了"电脑速度看 CPU 和内存"（答非所问）。检索本就按消息做，短消息
+    的语义匹配基本是噪声。
+
+    ⚠️ 传参必须是**用户原话**（`_strip_tail_wrapper` 之后）——2026-10-12 前这里直接
+    吃 `ThinAgentLoop.last_user_text`，而那是框架追加过语气/语言尾巴的文本（"哈喽"
+    →137 字），"≥6 字"恒成立 → 护栏自 09-20 起从未生效（库里因此混进 1 条"框架
+    自己的语气尾巴"被学成知识）。
+    """
+    t = (user_text or "").strip()
+    return len(t) >= 6 and not _is_chat_query(t)
 
 
 def _strip_transient_reminders(messages: list) -> list:
