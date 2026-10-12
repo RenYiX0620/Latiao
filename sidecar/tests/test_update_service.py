@@ -307,5 +307,63 @@ class TestCleanupOldPackages(TestUpdateService):
         assert orphan.name not in left
 
 
+class TestDownloadByteCap(TestUpdateService):
+    """写盘硬上限（2026-10-12 事故）：无界下载把磁盘写满。
+
+    实测事故：假响应体让 5 个下载任务各写出 20–52GB（合计 172GB）卡在系统
+    临时目录，Finder 显示为「系统数据 253GB」。本测试用**小上限**（打补丁）
+    复现两条闸门，不真写 GB 级数据。
+    """
+
+    def test_rejects_oversized_declared_length(self):
+        with mock.patch.object(us, "_MAX_PKG_BYTES", 1024):
+            class _Resp:
+                def read(self, n=-1): return b""
+                def getheader(self, k, d=None): return str(10 ** 9)   # 声明 1GB
+                def __enter__(self): return self
+                def __exit__(self, *a): return False
+            orig_sleep = us.time.sleep
+            us.time.sleep = lambda s: None          # 跳过 8 次重试退避（否则 ~108s）
+            try:
+                with mock.patch.object(us.urllib.request, "urlopen",
+                                       lambda *a, **k: _Resp()):
+                    us._state.clear()
+                    us._download_worker("https://x/pkg.tar.gz",
+                                        us.UPDATE_DIR / "pkg.tar.gz", "0.3.9")
+            finally:
+                us.time.sleep = orig_sleep
+            assert us._state.get("status") == "failed"
+            assert not (us.UPDATE_DIR / "pkg.tar.gz.part").exists(), "越界声明不得落盘"
+
+    def test_aborts_when_body_exceeds_cap(self):
+        """声明缺失（返回 0）、但实际数据流超过上限 → 中止且不留残片。"""
+        with mock.patch.object(us, "_MAX_PKG_BYTES", 100_000):
+            class _Resp:
+                def __init__(self): self.n = 0
+                def read(self, n=-1):
+                    self.n += 1
+                    if self.n > 1000:
+                        return b""
+                    return b"x" * 65536          # 每块 64KB，很快越过 100KB 上限
+                def getheader(self, k, d=None): return "0"
+                def __enter__(self): return self
+                def __exit__(self, *a): return False
+            orig_sleep = us.time.sleep
+            us.time.sleep = lambda s: None
+            try:
+                with mock.patch.object(us.urllib.request, "urlopen",
+                                       lambda *a, **k: _Resp()):
+                    us._state.clear()
+                    us._download_worker("https://x/pkg.tar.gz",
+                                        us.UPDATE_DIR / "pkg.tar.gz", "0.3.9")
+            finally:
+                us.time.sleep = orig_sleep
+            assert us._state.get("status") == "failed"
+            part = us.UPDATE_DIR / "pkg.tar.gz.part"
+            # 失败路径可能保留残片供续传，但**绝不能**接近或超过上限的离谱体积
+            if part.exists():
+                assert part.stat().st_size < 1_000_000
+
+
 if __name__ == "__main__":
     unittest.main()

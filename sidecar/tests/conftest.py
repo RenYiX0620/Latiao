@@ -53,6 +53,19 @@ def pytest_sessionstart(session):
     session.config._latiao_real_cfg_digest = _real_config_digest()
 
 
+def pytest_sessionfinish(session, exitstatus):
+    """会话结束清掉本会话的测试临时目录（2026-10-12 磁盘事故修复）。
+
+    为什么必须清：conftest 每次会话建一个 `latiao-test-progress-*` 目录，
+    其中 `update/` 会带上整包级别的下载残片（每个 ~310MB）。实测积到
+    **322 个目录、约 5.7GB** 一直留在系统临时目录里（Finder 里计入「系统
+    数据」）。此前从不回收——每次 pytest 都加一份。现在会话结束即删。
+    """
+    d = os.environ.get("LATIAO_TEST_PROGRESS_DIR", "")
+    if d and "latiao-test-progress-" in d and os.path.isdir(d):
+        shutil.rmtree(d, ignore_errors=True)
+
+
 import pytest  # noqa: E402
 
 # 真机更新状态（与 config 同级的"测试可污染的生产文件"）：2026-10-11 实测被

@@ -76,6 +76,11 @@ GITHUB_LATEST = "https://github.com/RenYiX0620/Latiao/releases/latest/download/l
 # 每个下载/清单请求按 [_直接, 镜像1, 镜像2] 轮换，重试时自动切换。
 _GH_MIRRORS = ["", "https://gh-proxy.com/", "https://ghfast.top/"]
 
+# 更新包写盘硬上限（2026-10-12 事故修复）：当前包 ~330MB，取 12 倍余量。
+# 防御场景：服务端声明/实际返回异常大的体积，把磁盘一路写满（实测 5 个
+# 失控下载各写出 20–52GB，合计 172GB 卡在系统临时目录 = "系统数据 253GB"）。
+_MAX_PKG_BYTES = 4 * 1024 ** 3
+
 
 def _mirror_urls(url: str) -> list:
     """直连优先 + 镜像轮换的候选 URL 列表。"""
@@ -271,7 +276,16 @@ def fetch_remote_manifest() -> dict | None:
 
 
 def _download_worker(url: str, dest: Path, version: str) -> None:
-    """断点续传下载（单线程 Range 续传 + 重试 8 次 + 状态落盘）。"""
+    """断点续传下载（单线程 Range 续传 + 重试 8 次 + 状态落盘）。
+
+    **写盘上限（2026-10-12 事故修复）**：此前对写入没有任何上界——服务端给出
+    异常大的 content-length（或读循环不按预期结束）时会一路写到把磁盘填满。
+    实测事故：一个测试用的假响应体让 5 个下载任务各写出 20–52GB、合计 172GB
+    卡在系统临时目录（Finder 里显示为「系统数据 253GB」）。现在两道闸：
+      ① 声明长度 + 已有偏移超过硬上限 → 立即拒绝（一个字节都不落盘）；
+      ② 读取循环逐块累计，超过硬上限 → 抛错中止并删 .part。
+    上限按"更新包最大合理体积"设（当前包 ~330MB，取 4GB＝12 倍余量）。
+    """
     part = dest.with_suffix(dest.suffix + ".part")
     max_retries = 8
     for attempt in range(max_retries):
@@ -285,7 +299,12 @@ def _download_worker(url: str, dest: Path, version: str) -> None:
                 _state.update({"status": "downloading", "part_path": str(part)})
                 _save_state()
             with urllib.request.urlopen(req, timeout=60, context=_ssl_context()) as resp:
-                total = int(resp.getheader("Content-Length", 0)) + offset
+                _clen = int(resp.getheader("Content-Length", 0) or 0)
+                if _clen + offset > _MAX_PKG_BYTES:
+                    raise RuntimeError(
+                        f"服务端声明的包体积异常（{(_clen + offset) / 1024**3:.1f}GB "
+                        f"> 上限 {_MAX_PKG_BYTES / 1024**3:.0f}GB），拒绝下载")
+                total = _clen + offset
                 with _state_lock:
                     _state["total"] = total
                 mode = "ab" if offset > 0 else "wb"
@@ -300,6 +319,9 @@ def _download_worker(url: str, dest: Path, version: str) -> None:
                             break
                         f.write(chunk)
                         _pos = f.tell()
+                        if _pos > _MAX_PKG_BYTES:
+                            raise RuntimeError(
+                                f"下载体积超过上限（>{_MAX_PKG_BYTES / 1024**3:.0f}GB），中止")
                         # 速度哨兵：起步 20 秒后平均速度 <200KB/s → 主动放弃本次
                         # 尝试（直连慢而不死，socket 超时按字节间隔算永不触发，
                         # 镜像轮换形同虚设——09-07 实测 25KB/s 要拖 2.3 小时）
