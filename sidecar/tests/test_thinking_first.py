@@ -191,6 +191,7 @@ async def test_two_phase_plan_then_execute_end_to_end():
         engine.push(engine.native_tool_response("list_dir", {"path": "."}))
         engine.push(engine.text_response(answer))
         old = local_llm._engine
+        _old_override = agent_context._LOCAL_NATIVE_TOOLS_OVERRIDE
         local_llm._engine = _StubEngine()
         agent_context._LOCAL_NATIVE_TOOLS_OVERRIDE = True
         try:
@@ -205,7 +206,10 @@ async def test_two_phase_plan_then_execute_end_to_end():
                 events.append(ev)
         finally:
             local_llm._engine = old
-            agent_context._LOCAL_NATIVE_TOOLS_OVERRIDE = None
+            # 恢复成**原值**而不是 None：本文件有 autouse 覆盖层（_native_tools_on），
+            # 清成 None 会让同一条用例**之后**的断言（_exec_tool_names 基线）在
+            # 无引擎环境（CI）退回围栏路径 → 2026-10-12 CI 第二次红的原因。
+            agent_context._LOCAL_NATIVE_TOOLS_OVERRIDE = _old_override
 
         assert not (engine.requests[0].get("tools") or []), "思考轮不下发工具表"
         _r1 = engine.requests[1].get("tools") or []
