@@ -88,7 +88,14 @@ async def test_thin_native_tool_round_trip():
         finally:
             local_llm._engine = old
             agent_context._LOCAL_NATIVE_TOOLS_OVERRIDE = None
-        assert isinstance(engine.requests[0].get("tools"), list), "首轮应携带原生 tools"
+        # 2026-10-12「先想后干」：第 1 轮是思考轮——不下发工具表、系统提示换成
+        # 工具名字清单；工具表从第 2 轮（执行阶段）恢复。这里的模型在第 1 轮就发
+        # 原生调用也照常执行（只撤广告、不撤能力），所以轮数与原契约一致。
+        _r0 = engine.requests[0]
+        assert not (_r0.get("tools") or []), "思考轮不下发工具表"
+        assert "本轮先思考规划" in json.dumps(_r0, ensure_ascii=False), "思考轮注入工具名字清单"
+        assert isinstance(engine.requests[1].get("tools"), list) and engine.requests[1]["tools"], \
+            "第 2 轮（执行阶段）应携带完整工具表"
         assert any(e.get("event") == "tool_start" for e in events), events
         assert any("根据刚才的目录输出" in str(e.get("content", "")) for e in events), events
 
@@ -148,6 +155,10 @@ async def test_thin_native_400_fallback():
     from agent.loop import ThinAgentLoop
     from tests.test_loop_scenarios import _StubEngine
     with FakeEngine() as engine:
+        # 两段式（2026-10-12）：第 1 轮是思考轮（不下发工具表），模型本轮就发原生
+        # 调用会照常执行（只撤广告不撤能力）→ 第 2 轮带表执行，400 落在**带表**的
+        # 那一轮上——这才是"引擎不支持 tools"的真实形态。
+        engine.push(engine.native_tool_response("list_dir", {"path": "."}))
         engine.push(engine.http_error(400, "model does not support tool calling"))
         engine.push(engine.local_tool_response("list_dir", {"path": "."}))
         engine.push(engine.text_response(NEUTRAL_TEXT))
@@ -161,9 +172,10 @@ async def test_thin_native_400_fallback():
         finally:
             local_llm._engine = old
             agent_context._LOCAL_NATIVE_TOOLS_OVERRIDE = None
-        assert "tools" in engine.requests[0], "首次请求带原生 tools"
-        assert "tools" not in engine.requests[1], "回退后不再携带 tools"
-        assert "```tool" in json.dumps(engine.requests[1], ensure_ascii=False), \
+        assert not (engine.requests[0].get("tools") or []), "思考轮不下发工具表"
+        assert "tools" in engine.requests[1], "执行轮带原生 tools"
+        assert "tools" not in engine.requests[2], "回退后不再携带 tools"
+        assert "```tool" in json.dumps(engine.requests[2], ensure_ascii=False), \
             "回退后应注入围栏提示词"
         assert any(e.get("event") == "tool_start" for e in events), events
 

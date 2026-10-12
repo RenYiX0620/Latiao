@@ -135,6 +135,47 @@ _ROUND_CONTENT_MAX = int(os.environ.get("LATIAO_ROUND_CONTENT_MAX", "1200") or 1
 # 4000 的实测表现：思考充分且正文正常产出（1200 档已验证同理，4000 留 2.5 倍
 # 余量）。截断重试（_needs_length_retry → _force_thinking_off_next）仍是兜底。
 _THINK_BUDGET_TOKENS = int(os.environ.get("LATIAO_THINK_BUDGET_TOKENS", "4000") or 4000)
+
+def _local_thinking_first_enabled() -> bool:
+    """先想后干开关（config agent.local_thinking_first；默认开）。
+
+    2026-10-12 两段式改动的回退阀：出问题改 config 一处即可回到旧行为，
+    不需要回退版本。环境变量 LATIAO_THINKING_FIRST=0 亦可（测试用）。
+    """
+    env = os.environ.get("LATIAO_THINKING_FIRST")
+    if env is not None:
+        return env.strip() not in ("0", "false", "False", "no")
+    try:
+        import json as _json
+
+        from agent_loop import CONFIG_FILE as _cf
+        cfg = _json.loads(_cf.read_text(encoding="utf-8"))
+        sec = cfg.get("agent") if isinstance(cfg, dict) else None
+        if isinstance(sec, dict) and sec.get("local_thinking_first") is not None:
+            return bool(sec.get("local_thinking_first"))
+    except Exception:
+        pass
+    return True
+
+
+def _tool_name_hint_line() -> str:
+    """思考轮注入的工具**名字清单**（一行，不是 JSON 表）。
+
+    为什么必须是"名字"而不是完整表：AB 实测（2026-10-12）同一模型同一问题——
+    完整 JSON 工具表 → 思考 129 字（切调度模式）；一行名字清单（32 个全列）
+    → 思考 4773 字且点名 mx_query/tavily。JSON 表本身才是触发调度模式的开关。
+    """
+    try:
+        from agent_loop import TOOLS
+        names = [str((t.get("function") or {}).get("name") or "") for t in TOOLS]
+        names = [n for n in names if n]
+        return ("# 可用工具（本轮先思考规划，工具表下一轮下发）\n"
+                "你可用：" + "、".join(names) + "。\n"
+                "请先想清楚要做什么、需要哪些工具（可点名），再给出下一步；"
+                "闲聊则直接回复。")
+    except Exception:
+        return ""
+
 _SEARCH_TOOL_REPEAT_LIMIT = int(os.environ.get("LATIAO_SEARCH_TOOL_REPEAT", "3") or 3)
 
 
@@ -1086,8 +1127,97 @@ class ThinAgentLoop:
             logger.debug("learnings heuristic skipped", exc_info=True)
 
     # ── 工具集 ────────────────────────────────────────────
+    def _thinking_first_round(self) -> bool:
+        """本回合是否处于"思考轮"（2026-10-12 两段式：先想后干）。
+
+        设计口径（用户拍板 + AB 实测）：
+        - 只在**本地**模型 + 档位非 off + 开关开启（config agent.local_thinking_first）
+          时生效；判据是**轮次序号**（`self.steps == 1` 且本回合尚未下发过思考轮），
+          即每次用户消息的第 1 轮。
+        - 思考轮**不给 JSON 工具表**——实测同一模型同一问题：带表思考 129 字
+          （走"调度模式"直接调工具）、只给名字清单思考 4773 字且点名工具。
+        - 第 2 轮起恢复工具表（执行阶段）。
+        """
+        if not self.is_local:
+            return False
+        if (self.thinking_level or "high").lower() == "off":
+            return False
+        if not _local_thinking_first_enabled():
+            return False
+        # 判据必须是**轮次**而非 `_turn_tool_ok`：思考轮没有工具表，模型不可能
+        # 调工具 → `_turn_tool_ok` 永远为假 → 第 2 轮也是思考轮 → 任务型提问
+        # 一路空手撞到收口轮（全量回归 14 红暴露的设计 bug）。
+        # 严格 `== 1`：0 = 尚未开轮（无回合而言，直接构造请求的路径不适用），>1 = 执行段。
+        # 重采路径（截断/复读/回退）是 `steps -= 1` 后再进 while 顶部 `+= 1` → **回
+        # 到同一轮号**，所以"第 1 轮的整段（含回包后的闸门判定）"都稳定读到 1。
+        if self.steps != 1:
+            return False
+        if self._finalize_round:    # 收口轮自带纪律，不叠加
+            return False
+        return True
+
+    def _plan_gate_has_tools(self) -> bool:
+        """空转闸门判定"有工具可用"的口径。
+
+        不能用 `bool(self._active_tools())` 直接判：思考轮工具表被**有意推迟**
+        （_active_tools 返回 []）→ `_looks_like_plan_only(text, False)` 一律放行
+        （见该函数首行）→ 第 1 轮那句"让我用 mx_query 查一下～"会直接进交付，
+        正是空转闸门要防的"只预告不行动"。工具对思考轮而言是存在的，只是下一轮
+        才下发——判定必须按"存在"算。
+        """
+        return bool(self._active_tools()) or self._thinking_first_round()
+
+    def _thinking_round_plan_leak(self, body_text: str) -> bool:
+        """"先想后干"思考轮的附加闸：正文只是"用 X 做什么"的**陈述式**声明。
+
+        真机实测（2026-10-12）：思考轮不下发工具表，模型少了"直接调用"的出口，
+        就把工具名写进正文——"使用 ak_finance 查询贵州茅台（600519）的行情数据。"
+        （24 字）末句没有"我来/让我"类意图词，`_looks_like_plan_only` 全判据漏网，
+        被当终答交付（用户看到"我要去查"却没有结果）。判据取三者交集：
+        短正文 + 点名**在册工具**（注册表里的英文名是强特征）+ 无数据信号
+        （真汇报通常带多个数字/百分号/表格行）。
+
+        刻意**只在思考轮**生效：这道闸是为"本轮没有工具表、模型把工具名写进正文"
+        这个结构性缺口加的；执行阶段的同类形态（如"ak_finance 暂时查不到数据。"）
+        不启用，避免动到 09-08/10-08/10-10 按真实语料校准过的既有判据。
+        """
+        if not self._thinking_first_round():
+            return False
+        t = re.sub(r"\s+", " ", (body_text or "")).strip()
+        if not t or len(t) > 200:
+            return False
+        # 「有数据信号」用比 _DATA_SIGNAL_RE 更严的口径：后者把**单个**数字串也算
+        # 数据，而实测原句里的股票代码"（600519）"正好命中 → 计划句整条漏网
+        # （真机端到端抓到）。真汇报的特征是**多个**数字事实 / 百分号 / 表格行。
+        if "%" in t or t.startswith("|"):
+            return False
+        if len(re.findall(r"\d[\d.,]*", t)) >= 2:
+            return False
+        try:
+            from agent_loop import TOOLS
+            names = [str((x.get("function") or {}).get("name") or "") for x in TOOLS]
+        except Exception:
+            return False
+        return any(n and n in t for n in names)
+
+    def _tools_in_scope(self) -> list:
+        """"在册工具"表（未知工具判定的基准）。
+
+        同样不能用 `self._active_tools()`：思考轮返回空表会把模型本轮发出的
+        任何调用判成"未知工具"（回一条 ⛔ 错误清单，白烧一轮）——工具只是**没
+        广告**，不是不存在。思考轮按注册表全量判定，其它轮与 _active_tools 一致。
+        """
+        tools = self._active_tools()
+        if tools or not self._thinking_first_round():
+            return tools
+        from agent_loop import TOOLS
+        return list(TOOLS)
+
     def _active_tools(self) -> list:
         from agent_loop import TOOLS, _cap_tools, _filter_tools
+        # 思考轮：工具表清空（名字清单由系统提示注入，见 _build_request）
+        if self._thinking_first_round():
+            return []
         if self.is_local:
             # ── 本地引擎：工具表**从第 1 轮就固定**（= 全部可用工具，按注册表顺序）──
             # 09-20 实测链路：工具表渲染在**提示头** → 而混合/线性注意力模型（Spark、
@@ -1190,10 +1320,14 @@ class ThinAgentLoop:
         # 复用（09-20 用户实测：普通对话两轮就是 0%，对照实验：严格续写 74%）。
         # 闲聊的约束改由尾部提示表达，不再动工具表。
         tools = self._active_tools()
+        _think_round = self._thinking_first_round()
         # 收口轮与普通轮用**同一套工具、同一份提示形态**：tools 参与模板渲染，撤掉它们
         # 等于换提示头，收口轮自身与下一轮的缓存会一起失效（09-19 实测）。收口约束改由
         # 尾部指令表达（见 _finalize_tail_directive / _append_tail_note）。
-        self.native_tools = bool(tools) and native_ok
+        # 思考轮同理——但**只撤"广告"，不撤"能力"**：`or _think_round` 让 native_tools
+        # 保持为真，否则会切到围栏路径（尾部邀请模型发 ```tool 调用），而思考轮工具表
+        # 为空、调用又被照旧执行判定，等于平白制造"未知工具"错误轮（全量回归实测）。
+        self.native_tools = (bool(tools) or _think_round) and native_ok
 
         # 检索收紧只作为**尾部提醒**下发，不再从请求里撤工具：tools 参与提示头渲染，
         # 撤掉工具＝换提示头＝整段缓存失效（09-19 实测 0%）。约束仍由尾部提醒表达。
@@ -1253,8 +1387,11 @@ class ThinAgentLoop:
         # 本地：原生 tools + 精简纪律；legacy 回退围栏提示词；闲聊不加提示
         sys_prompt = ""
         if self.native_tools:
-            body["tools"] = [dict(t) for t in tools]
-            sys_prompt = _NATIVE_LEAN_PROMPT
+            # 思考轮只撤广告（不下发工具表，也**不下发空数组**——引擎对 `tools: []`
+            # 的处理各家不一）：模型从"名字清单"知道可为什么，参数表下一轮才给。
+            if tools:
+                body["tools"] = [dict(t) for t in tools]
+            sys_prompt = "" if _think_round else _NATIVE_LEAN_PROMPT
         elif not light:
             # 围栏路径：工具说明放**最后一条消息尾部**（09-20 改）。
             # 放系统提示头部时，长提示会把它稀释掉：同一个 27B 模型在短提示下会
@@ -1266,6 +1403,13 @@ class ThinAgentLoop:
             if _fence:
                 msgs = _append_tail_note(msgs, "\n\n【工具使用说明（系统）】\n" + _fence)
                 body["messages"] = msgs      # body 已构造，必须写回（否则追加丢失）
+        if _think_round:
+            # 思考轮的系统提示 = 工具名字清单（见 _tool_name_hint_line）。不能用
+            # _NATIVE_LEAN_PROMPT：它声明"工具已随请求提供"（不实）且第 1 条纪律
+            # 禁止输出计划——与本轮"先想清楚要做什么、需要哪些工具"直接冲突。
+            _hint = _tool_name_hint_line()
+            if _hint:
+                sys_prompt = _hint
         if sys_prompt:
             if msgs and msgs[0].get("role") == "system":
                 msgs[0] = dict(msgs[0])
@@ -2251,10 +2395,12 @@ class ThinAgentLoop:
                             "③ mmproj 与 GGUF 不配套（不同 Hermes 版本不要混用）。")}
                         return
                     if (self.native_tools and not self.native_fallback_used
-                            and status == 400):
+                            and status == 400 and not self._thinking_first_round()):
                         # 引擎不支持 tools 参数（模板无工具能力）→ 回退围栏格式重跑本步。
                         # 带图时同样要回退：image_url+tools 一起会被拒，去掉 tools 重试
                         # 通常就能过；仍失败才走下面的识图提示。
+                        # 思考轮排除：本轮**没发** tools 参数，400 与工具无关——误判会
+                        # 永久置 native_fallback_used（整个回合一到围栏路径），代价太大。
                         self.native_fallback_used = True
                         self.native_tools = False
                         self.steps -= 1
@@ -2322,7 +2468,8 @@ class ThinAgentLoop:
                         tool_calls = fence_calls
                     else:
                         clean_text = streamed
-                tool_names = {t.get("function", {}).get("name") for t in self._active_tools()}
+                tool_names = {t.get("function", {}).get("name")
+                              for t in self._tools_in_scope()}
                 # 空名调用必须放行到执行器（恢复/守卫都在那边）。
                 # "有名但不在册"（模型幻觉出的工具名）：不静默丢弃（09-07 17:40
                 # 事故：原生=2 全被滤掉 → 模型以为调用了、用户拿到 3 字残答 +
@@ -2432,8 +2579,12 @@ class ThinAgentLoop:
                 # （此时模型的承诺多半是"我要去查"——多给一次真正动手的机会，
                 # 因为强行收口等于逼它在没有数据的情况下作答）
                 _plan_cap = _PLAN_NUDGE_MAX if self._turn_tool_ok else _PLAN_NUDGE_MAX + 1
+                # 空转闸门判据（两档共用）：经典承诺形态 + 思考轮的陈述式计划声明
+                _plan_only = (
+                    _looks_like_plan_only(body_text, self._plan_gate_has_tools())
+                    or self._thinking_round_plan_leak(body_text))
                 if (not tool_calls and not self._finalize_round
-                        and _looks_like_plan_only(body_text, bool(self._active_tools()))
+                        and _plan_only
                         and self._plan_nudge_used < _plan_cap):
                     # 空转闸门：只说了"我来/先调取"就收尾 → 要求真正行动或给出完整
                     # 答案（原为每 turn 一次；2026-10-08 16:13 实测催一次不够——
@@ -2445,10 +2596,18 @@ class ThinAgentLoop:
                                    f"只有计划声明、无工具调用 → 要求直接行动"
                                    f"（{self._plan_nudge_used}/{_plan_cap}）")
                     _anon_note("gate_idle_nudge")
+                    if self._thinking_first_round():
+                        # 思考轮的计划句只是过程自语（正文/思考面板都还在，见
+                        # _thinking_round_plan_leak 的注释），且点名的工具未必是最后
+                        # 真正调用的那个（真机实测：预告 ak_finance、实调 mx_query）
+                        # → 与"重复叙述抑制"同一手法撤回气泡；历史里本就没写这轮正文
+                        # （nudge 分支 continue 在 asst 入史之前），无需再改。
+                        # 只在思考轮撤回：经典闸门（09-08/10-08 校准）行为不动。
+                        yield {"event": "content_revised", "content": ""}
                     yield {"event": "heartbeat"}
                     continue
                 if (not tool_calls and not self._finalize_round
-                        and _looks_like_plan_only(body_text, bool(self._active_tools()))):
+                        and _plan_only):
                     # 空转闸门升级档：催促额度用尽仍是承诺 → 不给承诺留交付口，
                     # 转收口轮。用确定性收尾替代再赌一轮——收口轮自带 junk→重采→
                     # 数据兜底链（_finalize_body_is_junk），最差也只是"数据+如实
@@ -2462,6 +2621,9 @@ class ThinAgentLoop:
                                    f"催促 {self._plan_nudge_used} 次后仍是承诺 → "
                                    f"强制收口（{_what}）")
                     _anon_note("gate_force_final")
+                    if self._thinking_first_round():
+                        # 同上：思考轮的计划句不进交付气泡（历史里也未写入）
+                        yield {"event": "content_revised", "content": ""}
                     continue
                 if (not tool_calls and not self._finalize_round
                         and self._last_round_tool_failed
