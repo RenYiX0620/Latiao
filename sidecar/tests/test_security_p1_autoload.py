@@ -134,11 +134,20 @@ def test_upload_local_allows_normal_files(media_client, tmp_path):
 # ── 5. /v1/files/browse 范围限制 ──────────────────────────────────
 
 def test_browse_rejects_out_of_range(media_client):
-    """家目录之外（非模型根）的目录不再可列。"""
-    r = media_client.get("/v1/files/browse", params={"path": "/private/etc"}, headers=_H)
-    assert r.status_code == 403
-    r = media_client.get("/v1/files/browse", params={"path": "/usr"}, headers=_H)
-    assert r.status_code == 403
+    """家目录之外（非模型根）的目录不得可列。
+
+    断言只认"被拒"（4xx），不锁死具体码：路径不存在时先命中 400（不是目录），
+    存在且越界才是 403（不在可浏览范围内）——两者都证明"拿不到列表"，而
+    **平台差异**（macOS 有 /private/etc、CI 的 Linux 没有）曾让锁死 403 的
+    版本在 CI 假红（实测 1 failed, 1502 passed）。
+    """
+    for probe in ("/private/etc", "/usr", "/etc"):
+        r = media_client.get("/v1/files/browse", params={"path": probe}, headers=_H)
+        assert r.status_code >= 400, f"{probe} 必须被拒，实际 {r.status_code}"
+        body = r.json()
+        # 两类拒绝形态都算通过：HTTPException → {"detail": ...}；业务错误 → {"status":"error"}
+        assert body.get("status") == "error" or body.get("detail")
+        assert not body.get("entries"), "被拒时绝不能带回目录列表"
 
 
 def test_browse_allows_home_and_model_roots(media_client):
