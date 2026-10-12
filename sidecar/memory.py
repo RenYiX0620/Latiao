@@ -892,6 +892,62 @@ def reflection_learning_key(tool_name: str, tool_result_summary: str) -> tuple[s
     return topic, sig
 
 
+# ── 反思提升的「环境噪声」闸门（2026-10-12，用户拍板）────────────────────
+# 反思学习的价值在"下次怎么做"（topic 就是错误签名），但真库里活跃的 29 条噪声
+# 全是**环境/当次状态**造成的失败——复述不出任何做法，却占注入名额、还可能误导：
+#   · read_file 失败：错误：文件不存在 - /Users/langzuxiax/…（路径本身打错了）
+#   · read_file 失败：错误：文件不存在 - https://marketing.dcfw.com/…（拿 URL 当路径）
+#   · write_file 失败：failed: could not read back file（应用自身的回读校验）
+#   · run_cmd 失败：'utf-8' codec can't decode（当次输出的编码）
+# 判据的取向：**错误由环境/瞬时状态造成**的滤掉；"工具用法/接口语义"造成的保留
+# （那才是可复用经验，如"该接口不支持板块汇总，要指定单个板块名"）。
+_ENV_NOISE_PATTERNS = (
+    # 路径/目标漂移
+    "文件不存在", "no such file", "does not exist", "找不到文件",
+    # 瞬时网络
+    "connectionerr", "connection refused", "connection reset", "econnreset",  # 抗 60 字截断（ConnectionErr…）
+    "remotedisconnected", "timed out", "timeout", "temporarily unavailable",
+    "http 429", "429 too many requests", "502 bad gateway", "503 service",
+    # 应用自身的校验/机制
+    "could not read back", "read back",
+    # 当次 payload 的编码
+    "codec can't decode", "unicode decode", "unicodedecodeerror",
+    # 反思模型自认没提炼出东西（回填脚本路径的文案）
+    "无法从中提炼", "没有可提炼", "无有效知识",
+    # 泛型签名：兜底模板 + 括号里就是 "error"（不含任何具体错误）
+    "执行出错，可能需要重试或调整参数（error）",
+)
+
+
+def _reflection_is_env_noise(topic: str, content: str) -> bool:
+    """只是"环境/一次性"失败的反思 → 不该入库为知识（见上方说明）。"""
+    blob = f"{topic}\n{content}".lower()
+    return any(p in blob for p in _ENV_NOISE_PATTERNS)
+
+
+# 反思文案必须**是本应用的模板句**（`_quick_reflect` 生成，共四类）。
+# 为什么要求形状：真库 11 条"非模板"的 reflection 全是**逐字抄来的聊天/文档片段**
+# （含一条私密角色扮演台词、10 条建筑工程合同句子）——不是知识，却会被语义检索
+# 注入、还可能被送进云端提炼。模型自己提炼知识走的是 `_refine_learnings`
+# （source_type='refined'），两条路职责不同，反思路径不该变成任意文本的入口。
+_REFLECTION_TEMPLATE_STARTS = (
+    "权限不足，建议检查文件/目录权限",
+    "目标不存在，可能需要先确认路径或创建前置资源",
+    "工具返回为空，可能参数不正确或目标无内容",
+)
+_REFLECTION_TEMPLATE_ERR = "执行出错，可能需要重试或调整参数"
+
+
+def _reflection_is_known_template(reflection: str) -> bool:
+    """反思文案是否是应用自己的模板句（见上方说明）。"""
+    r = (reflection or "").strip()
+    if not r:
+        return False
+    if r.startswith("工具 ") and _REFLECTION_TEMPLATE_ERR in r[:80]:
+        return True
+    return any(r.startswith(p) for p in _REFLECTION_TEMPLATE_STARTS)
+
+
 def promote_reflection_to_learning(session_id: str, tool_name: str, tool_args: dict,
                                    tool_result_summary: str, reflection: str) -> bool:
     """把一条"真踩到的坑"写成 learning（⑧ 的核心动作，实时路径与回填脚本共用）。
@@ -906,6 +962,13 @@ def promote_reflection_to_learning(session_id: str, tool_name: str, tool_args: d
     _probe_content = f"{tool_name} 失败：{reflection}"
     if _is_junk_learning(topic, _probe_content):
         logger.debug("反思提升被噪声闸门拦下: %s", topic[:40])
+        return False
+    if _reflection_is_env_noise(topic, f"{_probe_content}｜{sig}"):
+        logger.debug("反思提升被环境噪声闸门拦下（无复用价值）: %s", topic[:40])
+        return False
+    if not _reflection_is_known_template(reflection):
+        logger.info("反思提升被形状闸门拦下（非应用模板文案，疑似聊天/文档片段）: %s",
+                    str(reflection)[:60])
         return False
     try:
         if isinstance(tool_args, dict) and tool_args:
