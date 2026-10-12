@@ -48,27 +48,22 @@ def guess_chat_format(model_path: str) -> str | None:
 
 
 def find_llama_server(model_path: str = "") -> Path | None:
-    """定位原生 llama-server（双引擎分派，09-15）。
+    """定位原生 llama-server（单引擎，2026-10-12 收编 fork）。
 
-    - macOS: sidecar/llama-server            = XHToken fork（Spark-X2.5 新架构补丁）
-             sidecar/llama-upstream/llama-server = 上游最新（普通模型兼容性更好）
+    - macOS: sidecar/llama-upstream/llama-server = 上游最新（所有模型统一走它）
     - Windows: sidecar/llama-server.exe（CI 下载的上游构建）
 
-    Spark 类模型必须用 fork（上游不认它的模板/函数调用格式）；其余优先上游，
-    上游缺失时回退 fork（保持旧行为，不至于因缺文件而无法启动）。
+    历史：Spark-X2.5 因上游不认其模板/工具格式，曾走 `sidecar/llama-server`
+    （XHToken fork，0.1.2 build 1）。2026-10-12 实测上游 b11554/b11571 已完全覆盖
+    ——加载 ✓、原生 tools 调用解析正确（finish=tool_calls + 参数类型无误）✓、
+    同一提示词下思考/正文长度与 fork 一致（506/537 字，均属思考吃预算的现象而非
+    引擎差异）→ fork 从包内移除（重建脚本 scripts/build-spark-llama.sh 保留），
+    此处也不再做 spark 特判；fork 若还在（旧安装）仅作最后兜底候选。
     """
     base = Path(__file__).parent
-    is_spark = "spark" in (model_path or "").lower()
-    if is_spark:
-        # fork 优先；缺失时仍试上游与 exe（宁可尝试也不硬失败——
-        # 09-15 事故：CI 包缺 fork 且直接报 python 的 ValueError，
-        # 用户只看到 "Failed to load model" 一头雾水）
-        cands = [base / "llama-server", base / "llama-upstream" / "llama-server",
-                 base / "llama-server.exe"]
-    else:
-        cands = [base / "llama-upstream" / "llama-server",
-                 base / "llama-server.exe",
-                 base / "llama-server"]
+    cands = [base / "llama-upstream" / "llama-server",
+             base / "llama-server.exe",
+             base / "llama-server"]
     for exe in cands:
         try:
             if exe.exists() and exe.is_file():

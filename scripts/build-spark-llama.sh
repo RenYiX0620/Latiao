@@ -1,6 +1,10 @@
 #!/bin/bash
 # 构建 Spark-X2.5 专用 llama.cpp（XHToken/llama.cpp fork）并安装到 sidecar/
 # 前置：Xcode + cmake。用法: bash scripts/build-spark-llama.sh [--skip-build]
+#
+# 2026-10-12 起这是**恢复路径**而非日常路径：fork 已退役（上游 b11554/b11571 能加载
+# Spark 并正确解析原生 tools 调用，见 fetch-upstream-llama.sh 的说明）。若某个 Spark
+# 量化/模板在上游上复现回归，再跑本脚本把 fork 装回来（分派会把它当兜底候选）。
 set -e
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SRC=/tmp/llama-spark
