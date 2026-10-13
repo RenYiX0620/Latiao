@@ -66,6 +66,22 @@ def test_thinking_round_has_no_tool_table_but_has_name_hint():
     assert "mx_query" in sys0 and "tavily_search" in sys0, "清单应点名真实工具"
 
 
+def test_hint_carries_the_completeness_discipline():
+    """思考轮的提示词必须保留"要写完整回答"的纪律（2026-10-13 用户的反馈修）。
+
+    回归背景：思考轮把 _NATIVE_LEAN_PROMPT 整段换成名字清单，而那段里的纪律
+    （"直接写出完整回答""把完整结论写进正文"）被一起换没了 → 第 1 轮（闲聊/角色
+    扮演/知识问答真正作答的那一轮）失去长度约束；原措辞"再给出下一步"还在暗示
+    简版。实测同一句人设对话：正文 214 → 150 字；补回纪律并明说"先思考过不等于
+    回答可以更简略"后回到 205 字（知识问答 610 字）。
+    """
+    from agent.loop import _tool_name_hint_line
+    hint = _tool_name_hint_line()
+    assert "完整" in hint and "饱满" in hint, "必须要求完整回答"
+    assert "更简略" in hint, "必须明说'先思考过不代表回答可以更简略'"
+    assert "再给出下一步" not in hint, "旧措辞「再给出下一步」在暗示简版，不许回来"
+
+
 def test_execution_phase_restores_full_tool_table():
     """执行阶段（第 2 轮起）：工具表恢复、清单不再注入。"""
     loop = _loop("max")

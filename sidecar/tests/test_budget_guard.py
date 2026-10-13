@@ -42,7 +42,10 @@ def _tool_round_with_usage(name: str, args: dict, prompt_tokens: int) -> list[st
 
 def _round(body) -> list[str]:
     """看到收口指令 → 给答案；否则继续调工具（把循环推向预算线）。"""
-    if "收尾" in json.dumps(body.get("messages"), ensure_ascii=False):
+    # 哨兵用终答指令的**专有短语**，别用"收尾"这种通用词——2026-10-13 实测：
+    # 思考轮提示词里写了一句"草草收尾"，桩引擎就在第 1 轮误判成终答轮，
+    # 预算根本没机会累加，这条测试直接红。
+    if "数据已足够" in json.dumps(body.get("messages"), ensure_ascii=False):
         return FakeEngine.text_response(ANSWER)
     return _tool_round_with_usage("list_dir", {"path": "."}, STEP_PROMPT_TOKENS)
 
