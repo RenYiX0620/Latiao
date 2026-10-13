@@ -511,15 +511,28 @@ _DATA_SIGNAL_RE = re.compile(r"(?:\d[.,]?\d){2,}|%|^\|", re.M)
 
 
 def _needs_length_retry(finish_reason, native_calls, empty_body: bool,
-                        retry_used: bool) -> bool:
-    """是否该因"长度截断"重跑本轮（关思考）。
+                        retry_used: bool, body_chars: int = -1,
+                        think_chars: int = -1) -> bool:
+    """是否该因"长度截断/思考吃光预算"重跑本轮（关思考）。
 
-    两种情况：① 解析出了 native 工具调用但被截断（半截 JSON 不可执行）；
-    ② 正文为空而思考非空（思考吃光预算 —— 09-20 实测 Bonsai 6144/6144）。
+    三种情况：
+    ① 解析出了 native 工具调用但被截断（半截 JSON 不可执行）；
+    ② 正文为空而思考非空（思考吃光预算 —— 09-20 实测 Bonsai 6144/6144）；
+    ③ 2026-10-13 事故补：正文非空但**极短**（不够一个完整答案）且思考远超预算
+       ——旧判据要求 empty_body，"思考 10543 字、正文 224 字"这种半截答案漏网，
+       用户看到"答了一半就停"。
     """
     if finish_reason != "length" or retry_used:
         return False
-    return bool(native_calls) or empty_body
+    if bool(native_calls) or empty_body:
+        return True
+    # ③ 思考吃光、正文半截：正文 <300 字且思考 ≥6000 字（远超正常思考量）。
+    #    刻意用字符相对判定而非 token 预算——think_chars 是字数，预算单位是 token，
+    #    直接比较会量纲错位（实测 10543 字思考漏判）。
+    if body_chars >= 0 and think_chars > 0:
+        if body_chars < 300 and think_chars >= 6000:
+            return True
+    return False
 
 
 def _anon_note(key: str) -> None:
@@ -1093,6 +1106,7 @@ class ThinAgentLoop:
         self._turn_tool_ok = False             # 本轮是否拿到过成功的工具结果（升级档分叉）
         self._toolfail_nudge_used = 0          # 工具失败闸门：承诺碎片的一次纠正
         self._last_round_tool_failed = False   # 上一轮工具结果是否失败（承诺碎片闸的上下文）
+        self._thinking_round_done = False      # 思考轮已过（防重采回 step 1 时再当思考轮）
         self._finalize_retry_used = False      # 终答轮空生成温度重采（一次）
         # 任务级验证器（gap 清单 P1，2026-09-29）：本轮工具账本 + 等级校验
         # 第一次未达标只提示（重采一次），第二次/作弊才交回用户（两级生效）
@@ -1166,6 +1180,8 @@ class ThinAgentLoop:
         # 重采路径（截断/复读/回退）是 `steps -= 1` 后再进 while 顶部 `+= 1` → **回
         # 到同一轮号**，所以"第 1 轮的整段（含回包后的闸门判定）"都稳定读到 1。
         if self.steps != 1:
+            return False
+        if self._thinking_round_done:   # 已转执行轮（2026-10-13）：重采退回 step 1 也不再当思考轮
             return False
         if self._finalize_round:    # 收口轮自带纪律，不叠加
             return False
@@ -2353,7 +2369,9 @@ class ThinAgentLoop:
                     # 09-06/09-07 推理模型 token 全进 <think> 同族根因）
                     _empty_body = not body_text.strip() and bool(reasoning)
                     if _needs_length_retry(finish_reason, bool(native), _empty_body,
-                                           self._len_retry_used):
+                                           self._len_retry_used,
+                                           body_chars=len((body_text or "").strip()),
+                                           think_chars=len((reasoning or "").strip())):
                         self._len_retry_used = True
                         self._note_retry("length_truncated")
                         self._force_thinking_off_next = True
@@ -2689,6 +2707,36 @@ class ThinAgentLoop:
                     continue
 
                 if not tool_calls:
+                    # ── 思考轮默认进执行轮（2026-10-13 事故修复：任务半途停）──
+                    # 旧设计靠"识别计划句"拦承诺（_looks_like_plan_only /
+                    # _thinking_round_plan_leak），但欧娜人设的承诺句式千变万化，
+                    # 判据（长度/数字/关键词）任何一条不满足就放行 → 第 1 轮的
+                    # "我这就帮你查～"被当终答交付，第 2 轮（真正的工具执行）永远
+                    # 不会来。**反转放行条件**：思考轮 + 无工具调用时，只有"有实质
+                    # 数据的完整答案"才允许终答，否则一律进执行轮——不再靠猜句式。
+                    if self._thinking_first_round() and not self._finalize_round:
+                        # 只对**任务型请求**要求实质数据（闲聊短答是合法终答）。
+                        # 请求侧判据与 _thinking_round_plan_leak 同源：行情/数据类
+                        # 请求不可能不需要实时数据——短正文+无数据就是空手说话。
+                        _task_like = False
+                        try:
+                            from agent.prompt_build import _MARKET_KW_RE
+                            _task_like = bool(_MARKET_KW_RE.search(self.last_user_text or ""))
+                        except Exception:
+                            pass
+                        _has_substance = bool(_DATA_SIGNAL_RE.search(body_text or "")) \
+                            and len((body_text or "").strip()) >= 80
+                        if _task_like and not _has_substance:
+                            self._step_log("思考轮转执行",
+                                           f"任务型请求无工具调用且无实质数据（正文 "
+                                           f"{len((body_text or '').strip())} 字）"
+                                           f"→ 恢复工具表进第 2 轮")
+                            # 计划句不进交付气泡（与空转闸门同一手法）
+                            yield {"event": "content_revised", "content": ""}
+                            yield {"event": "heartbeat"}
+                            # 标记思考轮已过：下一轮 _thinking_first_round 返回 False
+                            self._thinking_round_done = True
+                            continue
                     # 任务级验证器（gap 清单 P1）：交付前做机械验收——判据只来自本轮
                     # 工具账本（写文件/跑测试/正文声称的产物），开放问答返回 None。
                     # 两级生效：第一次未达标 → 要求补齐或如实说明（重采一次）；
