@@ -1205,7 +1205,12 @@ class ThinAgentLoop:
         if not self._thinking_first_round():
             return False
         t = re.sub(r"\s+", " ", (body_text or "")).strip()
-        if not t or len(t) > 200:
+        # 长度护栏 200 → 600（2026-10-13 二连事故）：欧娜的"两步计划"有 267 字
+        # （还点了 mx_query/tavily_search 的名字），被旧的 200 字护栏整条挡在门外 →
+        # 任务再次看起来"断了"。而计划变长的直接原因正是用户刚调的"回复 10～12 句"
+        # ——我的两个改动在打架。"这是汇报不是计划"的主判据交给**数据信号**（下面），
+        # 长度只当宽松的上界（真汇报动辄上千字）。
+        if not t or len(t) > 600:
             return False
         # 「有数据信号」用比 _DATA_SIGNAL_RE 更严的口径：后者把**单个**数字串也算
         # 数据，而实测原句里的股票代码"（600519）"正好命中 → 计划句整条漏网

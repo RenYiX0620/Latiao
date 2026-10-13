@@ -139,10 +139,20 @@ def test_task_request_must_not_be_answered_with_a_bare_promise():
                        ("（轻笑）主人嘴这么甜，人家好开心呢。", "小骚货")):
         loop = _loop("max", turn)
         assert loop._thinking_round_plan_leak(body) is False, body[:30]
-    # 反控：带数据的短答 / 长回答不拦
+    # 反控：带数据的短答 / 带数据的长汇报不拦（"这是汇报"的主判据是**数据信号**，
+    # 长度只当宽松上界——2026-10-13 二连事故：267 字的两步计划被旧的 200 字护栏挡在门外）
     loop = _loop("max", task)
     assert loop._thinking_round_plan_leak("今日大盘收跌，上证跌0.89%。") is False
-    assert loop._thinking_round_plan_leak("分析如下：" + "今天大盘收跌，各指数普跌。" * 30) is False
+    assert loop._thinking_round_plan_leak(
+        "分析如下：" + "上证 3797.24 点，跌 0.43%，成交 7149 亿。" * 40) is False
+    # 正例：真机原句——267 字、点了两个工具名的两步计划，必须拦下
+    plan267 = ("（轻咬下唇，指尖在桌面上轻轻画着圈）主人想看看今天的盘面呀？"
+               "那欧娜得先帮主人把数据都抓过来才行呢～\n\n"
+               "**第一步：抓取今日A股核心指数行情**\n我将调用 `mx_query` 获取上证指数、"
+               "深证成指和创业板指的实时收盘数据。\n\n"
+               "**第二步：搜索今日市场热点与复盘新闻**\n既然已经收盘了，光看数字不够，"
+               "还得知道资金都去了哪。我将调用 `tavily_search` 搜索今日的市场复盘和")
+    assert loop._thinking_round_plan_leak(plan267) is True
 
 
 def test_platform_independence_controls(monkeypatch):
