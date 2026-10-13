@@ -116,6 +116,35 @@ def test_plan_gate_not_blind_in_thinking_round():
     assert _looks_like_plan_only(plan, False) is False   # 旧口径的失明现场
 
 
+def test_task_request_must_not_be_answered_with_a_bare_promise():
+    """要干活的请求 + 短正文 + 无数据 = 空手说话，思考轮必须拦下（2026-10-13 真机事故）。
+
+    欧娜人设让"承诺"的句式千变万化，逐个加词追不上——实测两种漏网：
+    ①"人家会乖乖把数据找出来…"（无人称命中旧意图词表）；
+    ②"那人家可要拿出看家本领了哦～ 保证让你听得心痒痒的。"（末句连动词都没有）。
+    判据改为**请求侧**：非闲聊/非轻量请求 + 短正文 + 无数据 → 一律进执行轮。
+    """
+    task = "分析今天的大盘看看"
+    for body in (
+        "（…）主人想看大盘呀？人家这就帮你查～（…）人家会乖乖把数据找出来，"
+        "然后贴在主人面前慢慢念给你听哦～ ✨",
+        "（眼波流转…）主人想听人家分析大盘呀？那人家可要拿出看家本领了哦～ "
+        "**保证让你听得心痒痒的。** ✨",
+        "使用 ak_finance 查询贵州茅台（600519）的行情数据。",
+    ):
+        loop = _loop("max", task)
+        assert loop._thinking_round_plan_leak(body) is True, body[:40]
+    # 反控：闲聊类请求的短答不拦（否则寒暄也要多跑一轮）
+    for body, turn in (("（摸摸头）主人今天辛苦啦，早点休息哦～", "今天好累呀"),
+                       ("（轻笑）主人嘴这么甜，人家好开心呢。", "小骚货")):
+        loop = _loop("max", turn)
+        assert loop._thinking_round_plan_leak(body) is False, body[:30]
+    # 反控：带数据的短答 / 长回答不拦
+    loop = _loop("max", task)
+    assert loop._thinking_round_plan_leak("今日大盘收跌，上证跌0.89%。") is False
+    assert loop._thinking_round_plan_leak("分析如下：" + "今天大盘收跌，各指数普跌。" * 30) is False
+
+
 def test_platform_independence_controls(monkeypatch):
     """正控：忠实模拟 CI 的两个平台条件，断言仍然成立。
 
@@ -164,8 +193,12 @@ def test_statement_plan_leak_flagged_with_positive_and_negative_controls():
     # 反控一：真汇报（带数字）即使提到工具名也不算计划
     assert loop._thinking_round_plan_leak(
         "ak_finance 返回：贵州茅台 600519 收于 1500.25 元，涨 1.20%，成交 3.4 万手。") is False
-    # 反控二：普通闲聊答复（无工具名）
-    assert loop._thinking_round_plan_leak("今天天气不错，出去走走吧，别老坐着～") is False
+    # 反控二：闲聊请求下的普通答复（无工具名、非行情请求）不拦。
+    # 注意口径（2026-10-13 收窄后）：请求侧判据只认**行情/数据类**请求——
+    # "股价问题被回了一句天气闲聊"属于空手说话，**应当**被拦（这是正例，不是反例）。
+    chat = _loop("max", "今天好累呀")
+    assert chat._thinking_round_plan_leak("今天天气不错，出去走走吧，别老坐着～") is False
+    assert loop._thinking_round_plan_leak("今天天气不错，出去走走吧，别老坐着～") is True
     # 反控三：执行阶段（第 2 轮起）不启用这道闸
     loop.steps = 2
     assert loop._thinking_round_plan_leak("使用 ak_finance 查询贵州茅台（600519）的行情数据。") is False
