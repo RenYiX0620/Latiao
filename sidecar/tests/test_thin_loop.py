@@ -1089,3 +1089,52 @@ async def test_think_leak_retracts_first_copy():
     streamed = "".join(str(e.get("content", "")) for e in events if isinstance(e, dict)
                        and not e.get("event"))
     assert "</think>" not in streamed
+
+
+@pytest.mark.asyncio
+async def test_repetition_retry_emits_event_not_dash_content(monkeypatch):
+    """复读重采不再往正文塞 "---"（2026-10-13 用户实机反馈）。
+
+    实机问题：那串分隔符被前端当正文收进气泡，还被存成一条独立的 assistant 消息
+    （真库里有 3 字的 "---" 气泡）。现在只发 round_retry 事件（前端对未知事件忽略）。
+
+    触发方式：**确定性**地让复读闸门抛 _GenerationLoopError（脚本化"复读"要靠
+    上下文相似度，实测构造不出来——空跑会让断言假绿，这是刻意避开的坑）。
+    """
+    import time as _time
+    import agent.context as agent_context
+    import agent.loop as L
+    import local_llm
+    from agent.text_quality import _GenerationLoopError
+    from tests.test_loop_scenarios import _StubEngine
+
+    calls = {"n": 0}
+    orig_gate = L.ThinAgentLoop._gate_round_content
+
+    def _gate(self, text):
+        out = orig_gate(self, text)
+        # 第一次有正文流出就假装检测到复读（等价于检测器命中）
+        if not calls["n"] and out:
+            calls["n"] += 1
+            raise _GenerationLoopError("输出复读循环，已截断")
+        return out
+
+    monkeypatch.setattr(L.ThinAgentLoop, "_gate_round_content", _gate)
+    with FakeEngine() as engine:
+        engine.push(engine.text_response("（轻笑）主人稍等一下下，人家马上就好～" * 3))
+        engine.push(engine.text_response("（凑近你耳边）嗯，人家知道啦。"))
+        old = local_llm._engine
+        local_llm._engine = _StubEngine()
+        agent_context._LOCAL_NATIVE_TOOLS_OVERRIDE = True
+        try:
+            events = await _collect(L.ThinAgentLoop(
+                MESSAGES, "fake-model", engine.url, HEADERS,
+                session_id=f"thin-dup-{_time.time()}", access_mode="full").run())
+        finally:
+            local_llm._engine = old
+            agent_context._LOCAL_NATIVE_TOOLS_OVERRIDE = None
+    joined = "".join(str(e.get("content") or "") for e in events if "content" in e)
+    assert "---" not in joined, f"分隔符不该进正文：{joined[:200]}"
+    assert calls["n"] == 1, "场景没触发（断言会假绿）"
+    assert any(e.get("event") == "round_retry" for e in events), \
+        "复读重采应发 round_retry 事件（前端忽略、日志留痕）"

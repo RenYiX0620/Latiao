@@ -2369,7 +2369,14 @@ class ThinAgentLoop:
                         self.steps -= 1
                         logger.warning("thin loop: %s —— 重采本轮（temp=%s freq=%s）",
                                        e, self._retry_temp, self._retry_freq)
-                        yield {"content": "\n\n---\n\n"}
+                        # 不再把 "---" 当**正文**下发（2026-10-13 用户实机反馈）：
+                        # 它会被前端当内容收进气泡、还会被存成一条独立的 assistant
+                        # 消息（真库实测有 3 字的 "---" 气泡）。改成事件——前端对未知
+                        # 事件直接忽略（useChatStream 的 if/else 链），日志与 step log
+                        # 里"重采本轮"的痕迹照旧。
+                        yield {"event": "round_retry", "reason": "repetition",
+                               "attempt": self._gen_retry_used,
+                               "temp": self._retry_temp}
                         continue
                     logger.warning("thin loop: 重试后仍复读/截断，交付警告收尾: %s", e)
                     yield {"content": f"\n\n⚠️ {e}"}
