@@ -84,6 +84,34 @@ def _update_state_digest() -> str:
 
 
 @pytest.fixture(autouse=True)
+def _ci_parity_engine(monkeypatch):
+    """让本地跑 ≈ CI 跑：把引擎的"原生工具能力"调成 CI 的真值（2026-10-12 加的护栏）。
+
+    为什么需要：CI 在 Linux + 轻量依赖集下 `_local_native_tools_ok()` 为假 → 代码走
+    围栏路径（请求里**没有** tools 键）；而本机装了 mlx-lm，`backend='mlx'` → 探测为真
+    → 走原生路径。这个环境差让 v0.3.79 的 CI **连红两次**：测试本地"侥幸"绿、到 CI 才
+    现形（用户收到红点邮件）。现在统一成 CI 的真值。
+    只改三个决定能力判定的值（CI 上也是**完整引擎、只是没加载模型**，所以不用骨架类——
+    那会缺属性/方法，实测 10 条 AttributeError）；需要真原生路径的用例自己接管：
+    覆盖 `local_llm._engine`（test_thin_loop）或 `_LOCAL_NATIVE_TOOLS_OVERRIDE`
+    （test_thinking_first 的 autouse 覆盖层）。
+    """
+    import local_llm
+
+    eng = getattr(local_llm, "_engine", None)
+    if eng is None:
+        return
+    monkeypatch.setattr(eng, "_active_backend", "", raising=False)
+    monkeypatch.setattr(eng, "backend", "none", raising=False)
+    monkeypatch.setattr(eng, "_external_engine", "", raising=False)
+    # 还要中和"本机真的有引擎在跑"这件事：否则路由冒烟测试里的 /v1/chat/completions
+    # 会**真的连上用户 App 的 1235 引擎**去生成（实测卡住 >10 分钟；CI 上没有引擎会
+    # 秒失败）。指向死端口 = CI 的真值：任何真请求立刻连接被拒。
+    monkeypatch.setattr(eng, "server_status", "stopped", raising=False)
+    monkeypatch.setattr(eng, "server_port", 1, raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _guard_real_update_state():
     """每次用例前后核对真机 update/state.json：被测试改写 → 还原 + 该用例失败。
 
