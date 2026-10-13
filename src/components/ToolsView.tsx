@@ -475,6 +475,10 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
     }
     return "official";
   };
+  // 渲染上限（2026-10-13）：市场聚合后实测可达 1.6 万条（OpenClaw 技能库全量并入），
+  // 全量渲染会让页面卡到搜索框没反应——用户看到的"搜不到"里有一部分就是这个。
+  // 只渲染前 N 条匹配，并明确告知总数（关键词一输，剩下的自然就进来了）。
+  const MARKET_RENDER_MAX = 60;
   const filteredPlugins = marketPlugins.filter((p) => {
     if (marketCat !== "all" && catOf(p) !== marketCat) return false;
     if (!q) return true;
@@ -629,7 +633,12 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
           {filteredPlugins.length === 0 && marketPlugins.length > 0 && (
             <div className="card-desc" style={{ marginTop: 8 }}>{t("tools.no_match_query", { q: marketQuery })}</div>
           )}
-          {filteredPlugins.map((item) => {
+          {filteredPlugins.length > MARKET_RENDER_MAX && (
+            <div className="card-desc" style={{ marginTop: 6, fontSize: 11 }}>
+              {t("tools.market_capped", { max: String(MARKET_RENDER_MAX), n: String(filteredPlugins.length) })}
+            </div>
+          )}
+          {filteredPlugins.slice(0, MARKET_RENDER_MAX).map((item) => {
             const isEco = !!item.source_kind && item.source_kind !== "";
             const onClick = isEco
               ? () => installGitHubItem(item)

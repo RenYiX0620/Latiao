@@ -497,6 +497,7 @@ const T: Record<string, Record<Lang, string>> = {
   "tools.discover_from_repos": { zh: " · 来自 {n} 个仓库", en: " · from {n} repos", ja: " · {n} リポジトリから", ru: " · из {n} репозиториев" },
   "tools.market_collapsed_title": { zh: "扩展市场", en: "Extension marketplace", ja: "拡張マーケット", ru: "Маркет расширений" },
   "tools.matched_of": { zh: "{total} 条中匹配 {n} 条", en: "{n} of {total} match", ja: "{total} 件中 {n} 件が一致", ru: "Совпадает {n} из {total}" },
+  "tools.market_capped": { zh: "只显示前 {max} 条（共 {n} 条）——输入关键词缩小范围即可看到更多。", en: "Showing the first {max} of {n} — type a keyword to narrow down.", ja: "最初の {max} 件のみ表示（全 {n} 件）——キーワードで絞り込んでください。", ru: "Показаны первые {max} из {n} — введите ключевое слово, чтобы сузить." },
   "tools.no_match_query": { zh: '没有匹配"{q}"的内容。', en: 'Nothing matches "{q}".', ja: '「{q}」に一致するものはありません。', ru: 'Нет совпадений с «{q}».' },
   "tools.found_skills_hint": { zh: "系统从 GitHub 搜索 agent 技能仓库并自动解析 SKILL.md。当前已发现 {n} 个技能。", en: "Skills discovered from GitHub agent repos (SKILL.md parsed automatically): {n}.", ja: "GitHub のエージェントリポジトリから検出したスキル：{n} 件。", ru: "Навыков найдено на GitHub: {n}." },
   "tools.install_source_hint": { zh: "支持：https://github.com/owner/repo（或 /tree/分支/子目录）、zip 直链、本地文件路径", en: "Supported: https://github.com/owner/repo (or /tree/branch/subdir), a direct zip link, or a local file path", ja: "対応：https://github.com/owner/repo（/tree/ブランチ/サブディレクトリ 可）、zip 直リンク、ローカルパス", ru: "Поддерживается: https://github.com/owner/repo (или /tree/ветка/каталог), прямая ссылка на zip, локальный путь" },
