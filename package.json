@@ -1,6 +1,6 @@
 {
   "name": "local-ai-os",
-  "version": "0.3.80",
+  "version": "0.3.81",
   "description": "",
   "main": "index.js",
   "scripts": {
