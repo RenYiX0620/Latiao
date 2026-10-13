@@ -166,6 +166,25 @@ def _append_tail_to_content(content, tail: str):
     return str(content or "") + tail
 
 
+def current_reply_length() -> str:
+    """SOUL.md 声明的回复长度（`- 回复长度：X`）——尾部指令用（2026-10-13）。
+
+    为什么要有它：用户实测"回复变短"，而逐项 A/B 的结果是——同一条长度要求
+    写在 **SOUL 头部**：-5%（还被模型当成"写 3 句就算达标"的清单）；
+    贴到**尾部**（语气那一行的位置）：+10%；**尾部 + 更大目标（6～8 句/两段
+    动作描写）：+117%**（336→729 字，组内完全可复现）。位置就是权重，和语气
+    那条实测结论一致。所以长度要求不在头部生效，而是由本函数读出来、每轮贴尾。
+    """
+    try:
+        for _m in _read_identity():
+            if (_m.get("file") or "") == "SOUL.md":
+                _tm = re.search(r"^-\s*回复长度：\s*(.+?)\s*$", _m.get("content") or "", re.M)
+                return _tm.group(1).strip() if _tm else ""
+    except Exception:
+        pass
+    return ""
+
+
 def current_tone() -> str:
     """当前语气（SOUL.md 的 `- 对话语气：X`）——终答轮指令复用（2026-09-29）。
 
@@ -714,6 +733,15 @@ def _build_chat_messages(body: dict, messages: list) -> list:
                       f"不要退回中性平铺直叙的语气。）",
                 "en": f"\n\n(Tone for this reply: {_tone} — follow the tone set in SOUL.md above; "
                       f"do not fall back to a neutral voice.)",
+            })
+        _rlen = current_reply_length()
+        if _rlen:
+            # 与语气同理：位置就是权重。只写在 SOUL 头部时实测 -5%（模型把它当
+            # 达标清单）；贴尾并给明确目标才有效（尾部 +117%，见 current_reply_length）。
+            _tail_text += _get_localized_text(user_lang, {
+                "zh": f"\n\n（本轮回复长度：{_rlen}——按这个分量写，不要两三句就收尾。）",
+                "en": f"\n\n(Length for this reply: {_rlen} - write to that weight; "
+                      f"do not stop after two or three sentences.)",
             })
         _tail_text += _lang_note or ""
         if _tail_text:

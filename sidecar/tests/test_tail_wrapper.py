@@ -109,3 +109,40 @@ def test_build_chat_messages_emits_the_shared_mark(tmp_path):
     assert out.returncode == 0, out.stderr[-900:]
     data = json.loads(out.stdout.strip().splitlines()[-1])
     assert data == {"mark": True, "stripped": "哈喽", "grew": True}, data
+
+def test_reply_length_declaration_reaches_the_tail(tmp_path, monkeypatch):
+    """SOUL 里声明 `- 回复长度：X` → 每轮贴到**尾部**（语气那一行的位置）。
+
+    实测依据（2026-10-13）：长度要求写在 SOUL 头部 -5%（被当达标清单）、贴尾
+    +10%、贴尾且给明确目标（6～8 句/两段动作）+117%（336→729 字）。
+    """
+    import importlib
+    import agent.prompt_build as PB
+
+    state = tmp_path / "s"
+    state.mkdir()
+    (state / "SOUL.md").write_text(
+        "# Soul\n\n## 语气风格\n- 对话语气：暧昧撩人（测试）\n\n"
+        "## 表达习惯\n- 回复长度：6～8 句，两段动作描写\n", encoding="utf-8")
+    (state / "IDENTITY.md").write_text("# Identity\n名字是欧娜\n", encoding="utf-8")
+    (state / "USER.md").write_text("# User\n- 用户称呼：主人\n", encoding="utf-8")
+    (state / "PROGRESS.md").write_text("# ChangeLog\n- 测试\n", encoding="utf-8")
+    (state / "config.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("LATIAO_TEST_PROGRESS_DIR", str(state))
+    import config as cfg
+    importlib.reload(cfg)
+    import identity as idn
+    importlib.reload(idn)
+    importlib.reload(PB)
+    try:
+        assert PB.current_reply_length() == "6～8 句，两段动作描写"
+        msgs = [{"role": "user", "content": "在干嘛"}]
+        built = PB._build_chat_messages({"messages": msgs, "non_interactive": True}, msgs)
+        blob = "\n".join(str(m.get("content") or "") for m in built if m.get("role") == "user")
+        assert "本轮回复长度" in blob and "6～8 句" in blob, blob[-200:]
+    finally:
+        monkeypatch.setenv("LATIAO_TEST_PROGRESS_DIR",
+                            os.environ.get("LATIAO_TEST_PROGRESS_DIR", str(tmp_path)))
+        importlib.reload(cfg)
+        importlib.reload(idn)
+        importlib.reload(PB)
