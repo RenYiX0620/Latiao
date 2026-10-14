@@ -401,6 +401,11 @@ async def lifespan(app: FastAPI):
                             shutdown_engine()
                         except Exception:
                             logger.warning("退出清理时停止引擎失败", exc_info=True)
+                        try:
+                            from tts_local_service import stop as _stop_tts
+                            _stop_tts()
+                        except Exception:
+                            logger.warning("退出清理时停止语音服务失败", exc_info=True)
                         os._exit(0)
                 except Exception:
                     break
@@ -432,6 +437,20 @@ async def lifespan(app: FastAPI):
         logger.warning("语义检索预热启动失败", exc_info=True)
 
     _orphan_watchdog()
+
+    # 本机语音服务（Qwen3-TTS shim，2026-10-14）：配了 tts.service_dir 才管理——
+    # 辣条启动即后台拉起（不阻塞启动；幂等，已拉起则跳过），退出/被强杀由
+    # 下面关闭段与孤儿看门狗收掉（见 tts_local_service.py 的三层保障）。
+    try:
+        import tts_local_service as _tts_local
+        if _tts_local.available():
+            _tts_local.start_in_background()
+            logger.info("本机语音服务已配置（%s），后台启动中", _tts_local.service_dir())
+        else:
+            logger.info("本机语音服务未配置（tts.service_dir 为空或缺 start.sh）——朗读按外部服务处理")
+    except Exception:
+        logger.warning("本机语音服务启动失败", exc_info=True)
+
     cron_task = asyncio.create_task(_cron_loop())
     catchup_task = asyncio.create_task(run_cron_catchup())  # 补跑关闭期间错过的任务
     logger.info("Sidecar 启动 — cron loop started")
@@ -518,6 +537,14 @@ async def lifespan(app: FastAPI):
         shutdown_engine()
     except Exception:
         logger.warning("Sidecar 关闭 — 停止引擎失败", exc_info=True)
+    # 本机语音服务（2026-10-14）：与引擎同理，退出就把拉起过的服务收掉。
+    # 放在引擎之后：stop() 最多等 1.5s（SIGTERM→强杀），Rust 关闭预算是 3s；
+    # 即便被强杀打断，shim 侧父进程看门狗（PPID 变化）也会自灭兜底。
+    try:
+        from tts_local_service import stop as _stop_tts
+        _stop_tts()
+    except Exception:
+        logger.warning("Sidecar 关闭 — 停止本机语音服务失败", exc_info=True)
     SIDECAR_PID.unlink(missing_ok=True)
     cron_task.cancel()
     catchup_task.cancel()

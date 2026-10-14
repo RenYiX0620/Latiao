@@ -30,6 +30,10 @@ logger = logging.getLogger("latiao-sidecar")
 DEFAULT_TTS = {
     "enabled": True,                        # 关掉＝完全不碰语音服务，一律用系统语音
     "base_url": "http://127.0.0.1:7799",    # 本地语音服务（OpenAI 兼容）
+    # 本机语音服务目录（含 start.sh）：**设了才由辣条管理生命周期**——辣条启动时
+    # 拉起、退出时停掉（见 tts_local_service.py）。空＝只按 base_url 代理，不管进程
+    # （其他装机默认如此；服务在应用包外，只有本机装了才有这个路径）。
+    "service_dir": "",
     "model_id": "",                         # 服务端模型名；空＝用服务默认
     "voice": "",                            # 音色；空＝用服务默认
     # 参考音频路径：**零样本克隆类模型（IndexTTS 等）没有内置音色**，不给参考音频
@@ -101,6 +105,16 @@ def probe_service(conf: dict) -> bool:
     _probe_cache.update({"at": now, "base": base, "ok": ok})
     if ok:
         logger.info("语音服务可用: %s", base)
+    else:
+        # 服务不在就后台拉起（本机托管场景，2026-10-14）：本次朗读仍回退系统语音，
+        # 下次就好——与 embedding_service 的"后台起、本次返回 None"同一哲学。
+        # 未配置 service_dir 时 available() 恒 False，这里是一句空操作。
+        try:
+            import tts_local_service as _local
+            if _local.available():
+                _local.start_in_background()
+        except Exception:
+            logger.debug("本机语音服务拉起跳过", exc_info=True)
     return ok
 
 
