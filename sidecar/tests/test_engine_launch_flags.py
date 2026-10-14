@@ -5,12 +5,34 @@
 09-23 起：显式 `--parallel N` + `-c = N × 每会话窗口`，每槽独占完整窗口。
 
 这里不真起进程：mock subprocess.Popen 捕获命令行，并让健康检查立即失败。
+
+⚠️ 捕获只认**目标引擎命令行**（`_is_engine_spawn`）。全局 mock 会把背景线程
+的 subprocess 调用一起拦下（discovery 的钥匙串证书导出、GitHub 预热都在后台
+跑）——不筛的话捕获值会被无关命令覆盖，断言随机挂（2026-10-04 CI flake：
+cmd 变成 ['security', 'find-certificate', ...]）。
 """
 import json
+import subprocess
 import unittest.mock as mock
 from pathlib import Path
 
-import local_llm
+import local_llm_engine
+
+# 被测代码启动的假引擎二进制（_capture 传的 exe 与过滤器共用同一常量）
+_FAKE_EXE = "/tmp/fake-llama-server"
+
+
+def _is_engine_spawn(cmd) -> bool:
+    """命令行是不是被测代码发起的引擎启动（按 argv[0] 判定）。
+
+    背景线程的 subprocess.run 会经过同一个被 mock 的 Popen——必须筛掉，
+    否则捕获值被覆盖（见模块 docstring 的 CI flake）。
+    """
+    try:
+        argv = list(cmd)
+    except TypeError:
+        return False
+    return bool(argv) and str(argv[0]) == _FAKE_EXE
 
 
 class _StubEngine:
@@ -32,9 +54,13 @@ class _StubEngine:
         self._cancel_load = None
         self._active_backend = ""
         self._healthy = healthy
+        # 可选钩子：在"等引擎就绪"窗口内执行（回归测试用它模拟背景线程 spawn）
+        self.during_wait = None
 
     # 默认"启动成功"（避免真等 900s）；healthy=False 时走失败路径
     def _wait_for_http(self, *a, **k):
+        if self.during_wait:
+            self.during_wait()
         return self._healthy
 
     def _guess_chat_format(self, *a, **k):
@@ -58,14 +84,15 @@ def _capture(engine, model_path="/tmp/models/Test-Model.gguf", **kw):
             return None
 
     def _popen(cmd, **kwargs):
-        captured["cmd"] = list(cmd)
-        # 加载中的状态文案（用户能看到的那句）
-        captured["status_at_spawn"] = engine.status_message
+        if _is_engine_spawn(cmd):       # 背景线程的无关 spawn 不进捕获
+            captured["cmd"] = list(cmd)
+            # 加载中的状态文案（用户能看到的那句）
+            captured["status_at_spawn"] = engine.status_message
         return _Proc()
 
     with mock.patch("subprocess.Popen", side_effect=_popen):
-        local_llm.LocalLLMEngine._start_llama_native(
-            engine, model_path, 1234, exe="/tmp/fake-llama-server", **kw)
+        local_llm_engine.EngineProcess._start_llama_native(
+            engine, model_path, 1234, exe=_FAKE_EXE, **kw)
     return captured.get("cmd", [])
 
 
@@ -93,7 +120,7 @@ def test_native_1_slot_keeps_old_behavior():
 
 def test_slots_clamped_to_4():
     """配置里写再大也钳到 4（KV 内存按槽位线性增长）。"""
-    assert local_llm.LocalLLMEngine._resolve_parallel_slots(
+    assert local_llm_engine.EngineProcess._resolve_parallel_slots(
         type("E", (), {"model_token_limit": 1})()) in (1, 2, 3, 4)
 
 
@@ -101,11 +128,11 @@ def test_resolve_slots_env_wins(monkeypatch):
     """环境变量 LATIAO_LLM_SLOTS 优先于 config.json；非法值回退默认 2。"""
     eng = _StubEngine()
     monkeypatch.setenv("LATIAO_LLM_SLOTS", "3")
-    assert local_llm.LocalLLMEngine._resolve_parallel_slots(eng) == 3
+    assert local_llm_engine.EngineProcess._resolve_parallel_slots(eng) == 3
     monkeypatch.setenv("LATIAO_LLM_SLOTS", "99")
-    assert local_llm.LocalLLMEngine._resolve_parallel_slots(eng) == 4
+    assert local_llm_engine.EngineProcess._resolve_parallel_slots(eng) == 4
     monkeypatch.setenv("LATIAO_LLM_SLOTS", "abc")
-    assert local_llm.LocalLLMEngine._resolve_parallel_slots(eng) == 2
+    assert local_llm_engine.EngineProcess._resolve_parallel_slots(eng) == 2
     monkeypatch.delenv("LATIAO_LLM_SLOTS")
 
 
@@ -113,10 +140,10 @@ def test_resolve_slots_from_config(monkeypatch):
     """没设环境变量时读 config.json 的 local_llm.slots。"""
     eng = _StubEngine()
     monkeypatch.delenv("LATIAO_LLM_SLOTS", raising=False)
-    monkeypatch.setattr(local_llm, "_read_config", lambda: {"local_llm": {"slots": 3}})
-    assert local_llm.LocalLLMEngine._resolve_parallel_slots(eng) == 3
-    monkeypatch.setattr(local_llm, "_read_config", lambda: {"local_llm": {"slots": "x"}})
-    assert local_llm.LocalLLMEngine._resolve_parallel_slots(eng) == 2
+    monkeypatch.setattr(local_llm_engine, "_read_config", lambda: {"local_llm": {"slots": 3}})
+    assert local_llm_engine.EngineProcess._resolve_parallel_slots(eng) == 3
+    monkeypatch.setattr(local_llm_engine, "_read_config", lambda: {"local_llm": {"slots": "x"}})
+    assert local_llm_engine.EngineProcess._resolve_parallel_slots(eng) == 2
 
 
 def test_custom_engine_never_gets_parallel_flag():
@@ -157,13 +184,48 @@ def test_loading_status_shows_slots():
             return None
 
     def _popen(cmd, **kwargs):
-        captured["status"] = eng.status_message
+        if _is_engine_spawn(cmd):
+            captured["status"] = eng.status_message
         return _Proc()
 
     with mock.patch("subprocess.Popen", side_effect=_popen):
-        local_llm.LocalLLMEngine._start_llama_native(
-            eng, "/tmp/models/M.gguf", 1234, exe="/tmp/fake-llama-server")
+        local_llm_engine.EngineProcess._start_llama_native(
+            eng, "/tmp/models/M.gguf", 1234, exe=_FAKE_EXE)
     assert "2 并发" in captured["status"] and "64000" in captured["status"]
+
+
+def test_capture_survives_background_subprocess():
+    """背景线程在捕获窗口内 spawn 无关命令 → 不得覆盖捕获值。
+
+    2026-10-04 CI flake 的确定性复现：discovery/update_service 的钥匙串证书
+    导出（subprocess.run(["security", ...])）在后台线程跑，全局 Popen mock
+    会把它的命令行也记进 captured —— 修复前这里断言拿到的是证书命令，
+    --parallel 随机丢。钩子在"等引擎就绪"窗口触发，精确复刻时序。
+    """
+    def bg_export():
+        try:
+            subprocess.run(
+                ["security", "find-certificate", "-a", "-p",
+                 "/Library/Keychains/System.keychain"],
+                capture_output=True, text=True, timeout=1)
+        except Exception:
+            pass          # mock 下的 _Proc 不满足 run() 的协议，异常与产品无关
+
+    eng = _StubEngine(slots=2, ctx=64000)
+    eng.during_wait = bg_export
+    cmd = _capture(eng)
+    assert _flag(cmd, "--parallel") == "2"
+    assert cmd[0] == _FAKE_EXE
+
+
+def test_is_engine_spawn_filter():
+    """过滤器本体：只认目标引擎 argv[0]，证书命令/空命令一律拒。"""
+    assert _is_engine_spawn([_FAKE_EXE, "-m", "x"]) is True
+    assert _is_engine_spawn(["security", "find-certificate"]) is False
+    assert _is_engine_spawn([]) is False
+    assert _is_engine_spawn(None) is False
+    assert _is_engine_spawn("security") is False
+
 
 def test_kv_cache_flags_preserved():
     """并发改造不许动 KV 量化（q4_0 是显存/内存的关键）。"""

@@ -9,8 +9,8 @@ from datetime import datetime
 
 import httpx
 
-from config import SUBAGENT_MODEL
 from capability_registry import USER_SKILLS_DIR
+from config import SUBAGENT_MODEL
 from db import _db_write_lock
 
 logger = logging.getLogger(__name__)
@@ -137,8 +137,11 @@ def _mark_tfidf_dirty():
 
 
 def _tf_rows(conn, only_new_after: int | None = None):
+    # 记忆固化（2026-10-04）：归档条目不进 TF-IDF 索引——它们已被
+    # memory_consolidate.py 判定为噪音/误分类（工具观察 / 聊天碎片 / 低价值 refined）。
     sql = ("SELECT rowid, id, topic, content, confidence, hit_count, source_type FROM learnings"
-           + (" WHERE rowid > ? ORDER BY rowid" if only_new_after is not None else ""))
+           " WHERE COALESCE(archived, 0) = 0"
+           + (" AND rowid > ? ORDER BY rowid" if only_new_after is not None else ""))
     return conn.execute(sql, (only_new_after,) if only_new_after is not None else ()).fetchall()
 
 
@@ -160,7 +163,10 @@ def _build_tfidf_index():
         # 本模块的置脏 → 删掉的条目会一直留在检索结果里（缓存永不失效）。命中路径
         # 用一次 COUNT（~0.2ms）比对，行数不符即当脏处理，这类陈旧就不可能发生。
         try:
-            total_now = _get_db().execute("SELECT COUNT(*) FROM learnings").fetchone()[0]
+            # 口径 = 活跃条数：归档是 UPDATE（不改行数），按总数比对会漏掉归档 →
+            # archived 条目会一直留在缓存里（2026-10-04 记忆固化时加）。
+            total_now = _get_db().execute(
+                "SELECT COUNT(*) FROM learnings WHERE COALESCE(archived, 0) = 0").fetchone()[0]
             if total_now == len(_TFIDF_DOCS or []):
                 return _TFIDF_CACHE
         except Exception:
@@ -168,7 +174,8 @@ def _build_tfidf_index():
         _TFIDF_CACHE_DIRTY = True
     try:
         conn = _get_db()
-        total = conn.execute("SELECT COUNT(*) FROM learnings").fetchone()[0]
+        total = conn.execute(
+            "SELECT COUNT(*) FROM learnings WHERE COALESCE(archived, 0) = 0").fetchone()[0]
     except Exception:
         return [], {}, {}
     if not total:
@@ -205,7 +212,8 @@ def _build_tfidf_index():
             incremental = True
             # 已存在文档的 confidence/hit_count 可能变了（改置信度不动内容）→ 只刷元数据
             meta = {r[0]: (r[1], r[2]) for r in conn.execute(
-                "SELECT rowid, confidence, hit_count FROM learnings")}
+                "SELECT rowid, confidence, hit_count FROM learnings "
+                "WHERE COALESCE(archived, 0) = 0")}
             for i, rid in enumerate(rowids[:len(rowids) - len(new_rows)]):
                 m = meta.get(rid)
                 if m:
@@ -385,11 +393,86 @@ def _is_junk_learning(topic, content, include_topic_prefix: bool = True) -> bool
     return False
 
 
+def _assistant_text_since(conn, session_id: str, since: str) -> str:
+    """取 since 之后该会话最近的 assistant 文本（供注入自动结算用）。"""
+    import json as _json
+    try:
+        rows = conn.execute(
+            "SELECT data FROM session_messages WHERE session_id = ? AND role = 'assistant' "
+            "AND created_at > ? ORDER BY seq DESC LIMIT 2",
+            (session_id, since)).fetchall()
+    except Exception:
+        return ""
+    parts: list[str] = []
+    for (data,) in rows:
+        try:
+            d = _json.loads(data)
+        except Exception:
+            continue
+        c = d.get("content") if isinstance(d, dict) else None
+        if isinstance(c, str):
+            parts.append(c)
+        elif isinstance(c, list):
+            parts.extend(b.get("text", "") for b in c
+                         if isinstance(b, dict) and b.get("type") == "text")
+    return " ".join(p for p in parts if p)
+
+
+def _settle_prev_injection(session_id: str) -> None:
+    """自动结算上一条注入（10-04）：用注入之后产生的 assistant 回答做 token 重叠
+    检测，把 used 标成 1/0——替代"等用户点赞"的空转机制（真库实测 374 次注入
+    仅 1 次反馈，信号等于没有）。
+
+    这是弱信号：重叠说明"回答里出现了注入知识的词"，不证明因果；used=0 也只表示
+    "这一轮没用上"。**不据此自动降权**——只作为长期门槛调优的统计样本。
+    """
+    import json as _json
+    if not session_id:
+        return
+    try:
+        conn = _get_db()
+        row = conn.execute(
+            "SELECT id, injected, created_at FROM memory_injections "
+            "WHERE session_id = ? AND used IS NULL ORDER BY created_at DESC LIMIT 1",
+            (session_id,)).fetchone()
+        if not row:
+            return
+        inj_id, injected, created = row
+        answer = _assistant_text_since(conn, session_id, created)
+        if len(answer.strip()) < 20:
+            return                       # 回答还没产生（或太短）：留待下次结算
+        answer_tokens = set(_tokenize_zh(answer))
+        if not answer_tokens:
+            return
+        try:
+            items = _json.loads(injected or "[]")
+        except Exception:
+            items = []
+        used = False
+        for it in items:
+            text = f"{it.get('topic') or ''} {it.get('content') or ''}".strip()
+            toks = set(_tokenize_zh(text))
+            if not toks:
+                continue
+            if len(toks & answer_tokens) / len(toks) >= 0.5:   # 半数以上 token 出现在回答里
+                used = True
+                break
+        with _db_write_lock:
+            conn.execute("UPDATE memory_injections SET used = ? WHERE id = ?",
+                         (1 if used else 0, inj_id))
+            conn.commit()
+    except Exception:
+        logger.debug("注入自动结算失败", exc_info=True)
+
+
 def _log_injection(session_id: str, query: str, items: list[dict]) -> None:
-    """记一条注入日志（④）：供点赞/点踩回流成标签。失败只记 debug（不影响检索）。"""
+    """记一条注入日志（④）：used 由自动结算（_settle_prev_injection）或用户
+    点赞/点踩（mark_injection_used）回流。失败只记 debug（不影响检索）。"""
+    _settle_prev_injection(session_id)   # 先结算上一条（此时它的回答已产生）
     try:
         import json as _json
         payload = _json.dumps([{"id": r.get("id"), "topic": r.get("topic"),
+                                "content": (r.get("content") or "")[:200],
                                 "score": r.get("score"), "sem": r.get("_semantic")}
                                for r in items], ensure_ascii=False)
         conn = _get_db()
@@ -423,6 +506,60 @@ def mark_injection_used(session_id: str, used: bool) -> int:
         return 0
 
 
+# ── 工具报错类学习的时效（2026-09-29 事故）─────────────────────────────
+# 9-23 的「mx_query 免费额度当日用完」学习 6 天后被语义召回，模型信以为真绕开
+# mx_query → ak_finance 撞上东财持续拒连 → 板块查询全挂。失败分两类：
+# **瞬态**（额度/限流/网络——当天有效，隔天就是谎言）与**结构**（不支持某查询
+# ——长期有用）。只对瞬态类做 TTL：过期即不再注入，并顺手从库里清掉。
+_TOOL_ERROR_TTL_HOURS = 24.0
+_TRANSIENT_FAIL_RE = re.compile(
+    r"调用次数已用|额度|限流|429|ConnectionError|RemoteDisconnected"
+    r"|连接中止|连接被拒|超时|timeout|timed?\s*out",
+    re.I,
+)
+# 反思提炼的固定开头："X(query=…) 失败：工具 X 执行出错"（memory.py 反思链写入）
+_TOOL_FAIL_STEM = "%失败：工具%"
+
+
+def _filter_stale_tool_failures(results: list[dict]) -> list[dict]:
+    """注入前把**过期的瞬态**工具报错学习剔掉，并把全库同类过期项顺手清掉。
+
+    只动「失败：工具 …」开头且命中瞬态标记（额度/限流/网络）的行；结构性失败
+    （"未返回数据/仅支持…"）是长期知识，不过期。清库走 learnings 表；
+    learnings_fts 是 JOIN 查询，主表行删掉后孤儿行自然失配，无需重建。
+    """
+    if not results:
+        return results
+    try:
+        from datetime import timedelta
+        cutoff = (datetime.now() - timedelta(hours=_TOOL_ERROR_TTL_HOURS)).isoformat()
+        markers = ("调用次数已用", "额度", "限流", "429", "ConnectionError",
+                   "RemoteDisconnected", "连接中止", "连接被拒", "超时", "timeout")
+        where_markers = " OR ".join("content LIKE ?" for _ in markers)
+        conn = _get_db()
+        with _db_write_lock:
+            conn.execute(
+                f"DELETE FROM learnings WHERE content LIKE ? AND created_at < ? "
+                f"AND ({where_markers})",
+                [_TOOL_FAIL_STEM, cutoff] + [f"%{m}%" for m in markers],
+            )
+            conn.commit()
+        # 召回结果里再拦一道：DELETE 之后仍留在旧结果列表里的过期项按"行已消失"识别
+        out = []
+        for r in results:
+            c = str(r.get("content") or "")
+            if "失败：" in c and _TRANSIENT_FAIL_RE.search(c):
+                row = conn.execute("SELECT created_at FROM learnings WHERE id = ?",
+                                   (r.get("id"),)).fetchone()
+                if row is None or str(row[0] or "") < cutoff:
+                    continue
+            out.append(r)
+        return out
+    except Exception:
+        logger.debug("瞬态工具报错学习过期过滤失败（fail-open）", exc_info=True)
+        return results
+
+
 def _retrieve_relevant_learnings(query: str, limit: int = MAX_LEARNINGS_INJECT,
                                  prev_user_text: str = "", session_id: str = "") -> list[dict]:
     """Search past learnings using TF-IDF semantic similarity.
@@ -442,6 +579,7 @@ def _retrieve_relevant_learnings(query: str, limit: int = MAX_LEARNINGS_INJECT,
         results = tf_candidates[:limit]
     results = [r for r in results
                if not _learning_is_garbage(r.get("topic", ""), r.get("content", ""))]
+    results = _filter_stale_tool_failures(results)
 
     if results:
         _log_injection(session_id, query, results)
@@ -469,7 +607,7 @@ def _retrieve_relevant_learnings(query: str, limit: int = MAX_LEARNINGS_INJECT,
                     """SELECT l.id, l.topic, l.content, l.confidence, l.hit_count, l.source_type
                        FROM learnings l
                        JOIN learnings_fts f ON l.rowid = f.rowid
-                       WHERE learnings_fts MATCH ?
+                       WHERE learnings_fts MATCH ? AND COALESCE(l.archived, 0) = 0
                        ORDER BY l.confidence * (1.0 + l.hit_count * 0.1) DESC
                        LIMIT ?""",
                     (safe_query, limit),
@@ -488,7 +626,7 @@ def _retrieve_relevant_learnings(query: str, limit: int = MAX_LEARNINGS_INJECT,
             rows = conn.execute(
                 """SELECT id, topic, content, confidence, hit_count, source_type
                    FROM learnings
-                   WHERE topic LIKE ? OR content LIKE ?
+                   WHERE (topic LIKE ? OR content LIKE ?) AND COALESCE(archived, 0) = 0
                    ORDER BY confidence DESC
                    LIMIT ?""",
                 (like_q, like_q, limit),
@@ -504,7 +642,7 @@ def _retrieve_relevant_learnings(query: str, limit: int = MAX_LEARNINGS_INJECT,
             rows = conn.execute(
                 """SELECT id, topic, content, confidence, hit_count, source_type
                    FROM learnings
-                   WHERE confidence >= ?
+                   WHERE confidence >= ? AND COALESCE(archived, 0) = 0
                    ORDER BY updated_at DESC
                    LIMIT ?""",
                 (LEARNING_CONFIDENCE_THRESHOLD, limit),
@@ -521,6 +659,7 @@ def _retrieve_relevant_learnings(query: str, limit: int = MAX_LEARNINGS_INJECT,
         # 用户看到的是"我说什么他都去找股市、新会话也记得"。
         results = [r for r in results
                    if not _learning_is_garbage(r.get("topic"), r.get("content"))]
+        results = _filter_stale_tool_failures(results)
         _q_tokens = [t for t in _tokenize_zh(query) if len(t) >= 2]
         if _q_tokens:
             results = [r for r in results
@@ -556,7 +695,17 @@ def _retrieve_relevant_learnings(query: str, limit: int = MAX_LEARNINGS_INJECT,
 
 
 def _store_learning(session_id: str, topic: str, content: str, confidence: float = 0.5, source_type: str = "extracted"):
-    """Store a new learning. If a similar topic already exists, update confidence."""
+    """Store a new learning. If a similar topic already exists, update confidence.
+
+    入库前统一脱敏（P2）：高置信度学习会被注入后续会话，密钥不能进记忆库。
+    """
+    try:
+        from cmd_safety import redact_secrets
+        topic = redact_secrets(str(topic or ""))[:200]
+        content = redact_secrets(str(content or ""))[:4000]
+    except Exception:
+        topic = str(topic or "")[:200]
+        content = str(content or "")[:4000]
     _mark_tfidf_dirty()
     try:
         conn = _get_db()
@@ -630,6 +779,13 @@ def _resolve_preference_key(matched_text: str) -> str:
 
 def _store_preference(key: str, value: str, confidence: float = 0.5):
     """Store a learned user preference. Boosts confidence if already exists."""
+    try:
+        from cmd_safety import redact_secrets
+        key = redact_secrets(str(key or ""))[:120]
+        value = redact_secrets(str(value or ""))[:500]
+    except Exception:
+        key = str(key or "")[:120]
+        value = str(value or "")[:500]
     try:
         conn = _get_db()
         now = datetime.now().isoformat()
@@ -736,6 +892,62 @@ def reflection_learning_key(tool_name: str, tool_result_summary: str) -> tuple[s
     return topic, sig
 
 
+# ── 反思提升的「环境噪声」闸门（2026-10-12，用户拍板）────────────────────
+# 反思学习的价值在"下次怎么做"（topic 就是错误签名），但真库里活跃的 29 条噪声
+# 全是**环境/当次状态**造成的失败——复述不出任何做法，却占注入名额、还可能误导：
+#   · read_file 失败：错误：文件不存在 - /Users/langzuxiax/…（路径本身打错了）
+#   · read_file 失败：错误：文件不存在 - https://marketing.dcfw.com/…（拿 URL 当路径）
+#   · write_file 失败：failed: could not read back file（应用自身的回读校验）
+#   · run_cmd 失败：'utf-8' codec can't decode（当次输出的编码）
+# 判据的取向：**错误由环境/瞬时状态造成**的滤掉；"工具用法/接口语义"造成的保留
+# （那才是可复用经验，如"该接口不支持板块汇总，要指定单个板块名"）。
+_ENV_NOISE_PATTERNS = (
+    # 路径/目标漂移
+    "文件不存在", "no such file", "does not exist", "找不到文件",
+    # 瞬时网络
+    "connectionerr", "connection refused", "connection reset", "econnreset",  # 抗 60 字截断（ConnectionErr…）
+    "remotedisconnected", "timed out", "timeout", "temporarily unavailable",
+    "http 429", "429 too many requests", "502 bad gateway", "503 service",
+    # 应用自身的校验/机制
+    "could not read back", "read back",
+    # 当次 payload 的编码
+    "codec can't decode", "unicode decode", "unicodedecodeerror",
+    # 反思模型自认没提炼出东西（回填脚本路径的文案）
+    "无法从中提炼", "没有可提炼", "无有效知识",
+    # 泛型签名：兜底模板 + 括号里就是 "error"（不含任何具体错误）
+    "执行出错，可能需要重试或调整参数（error）",
+)
+
+
+def _reflection_is_env_noise(topic: str, content: str) -> bool:
+    """只是"环境/一次性"失败的反思 → 不该入库为知识（见上方说明）。"""
+    blob = f"{topic}\n{content}".lower()
+    return any(p in blob for p in _ENV_NOISE_PATTERNS)
+
+
+# 反思文案必须**是本应用的模板句**（`_quick_reflect` 生成，共四类）。
+# 为什么要求形状：真库 11 条"非模板"的 reflection 全是**逐字抄来的聊天/文档片段**
+# （含一条私密角色扮演台词、10 条建筑工程合同句子）——不是知识，却会被语义检索
+# 注入、还可能被送进云端提炼。模型自己提炼知识走的是 `_refine_learnings`
+# （source_type='refined'），两条路职责不同，反思路径不该变成任意文本的入口。
+_REFLECTION_TEMPLATE_STARTS = (
+    "权限不足，建议检查文件/目录权限",
+    "目标不存在，可能需要先确认路径或创建前置资源",
+    "工具返回为空，可能参数不正确或目标无内容",
+)
+_REFLECTION_TEMPLATE_ERR = "执行出错，可能需要重试或调整参数"
+
+
+def _reflection_is_known_template(reflection: str) -> bool:
+    """反思文案是否是应用自己的模板句（见上方说明）。"""
+    r = (reflection or "").strip()
+    if not r:
+        return False
+    if r.startswith("工具 ") and _REFLECTION_TEMPLATE_ERR in r[:80]:
+        return True
+    return any(r.startswith(p) for p in _REFLECTION_TEMPLATE_STARTS)
+
+
 def promote_reflection_to_learning(session_id: str, tool_name: str, tool_args: dict,
                                    tool_result_summary: str, reflection: str) -> bool:
     """把一条"真踩到的坑"写成 learning（⑧ 的核心动作，实时路径与回填脚本共用）。
@@ -750,6 +962,13 @@ def promote_reflection_to_learning(session_id: str, tool_name: str, tool_args: d
     _probe_content = f"{tool_name} 失败：{reflection}"
     if _is_junk_learning(topic, _probe_content):
         logger.debug("反思提升被噪声闸门拦下: %s", topic[:40])
+        return False
+    if _reflection_is_env_noise(topic, f"{_probe_content}｜{sig}"):
+        logger.debug("反思提升被环境噪声闸门拦下（无复用价值）: %s", topic[:40])
+        return False
+    if not _reflection_is_known_template(reflection):
+        logger.info("反思提升被形状闸门拦下（非应用模板文案，疑似聊天/文档片段）: %s",
+                    str(reflection)[:60])
         return False
     try:
         if isinstance(tool_args, dict) and tool_args:
@@ -775,9 +994,16 @@ async def _refine_learnings(tool_name: str, args: dict, result: str, session_id:
     if len(result) < 20 or result.startswith("Error") or result.startswith("⛔"):
         return  # Don't learn from errors or empty results
     try:
+        # 记忆固化（2026-10-04）：原提示词"聚焦于项目结构"直接催生了 88 条
+        # "read_file: 项目采用…"式的工具观察噪音——"可从项目现状读出"的内容，
+        # 两家 agent 的记忆规范都明令不该记（且大批低命中条目稀释检索）。
+        # 收紧为"三选一才值得记"，并显式排除文件观察与一次性任务/对话内容；
+        # "无需记录"是 1-5 字的短回复，会被下方 len(summary) > 5 的检查拦住不入库。
         prompt = (
-            "从以下工具执行结果中提炼一条可复用的知识或发现，用一句中文总结（不超过50字），"
-            "聚焦于项目结构、代码模式、配置习惯或用户偏好。\n\n"
+            "从以下工具执行结果中提炼一条可复用知识，用一句中文总结（不超过50字）。"
+            "只有满足下列之一才值得记：① 下次能省步骤的具体做法；② 失败教训（症状→原因→处理）；"
+            "③ 用户偏好或纠正。不要记录「读了哪个文件 / 文件里有什么」这类可从项目现状直接读出的内容，"
+            "也不要记录一次性的任务描述或对话内容。若不满足上述条件，只回复：无需记录。\n\n"
             f"工具: {tool_name}\n"
             f"参数: {json.dumps(args, ensure_ascii=False)[:200]}\n"
             f"结果摘要: {result[:800]}\n\n"
@@ -807,6 +1033,21 @@ async def _refine_learnings(tool_name: str, args: dict, result: str, session_id:
                 # 当"知识"存库（09-07 清理出多条 <think> 垃圾，置信度 1.0）
                 "chat_template_kwargs": {"enable_thinking": False},
             }, headers=headers)
+            # 成本可见（gap 第 4 步，2026-09-29）：这次调用此前完全不计账——每个工具
+            # 执行后都会额外发一次（云端优先），用户只看到主循环的开销。只计数、不改行为。
+            # 注意：**先记"发出去了一次"**，再尝试取 usage——响应不是 JSON 时也不能漏记。
+            try:
+                import context_stats as _cs
+                _usage = None
+                if r.status_code == 200:
+                    try:
+                        _usage = r.json().get("usage")
+                    except Exception:
+                        _usage = None
+                _cs.record_refine(session_id, _usage if isinstance(_usage, dict) else None,
+                                  ok=(r.status_code == 200))
+            except Exception:
+                logger.debug("refine 用量记账失败", exc_info=True)
             if r.status_code == 200:
                 data = r.json()
                 summary = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
@@ -841,7 +1082,8 @@ def _is_duplicate_learning(summary: str, threshold: float = 0.7) -> bool:
     try:
         conn = _get_db()
         rows = conn.execute(
-            "SELECT content FROM learnings ORDER BY created_at DESC LIMIT 20"
+            "SELECT content FROM learnings WHERE COALESCE(archived, 0) = 0 "
+            "ORDER BY created_at DESC LIMIT 20"
         ).fetchall()
         summary_tokens = set(_tokenize_zh(summary))
         if not summary_tokens:
@@ -885,7 +1127,7 @@ async def _maybe_generate_skill(tool_name: str, args: dict, result: str):
     try:
         conn = _get_db()
         rows = conn.execute(
-            "SELECT topic, content, confidence FROM learnings WHERE content LIKE ? AND confidence >= 0.5 ORDER BY created_at DESC LIMIT 5",
+            "SELECT topic, content, confidence FROM learnings WHERE content LIKE ? AND confidence >= 0.5 AND COALESCE(archived, 0) = 0 ORDER BY created_at DESC LIMIT 5",
             (f"%{tool_name}%",),
         ).fetchall()
         if not rows:
@@ -976,7 +1218,7 @@ def get_recent_learnings_for_ui(limit: int = 8) -> list[dict]:
         db = _get_db()
         rows = db.execute(
             "SELECT topic, content, confidence FROM learnings "
-            "WHERE length(content) > 10 "
+            "WHERE length(content) > 10 AND COALESCE(archived, 0) = 0 "
             "ORDER BY confidence DESC, updated_at DESC LIMIT ?",
             (limit,),
         ).fetchall()
@@ -1009,11 +1251,20 @@ _KNOWLEDGE_PATTERNS = [
     # "我要你…"这类整句发言被存成 0.7 偏好并**无条件注入**，模型此后每轮都照它走
     # （用户实测：一句露骨要求被持久化后，助手每轮都拒答，换新会话也无效）。
     # 改成必须出现完整愿望词（想要/希望/喜欢…），不再收裸"我要"。
-    (r"(?:我(?:更|最|比较|挺|很)?(?:喜欢|想要|希望|偏好|中意)|倾向于|习惯|"
-     r"我不(?:想要|喜欢)|我更(?:希望|喜欢|想要|倾向)|能不能(?:不要|别)|"
-     r"最好(?:是|不要|别)|不喜欢)[^\n]{5,100}", "preference", 0.7),
+    (r"(?:我(?:更|最|比较|挺|很|也|还是|就)?(?:喜欢|想要|希望|偏好|中意|需要|宁愿|宁可)|"
+     r"倾向于|习惯|我不(?:想要|喜欢|希望)|我更(?:希望|喜欢|想要|倾向)|"
+     r"能不能(?:不要|别)|最好(?:是|不要|别)|不喜欢)[^\n]{5,100}", "preference", 0.7),
     # User gives behavioral instruction
     (r"(?:以后|接下来|从现在开始|请[你]?[不要要]).{0,30}(?:回复|回答|说话|做事)[^\n]{5,80}", "preference", 0.75),
+    # 10-04 扩召回：09-21 修劫持时把模式收得过窄——"别用表格"、"下次直接给结论"、
+    # "记住我用中文"这类真实偏好全都不命中（上线一个月 preferences 表只有 1 条，
+    # 用户抱怨"说过的话记不住"）。放宽的边界由既有的三层保护兜底：写入档 0.6
+    #（单次不注入系统提示）→ 重复表达才累加到 0.7+（无条件注入档）→ 守卫仍拦
+    # 露骨内容与整句命令式发言。多收的是"候选"，不是"生效的偏好"。
+    # 长期性设定（带"以后/下次/每次"等时间标记的短指令）
+    (r"(?:以后|今后|下次|每次|从现在起|往后|再也不|再也别|永远)[^\n]{2,80}", "preference", 0.7),
+    # 明示记忆指令（"记住我用中文"——用户明确要求记住，是最强的偏好信号）
+    (r"(?:记住|记着)[^，。\n]{0,12}[，,]?[^\n]{2,60}", "preference", 0.7),
 
     # ── Technical ──
     (r"(?:这个项目|项目[中里]|这里|代码[中里]|API|接口|函数|类[名型]|变量|参数|模块|包|库|框架)[^\n]{10,120}(?:是|用|在|需要|可以|叫做|位于|指向|引用)[^\n]{5,60}", "technical", 0.5),

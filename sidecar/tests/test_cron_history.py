@@ -65,8 +65,8 @@ def test_tool_returns_summary_and_hint(env):
     db, cron = env
     conn = db._get_db()
     _add(conn, "查询A股大盘资金", "# 完整报告\n" + "细节 " * 200, "2026-09-01 09:00")
-    from pathlib import Path
     import importlib.util
+    from pathlib import Path
     spec = importlib.util.spec_from_file_location(
         "cron_history_under_test",
         Path(cron.__file__).parent / "plugins" / "cron_history.py")
@@ -84,6 +84,7 @@ def test_tool_returns_summary_and_hint(env):
 def test_tool_clamps_limit(env):
     import importlib.util
     from pathlib import Path
+
     import cron as _cron
     spec = importlib.util.spec_from_file_location(
         "ch2", Path(_cron.__file__).parent / "plugins" / "cron_history.py")

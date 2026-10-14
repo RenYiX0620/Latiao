@@ -8,26 +8,68 @@
 通过惰性导入联系——注册表由 main.py 门面在启动时装配，属于宿主职责，不从本模块
 反向 import（会造出回环）。
 """
-import logging
-
 import asyncio
 import inspect
 import json
+import logging
 import time
 import uuid
-from agent.confirm import _await_tool_confirmation, _check_pre_hooks, _count_successful_duplicates, _wait_tool_confirmation
-from agent.context import AUTO_EDIT_TOOLS, _candidate_tool_names, _check_access, _normalize_access, _recover_tool_name, subagent_tool_gate
+from datetime import datetime
+
+from agent.confirm import (
+    _await_tool_confirmation,
+    _check_pre_hooks,
+    _count_successful_duplicates,
+    _wait_tool_confirmation,
+)
+from agent.context import (
+    AUTO_EDIT_TOOLS,
+    _candidate_tool_names,
+    _check_access,
+    _normalize_access,
+    _recover_tool_name,
+    subagent_tool_gate,
+)
 from agent.progress import _record_progress
 from agent.session_events import _event_log_for
 from agent.verify import _auto_verify
 from cmd_safety import redact_secrets, tool_log_preview
-from datetime import datetime
 from db import _db_write_lock, _get_db
 from memory import _maybe_generate_skill, _refine_learnings, record_tool_reflection
 from threat_scan import guard_tool_result
+from threat_scan import is_suspect as _threat_is_suspect
 from tool_executor import _resolve_permission
 
 logger = logging.getLogger("latiao-sidecar")   # 与 agent_loop 同名：日志格式不变
+
+
+def _append_run_outcome(tool_name: str, result: str, arguments: dict) -> str:
+    """执行后校验与状态标记（纯函数，便于单测）。
+
+    run_cmd 的成功标记**只在确实执行过**时加：此前按"文本里没有 Error/错误"判定，
+    被拒（`⛔ 不支持 shell 操作符 …`）与超时（`超时: …`）的结果都会被贴上
+    `✅ Exit code: 0 (success)`，模型于是把"被拒绝"读成"跑过了、只是没输出"
+    （2026-09-24 用户实测：⛔ 与 ✅ 同时出现）。
+    """
+    if tool_name == "write_file":
+        path = arguments.get("path", "")
+        expected = arguments.get("content", "")
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                actual = f.read()
+            if actual == expected:
+                result += "\n✅ Verified: file content matches exactly."
+            else:
+                result += f"\n⚠️ Verification: content mismatch (expected {len(expected)} chars, got {len(actual)} chars)."
+        except Exception as e:
+            result += f"\n⚠️ Verification failed: could not read back file ({e})."
+    elif tool_name == "run_cmd":
+        # 没执行（被拒/超时/格式错误/用户停止）→ 不加任何成功标记
+        _not_run = result.lstrip().startswith(("⛔", "❌", "⚠️", "超时", "⏹"))
+        if not _not_run and ("(退出码: 0)" in result or "退出码" not in result):
+            result += "\n✅ Exit code: 0 (success)"
+    return result
+
 
 async def execute_tool(tool_name: str, arguments: dict) -> str:
     """Execute a tool with feedback verification. Supports both sync and async tool functions."""
@@ -62,38 +104,67 @@ async def execute_tool(tool_name: str, arguments: dict) -> str:
         logger.debug("bump_usage failed for %s", tool_name, exc_info=True)
 
     # ── Feedback subsystem: post-execution verification ──
-    if tool_name == "write_file":
-        path = arguments.get("path", "")
-        expected = arguments.get("content", "")
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                actual = f.read()
-            if actual == expected:
-                result += "\n✅ Verified: file content matches exactly."
-            else:
-                result += f"\n⚠️ Verification: content mismatch (expected {len(expected)} chars, got {len(actual)} chars)."
-        except Exception as e:
-            result += f"\n⚠️ Verification failed: could not read back file ({e})."
-    elif tool_name == "run_cmd":
-        # Exit code already captured; add explicit pass/fail
-        if "(退出码: 0)" in result or "退出码" not in result:
-            if "Error" not in result and "错误" not in result:
-                result += "\n✅ Exit code: 0 (success)"
+    return _append_run_outcome(tool_name, result, arguments)
 
-    return result
+# 失败文案的"开头形态"（我们自己的约定）：⛔/❌ 是工具层的失败标记
+_FAIL_PREFIXES = ("Error", "错误", "⛔", "❌")
+# 中文失败句的首词（只认"首行就是失败句"，不做整段子串搜索）
+_FAIL_LINE_PREFIXES = ("未找到", "不存在", "权限不足", "失败", "无法", "不支持")
+
+
+def _looks_like_tool_failure(result: str) -> bool:
+    """工具结果是否表示失败（**唯一判据**，2026-09-29 抽出一份）。
+
+    为什么必须共享：`read_file` 缺文件返回的是「错误：文件不存在 - …」——既无
+    "Error" 也无 "⛔"。同错升级的扫描曾自带一份只认英文的判据，于是中文报错的工具
+    永远不会被计成失败（受控实测 + 故障注入测试抓到）。这里含中文形态，与
+    verify_failed 同源；`_scan_tool_failures` 也复用本函数，避免再次漂移。
+
+    2026-09-29 审计收紧（原实现是"头 200 字里含 不存在/未找到/权限不足 即失败"，
+    实证误判过两类**成功**结果）：读到含这些词的源码、搜索恰好命中这些词
+    （如 tavily 的「🔍 …未找到相关结果。」）都被判成失败 → 计数进同错升级。
+    现在只认**首行的失败句形状**（首行短且以失败词开头）+ 我们的失败前缀 + 结构化
+    `{"status":"error"}`。真失败文案（错误：/⛔/❌/未找到…开头 / adapters 的 dict）
+    全部仍被判定（`test_tool_failure_judge.py` 逐条钉住）。
+    """
+    r = str(result or "")
+    if not r:
+        return False
+    head = r[:200]
+    first = (head.splitlines() or [""])[0].strip()
+    if first.startswith(_FAIL_PREFIXES):
+        return True
+    if "permission denied" in head.lower():
+        return True
+    if 0 < len(first) <= 60 and first.startswith(_FAIL_LINE_PREFIXES):
+        return True
+    # adapters 等把结构化结果文本化后以 { 开头（只有 status=error 才算失败）
+    if r.lstrip().startswith("{") and '"status"' in head:
+        try:
+            d = json.loads(r[:4000])
+            if isinstance(d, dict) and str(d.get("status") or "") == "error":
+                return True
+        except Exception:
+            pass
+    return False
+
 
 async def _handle_tool_execution(tc: dict, current_msgs: list, session_id: str,
                                  agent_id: str, access_mode: str = "confirm",
-                                 pre_started: dict | None = None) -> tuple[bool, list[dict]]:
+                                 pre_started: dict | None = None,
+                                 tool_whitelist: set | None = None) -> tuple[bool, list[dict]]:
     """事件日志包装（阶段 1，灰度）：tool/call + tool/result 单点入日志。
 
     _handle_tool_execution_inner 是全循环唯一的工具执行入口（云/本地两个
     生成器都在此交汇），在这里配对其"调用-结果"事件最不容易漏——
     早期/拒绝/异常四条早退路径都经过同一包装。
+
+    tool_whitelist: 子代理/cron 的工具隔离（None = 不限制）。此前只在**发给模型的
+    目录**里过滤（loop 组装 tools 时），执行层不过问——模型用文本方言绕过目录
+    仍能调到任意工具（2026-10-11 深审 Critical）。这里在唯一执行入口做硬闸门。
     """
     # 依赖仍留在 agent_loop 的定义 → 函数内惰性导入（避免循环依赖）
-    from agent_loop import _tool_end_result
-    from agent_loop import _tool_timeout_for
+    from agent_loop import _tool_end_result, _tool_timeout_for
     log = _event_log_for(session_id) if session_id else None
     call_seq: int | None = None
     if log is not None:
@@ -114,15 +185,20 @@ async def _handle_tool_execution(tc: dict, current_msgs: list, session_id: str,
     try:
         verify_failed, events = await asyncio.wait_for(
             _handle_tool_execution_inner(
-                tc, current_msgs, session_id, agent_id, access_mode, pre_started),
+                tc, current_msgs, session_id, agent_id, access_mode, pre_started,
+                tool_whitelist),
             timeout=_tlimit,
         )
     except asyncio.TimeoutError:
         _call_id = tc.get("id") or ""
         logger.warning("工具执行超时：%s 超过 %.0fs（已中止并回报模型）", _tname, _tlimit)
-        from agent.messages import lang_of, msg as _msg
+        from agent.messages import lang_of
+        from agent.messages import msg as _msg
         result = _msg("tool_timeout", lang_of(current_msgs),
                       name=_tname, limit=_tlimit)
+        # 必须写 role:tool 消息（2026-10-11 修复：此前只发事件不入史，
+        # 模型不知道工具超时了，_sanitize 再填占位符把真相盖掉）
+        current_msgs.append({"role": "tool", "tool_call_id": _call_id, "content": result})
         verify_failed, events = False, [{"event": "tool_end", "call_id": _call_id,
                                          "tool": _tname, "result": result,
                                          "ts": int(time.time() * 1000)}]
@@ -136,21 +212,37 @@ async def _handle_tool_execution(tc: dict, current_msgs: list, session_id: str,
             )
         except Exception:
             logger.warning("failed to log tool/result for %s", session_id, exc_info=True)
+    # 任务级验证账本（gap 清单 P1，2026-09-29）：本函数是全循环唯一的工具执行入口
+    # （云/本地、串行/并行、含早退路径都在此交汇），在这里记账最不容易漏。只记录，
+    # 不做任何判定——判定在交付前（`agent/task_verify.verify`）。
+    try:
+        from agent import task_verify as _tv
+        _tv.note_tool(session_id, _tname, tc.get("function", {}).get("arguments", ""),
+                      _tool_end_result(events))
+    except Exception:
+        logger.debug("task_verify.note_tool 失败", exc_info=True)
     return verify_failed, events
 
 async def _handle_tool_execution_inner(tc: dict, current_msgs: list, session_id: str,
                                        agent_id: str, access_mode: str = "confirm",
-                                       pre_started: dict | None = None) -> tuple[bool, list[dict]]:
+                                       pre_started: dict | None = None,
+                                       tool_whitelist: set | None = None) -> tuple[bool, list[dict]]:
     """Execute a single tool call within the agent loop. Returns (verify_failed, events).
 
     pre_started: SSE 调用方已通过 _start_tool_confirmation 启动确认并发出
     tool_confirm 事件时传入（含 event_obj）——本函数只等待结果，不再重复发事件。
-    确认事件若在等待完成后才发出，前端弹窗永不出现（死锁）。"""
+    确认事件若在等待完成后才发出，前端弹窗永不出现（死锁）。
+
+    tool_whitelist: 非 None 时**执行前硬拒**名单外的工具名（子代理/cron 隔离）。
+    目录过滤（loop 组 tools）只是软约束，fence 解析出的名字不经过它。
+    """
     # 依赖仍留在 agent_loop 的定义 → 函数内惰性导入（避免循环依赖）
-    from agent_loop import _TIME_SENSITIVE_TOOLS
-    from agent_loop import _REPEAT_ALLOWED_TOOLS
-    from agent_loop import TOOL_HOOKS
-    from agent_loop import _spawn
+    from agent_loop import (
+        _REPEAT_ALLOWED_TOOLS,
+        _TIME_SENSITIVE_TOOLS,
+        TOOL_HOOKS,
+        _spawn,
+    )
     call_id = tc.get("id") or str(uuid.uuid4())
     func = tc.get("function", {})
     tool_name = func.get("name", "unknown") or ""
@@ -188,6 +280,20 @@ async def _handle_tool_execution_inner(tc: dict, current_msgs: list, session_id:
             current_msgs.append({"role": "tool", "tool_call_id": call_id, "content": result})
             return True, [{"event": "tool_end", "call_id": call_id, "tool": "?", "result": result,
                            "ts": int(time.time() * 1000)}]
+    # ── 工具白名单硬闸门（2026-10-11 深审 Critical）──
+    # 子代理/cron 的 tool_whitelist 此前只在"发给模型的目录"里过滤（loop 组 tools），
+    # 执行层不过问：文本方言 fence 解析出的任意工具名仍会进 TOOL_DISPATCH。这里在
+    # 唯一执行入口做硬拒——名单外一律不执行（与目录过滤共同构成"软+硬"两道）。
+    if tool_whitelist is not None and tool_name not in tool_whitelist:
+        _wl_names = sorted(tool_whitelist)[:20]
+        result = (
+            f"⛔ 工具 {tool_name} 不在本次运行的工具白名单内，已拒绝执行。"
+            + (f"可用工具：{', '.join(_wl_names)}" if _wl_names
+               else "本次运行不允许任何工具调用（白名单为空）。")
+        )
+        current_msgs.append({"role": "tool", "tool_call_id": call_id, "content": result})
+        return False, [{"event": "tool_end", "call_id": call_id, "tool": tool_name,
+                        "result": result, "ts": int(time.time() * 1000)}]
     # 权限模式拦截：read_only/workspace 下越权工具直接拒绝（不执行）
     denied = _check_access(tool_name, access_mode)
     if denied:
@@ -269,7 +375,18 @@ async def _handle_tool_execution_inner(tc: dict, current_msgs: list, session_id:
     # full（完全访问）档：confirm 级工具免确认直接执行——此前 5 档中
     # confirm/plan/full 三档无门控、与默认档完全等价（审计 A2）。
     # danger/deny 规则拦截仍在上方生效，不受此豁免影响。
-    _full_bypass = (_access == "full") or _sub_gate_checked
+    # full 也保留 run_cmd/control_launch/control_kill_process 确认（P0）
+    from agent.confirm import _FULL_ALWAYS_CONFIRM
+    _full_bypass = ((_access == "full" and tool_name not in _FULL_ALWAYS_CONFIRM)
+                    or _sub_gate_checked)
+    # 注入命中后（threat_scan 标记会话可疑）：高危工具不再吃任何 bypass，强制二次确认
+    if _threat_is_suspect(session_id) and tool_name in _FULL_ALWAYS_CONFIRM:
+        _full_bypass = False
+        _auto_edit_bypass = False
+    # 注入命中后（threat_scan 标记可疑会话）：高危工具不再吃任何 bypass，强制确认
+    if _threat_is_suspect(session_id) and tool_name in _FULL_ALWAYS_CONFIRM:
+        _full_bypass = False
+        _auto_edit_bypass = False
     # 事件列表必须先初始化：confirm 分支的 pre_started 路径（当前两个 SSE
     # 循环的唯一调用方式）此前从未绑定 events 就 extend → UnboundLocalError
     # 整个任务崩溃（审计 P0：每次确认弹窗路径必炸）
@@ -299,10 +416,29 @@ async def _handle_tool_execution_inner(tc: dict, current_msgs: list, session_id:
 
     # ── Execute + Post-hooks ──
     events.append({"event": "tool_start", "call_id": call_id, "tool": tool_name, "args": args, "ts": int(time.time() * 1000)})
+    # 匿名使用数据（2026-10-11）：工具名也不记——只记"发生了一次工具调用"。
+    # 失败与否在结果判定之后补记（tool_errors），见下方 _looks_like_tool_failure 处。
+    try:
+        import anon_usage
+        anon_usage.note("tool_calls")
+    except Exception:
+        logger.debug("anon_usage 工具记账失败", exc_info=True)
     # 参数预览也要脱敏：run_cmd 的 token、api key 常出现在参数里（09-23）
     logger.info("Tool executing: %s %s", tool_name,
                 redact_secrets(json.dumps(args, ensure_ascii=False))[:120])
-    result = await execute_tool(tool_name, args)
+    # 会话上下文进线程（asyncio.to_thread 拷贝 context）：run_cmd 等长命令据此
+    # 感知停止键——取消到达即杀进程树，不再跑满自己的超时（2026-10-05）
+    # 同时把工具白名单放进 context：delegate_task 派生子代理时据此收窄
+    # （2026-10-11 深审：parent_whitelist 从没人传，受限父会话生出全量子代理）。
+    from tool_executor import CURRENT_TOOL_SESSION, CURRENT_TOOL_WHITELIST
+    _tool_ctx = CURRENT_TOOL_SESSION.set(session_id)
+    _wl_ctx = CURRENT_TOOL_WHITELIST.set(
+        frozenset(tool_whitelist) if tool_whitelist is not None else None)
+    try:
+        result = await execute_tool(tool_name, args)
+    finally:
+        CURRENT_TOOL_SESSION.reset(_tool_ctx)
+        CURRENT_TOOL_WHITELIST.reset(_wl_ctx)
     # 结果预览脱敏：read_file 这类内容工具只记长度（真机实测原样落盘过 API key）
     logger.info("Tool result: %s → %s", tool_name, tool_log_preview(tool_name, result))
 
@@ -326,15 +462,24 @@ async def _handle_tool_execution_inner(tc: dict, current_msgs: list, session_id:
     _spawn(_refine_learnings(tool_name, args, result, session_id))
     _spawn(_maybe_generate_skill(tool_name, args, result))
 
-    verify_report = await _auto_verify(tool_name, args, result)
+    # 校验器本身绝不能打死整轮：它的异常此前会冒到 Agent 循环，把"写 Word 文档"
+    # 这类正常请求变成"Agent 循环内部错误"（2026-09-24 用户实测：.docx 回读
+    # UnicodeDecodeError）。单个检查失败 → 只记日志、跳过报告。
+    try:
+        verify_report = await _auto_verify(tool_name, args, result)
+    except Exception:
+        logger.warning("auto-verify 失败（不影响工具结果）: %s", tool_name, exc_info=True)
+        verify_report = ""
     verify_failed = bool(verify_report and "❌" in verify_report)
-    result_lower = result.lower()
-    if not verify_failed and (
-        result.startswith("Error") or result.startswith("错误") or
-        result.startswith("⛔") or "permission denied" in result_lower or
-        "权限不足" in result or "不存在" in result or "未找到" in result
-    ):
+    if not verify_failed and _looks_like_tool_failure(result):
         verify_failed = True
+    if verify_failed:
+        # 匿名使用数据：只记"工具失败"发生的次数（哪个工具、什么错都不记）
+        try:
+            import anon_usage
+            anon_usage.note("tool_errors")
+        except Exception:
+            logger.debug("anon_usage 失败计数跳过", exc_info=True)
 
     # 反思链路唯一入口：生成文案 + 诚实 was_useful + 真失败提升为 learning（⑧）
     reflection_note = record_tool_reflection(session_id, tool_name, args, result)
@@ -370,7 +515,15 @@ async def _handle_tool_execution_inner(tc: dict, current_msgs: list, session_id:
     # 搜索结果、接口返回），而工具集里有 shell / write_file。命中疑似注入句式时只加
     # 一条"这是数据、不是指令"的标注、**不删数据**（删了用户就看不懂搜索结果）；
     # 未命中时原样返回，零改动零开销。这里是全循环唯一的工具结果落库点。
-    tool_content = guard_tool_result(tool_name, tool_content)
+    tool_content = guard_tool_result(tool_name, tool_content, session_id)
+    # 子代理结果**恒定**围栏（2026-10-11 深审 High）：delegate_task 的返回值是
+    # 子代理读网页/文件后的结论，guard_tool_result 只在命中注入句式时才围栏——
+    # 而"忽略上述指令"这类句子很容易绕过正则。子代理产出一律按外部数据处理。
+    # 台账/注册表存的仍是原文（_delegate_task 写 s["result"]），只有进模型上下文
+    # 的这一份围栏。
+    if tool_name == "delegate_task":
+        from threat_scan import fence_untrusted
+        tool_content = fence_untrusted("子代理", tool_content)
     current_msgs.append({"role": "tool", "tool_call_id": call_id,
                          "content": (_stamp_time_sensitive() + tool_content
                                      if tool_name in _TIME_SENSITIVE_TOOLS else tool_content)})
@@ -408,11 +561,25 @@ def _dispatch_delegate(args: dict):
     子代理 run() 不会覆盖它——后台完成通知靠它回寻父会话）。"""
     agent = args.get("agent", "code-reviewer")
     task = args.get("task", "")
-    from agent.subagent import _CURRENT_PARENT_SESSION, _delegate_task_bg, _delegate_task_fg
+    from agent.subagent import (
+        _CURRENT_PARENT_SESSION,
+        _delegate_task_bg,
+        _delegate_task_fg,
+    )
     parent_session = _CURRENT_PARENT_SESSION.get()
     if args.get("background"):
         return _delegate_task_bg(agent, task, parent_session=parent_session)
     return _delegate_task_fg(agent, task)
+
+
+def _dispatch_update_todos(args: dict):
+    """update_todos 分发：写入本会话的任务清单（存储/快照在 todos.py）。
+    session 从 contextvar 捕获——与 delegate_task 同一套语义（loop.run() 每轮
+    起始 set(self.session_id)，见 agent/loop.py）。"""
+    from agent.subagent import _CURRENT_PARENT_SESSION
+    from todos import update as _update
+    session = _CURRENT_PARENT_SESSION.get() or ""
+    return _update(session, args.get("todos") or [])
 
 def _dispatch_use_skill(args: dict) -> str:
     """use_skill 分发：从 registry 取技能全文。未启用/不存在时返回可用目录。"""

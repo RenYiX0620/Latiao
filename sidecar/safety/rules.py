@@ -26,8 +26,8 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 try:  # tree-sitter 为可选依赖：缺失时语义层不可用，调用方会记录并回退正则层
-    from tree_sitter import Language, Parser
     import tree_sitter_bash
+    from tree_sitter import Language, Parser
 
     _LANGUAGE = Language(tree_sitter_bash.language())
     _TS_AVAILABLE = True
@@ -258,6 +258,21 @@ def _match_forbidden(inv: Invocation, rules: dict[str, Any]) -> str | None:
         if pattern is None and inv.name in table:
             return f"禁止命令: {inv.name}"
         if pattern is not None and inv.args and _any_arg_match(inv.args, pattern):
+            # 解释器内联（python -c / node -e …）：2026-09-24 误杀修复——
+            # 改为审查内联源码（与脚本文件同一黑名单），干净则放行。
+            # bash/sh/zsh/fish 的 -c 仍是完整 shell，继续禁。
+            if table_key == "forbidden_commands_any_arg" and re.match(
+                    r"^(python|python3|node|nodejs|deno|bun|perl|ruby|php|lua|nu|pwsh|powershell)\d*",
+                    inv.name, re.I):
+                code = inv.args[1] if len(inv.args) > 1 else ""
+                try:
+                    from cmd_safety import check_inline_code
+                    denied = check_inline_code(code)
+                except Exception as e:
+                    return f"禁止用法: {inv.name} {inv.args[0]}（审查失败: {e}）"
+                if denied:
+                    return denied
+                return None
             return f"禁止用法: {inv.name} {inv.args[0]}"
     # 敏感读（保留正则层同款对齐；语义层提前拦）
     if inv.name in rules.get("sensitive_readers", ()):
@@ -303,6 +318,14 @@ _READONLY_COMMANDS = frozenset({
 })
 _GIT_READONLY = re.compile(r"^(log|status|diff|show|branch|remote|tag|blame)$")
 
+# 只读命令里带**写/删副作用**的 flag（2026-10-11 修复）：`find . -delete` 此前
+# 在语义层与本模块的降级正则路径**都判只读**（实测），子代理可免确认批量删除。
+# 与 tool_executor 共用同一份名单（那边 import 本常量），避免两处漂移。
+READONLY_DANGER_FLAGS = frozenset({
+    "-delete", "-exec", "-execdir", "-ok", "-okdir",
+    "-fprint", "-fprintf", "-fls",
+})
+
 
 def readonly_safe(cmd: str) -> bool:
     """全部调用都是单条简单只读命令才放行（否则 False，不 fail-open）。
@@ -322,6 +345,9 @@ def readonly_safe(cmd: str) -> bool:
     if inv.name == "git":
         return bool(inv.args and _GIT_READONLY.fullmatch(inv.args[0]))
     if inv.name not in _READONLY_COMMANDS:
+        return False
+    # 带副作用的 flag（find -delete/-exec/-fprint…）直接拒绝
+    if any(arg in READONLY_DANGER_FLAGS for arg in inv.args):
         return False
     if not is_safe_shape(inv.words, shape):
         return False

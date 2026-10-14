@@ -60,6 +60,14 @@ function toggleOnChange(setter: (v: boolean) => void, storageKey: string) {
   };
 }
 
+/** 匿名使用数据的本机状态（/v1/settings/anonymous-data）。 */
+interface AnonStatus {
+  enabled: boolean;
+  endpoint_configured: boolean;
+  events_total: number;
+  last_sent: string;
+}
+
 /** 人格与称呼：显示当前的 称呼/名字/语气，并可重新运行首启引导。 */
 function PersonaCard({ active, sidecarReady }: { active: boolean; sidecarReady: boolean }) {
   const { t } = useTranslation();
@@ -156,6 +164,41 @@ export default function SettingsView({
   ttsPitch, setTtsPitch, ttsEmotion, setTtsEmotion, ttsAutoRead, setTtsAutoRead,
 }: SettingsViewProps) {
   const { t, lang, setLanguage } = useTranslation();
+
+  // 匿名使用数据（2026-10-11 由假开关转真）：开关状态同步到 sidecar（总闸在
+  // config.json privacy.anonymous_usage），并展示本机攒了多少条 / 是否在往外发。
+  // 常驻挂载的页面要按 active 拉数（挂载即拉会撞 sidecar 启动竞态——老坑）。
+  const [anonStatus, setAnonStatus] = useState<AnonStatus | null>(null);
+
+  const refreshAnonStatus = useCallback(async () => {
+    try {
+      const resp = await authFetch("/v1/settings/anonymous-data", { signal: AbortSignal.timeout(4000) });
+      if (resp.ok) {
+        const d = await resp.json();
+        if (d?.status === "ok") {
+          setAnonStatus({
+            enabled: !!d.enabled,
+            endpoint_configured: !!d.endpoint_configured,
+            events_total: Number(d.events_total) || 0,
+            last_sent: String(d.last_sent || ""),
+          });
+        }
+      }
+    } catch { /* 拿不到就不显示状态行，不影响开关本身 */ }
+  }, []);
+
+  useEffect(() => {
+    if (!active) return;
+    void refreshAnonStatus();
+  }, [active, refreshAnonStatus]);
+
+  const onToggleAnonymous = useCallback((v: boolean) => {
+    setAnonymousData(v);
+    localStorage.setItem("latiao_anonymous_data", String(v));
+    // 推给 sidecar 由 App 的 effect 统一做（sidecarStatus/anonymousData 双依赖，
+    // 重启后也能自愈），这里只等一拍刷新状态行。
+    setTimeout(() => { void refreshAnonStatus(); }, 300);
+  }, [setAnonymousData, refreshAnonStatus]);
 
   const reflectionOptions: { value: "off" | "light" | "deep"; label: string }[] = [
     { value: "off", label: t("settings.reflection_off") },
@@ -359,10 +402,21 @@ export default function SettingsView({
           <div className="settings-row">
             <div><div className="settings-row-label">{t("settings.anonymous")}</div><div className="settings-row-desc">{t("settings.anonymous_desc")}</div></div>
             <label className="toggle">
-              <input type="checkbox" checked={anonymousData} onChange={toggleOnChange(setAnonymousData, "latiao_anonymous_data")} />
+              <input type="checkbox" checked={anonymousData} onChange={(e) => onToggleAnonymous(e.target.checked)} />
               <span className="toggle-slider"></span>
             </label>
           </div>
+          {anonStatus && (
+            <div className="settings-row">
+              <div style={{ fontSize: 10, color: "var(--text-muted)", lineHeight: 1.6 }}>
+                {!anonStatus.enabled
+                  ? t("settings.anonymous_off_note")
+                  : anonStatus.endpoint_configured
+                    ? t("settings.anonymous_on_sending", { count: anonStatus.events_total, last: anonStatus.last_sent || "—" })
+                    : t("settings.anonymous_on_local", { count: anonStatus.events_total })}
+              </div>
+            </div>
+          )}
         </div>
 
         <div className="settings-group">

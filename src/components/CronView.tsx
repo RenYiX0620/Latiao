@@ -103,7 +103,7 @@ function CronHistoryPanel() {
 
   useEffect(() => {
     if (!open) return;
-    setLoading(true);
+    void Promise.resolve().then(() => setLoading(true));
     authFetch("/v1/cron/history?limit=20")
       .then((r) => r.json())
       .then((d) => {

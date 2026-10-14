@@ -1,12 +1,16 @@
-import { memo, lazy, Suspense, useCallback, useState, useMemo, useRef, useEffect } from "react";
+import { memo, lazy, Suspense, useCallback, useState, useMemo, useRef, useEffect, Profiler } from "react";
 import type { Message, PendingFile } from "../types";
 import { useTranslation } from "../i18n";
 import { loadedMismatch } from "../utils/modelSelection";
 import RunMetrics from "./RunMetrics";
+import ChatInput, { type ChatInputApi } from "./ChatInput";
+import { ToolConfirmCard } from "./ToolConfirmCard";
 import ToolCallBubble from "./ToolCallBubble";
+import { FileEditCard, ToolActivityCard, SubagentRow } from "./TurnCards";
+import type { PreviewItem } from "./PreviewPanel";
 import ToolbarSelect from "./ToolbarSelect";
 import {
-  Eye, ShieldCheck, PencilRuler, ListChecks, Zap, CircleOff, Circle, Brain, BrainCircuit,
+  Eye, ShieldCheck, PencilRuler, ListChecks, Zap, CircleOff, Brain, BrainCircuit,
   Bot, User, ChevronRight, ChevronDown, Wrench, Search, Database, FileText,
   FolderOpen, FilePen, Terminal, AppWindow, Users, Clock,
   MousePointer2, Keyboard, Camera, ListTree, Play, History, ScanLine,
@@ -57,18 +61,19 @@ const SyntaxHighlighter = lazy(async () => {
   ]);
   // 主题按 <html data-theme> 切换：深色用 oneDark、浅色用 oneLight，
   // 统一做扁平化（去面板背景/圆角/内边距，仅保留语法颜色）
-  const flatten = (src: Record<string, any>): Record<string, any> => {
-    const out = Object.fromEntries(
-      Object.entries(src).map(([k, v]) => [k, { ...(v as object), background: "transparent" }])
+  type PrismStyleMap = Record<string, import("react").CSSProperties>;
+  const flatten = (src: PrismStyleMap): PrismStyleMap => {
+    const out: PrismStyleMap = Object.fromEntries(
+      Object.entries(src).map(([k, v]) => [k, { ...v, background: "transparent" }])
     );
     out['pre[class*="language-"]'] = {
       ...(out['pre[class*="language-"]'] as object),
       background: "transparent", margin: 0, padding: 0, boxShadow: "none",
-    } as any;
+    };
     out['code[class*="language-"]'] = {
       ...(out['code[class*="language-"]'] as object),
       background: "transparent", boxShadow: "none", textShadow: "none",
-    } as any;
+    };
     return out;
   };
   const darkFlat = flatten(themes.oneDark);
@@ -108,8 +113,7 @@ interface ChatViewProps {
   isProcessing: boolean;
   pendingFile: PendingFile | null;
   setPendingFile: (f: PendingFile | null) => void;
-  prompt: string;
-  setPrompt: (p: string) => void;
+  inputRef: React.RefObject<ChatInputApi | null>;
   fileInputRef: React.RefObject<HTMLInputElement | null>;
   mediaRecorderRef: React.MutableRefObject<MediaRecorder | null>;
   isRecording: boolean;
@@ -117,7 +121,8 @@ interface ChatViewProps {
   sendMessage: () => void;
   handleFileSelect: (e: React.ChangeEvent<HTMLInputElement>) => void;
   startRecording: () => void;
-  confirmTool: (callId: string, approved: boolean) => void;
+  confirmTool: (callId: string, approved: boolean, always?: boolean) => void;
+  onPreview?: (item: PreviewItem) => void;
   /** 朗读一条回复（同一个 id 再点＝停止）。文本的 Markdown 剥离在 App 里统一做。 */
   onSpeak?: (text: string, id?: string) => void;
   speakingId?: string | null;
@@ -132,8 +137,8 @@ interface ChatViewProps {
   engineStatus?: { status?: string; model_id?: string; model_name?: string } | null;
   accessMode: "read_only" | "confirm" | "auto_edit" | "plan" | "full";
   setAccessMode: (m: "read_only" | "confirm" | "auto_edit" | "plan" | "full") => void;
-  thinkingLevel: "off" | "low" | "high" | "max";
-  setThinkingLevel: (l: "off" | "low" | "high" | "max") => void;
+  thinkingLevel: "off" | "max";
+  setThinkingLevel: (l: "off" | "max") => void;
   contextEstimate?: { max_context: number; recommended_context: number } | null;
   sessionId?: string;   // 上下文统计面板按会话取数
   showToast: (msg: string, type?: string) => void;
@@ -141,6 +146,7 @@ interface ChatViewProps {
   taskStartAt: number | null;
   streamingThink?: string;  // 流式中的思考缓冲（运行中 Think 行实时摘要）
   subagents?: { id: string; agent: string; task: string; status: string; summary?: string }[];
+  todos?: { step: string; status: string }[];  // 任务清单（update_todos 工具维护，心跳回传）
   routeInfo?: { engine: string; declaredModel: string } | null;  // 实际引擎路由（engine_route/route_fallback）
   localModelId?: string;    // 已加载的本地模型 id（选择器展示 💻 选项）
   localModelName?: string;  // 已加载的本地模型名
@@ -148,25 +154,30 @@ interface ChatViewProps {
 
 export default memo(function ChatView({
   messages, isProcessing, pendingFile, setPendingFile,
-  prompt, setPrompt,
   fileInputRef, mediaRecorderRef, isRecording,
-  sendMessage, onStop, handleFileSelect, startRecording, confirmTool,
+  inputRef,
+  sendMessage, onStop, handleFileSelect, startRecording, confirmTool, onPreview,
   onSpeak, speakingId,
   chatEndRef, handleDrop, onPasteImage,
   cloudModels, selectedModel, onSelectModelAndLoad, engineStatus, sessionId,
   accessMode, setAccessMode, thinkingLevel, setThinkingLevel,
-  contextEstimate, showToast, activeTask, taskStartAt, streamingThink, subagents,
+  contextEstimate, showToast, activeTask, taskStartAt, streamingThink, subagents, todos,
   routeInfo, localModelId, localModelName,
 }: ChatViewProps) {
   const { t } = useTranslation();
+  // 待确认的工具调用（转录区可能已滚出屏幕）→ 停靠在输入栏正上方（2026-10-05，
+  // 对齐 ZCode 的权限面板形态）。同一条消息在转录区不再重复渲染按钮，只作记录。
+  const pendingConfirm = useMemo(
+    () => [...messages].reverse().find((m) => m.type === "tool_call" && m.toolStatus === "confirming"),
+    [messages],
+  );
   // WebKit (WKWebView) 下 compositionend 先于最终 keydown 派发，
   // 仅靠 e.nativeEvent.isComposing 会在按 Enter 确认候选词时已变 false
   // → 半句话被发送。用 compositionend 时间戳做一小段缓冲（VSCode 同款方案）。
   // 09-21 修：原来组词开始时把缓冲设成 Number.MAX_SAFE_INTEGER，一旦某次
   // compositionend 没派发就**永久锁死回车**（症状：回车只换行、点按钮才发送）；
   // 且 300ms 窗口会连"打完字紧接着按的回车"一起吞掉。判定逻辑见 utils/composer.ts。
-  const composingUntilRef = useRef(0);
-  const handleCompositionStart = useCallback(() => {
+  const composingUntilRef = useRef(0);  const handleCompositionStart = useCallback(() => {
     composingUntilRef.current = Date.now() + COMPOSING_BACKSTOP_MS;
   }, []);
   const handleCompositionEnd = useCallback(() => {
@@ -263,11 +274,14 @@ export default memo(function ChatView({
   // 任务头部"已工作 X 分 X 秒"计时（isProcessing / 工具执行期间显示）
   const [elapsed, setElapsed] = useState(0);
   useEffect(() => {
-    if (!taskStartAt || (!isProcessing && !activeTask)) { setElapsed(0); return; }
+    if (!taskStartAt || (!isProcessing && !activeTask)) {
+      const id = setTimeout(() => setElapsed(0), 0);
+      return () => clearTimeout(id);
+    }
     const tick = () => setElapsed(Date.now() - taskStartAt);
-    tick();
     const iv = setInterval(tick, 1000);
-    return () => clearInterval(iv);
+    const id = setTimeout(tick, 0);
+    return () => { clearInterval(iv); clearTimeout(id); };
   }, [taskStartAt, isProcessing, activeTask]);
 
   // 时长格式化：<3s 显示"几秒"，长于 60s 显示"X 分 X 秒"
@@ -284,19 +298,7 @@ export default memo(function ChatView({
     const flat = line.replace(/\s+/g, " ").trim();
     return flat.length > 80 ? flat.slice(0, 80) + "…" : flat;
   };
-  // 工具行摘要：run_cmd→command/description，搜索→query/pattern/url，文件→path，其他→args 前 60 字
-  const toolSummary = (m: Message) => {
-    const a = (m.toolArgs || {}) as Record<string, unknown>;
-    const pick = (k: string) => (typeof a[k] === "string" || typeof a[k] === "number") ? String(a[k]) : "";
-    let s = "";
-    if (m.toolName === "run_cmd" || m.toolName === "control_launch") s = pick("command") || pick("description");
-    else if (["web_search", "bing_search", "tavily_search", "search_files"].includes(m.toolName || "")) s = pick("query") || pick("pattern") || pick("url");
-    else if (["read_file", "write_file", "list_dir", "open_folder", "open_app", "control_process_log"].includes(m.toolName || "")) s = pick("path") || pick("directory") || pick("app") || pick("pattern");
-    else if (m.toolName === "mx_query" || m.toolName === "ak_finance") s = pick("query") || pick("index");
-    if (!s) s = JSON.stringify(a || {}).slice(0, 60);
-    s = s.replace(/\s+/g, " ").trim();
-    return s.length > 80 ? s.slice(0, 80) + "…" : s;
-  };
+  // 工具行摘要（TurnCards.argSummary 已覆盖；保留 toolSummary 会 unused —— 已删）
 
   // ── 对话分段（ZCode 式：一次对话 = 一张卡片，头部显示耗时）──
   // 每轮顺序固定为 [user, tool…, assistant]（App.tsx 已保证插入位置）；
@@ -379,10 +381,19 @@ export default memo(function ChatView({
                     <div className="msg-bubble assistant">
                       <ReactMarkdown remarkPlugins={[remarkGfm]} components={
                         {
-                          code: ({ inline, className, children, ...props }: { inline?: boolean; className?: string; children?: React.ReactNode }) =>
-                            inline
+                          // react-markdown v10 移除了 `inline` prop（源码里已无此字段，
+                          // 2026-10-11 核实）——旧写法读到的 inline 恒为 undefined，
+                          // 行内 `code` 被当围栏代码块渲染（多出行号块/高亮框）。
+                          // 现在按官方 v10 语义判定：有 language-* 类名 = 围栏代码块；
+                          // 无类名且内容不含换行 = 行内代码（缩进代码块含换行，仍走块渲染）。
+                          code: ({ className, children, ...props }: { className?: string; children?: React.ReactNode }) => {
+                            const lang = (className || "").replace("language-", "");
+                            const text = String(children ?? "");
+                            const isInline = !className && !text.includes("\n");
+                            return isInline
                               ? <code className={className} {...props}>{children}</code>
-                              : <CodeBlock language={(className || "").replace("language-", "")}>{String(children)}</CodeBlock>,
+                              : <CodeBlock language={lang}>{text}</CodeBlock>;
+                          },
                           a: ({ href, children }: { href?: string; children?: React.ReactNode }) => (
                             <a href={href} onClick={(e) => { e.preventDefault(); if (href) openUrl(href); }}>{children}</a>
                           ),
@@ -473,8 +484,25 @@ export default memo(function ChatView({
   const estTokens = Math.round(messages.reduce((s, m) => s + m.content.length, 0) * 0.55); // 中文近似
 
   return (
-    <>
+    <Profiler id="chat-view" onRender={(_id, _phase, actualDuration) => {
+      // 渲染埋点（诊断探针）：actualDuration = 本子树本次提交的实际渲染耗时；
+      // >40ms 才上报（"长会话更卡"的硬数据，长期留作诊断能力）
+      void import("../utils/jankProbe").then(({ reportSlowRender }) =>
+        reportSlowRender(actualDuration, messages.length));
+    }}>
       <div className="chat-wrap">
+      {(todos && todos.length > 0) && (
+        <div className="subagent-bar todo-bar">
+          {todos.map((td, i) => (
+            <div key={i} className={`subagent-row todo-row${td.status === "in_progress" ? " running" : ""}`}>
+              <span className={`todo-mark ${td.status}`}>
+                {td.status === "completed" ? "✓" : td.status === "in_progress" ? "●" : "○"}
+              </span>
+              <span className="subagent-task">{td.step}</span>
+            </div>
+          ))}
+        </div>
+      )}
       {(subagents && subagents.length > 0) && (
         <div className="subagent-bar">
           {(subagents as { id: string; agent: string; task: string; status: string; steps?: number; activity?: Record<string, number>; last_activity?: string; summary?: string }[]).map(sa => {
@@ -511,7 +539,10 @@ export default memo(function ChatView({
             <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
               <span style={{ fontWeight: 700, fontSize: 14 }}>{subagentDetail.agent === "explore" ? "🔍" : "🤖"} {t("chat.subagent_detail")}</span>
               <span style={{ fontSize: 11, color: subagentDetail.status === "error" ? "var(--danger)" : subagentDetail.status === "done" ? "var(--success)" : "var(--warning)", marginLeft: "auto" }}>
-                {subagentDetail.status === "running" ? t("chat.status_running") : subagentDetail.status === "done" ? t("chat.status_done") : t("chat.status_failed")}
+                {subagentDetail.status === "running" ? t("chat.status_running")
+                  : subagentDetail.status === "done" ? t("chat.status_done")
+                  : String(subagentDetail.summary || "").includes("中断") ? t("chat.status_stopped")
+                  : t("chat.status_failed")}
               </span>
               {subagentDetail.status !== "running" && (
                 <button className="btn btn-sm btn-ghost" style={{ color: "var(--danger)", padding: "2px 8px" }}
@@ -668,33 +699,36 @@ export default memo(function ChatView({
                 </details>
               )}
               {!collapsed && planMsgs.map((m, i) => renderMsg(m, i))}
-              {!collapsed && catGroups.map((g, gi) => {
-                const Icon = g.icon;
-                // 执行中/待确认的调用必须直接露出卡片（旋转指示/确认按钮），不折叠
-                const needsDirect = g.msgs.some((m) => m.toolStatus === "running" || m.toolStatus === "confirming");
-                if (needsDirect) {
-                  return (
-                    <div key={`cg${gi}`} style={{ margin: "2px 0" }}>
-                      {g.msgs.map((m) => <ToolCallBubble key={m.id} msg={m} onConfirm={confirmTool} />)}
-                    </div>
-                  );
-                }
-                const gSummary = toolSummary(g.msgs[0]);
+              {!collapsed && (() => {
+                const doneTools = toolMsgs.filter((m) => m.toolStatus === "done");
+                const activeTools = toolMsgs.filter((m) => m.toolStatus === "running" || m.toolStatus === "confirming" || m.toolStatus === "error");
+                const editMsgs = doneTools.filter((m) => m.toolName === "write_file");
+                const delegates = toolMsgs.filter((m) => m.toolName === "delegate_task");
+                const activityMsgs = doneTools.filter((m) => m.toolName !== "write_file" && m.toolName !== "delegate_task");
                 return (
-                  <details key={`cg${gi}`} className="tool-group-row">
-                    <summary className="tool-group-row-head">
-                      <span className="tool-call-icon"><Icon size={14} /></span>
-                      <span className="tool-call-name">{g.verb}</span>
-                      <span className="tool-group-row-meta">· {g.msgs.length} {t(g.noun)}</span>
-                      {gSummary && <span className="tool-group-row-summary">· {gSummary}</span>}
-                      <span className="tool-group-row-chevron"><ChevronDown size={12} /></span>
-                    </summary>
-                    <div className="tool-group-row-body">
-                      {g.msgs.map((m) => <ToolCallBubble key={m.id} msg={m} onConfirm={confirmTool} />)}
-                    </div>
-                  </details>
+                  <>
+                    {delegates.map((m) => {
+                      const a = (m.toolArgs || {}) as Record<string, unknown>;
+                      return (
+                        <SubagentRow
+                          key={m.id || String(a.task)}
+                          agent={String(a.agent || "explore")}
+                          task={String(a.task || "")}
+                          status={m.toolStatus === "done" ? "done" : m.toolStatus === "error" ? "error" : "running"}
+                        />
+                      );
+                    })}
+                    {editMsgs.length > 0 && (
+                      <FileEditCard msgs={editMsgs} onPreview={onPreview} onUndo={() => showToast(t("cards.undo_hint"), "warn")} />
+                    )}
+                    {activityMsgs.length > 0 && <ToolActivityCard msgs={activityMsgs} />}
+                    {activeTools.map((m) => (
+                      <ToolCallBubble key={m.id} msg={m} sessionId={sessionId} onConfirm={confirmTool}
+                        confirmHidden={pendingConfirm?.id === m.id} />
+                    ))}
+                  </>
                 );
-              })}
+              })()}
               {!collapsed && answerMsgs.map((m, i) => renderMsg(m, i))}
             </div>
           );
@@ -704,6 +738,14 @@ export default memo(function ChatView({
       </div>
 
       <div className="input-area">
+        {pendingConfirm && (
+          <ToolConfirmCard
+            msg={pendingConfirm}
+            onConfirm={confirmTool}
+            sessionId={sessionId}
+            docked
+          />
+        )}
         {pendingFile && (
           <div className="file-preview">
             <div className={`file-preview-thumb ${pendingFile.type === "pdf" ? "pdf" : "code"}`}>
@@ -714,12 +756,8 @@ export default memo(function ChatView({
           </div>
         )}
         <div className="input-row">
-          <textarea
-            className={`chat-input${prompt ? "" : " is-empty"}`}
-            value={prompt}
-            onChange={(e) => setPrompt(e.target.value)}
-            onCompositionStart={handleCompositionStart}
-            onCompositionEnd={handleCompositionEnd}
+          <ChatInput
+            ref={inputRef}
             onKeyDown={handleEditableKeyDown}
             onPaste={async (e) => {
               if (!onPasteImage) return;
@@ -734,9 +772,9 @@ export default memo(function ChatView({
                 }
               }
             }}
+            onCompositionStart={handleCompositionStart}
+            onCompositionEnd={handleCompositionEnd}
             placeholder={t("chat.placeholder")}
-            rows={1}
-            style={{ resize: "none", minHeight: 52, maxHeight: 150 }}
           />
           <input type="file" ref={fileInputRef} style={{ display: "none" }} onChange={handleFileSelect} />
           {/* 底部工具栏：左（附件/语音/模式）右（模型/设置/发送） */}
@@ -758,12 +796,10 @@ export default memo(function ChatView({
               <ToolbarSelect value={thinkingLevel}
                 options={[
                   { value: "off", label: t("chat.thinking_off"), icon: <CircleOff size={15} /> },
-                  { value: "low", label: t("chat.thinking_low"), icon: <Circle size={15} /> },
-                  { value: "high", label: t("chat.thinking_high"), icon: <Brain size={15} /> },
-                  { value: "max", label: t("chat.thinking_max"), icon: <BrainCircuit size={15} /> },
+                  { value: "max", label: t("chat.thinking_on"), icon: <BrainCircuit size={15} /> },
                 ]}
                 onChange={(v) => {
-                  setThinkingLevel(v as "off" | "low" | "high" | "max");
+                  setThinkingLevel(v as "off" | "max");
                   // 强制思考模型（DeepSeek 推理系等）API 层面无法关闭思考——
                   // 诚实提示，避免用户设了 off 却不见效果以为工具坏了
                   if (v === "off") {
@@ -838,6 +874,6 @@ export default memo(function ChatView({
           )}
         </div>
       </div>
-    </>
+    </Profiler>
   );
 });

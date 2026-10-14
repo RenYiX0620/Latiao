@@ -20,7 +20,7 @@ DEFINITION = {
     "type": "function",
     "function": {
         "name": "read_file",
-        "description": "Read the contents of a file at the given path. Large files are truncated.",
+        "description": "Read the contents of a file at the given path. Large files are truncated. Do NOT read files via run_cmd (cat/head/tail) — this tool is faster, needs no confirmation and is recorded in history. When the path is unknown, locate it with search_files first.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -76,7 +76,7 @@ def _safe_path(path: str) -> str | None:
 
 
 def execute(args: dict) -> str:
-    p = _safe_path(args["path"])
+    p = _safe_path(args.get("path") or args.get("file") or "")
     if p is None:
         return "⛔ Blocked: 路径无效（空路径或包含 .. 穿越片段）"
     # 敏感路径（密钥目录/凭据文件/.env 家族/辣条自身 config.json）一律拒绝

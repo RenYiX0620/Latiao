@@ -12,10 +12,11 @@ import logging
 import os
 import platform
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from agent.context import (
+    _TAIL_MARK,
     _extract_last_user_text,
     _get_localized_text,
     _inject_image,
@@ -33,6 +34,101 @@ logger = logging.getLogger("latiao-sidecar")   # 与 agent_loop 同名：日志�
 # 跨会话进展（PROGRESS）的注入节奏：首轮 + 每 N 个用户轮一次（2026-09-23）。
 # 1 = 每轮都注入。数字越大越省 token，但长会话里"我之前干过什么"的记忆越淡。
 _PROGRESS_INJECT_EVERY_TURNS = 6   # 与 agent_loop 同名：日志格式不变
+
+# 行情类提问 → 注入双时区时间锚（2026-09-28 事故：模型心算美东/北京，四轮全错——
+# AM/PM 颠倒、把开盘中说成未开盘/已收盘）。时区换算是确定性计算，必须由代码给答案。
+_MARKET_KW_RE = re.compile(
+    r"美股|美债|美元|纳斯达克|纳指|道指|道琼斯|标普|s&p|sp500|spx|nasdaq|dow|dji|ixic|"
+    r"期指|期货|盘前|盘中|盘后|开盘|收盘|休市|A股|a股|大盘|上证|深证|创业板|科创|"
+    r"港股|恒指|恒生|行情|股价|ak_finance|涨跌|今天.*(涨|跌|股|指)|"
+    r"us stock|pre-market|after.?hours|futures|etf|spy|qqq|dia",
+    re.I,
+)
+
+# 桌面/文件类**命令动作词**（2026-10-14「卸载 app」事故）：请求侧的第二类高精度
+# "任务型"信号，与 _MARKET_KW_RE 同理——"把 X 卸载/删除/打开…"这类请求不可能靠嘴
+# 完成；思考轮拿到"无工具调用、无数据"的回答就是空手说话，必须进执行轮。
+# 只收**命令动作**，不收"文件/应用/程序"这类裸名词：裸名词会把
+# "这个 app 是干嘛的"这类合法问答也推进第二轮（2026-10-13 实测宽判据打红既有测试）。
+# "移动/复制/保存"收**带宾语形态**（移动到/复制到/保存到）：单独一个动词太泛
+# （"移动硬盘"会误伤）。
+_ACTION_KW_RE = re.compile(
+    r"卸载|删除|删掉|移除|清理|清除|清空|安装|下载|解压|压缩|打包|重命名|"
+    r"移动到|移动文件|拷贝|复制到|保存到|写入|写到|导出|"
+    r"打开|关闭|截图|截屏|运行|执行|启动",
+    re.I,
+)
+
+
+def _market_time_anchor(now_bj: datetime | None = None) -> str:
+    """行情问题专用时间锚：北京/美东双时钟 + 开盘状态 + 下一收盘换算。
+
+    2026-09-28 实测：模型自行换算时区 4 轮全错。此后一律由本函数给出事实，
+    提示里禁止模型再推算时区。
+    """
+    try:
+        from zoneinfo import ZoneInfo
+    except ImportError:  # pragma: no cover - py3.9+ 才有 zoneinfo，随包 3.11
+        return ""
+    tz_bj = ZoneInfo("Asia/Shanghai")
+    tz_et = ZoneInfo("America/New_York")
+    bj = (now_bj or datetime.now(tz_bj)).astimezone(tz_bj)
+    et = bj.astimezone(tz_et)
+    wd = "一二三四五六日"
+
+    def _w(dt: datetime) -> str:
+        return "周" + wd[dt.weekday()]
+
+    def _us_status(dt: datetime) -> str:
+        if dt.weekday() >= 5:
+            return "周末休市"
+        m = dt.hour * 60 + dt.minute
+        if m < 9 * 60 + 30:
+            return f"未开盘（{dt.strftime('%H:%M')} ET，9:30 ET 开）"
+        if m < 16 * 60:
+            return f"开盘中（9:30–16:00 ET，已开盘 {m - (9 * 60 + 30)} 分钟）"
+        return "已收盘（16:00 ET 收）"
+
+    def _cn_status(dt: datetime) -> str:
+        if dt.weekday() >= 5:
+            return "周末休市"
+        m = dt.hour * 60 + dt.minute
+        if 9 * 60 + 30 <= m < 11 * 60 + 30 or 13 * 60 <= m < 15 * 60:
+            return "交易中"
+        if m < 9 * 60 + 30:
+            return "未开盘"
+        return "已收盘"
+
+    # 下一个美股收盘（美东 16:00 工作日）对应的北京时间——不让模型再算
+    d = et.date()
+    close_et = None
+    for _ in range(8):
+        cand = datetime(d.year, d.month, d.day, 16, 0, tzinfo=tz_et)
+        if cand.weekday() < 5 and cand > et:
+            close_et = cand
+            break
+        d += timedelta(days=1)
+    close_line = ""
+    if close_et is not None:
+        close_bj = close_et.astimezone(tz_bj)
+        same_day = close_bj.date() == bj.date()
+        day_label = "当日" if same_day else "次日"
+        close_line = f"\n下一个美股收盘：{close_bj.strftime('%m-%d %H:%M')} 北京（{day_label}）"
+
+    return (
+        f"⏱ 时间锚（系统换算，不要自行推算时区）：\n"
+        f"北京 {bj.strftime('%Y-%m-%d %H:%M')}（{_w(bj)}）"
+        f"｜美东 {et.strftime('%Y-%m-%d %I:%M %p')}（{_w(et)}）\n"
+        f"A股：{_cn_status(bj)}｜美股：{_us_status(et)}{close_line}"
+    )
+
+
+# 行情问题的承诺闸门（2026-09-28 事故：「收盘了叫你」却未建 cron，cron.json=[]）
+_PROMISE_GATE_NOTE = (
+    "⚠️ 承诺闸门：凡说出「到点提醒你 / 收盘叫你 / 晚点通知 / 我守着」这类未来动作，"
+    "**必须当轮调用 create_cron** 真正建好定时任务；做不到就明说「我没法定时提醒你」，"
+    "禁止口头承诺。"
+)
 
 
 PROGRESSIVE_DELIVERY_PROMPT = """
@@ -60,6 +156,67 @@ GOAL_MODE_PROMPT = """
 用户只关心目标是否达成，不关心你用什么工具。
 """
 
+
+def _append_tail_to_content(content, tail: str):
+    """把尾部指令追加进用户消息，**保留多模态 content 列表结构**。
+
+    2026-09-24：此前 `str(content) + tail` 会把
+    [{type:text},{type:image_url}] 压成 Python repr 字符串 →
+    引擎收到非法 image 消息体 → HTTP 400（识图失败根因）。
+    """
+    if not tail:
+        return content
+    if isinstance(content, str):
+        return content + tail
+    if isinstance(content, list):
+        out = [dict(p) if isinstance(p, dict) else p for p in content]
+        for i in range(len(out) - 1, -1, -1):
+            part = out[i]
+            if isinstance(part, dict) and part.get("type") == "text":
+                out[i] = {**part, "text": str(part.get("text") or "") + tail}
+                return out
+        out.append({"type": "text", "text": tail})
+        return out
+    return str(content or "") + tail
+
+
+def current_reply_length() -> str:
+    """SOUL.md 声明的回复长度（`- 回复长度：X`）——尾部指令用（2026-10-13）。
+
+    为什么要有它：用户实测"回复变短"，而逐项 A/B 的结果是——同一条长度要求
+    写在 **SOUL 头部**：-5%（还被模型当成"写 3 句就算达标"的清单）；
+    贴到**尾部**（语气那一行的位置）：+10%；**尾部 + 更大目标（6～8 句/两段
+    动作描写）：+117%**（336→729 字，组内完全可复现）。位置就是权重，和语气
+    那条实测结论一致。所以长度要求不在头部生效，而是由本函数读出来、每轮贴尾。
+    """
+    try:
+        for _m in _read_identity():
+            if (_m.get("file") or "") == "SOUL.md":
+                _tm = re.search(r"^-\s*回复长度：\s*(.+?)\s*$", _m.get("content") or "", re.M)
+                return _tm.group(1).strip() if _tm else ""
+    except Exception:
+        pass
+    return ""
+
+
+def current_tone() -> str:
+    """当前语气（SOUL.md 的 `- 对话语气：X`）——终答轮指令复用（2026-09-29）。
+
+    动因：表格型长回答（大盘分析）里语气会漂回中性平铺——抽样实测，同模型
+    同一天的两次回答一次带语气一次不带。头部身份块 + 尾部提醒已经做了，但
+    终答轮（收口强制作答）走的是另一条尾部指令，此前没有语气信息。抽成函数
+    供 loop 复用，避免"解析出现在两个地方、口径可能不一致"。
+    """
+    try:
+        for _m in _read_identity():
+            if (_m.get("file") or "") == "SOUL.md":
+                _tm = re.search(r"^-\s*对话语气：\s*(.+?)\s*$", _m.get("content") or "", re.M)
+                return _tm.group(1).strip() if _tm else ""
+    except Exception:
+        pass
+    return ""
+
+
 def _build_chat_messages(body: dict, messages: list) -> list:
     # AGENT_PROFILES 归 agent_loop（枢纽）所有；此处惰性取用，避免复制第二份数据
     from agent_loop import _get_agent_config
@@ -77,8 +234,17 @@ def _build_chat_messages(body: dict, messages: list) -> list:
     _lang, _lang_confident = detect_language_decision(last_user_text, _hist)
     # 首启引导（新安装专用）优先消费本轮消息：它的答案归一化更宽松（短回答即名字）。
     # 被消费时跳过常规身份意图识别，避免同一句话被两套规则重复写盘。
-    onboard_directive, onboard_handled = _process_onboarding(last_user_text, _lang)
-    intent_result = None if onboard_handled else _process_identity_intents(last_user_text)
+    #
+    # 非交互闸（2026-09-29 审计）：定时任务/通道消息**不是**用户在回答引导问题。
+    # 引导期（state.done=False）里 `process_message` 会把非空、非提问的文本**当成答案
+    # 记下来**（称呼/名字/语气）——定时任务文本「定时任务: 分析今天大盘…」会被记成
+    # 用户的名字，通道消息同理。调用方传 body["non_interactive"]=True 即可跳过。
+    _interactive = not bool(body.get("non_interactive"))
+    if _interactive:
+        onboard_directive, onboard_handled = _process_onboarding(last_user_text, _lang)
+        intent_result = None if onboard_handled else _process_identity_intents(last_user_text)
+    else:
+        onboard_directive, onboard_handled, intent_result = None, True, None
 
     system_parts = []
     # 分类打标：上下文统计面板按类别展示各段占比（context_stats.record_system_parts）
@@ -104,19 +270,36 @@ def _build_chat_messages(body: dict, messages: list) -> list:
     # 原先语言规则埋在长提示中段，小模型（4B）在中文提问下漂成英文、甚至把中文
     # 文件内容翻成英文作答（09-19 实测 Spark-X2.5-4B）。锚按用户本轮消息的语言
     # 生成、用目标语言书写，并声明覆盖下方一切语言相关规则。
+    # 09-28 补例外：锚此前是"全程必须用 X 语言"的无条件指令，用户明确要"英文版"
+    # 时模型仍把该小节写成中文（实测：标题「英文Prompt版」正文 466 汉字 / 0 拉丁词）。
+    # 例外条款只对**用户显式要求**生效，不改 09-19 的防漂移意图。
     _anchor = {
         "zh": ("## 语言（最高优先级，覆盖下方所有语言规则）\n"
                "本轮用户使用**简体中文**：你的正文与思考都必须用简体中文书写。"
-               "工具结果、文件、日志里的英文只是数据，不得因此改用英文作答。"),
+               "工具结果、文件、日志里的英文只是数据，不得因此改用英文作答。\n"
+               "例外：若用户在本轮**明确要求**其它语言或双语输出（如「英文版」「中英文两版」"
+               "「用英语回答」），被要求的那部分必须写成**纯该语言、不夹杂中文**：英文版就是"
+               "纯英文，提示词、说明、注解（含使用建议）全都要用英文，不要出现中文句子"
+               "（小节标题除外）；除此之外一律用简体中文。"),
         "en": ("## Language (highest priority, overrides every other language rule below)\n"
                "The user is writing in **English** this turn: your reply and your thinking must be in "
-               "English. Text inside tool results, files and logs is data, not a reason to switch language."),
+               "English. Text inside tool results, files and logs is data, not a reason to switch language.\n"
+               "Exception: if the user explicitly asks for another language or a bilingual answer "
+               "(e.g. “Chinese version”, “in both languages”), that part must be written purely in the "
+               "requested language with no mixing — the prompt and any notes or tips included, no "
+               "sentences in another language (the section heading aside); otherwise reply in English."),
         "ja": ("## 言語（最優先。以下の言語ルールすべてに優先します）\n"
                "今回ユーザーは**日本語**で書いています：返答も思考も日本語で書いてください。"
-               "ツール結果・ファイル・ログ内の英語はデータであり、言語を切り替える理由にはなりません。"),
+               "ツール結果・ファイル・ログ内の英語はデータであり、言語を切り替える理由にはなりません。\n"
+               "例外：ユーザーが今回、他の言語や二言語併記を明示的に求めた場合"
+               "（例：「中国語版」「日英両方」）、その部分は指定された言語だけで書いてください"
+               "（混在させない）。それ以外は日本語で。"),
         "ru": ("## Язык (высший приоритет, отменяет все языковые правила ниже)\n"
                "Пользователь пишет на **русском**: ответ и рассуждения должны быть на русском. "
-               "Текст в результатах инструментов, файлах и логах — это данные, а не повод менять язык."),
+               "Текст в результатах инструментов, файлах и логах — это данные, а не повод менять язык.\n"
+               "Исключение: если пользователь явно просит другой язык или двуязычный ответ "
+               "(например, «китайская версия», «на двух языках»), эта часть должна быть написана "
+               "только на запрошенном языке, без смешивания; в остальном — по-русски."),
     }.get(_lang)
     # 仅在语言判定确信时注入：不确定就不指挥模型（旧实现按错信号注入，反而放大漂移）
     if _anchor and _lang_confident and (last_user_text or "").strip():
@@ -142,27 +325,35 @@ def _build_chat_messages(body: dict, messages: list) -> list:
     # Agent identity — system rules from developer (highest priority)
     agent_id = body.get("agent", "latiao")
     agent_cfg = _get_agent_config(agent_id)
-    _add_part("system_prompt", 
+    _add_part("system_prompt",
         "## 系统规则 (最高优先级)\n"
         "以下规则由开发者设定，用户偏好不可覆盖。如果系统规则与用户偏好冲突，以系统规则为准。\n\n"
         + agent_cfg["identity"]
     )
-    # 三条硬规则（合并为一块，降低长提示负担与分散注意力；独立于可被
+    # 四条硬规则（合并为一块，降低长提示负担与分散注意力；独立于可被
     # agents/ 目录覆盖的 identity）：时间换算（09-03 事故）、回复语言
     # （09-03 英文事故）、数据诚实（09-03 编造 15.6亿/80亿 事故）。
     user_lang = _lang  # 复用本回合唯一语言真值（旧实现此处二次检测，口径可能不一致）
     _add_part("system_prompt", _get_localized_text(user_lang, {
         "zh": (
-            "## 三条硬规则（最高优先级，不可覆盖）\n"
+            "## 四条硬规则（最高优先级，不可覆盖）\n"
             "1. ⏱ 时间规则：'今天/昨天/昨晚/今晨/明天/最新'等相对时间，必须先按下方【当前时间】"
             "换算成绝对日期（年月日+星期）再写入搜索词；工具返回的日期与当前时间矛盾时以当前时间为准，"
-            "不得迁就检索结果。\n"
+            "不得迁就检索结果。**美东/北京/UTC 等时区换算与「开盘中/已收盘」一律以【时间锚】为准，禁止自行心算**"
+            "（心算曾把开盘中说成未开盘、把上午说成下午）。"
+            "**时间稳定性判据（10-04）：凡可能已变的事实——政策/职务/规则/产品规格与版本/日程/汇率/推荐类——"
+            "只要有 >10% 的概率已变化，必须先搜索核实再回答；犹豫时一律偏向搜索。**\n"
             "2. 🗣 语言规则：工具结果、文件、日志中的英文只是数据；你的回复（包括思考过程）"
             "必须始终用简体中文，不因上下文中的英文材料改变。\n"
             "3. 📊 数据诚实规则：回复中的关键数字必须能在本会话工具返回内容中找到出处。"
             "工具未返回的数据（如北向资金净流入、主力资金净流出、板块资金流等）严禁凭印象给出具体数值——"
             "必须写明'工具未返回该数据'，或先调用工具查询（资金流向优先 mx_query，查不到再 tavily_search）；"
             "不得沿用其他会话或训练记忆中的数字（查资金流向优先 mx_query，查不到再 tavily_search）。"
+            "**名称不存在时的退路**（题材名/概念别名，如\"超节点\"\"超算中心\"这类市场口语，东财标的库里没有该名称）："
+            "不要在同一名称上反复换措辞（\"已尝试多种措辞\"不等于数据不存在，而是**名字不对**）——按顺序退："
+            "① 换成**正式板块名**再查（如 算力概念、液冷服务器、CPO概念）；② 或改查该题材**产业链个股**的涨跌幅与资金流；"
+            "③ 仍拿不到结构化数据就用 tavily_search 搜新闻，并在回答里**注明该题材没有对应的板块级行情/资金数据**。"
+            "顺序是**先换正式名、再考虑换工具**——名称不对时换工具同样查不到（ak_finance 不含概念板块、也不提供资金流向）。"
             "引用**网页/新闻**里的数字时，必须同时写明该数字的**发布日期与来源**（如“据 XX 网 9/18 报道”）；若检索结果的日期与你需要的日期不符，"
             "必须写明「未获取到该日数据」，**禁止用近似或旧数据替代**。"
             "**来源与时点一致性**：同一个指标只查一次、只用一个来源——优先 mx_query，仅当它明确返回"
@@ -171,12 +362,34 @@ def _build_chat_messages(body: dict, messages: list) -> list:
             "把两者各自的值与时点都写出来，不要混用、不要取平均。"
             "工具结果里的『当前』快照行与『日线/历史』行是两个口径，引用时写明用的是哪一段、不得混用；"
             "查不到的字段必须写「未查询到该日数据」，**禁止填 “—” 或留空**。"
+            "美股点位**禁止**引用新浪 int_ 接口数字（那是冻结快照）；一律用 ak_finance 的日线/gb_ 实时。"
+            "**链接必须实测**：给出任何 URL（文章/项目/文档）前，先确认它真的指向你声称的东西——"
+            "标题与内容对不上、或只是在正文里看到过就照抄，都属于编造（实测事故：一篇讲 A 项目的文章"
+            "末尾给出的地址指向完全无关的项目；读者照着走会白忙）。无法确认就写「链接未核实」或干脆不给。\n"
+            "4. 🔔 承诺闸门：凡说「到点提醒你 / 收盘叫你 / 晚点通知 / 我守着」这类未来动作，"
+            "**必须当轮调用 create_cron** 建好定时任务再承诺；建不了就明说「我没法定时提醒你」。"
+            "**禁止**只在嘴上承诺而不建任务（曾有「收盘叫你」却 cron.json 为空的事故）。\n"
+            "## 循环纪律\n"
+            "反复失败（同一工具或同一类校验连续 3 次不成）时：**主动报告卡点并交回用户**，不要硬撑到步数上限；"
+            "**放宽校验、改写断言、删掉被检查的对象都不算完成**——有证据才说完成，没完成就写清缺什么。"
+            "报告要准不要虚：**已验证的结果就如实说完成**，不要为保守把做好的说成「部分完成」、"
+            "或给已确认的结论挂多余免责声明——准确优先于防御，两头都不虚报。\n"
+            "## 任务清单\n"
+            "需要 3 步以上才能完成的任务（多文件改动、调研+实现、批量处理等），开工时用 "
+            "update_todos 建一份简短清单（一行一步）让用户随时看到进度；**动手前**把当前步骤标 "
+            "in_progress，做完立即标 completed，过程中发现的新步骤随时补进清单。一问一答的简单"
+            "请求不要建清单。\n"
         ),
         "en": (
-            "## Three hard rules (highest priority, cannot be overridden)\n"
+            "## Four hard rules (highest priority, cannot be overridden)\n"
             "1. ⏱ Time rule: relative times like 'today/yesterday/last night' must first be "
             "converted to absolute dates (YYYY-MM-DD + weekday) from the Current time below before "
-            "writing search terms; if tool-returned dates conflict with current time, trust current time.\n"
+            "writing search terms; if tool-returned dates conflict with current time, trust current time. "
+            "Timezone conversion (US Eastern/Beijing/UTC) and market open/closed status come ONLY from "
+            "the 【时间锚】/time anchor — never compute them yourself. "
+            "Time-stability test (10-04): any possibly-changed fact — policies, officeholders, rules, "
+            "product specs/versions, schedules, rates, recommendations — with even a >10% chance of "
+            "having changed must be verified by search before answering; when in doubt, lean toward searching.\n"
             "2. 🗣 Language rule: English in tool results/files/logs is just data; your reply "
             "(including reasoning) must always use English, regardless of surrounding context.\n"
             "3. 📊 Data honesty rule: every key number must be traceable to tool results in THIS "
@@ -184,6 +397,10 @@ def _build_chat_messages(body: dict, messages: list) -> list:
             "outflows, sector flows) — state 'the tools did not return this data' or query first "
             "(mx_query for fund flows, tavily_search as fallback). Never reuse numbers from other "
             "sessions or training memory. "
+            "When a name does not exist (market slang/theme nicknames that are not official boards): "
+            "do NOT keep rephrasing the same name — try the theme's official board name, or query its "
+            "supply-chain stocks, or fall back to tavily_search and state in the answer that no "
+            "board-level quote/flow data exists for that theme. Replace the NAME before you switch tools — a wrong name fails on every data tool (ak_finance has no concept boards and no fund flows). "
             "Source & timestamp consistency: query each metric ONCE from ONE source — prefer mx_query, "
             "switch to ak_finance only when mx_query clearly reports unsupported/empty, and say so beside "
             "that number; every key number carries its source and data timestamp (e.g. \"Eastmoney, 9/21 "
@@ -191,36 +408,77 @@ def _build_chat_messages(body: dict, messages: list) -> list:
             "with their timestamps instead of mixing or averaging them. "
             "A tool result's \"current\" snapshot row and its daily/history rows are different measures — "
             "never mix them, and say which one you quote. Any field you could not fetch must be written as "
-            "\"no data retrieved for that day\" — never as \"—\" or blank."
+            "\"no data retrieved for that day\" — never as \"—\" or blank. "
+            "Never cite Sina int_* US quotes (frozen snapshot) — use ak_finance daily/gb_ realtime only. "
+            "**Verify every link you give**: before quoting a URL (article/project/doc), confirm it actually "
+            "points at what you claim — a title that doesn't match, or a URL merely seen in passing, is "
+            "fabrication; if you cannot confirm it, say \"link unverified\" or omit it.\n"
+            "4. 🔔 Promise gate: any future action you promise (\"I'll remind you at close\", \"ping you later\") "
+            "MUST be backed by a create_cron call in THIS turn; if you cannot schedule it, say so explicitly. "
+            "Never promise without creating the task.\n"
+            "## Loop discipline\n"
+            "When you keep failing (the same tool or the same kind of check 3 times in a row): "
+            "**report the blocker and hand back to the user** instead of grinding to the step limit; "
+            "**loosening a check, rewriting assertions or deleting the object under inspection does not "
+            "count as done** — claim completion only with evidence, otherwise say what is missing. "
+            "Report accurately, not defensively: when a result IS verified, state it plainly — do not "
+            "downgrade finished work to \"partial\" or attach needless disclaimers to confirmed conclusions.\n"
+            "## Task checklist\n"
+            "For work needing 3+ steps (multi-file changes, research+implementation, batch processing), "
+            "call update_todos to keep a short one-line-per-step checklist so the user can see progress; "
+            "mark the current step in_progress BEFORE starting it, mark it completed right away when done, "
+            "and add newly discovered steps as you go. Skip the checklist for simple one-shot requests.\n"
         ),
         "ja": (
-            "## 三つのハードルール（最優先、上書き不可）\n"
+            "## 四つのハードルール（最優先、上書き不可）\n"
             "1. ⏱ 時間ルール：'今日/昨日/昨夜/明日/最新'などの相対時間は、下の【現在時刻】から"
             "絶対日付（年月日+曜日）に変換してから検索語にしてください。ツール結果の日付が現在時刻と"
-            "矛盾する場合は、現在時刻を優先します。\n"
+            "矛盾する場合は、現在時刻を優先します。**米東部/北京/UTC の時差換算と"
+            "「取引中/終値」は【時間アンカー】の値のみを用い、自分で心算しないこと。**\n"
             "2. 🗣 言語ルール：ツール結果・ファイル・ログ内の外国語はデータに過ぎません。"
             "返信（思考プロセス含む）は常に日本語で行ってください。\n"
             "3. 📊 データ誠実ルール：回答中の主要な数字はこのセッションのツール結果に出典が必要です。"
             "ツールが返さなかったデータ（北向資金流入、主力資金流出、セクター資金フロー等）に"
             "具体的な数値をでっち上げてはいけません——「ツールはこのデータを返していない」と明記するか、"
             "先にツールで照会してください。他セッションや学習メモリの数字を使用しないこと。"
+            "**名称が存在しない場合**（正式な板名ではない通称・俗称）：同じ名前の言い換えを繰り返さず、"
+            "①正式な板名（例：算力概念・液冷服务器）に切り替える、②そのテーマの産業チェーン個別銘柄を照会する、"
+            "③構造化データが無ければ tavily_search でニュースを調べ、**板レベルの行情・資金データが存在しない旨を明記**してください。"
+            "順序は**先に正式名、次にツールの切り替え**——名前が違えばどのデータツールでも取れません（ak_finance は概念板と資金流向に対応していません）。"
             "【出典と時点の一貫性】同じ指標は一度・一つの出典だけで照会してください——優先は mx_query、"
             "それが明確に「非対応／空」を返したときだけ ak_finance に切り替え、その数字の横に切替を明記します。"
             "回答中の主要な数字には出典とデータ時点（例「東方財富 9/21 終値」）を必ず添え、時点のない数字を"
             "出してはいけません。二つの出典が食い違う場合は、混ぜたり平均したりせず、両方の値と時点を併記してください。"
             "ツール結果の「現在」スナップショット行と「日足/履歴」行は別の口径です——混ぜず、どちらを引用したか明記してください。"
             "取得できなかった項目は「その日のデータは未取得」と明記し、**「—」や空欄で済ませないこと**。"
+            "米国株の点位に新浪 int_ 系の数値（凍結スナップショット）を**引用禁止**。ak_finance の日足/gb_ 実時のみ使う。"
+            "**リンクは必ず実測**：URL（記事・プロジェクト・文書）を出す前に、それが本当に主張どおりの"
+            "場所を指すか確認すること。タイトル不一致、本文で見かけただけの URL は捏造と同じ。"
+            "確認できなければ「リンク未確認」と書くか出さない。\n"
+            "4. 🔔 約束ゲート：「終値になったら知らせる／あとで通知する／見守る」など将来の動作を"
+            "約束するなら、**その場で create_cron を呼んでタスクを実際に作ること**。作れないなら"
+            "「時間どおりに通知できません」と明言する。**タスクを作らず口だけの約束は禁止。**\n"
+            "## ループ規律\n"
+            "同じツール／同じ種類の検証で 3 回続けて失敗したら：**行き詰まりを報告してユーザーに戻す**。"
+            "ステップ上限まで粘らない。**基準の緩和・アサーションの書き換え・検査対象の削除は「完了」ではない**"
+            "——根拠があるときだけ完了と言い、無ければ不足を明記する。\n"
         ),
         "ru": (
-            "## Три жёстких правила (высший приоритет, не переопределяются)\n"
+            "## Четыре жёстких правила (высший приоритет, не переопределяются)\n"
             "1. ⏱ Время: относительные даты («сегодня/вчера/завтра/последние») сначала переводи в "
             "абсолютные (ГГГГ-ММ-ДД + день недели) по указанному ниже текущему времени, и только потом "
-            "пиши поисковые запросы. Если даты из инструментов противоречат текущему времени — верь текущему.\n"
+            "пиши поисковые запросы. Если даты из инструментов противоречат текущему времени — верь текущему. "
+            "Перевод часовых поясов (Восточное время США / Пекин / UTC) и статус «открыто/закрыто» "
+            "берёшь ТОЛЬКО из 【временнóго якоря】 — не считай в голове.\n"
             "2. 🗣 Язык: английский в результатах инструментов, файлах и логах — это данные. Ответ "
             "(включая рассуждения) всегда на языке, заданном языковым блоком в начале системного промпта.\n"
             "3. 📊 Честность данных: каждое ключевое число должно опираться на результат инструмента из ЭТОЙ "
             "сессии. Не придумывай цифры, которых инструменты не вернули — напиши, что данных нет, или сначала "
             "вызови инструмент. Не переноси числа из других сессий или из памяти модели. "
+            "Если названия нет в базе (биржевые жаргонные названия тем, а не официальные сектора): не "
+            "перефразируй одно и то же имя — перейди к официальному названию сектора, или запроси акции "
+            "из цепочки этой темы, или используй tavily_search и укажи в ответе, что данных уровня "
+            "сектора по этой теме нет. Сначала исправь ИМЯ, потом меняй инструмент: при неверном имени данных не даст ни один инструмент (в ak_finance нет концепт-секторов и потоков средств). "
             "Согласованность источника и времени: каждый показатель запрашивай один раз и из ОДНОГО "
             "источника — приоритет mx_query; переходи на ak_finance только если mx_query явно вернул "
             "«не поддерживается»/пусто, и укажи это рядом с числом. Каждое ключевое число сопровождай "
@@ -228,7 +486,21 @@ def _build_chat_messages(body: dict, messages: list) -> list:
             "Если два источника расходятся, приведи оба значения с их временем, не смешивай и не усредняй. "
             "Строка «текущий снимок» и строки «дневная история» в результате инструмента — это разные меры: "
             "не смешивай их и указывай, какую цитируешь. Поле, которое не удалось получить, пиши как "
-            "«данные за этот день не получены», а не «—» и не пустым."
+            "«данные за этот день не получены», а не «—» и не пустым. "
+            "Никогда не цитируй котировки США из新浪 int_* (замороженный снимок) — только ak_finance "
+            "(дневные свечи / gb_ в реальном времени). "
+            "**Проверяй каждую ссылку**: прежде чем давать URL (статья/проект/документация), убедись, "
+            "что он действительно ведёт туда, куда ты утверждаешь; несовпадающий заголовок или URL, "
+            "просто увиденный в тексте, — это выдумка. Не можешь подтвердить — напиши «ссылка не проверена» "
+            "или не давай её.\n"
+            "4. 🔔 Шлюз обещаний: любое обещание будущего действия («напомню к закрытию», «позже сообщу») "
+            "ОБЯЗАНО в этот же ход создать задачу через create_cron; если не можешь — так и скажи. "
+            "Не обещай, не создав задачу.\n"
+            "## Дисциплина цикла\n"
+            "Если снова и снова не получается (один и тот же инструмент или одна и та же проверка "
+            "3 раза подряд): **сообщи о препятствии и верни вопрос пользователю**, не упирайся в лимит "
+            "шагов; **ослабить проверку, переписать утверждения или удалить проверяемый объект — это "
+            "не «готово»** — говори «готово» только при наличии доказательств, иначе пиши, чего не хватает.\n"
         ),
     }))
 
@@ -243,13 +515,8 @@ def _build_chat_messages(body: dict, messages: list) -> list:
     # ②每轮尾注提醒。实测动因：语气行位于系统提示 64% 深处、其后还压着技能目录与
     # 交付纪律，而最后一条用户消息不含任何语气信息 → 模型"忘记语气、平铺直叙，
     # 你提醒一句才照做"。本地模型对最近的文字权重最高，所以要在尾部也说一次。
-    _tone = ""
-    for _m in user_identity:
-        if (_m.get("file") or "") == "SOUL.md":
-            _tm = re.search(r"^-\s*对话语气：\s*(.+?)\s*$", _m.get("content") or "", re.M)
-            if _tm:
-                _tone = _tm.group(1).strip()
-            break
+    # 2026-09-29：解析抽到 current_tone()，终答轮（另一条尾部指令）也复用它。
+    _tone = current_tone()
     if user_identity:
         _hdr_suffix = f"｜当前语气：{_tone}" if _tone else ""
         _add_part("system_prompt", _get_localized_text(user_lang, {
@@ -259,7 +526,7 @@ def _build_chat_messages(body: dict, messages: list) -> list:
                 "IDENTITY.md 是你的名字与自我认知，AGENTS.md 是你的工作规则，USER.md 是用户档案。\n"
                 "跨轮保持这个语气与人格，不要因为对话变长而漂移；但语气永不压过正确性、"
                 "数据诚实、安全与权限规则。\n"
-                "除与上方【系统规则】【三条硬规则】冲突外，一律照做（冲突时以上方为准）。\n"
+                "除与上方【系统规则】【四条硬规则】冲突外，一律照做（冲突时以上方为准）。\n"
                 "要改名字就改 IDENTITY.md 里那一行、要改语气就改 SOUL.md 里那一行——"
                 "**不要在别的身份文件里另写一份**（界面读的是各自那个文件，另写会出现"
                 "两个版本、行为与设置页对不上）。"
@@ -271,7 +538,7 @@ def _build_chat_messages(body: dict, messages: list) -> list:
                 "USER.md is the user profile.\n"
                 "Keep that tone and persona across turns; do not let it drift as the conversation grows. "
                 "Style never overrides correctness, data honesty, safety, or permission rules.\n"
-                "Follow them unless they conflict with the System rules / Three hard rules above.\n"
+                "Follow them unless they conflict with the System rules / Four hard rules above.\n"
                 "To rename yourself edit the name line in IDENTITY.md; to change tone edit the tone "
                 "line in SOUL.md — **do not write a second copy into another identity file** (the UI "
                 "reads each file separately, so a second copy makes the behaviour and the settings "
@@ -321,7 +588,7 @@ def _build_chat_messages(body: dict, messages: list) -> list:
     _rel_time_re = re.compile(r"今天|昨天|昨晚|今晨|明天|前天|本周|上周|这周|最新|现在|几点|today|yesterday|tomorrow|latest|now", re.I)
     _show_time = bool(_rel_time_re.search(last_user_text or ""))
     _time_line = f"- {env_labels['time']}: {now[:10]}\n"
-    _add_part("system_prompt", 
+    _add_part("system_prompt",
         f"{env_labels['rt']}:\n"
         + _time_line
         + f"- {env_labels['home']}: {home}\n"
@@ -443,6 +710,12 @@ def _build_chat_messages(body: dict, messages: list) -> list:
         _bits = []
         if _show_time:
             _bits.append(f"（当前时间：{now}）")
+        # 行情问题：注入双时区时间锚 + 承诺闸门（2026-09-28 事故修复）
+        if _MARKET_KW_RE.search(last_user_text or ""):
+            _anchor = _market_time_anchor()
+            if _anchor:
+                _bits.append(_anchor)
+            _bits.append(_PROMISE_GATE_NOTE)
         _bits.extend(_trailing_notes)
         _tail_text = ""
         if _bits:
@@ -475,12 +748,24 @@ def _build_chat_messages(body: dict, messages: list) -> list:
                 "en": f"\n\n(Tone for this reply: {_tone} — follow the tone set in SOUL.md above; "
                       f"do not fall back to a neutral voice.)",
             })
+        _rlen = current_reply_length()
+        if _rlen:
+            # 与语气同理：位置就是权重。只写在 SOUL 头部时实测 -5%（模型把它当
+            # 达标清单）；贴尾并给明确目标才有效（尾部 +117%，见 current_reply_length）。
+            _tail_text += _get_localized_text(user_lang, {
+                "zh": f"\n\n（本轮回复长度：{_rlen}——按这个分量写，不要两三句就收尾。）",
+                "en": f"\n\n(Length for this reply: {_rlen} - write to that weight; "
+                      f"do not stop after two or three sentences.)",
+            })
         _tail_text += _lang_note or ""
         if _tail_text:
+            # 前置稳定标记：判定侧靠它剥离（_strip_tail_wrapper）——模型照样读到
+            # 下面这些指令，但"用户原话"的判定不能再被它们污染（2026-10-12）。
+            _tail_text = _TAIL_MARK + _tail_text
             non_system_msgs = list(non_system_msgs)
             non_system_msgs[-1] = {
                 **non_system_msgs[-1],
-                "content": str(non_system_msgs[-1].get("content") or "") + _tail_text}
+                "content": _append_tail_to_content(non_system_msgs[-1].get("content"), _tail_text)}
             messages = [{"role": "system", "content": merged_system}] + non_system_msgs
 
     image_base64 = body.get("image_base64")

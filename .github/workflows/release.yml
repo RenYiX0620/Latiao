@@ -38,23 +38,15 @@ jobs:
           rm -rf sidecar/.pytest_cache sidecar/.mypy_cache 2>/dev/null || true
           du -sh sidecar || true
 
-      - name: "Build Spark fork engine (XHToken llama.cpp)"
-        run: |
-          # 09-15 事故：fork 二进制在 .gitignore 里（不入库），CI 从干净仓库构建
-          # → 打出的 macOS 包从来没有 sidecar/llama-server → Spark 类模型
-          # “启动失败: Failed to load model”（python 引擎不支持其架构，而回退
-          # 引擎缺失）。此步骤在 CI 内现编，并在编译失败时立刻终止发版。
-          command -v cmake >/dev/null 2>&1 || brew install cmake
-          bash scripts/build-spark-llama.sh
-          test -x sidecar/llama-server || { echo "::error::Spark fork 未产出 sidecar/llama-server"; exit 1; }
-          echo "Spark fork engine:"; ./sidecar/llama-server --version | head -2
-
-      - name: "Fetch upstream llama.cpp engine (dual-engine dispatch)"
+      - name: "Fetch upstream llama.cpp engine (single engine)"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # 09-15：macOS 内置双引擎——sidecar/llama-server 是 Spark 专用 fork，
-          # 上游引擎由本步骤抓预编译包到 sidecar/llama-upstream/（普通模型走上游）
+          # 2026-10-12 收编：fork 退役、不再构建也不入包——实测上游 b11554/b11571 能
+          # 加载 Spark-X2.5 并正确解析原生 tools 调用（finish=tool_calls、参数类型无误），
+          # 同提示词行为与 fork 一致。此前这里还有一步"CI 现编 XHToken fork"（09-15 为
+          # Spark 加的），已删：既省 CI 时间，也省包体约 44MB（加 dylib 重复拷贝共 ~84MB）。
+          # 恢复路径：scripts/build-spark-llama.sh + 把下面 Verify 步骤的断言改回双引擎。
           bash scripts/fetch-upstream-llama.sh
 
       - name: "Guard: signing key configured?"
@@ -89,15 +81,22 @@ jobs:
           fi
           ls -la "$BUNDLE/macos"
 
-      - name: "Verify bundled engines (fork + upstream)"
+      - name: "Verify bundled engine (upstream only, fork must be absent)"
         run: |
-          # 硬性校验：包里必须同时有 Spark fork 与上游引擎，否则失败而不是静默发布
+          # 2026-10-12 起单引擎：只校验上游，并**反过来断言 fork 不在包里**——
+          # 防止旧产物/漏删的构建步骤把 44MB 的 fork 又带进包（本步骤是 tripwire）。
           APP=$(ls -d src-tauri/target/release/bundle/macos/*.app | head -1)
           RES="$APP/Contents/Resources/sidecar"
-          for e in "$RES/llama-server" "$RES/llama-upstream/llama-server"; do
-            if [ ! -x "$e" ]; then echo "::error::缺少引擎: $e"; exit 1; fi
-            "$e" --version | head -1
-          done
+          if [ ! -x "$RES/llama-upstream/llama-server" ]; then
+            echo "::error::缺少上游引擎: $RES/llama-upstream/llama-server"; exit 1
+          fi
+          "$RES/llama-upstream/llama-server" --version | head -1
+          if [ -e "$RES/llama-server" ]; then
+            echo "::error::包内出现了已退役的 Spark fork（$RES/llama-server）——检查构建步骤"; exit 1
+          fi
+          _n=$(ls "$RES/llama-upstream" | wc -l | tr -d ' ')
+          echo "上游引擎文件数: $_n（精简布局应为 11）"
+          [ "$_n" = "11" ] || { echo "::error::引擎目录不是精简布局（$_n 个文件，期望 11）"; exit 1; }
 
       - name: Generate latest.json (darwin 条目)
         run: |

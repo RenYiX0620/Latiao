@@ -4,20 +4,20 @@
 不依赖 tokenizer 的路径；精确计数（vocab_only / tokenizers）在实现时用真机
 实测校验过（GGUF 与 MLX 两路计数一致，误差 0）。
 """
-from unittest import mock
-import time
 import json
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import agent.tool_exec as TE  # noqa: E402  （工具执行簇 2026-09-23 拆出：patch 面在此）
-
 import context_stats as cs
+import local_llm_probe
 
 
 class TestEstimateTokens(unittest.TestCase):
@@ -162,7 +162,7 @@ class TestUsageAndCache(unittest.TestCase):
         self.assertEqual(after, before + 5000)
 
     def test_rolling_average_and_cap(self):
-        for i in range(cs.CACHE_SAMPLES + 5):
+        for _ in range(cs.CACHE_SAMPLES + 5):
             cs.record_usage(self.SESSION, None, {"prompt_n": 50, "cache_n": 50})   # 50/(50+50)
         st = cs.stats(self.SESSION)
         self.assertEqual(st["cache_samples"], cs.CACHE_SAMPLES)
@@ -235,7 +235,7 @@ class TestInfoSaturation(unittest.TestCase):
 
     def test_repeat_scores_low_gain(self):
         # 真实形态：换个 query 重搜，返回的仍是同一批快讯（内容重复、仅顺序/措辞不同）
-        from agent.loop import _info_points, _info_gain, _INFO_GAIN_RATIO
+        from agent.loop import _INFO_GAIN_RATIO, _info_gain, _info_points
         base = ("美股三大指数涨跌不一，道指跌0.18%报51682.64点，纳指涨0.39%报26522.55点，"
                 "标普500涨0.17%报7650.5点。半导体板块走强，闪迪涨近11%。")
         reordered = ("标普500涨0.17%报7650.5点；纳指涨0.39%报26522.55点；道指跌0.18%报51682.64点。"
@@ -244,7 +244,7 @@ class TestInfoSaturation(unittest.TestCase):
         self.assertLess(gain, _INFO_GAIN_RATIO)      # 同批数据复述 → 低增量（实测 12%）
 
     def test_new_topic_scores_high_gain(self):
-        from agent.loop import _info_points, _info_gain
+        from agent.loop import _info_gain, _info_points
         seen = _info_points("道指跌0.18%报51682.64点，纳指涨0.39%")
         gain, _new = _info_gain("苹果发布新款芯片，出货量同比增长23%，营收120亿美元", seen)
         self.assertGreater(gain, 0.5)
@@ -372,7 +372,7 @@ class TestBoundedToolExecution(unittest.TestCase):
         self.assertIn("No such directory", search_files("/definitely/not/here", "*.md"))
 
     def test_tool_timeout_table(self):
-        from agent_loop import _tool_timeout_for, _TOOL_TIMEOUT_DEFAULT
+        from agent_loop import _TOOL_TIMEOUT_DEFAULT, _tool_timeout_for
         self.assertLessEqual(_tool_timeout_for("search_files"), 30)
         self.assertLessEqual(_tool_timeout_for("tavily_search"), 60)
         self.assertEqual(_tool_timeout_for("no_such_tool"), _TOOL_TIMEOUT_DEFAULT)
@@ -382,6 +382,7 @@ class TestToolTimeoutWrapper(unittest.TestCase):
 
     def test_timeout_returns_result_not_raise(self):
         import asyncio
+
         import agent_loop
         from agent_loop import _handle_tool_execution
 
@@ -527,7 +528,8 @@ class TestHeadStabilityAcrossTurns(unittest.TestCase):
 
     def test_head_stable_from_first_turn(self):
         """本地引擎：**从第 1 轮起**头部就固定（工具表=整套），不随措辞变化。"""
-        import local_llm, context_stats as cs
+        import context_stats as cs
+        import local_llm
         local_llm._engine._active_backend = "llama-cpp-native"
         heads, names = [], []
         for q in ("你好呀", "分析周五A股大盘走势", "帮我写个 python 脚本存文件",
@@ -544,7 +546,8 @@ class TestHeadStabilityAcrossTurns(unittest.TestCase):
         用户实测的 0% 就出在这里：旧实现每轮按措辞重算工具表（14↔12 交替）→ 头部
         每轮都变 → 混合/线性注意力模型无法复用。新实现只增不减，饱和后即稳定。
         """
-        import local_llm, context_stats as cs
+        import context_stats as cs
+        import local_llm
         local_llm._engine._active_backend = "llama-cpp-native"
         for q in ("分析周五A股大盘走势", "你好呀", "帮我写个 python 脚本存文件",
                   "读一下 README.md", "我心情不错"):
@@ -614,7 +617,8 @@ class TestCustomEngine(unittest.TestCase):
     """路线 A：custom_engine 配置（第三方 fork 引擎当辣条本地后端）。"""
 
     def setUp(self):
-        import pathlib as _pl, os
+        import os
+        import pathlib as _pl
         self.tmp = tempfile.TemporaryDirectory()
         self.bin = _pl.Path(self.tmp.name) / "their-llama-server"
         self.bin.write_text("#!/bin/sh\n")
@@ -622,7 +626,9 @@ class TestCustomEngine(unittest.TestCase):
         import local_llm
         self._ll = local_llm
         self._old_cfg_fn = local_llm._config_file
+        self._old_cfg_fn_probe = local_llm_probe._config_file
         local_llm._config_file = lambda: self.cfg
+        local_llm_probe._config_file = lambda: self.cfg
         self._env = dict(os.environ)
         for k in ("LATIAO_CUSTOM_ENGINE", "LATIAO_CUSTOM_ENGINE_BIN",
                   "LATIAO_CUSTOM_ENGINE_ARGS"):
@@ -631,6 +637,7 @@ class TestCustomEngine(unittest.TestCase):
     def tearDown(self):
         import os
         self._ll._config_file = self._old_cfg_fn
+        local_llm_probe._config_file = self._old_cfg_fn_probe
         os.environ.clear(); os.environ.update(self._env)
         self.tmp.cleanup()
 
@@ -661,6 +668,7 @@ class TestCustomEngine(unittest.TestCase):
 
     def test_missing_binary_or_disable_flag(self):
         import os
+
         from local_llm import _custom_engine_spec
         self._write({"custom_engine": {"enabled": True, "binary": "/nope/llama-server"}})
         self.assertEqual(_custom_engine_spec("/x.gguf"), {})          # 二进制不存在 → 忽略
@@ -670,6 +678,7 @@ class TestCustomEngine(unittest.TestCase):
 
     def test_env_overrides_config(self):
         import os
+
         from local_llm import _custom_engine_spec
         self._write({"custom_engine": {"binary": "/nope/x"}})
         os.environ["LATIAO_CUSTOM_ENGINE_BIN"] = str(self.bin)
@@ -741,7 +750,7 @@ class TestGgufPrecheck(unittest.TestCase):
         return str(path)
 
     def test_flags_private_quant_type(self):
-        from local_llm import _gguf_scan, _gguf_precheck
+        from local_llm import _gguf_precheck, _gguf_scan
         with tempfile.TemporaryDirectory() as tmp:
             path = self._gguf(tmp, 142, [5120, 248320], 4096)
             scan = _gguf_scan(path)
@@ -769,6 +778,7 @@ class TestGgufPrecheck(unittest.TestCase):
 
     def test_garbage_file_fails_open(self):
         import pathlib as _pl
+
         from local_llm import _gguf_precheck, _gguf_scan
         with tempfile.TemporaryDirectory() as tmp:
             path = _pl.Path(tmp) / "x.gguf"
@@ -782,6 +792,7 @@ class TestParallelToolSafety(unittest.TestCase):
 
     def test_mx_query_not_parallel(self):
         import inspect
+
         from agent import loop as L
         src = inspect.getsource(L.ThinAgentLoop.run)
         start = src.index("_SAFE_PARALLEL_TOOLS")
@@ -794,6 +805,7 @@ class TestCustomEngineTarget(unittest.TestCase):
 
     def test_gguf_file_and_directory(self):
         import pathlib as _pl
+
         from local_llm import _custom_engine_target
         with tempfile.TemporaryDirectory() as tmp:
             d = _pl.Path(tmp)
@@ -806,7 +818,9 @@ class TestCustomEngineTarget(unittest.TestCase):
             self.assertEqual(_custom_engine_target(str(bad))[0], "err")
 
     def test_mlx_pack_directory(self):
-        import pathlib as _pl, json
+        import json
+        import pathlib as _pl
+
         from local_llm import _custom_engine_target
         with tempfile.TemporaryDirectory() as tmp:
             d = _pl.Path(tmp)
@@ -825,8 +839,8 @@ class TestShortMessageNoInjection(unittest.TestCase):
     上个会话的半导体板块 —— 因为注入块贴在最后一条用户消息尾部，权重最高）。"""
 
     def setUp(self):
+        import agent.prompt_build as PB  # _build_chat_messages 的规范模块（2026-09-23 拆出）
         import agent_loop as A
-        import agent.prompt_build as PB     # _build_chat_messages 的规范模块（2026-09-23 拆出）
         self.A, self.PB = A, PB
         # monkeypatch 面必须跟着代码搬：_build_chat_messages 现在在 prompt_build 里
         # 按自己的全局名查这些符号，改 agent_loop 的同名属性不会再生效
@@ -861,7 +875,8 @@ class TestUsIndexRouting(unittest.TestCase):
     """美股指数识别（09-20）：道指/标普/纳指/罗素 要能识别，A股/个股不能误判。"""
 
     def _targets(self, q):
-        import sys, pathlib as _pl
+        import pathlib as _pl
+        import sys
         sys.path.insert(0, str(_pl.Path(__file__).resolve().parents[1]))
         sys.path.insert(0, str(_pl.Path(__file__).resolve().parents[1] / "plugins"))
         from plugins.ak_finance import _us_index_targets
@@ -881,7 +896,8 @@ class TestMultiCustomEngines(unittest.TestCase):
     """同一模型家族多个包（GGUF→fork 引擎、MLX→自带运行时）各用各的 binary（09-20）。"""
 
     def setUp(self):
-        import pathlib as _pl, os
+        import os
+        import pathlib as _pl
         self.tmp = tempfile.TemporaryDirectory()
         self.a = _pl.Path(self.tmp.name) / "fork-llama-server"
         self.b = _pl.Path(self.tmp.name) / "mlx-shim.sh"
@@ -890,18 +906,22 @@ class TestMultiCustomEngines(unittest.TestCase):
         import local_llm
         self._ll = local_llm
         self._old = local_llm._config_file
+        self._old_probe = local_llm_probe._config_file
         local_llm._config_file = lambda: self.cfg
+        local_llm_probe._config_file = lambda: self.cfg
         self._env = dict(os.environ)
         os.environ.pop("LATIAO_CUSTOM_ENGINE_BIN", None)
 
     def tearDown(self):
         import os
         self._ll._config_file = self._old
+        local_llm_probe._config_file = self._old_probe
         os.environ.clear(); os.environ.update(self._env)
         self.tmp.cleanup()
 
     def test_picks_entry_by_match(self):
         import json
+
         from local_llm import _custom_engine_spec
         self.cfg.write_text(json.dumps({"custom_engine": [
             {"enabled": True, "binary": str(self.a), "name": "fork", "match": "PQ2_0"},
@@ -915,6 +935,7 @@ class TestMultiCustomEngines(unittest.TestCase):
 
     def test_single_object_still_works(self):
         import json
+
         from local_llm import _custom_engine_spec
         self.cfg.write_text(json.dumps({"custom_engine": {
             "enabled": True, "binary": str(self.a), "name": "solo"}}), encoding="utf-8")
@@ -926,7 +947,8 @@ class TestMlxRejectReason(unittest.TestCase):
     把"需要自带运行时"的包（Prism Bonsai MLX，无视觉塔）说成"多模态 MLX-VLM"。"""
 
     def _mk(self, files: dict) -> str:
-        import json, pathlib as _pl
+        import json
+        import pathlib as _pl
         d = _pl.Path(tempfile.mkdtemp())
         for name, content in files.items():
             f = d / name.replace("__", "/")
@@ -974,7 +996,9 @@ class TestMaxTokensAndLengthRetry(unittest.TestCase):
         self.assertEqual(_resolve_max_tokens("x", local=True, override=32768), 32768)  # 配置优先
 
     def test_custom_engine_max_tokens_from_config(self):
-        import json, pathlib as _pl
+        import json
+        import pathlib as _pl
+
         import agent_loop as A
         from agent.context import _custom_engine_max_tokens
         old = A.CONFIG_FILE
@@ -1035,7 +1059,7 @@ class TestProcessNarrationFold(unittest.TestCase):
     """工具轮过程叙述折叠（09-19：关思考后推理倒进正文，实测单轮 11171 字）。"""
 
     def test_long_narration_folded(self):
-        from agent.loop import _trim_process_narration, _ROUND_CONTENT_MAX
+        from agent.loop import _ROUND_CONTENT_MAX, _trim_process_narration
         long_text = "The search results are messy. Let me analyze: " * 300
         out = _trim_process_narration(long_text)
         self.assertLess(len(out), _ROUND_CONTENT_MAX + 120)
@@ -1064,7 +1088,12 @@ class TestChunkedTranslation(unittest.TestCase):
         self.assertEqual(len(_split_translation_chunks("很短的一段话。")), 1)
 
 class TestThinkingLevelRespected(unittest.TestCase):
-    """思考档位跟随用户选择（09-19：此前 steps>1 一律关思考 → 推理倒进正文）。"""
+    """思考两档（2026-10-11 改制：关闭 / 开启）。
+
+    背景：四档时代"高"与"最高"逐字节相同（用户实测"切了没用"）。现在：
+    off = 真不思考；其余（max/high/low 兼容旧前端）= 开启 + 请求级思考预算
+    （实测 b11118：预算有效但非硬上限，不设预算会饿死正文 → 定 4000）。
+    """
 
     def _body(self, level, steps):
         from agent.loop import ThinAgentLoop
@@ -1072,54 +1101,74 @@ class TestThinkingLevelRespected(unittest.TestCase):
                              "http://127.0.0.1:9/v1/chat/completions", {}, "s-th",
                              thinking_level=level)
         loop.steps = steps
-        return loop._build_request("m").get("chat_template_kwargs", {})
+        return loop._build_request("m")
 
-    def test_high_keeps_thinking_after_tools(self):
-        self.assertTrue(self._body("high", 2).get("enable_thinking"))
+    def test_on_keeps_thinking_after_tools(self):
+        body = self._body("max", 2)
+        self.assertTrue(body["chat_template_kwargs"].get("enable_thinking"))
 
-    def test_max_keeps_thinking_after_tools(self):
-        self.assertTrue(self._body("max", 2).get("enable_thinking"))
+    def test_on_carries_reasoning_budget(self):
+        """开启档必须带请求级思考预算（这是两档制里"开"的实质）。"""
+        from agent.loop import _THINK_BUDGET_TOKENS
+        body = self._body("max", 1)
+        self.assertEqual(body.get("reasoning_budget_tokens"), _THINK_BUDGET_TOKENS)
+        self.assertGreater(_THINK_BUDGET_TOKENS, 0)
 
-    def test_off_stays_off(self):
-        self.assertIs(self._body("off", 1).get("enable_thinking"), False)
-        self.assertIs(self._body("off", 2).get("enable_thinking"), False)
+    def test_legacy_levels_map_to_on(self):
+        """旧前端/旧 localStorage 的 low/high 一律按"开"处理，不报错、不静默变关。"""
+        for legacy in ("low", "high"):
+            body = self._body(legacy, 2)
+            self.assertTrue(body["chat_template_kwargs"].get("enable_thinking"), legacy)
+            self.assertIn("reasoning_budget_tokens", body, legacy)
+
+    def test_off_stays_off_and_has_no_budget(self):
+        for steps in (1, 2):
+            body = self._body("off", steps)
+            self.assertIs(body["chat_template_kwargs"].get("enable_thinking"), False)
+            self.assertNotIn("reasoning_budget_tokens", body)
 
     def test_truncation_retry_still_forces_off(self):
         from agent.loop import ThinAgentLoop
         loop = ThinAgentLoop([{"role": "user", "content": "写个长回答"}], "m",
                              "http://127.0.0.1:9/v1/chat/completions", {}, "s-th2",
-                             thinking_level="high")
+                             thinking_level="max")
         loop.steps = 2
         loop._force_thinking_off_next = True          # 截断重试轮
         self.assertIs(loop._build_request("m")["chat_template_kwargs"]["enable_thinking"], False)
+        # 日志诚实化：用户档位是"开"却被重试顶掉 → 必须登记来源
+        self.assertIn("截断重试", loop.thinking_off_reasons)
 
-class TestThinkingLowLevel(unittest.TestCase):
-    """低档（09-19 新增）：规划轮与作答轮开思考、工具轮关闭——兼顾"想清楚"与"别每轮想几分钟"。"""
+class TestCloudThinkingLevel(unittest.TestCase):
+    """云端档位（2026-10-11 接通）：此前云端请求完全不读档位，四个档零效果。"""
 
-    def _body(self, level, steps, prev_tools):
+    def _cloud_body(self, level, model="gpt-5-mini"):
         from agent.loop import ThinAgentLoop
-        loop = ThinAgentLoop([{"role": "user", "content": "分析周五美股走势"}], "m",
-                             "http://127.0.0.1:9/v1/chat/completions", {}, "s-low",
-                             thinking_level=level)
-        loop.steps = steps
-        loop._last_round_had_tools = prev_tools
-        return loop._build_request("m").get("chat_template_kwargs", {}).get("enable_thinking")
+        loop = ThinAgentLoop([{"role": "user", "content": "你好"}], model,
+                             "https://api.example.com/v1/chat/completions", {}, "s-cl",
+                             thinking_level=level, is_local=False)
+        return loop._build_request(model)
 
-    def test_low_keeps_thinking_on(self):
-        # 低档=思考开着+限长（关思考既不省时、又把英文推理倒进正文，09-19 实测）
-        self.assertTrue(self._body("low", 1, False))
-        self.assertTrue(self._body("low", 2, True))
+    def test_off_disables_for_openai_reasoners(self):
+        self.assertEqual(self._cloud_body("off", "o3-mini").get("reasoning_effort"), "none")
 
-    def test_low_caps_tool_round_output(self):
-        """低档=限长：工具轮单轮输出受限（速度唯一直接杠杆是少生成 token）。"""
-        from agent.loop import ThinAgentLoop, _LOW_MAX_TOKENS
-        loop = ThinAgentLoop([{"role": "user", "content": "分析周五美股走势"}], "m",
-                             "http://127.0.0.1:9/v1/chat/completions", {}, "s-lowcap",
-                             thinking_level="low")
-        loop.steps = 2
-        self.assertEqual(loop._build_request("m")["max_tokens"], _LOW_MAX_TOKENS)
-        loop.steps = 1                                     # 首轮规划不限长
-        self.assertGreater(loop._build_request("m")["max_tokens"], _LOW_MAX_TOKENS)
+    def test_off_disables_for_anthropic(self):
+        self.assertEqual(self._cloud_body("off", "claude-sonnet-4").get("thinking"),
+                         {"type": "disabled"})
+
+    def test_off_marks_forced_reasoning_models(self):
+        self.assertTrue(self._cloud_body("off", "deepseek-reasoner").get("_thinking_unsupported"))
+
+    def test_on_requests_high_effort(self):
+        self.assertEqual(self._cloud_body("max", "gpt-5-mini").get("reasoning_effort"), "high")
+
+    def test_on_does_not_inflate_max_tokens(self):
+        """旧实现把 max_tokens 一律抬到 18432——对上限 8k 的模型会 400；现已移除。"""
+        body = self._cloud_body("max", "deepseek-reasoner")
+        self.assertNotIn("reasoning_effort", body)     # deepseek 系不认该字段
+        self.assertLessEqual(int(body.get("max_tokens") or 0), 12288)
+
+class TestSearchToolSaturation(unittest.TestCase):
+    """搜索工具第 3 次调用触发饱和收口（从原云端档位类中拆出，避免类名冲突）。"""
 
     def test_same_search_tool_third_call_saturates(self):
         from agent.loop import ThinAgentLoop
@@ -1129,14 +1178,6 @@ class TestThinkingLowLevel(unittest.TestCase):
         self.assertFalse(loop._note_tool_counts(call))
         self.assertFalse(loop._note_tool_counts(call))
         self.assertTrue(loop._note_tool_counts(call))      # 第 3 次 → 饱和收口
-
-    def test_high_and_max_always_on_after_tools(self):
-        self.assertTrue(self._body("high", 2, True))
-        self.assertTrue(self._body("max", 2, True))
-
-    def test_off_never_on(self):
-        self.assertIs(self._body("off", 1, False), False)
-        self.assertIs(self._body("off", 2, True), False)
 
 class TestLocalizedMessages(unittest.TestCase):
     """运行时提示四语齐备（09-19 审计：这些提示原为中文写死，英文/日文/俄文用户会看到中文）。"""
@@ -1148,6 +1189,7 @@ class TestLocalizedMessages(unittest.TestCase):
 
     def test_en_and_ru_have_no_han(self):
         import re
+
         from agent.messages import MESSAGES
         for key, table in MESSAGES.items():
             for lang in ("en", "ru"):
@@ -1269,6 +1311,7 @@ class TestFinalizeDigestLanguage(unittest.TestCase):
 
     def test_no_chinese_forced_for_english_user(self):
         import re
+
         from agent.loop import _build_finalize_digest
         msgs = [{"role": "user", "content": "analyze friday us stocks"}]
         ask = _build_finalize_digest(msgs, lang="en")[-1]["content"]
@@ -1298,6 +1341,7 @@ class TestPromptCacheFriendly(unittest.TestCase):
     def test_compaction_skips_mid_turn(self):
         """轮内不压缩（steps>1 直接返回）——mid-turn 改写历史会打掉前缀缓存。"""
         import inspect
+
         from agent.plugins import builtin
         src = inspect.getsource(builtin.setup_compaction)
         self.assertIn('getattr(loop, "steps", 0) > 1', src)
@@ -1396,3 +1440,203 @@ class TestCounterFailureMemory(unittest.TestCase):
                 self.cs.count_tokens("今天", "/tmp/warn.gguf")
         warnings = [r for r in logs.output if "精确计数不可用" in r]
         self.assertEqual(len(warnings), 1, "同一模型的告警只打一次")
+
+
+class TestSafeTps(unittest.TestCase):
+    """tps 地板（2026-09-29 实测 278001 tok/s）：思考型步骤 TTFT≈步长 →
+    gen_seconds≈0.01 → 分母近零除法。低于地板必须显示 None 而不是天文数字。"""
+
+    def _stats(self):
+        sid = f"tps-{time.time()}"
+        cs.begin_turn(sid)
+        return sid, cs._session(sid)
+
+    def test_near_zero_gen_seconds_returns_none(self):
+        sid, sess = self._stats()
+        cs.record_step(sid, 26.8, 26.79)     # TTFT≈步长 → 贡献 0.01s
+        self.assertAlmostEqual(sess["gen_seconds"], 0.01, places=3)
+        self.assertIsNone(cs._safe_tps(sess), "分母近零必须返回 None")
+
+    def test_healthy_generation_returns_tps(self):
+        sid, sess = self._stats()
+        cs.record_step(sid, 106.7, 1.2)      # 真·首 token：闸前打点后的形态
+        sess["gen_tokens"] = 2780
+        self.assertEqual(cs._safe_tps(sess), round(2780 / 105.5))
+
+    def test_get_stats_endpoints_use_floor(self):
+        sid, sess = self._stats()
+        cs.record_step(sid, 26.8, 26.79)
+        d = cs.stats(sid, limit=0)
+        self.assertIsNone(d["tps"], "stats() 也要走地板")
+
+
+class TestPlanOnlyGateTailRewrite(unittest.TestCase):
+    """空转闸门末句判定重构（2026-10-08 二次事故）。
+
+    现场（日志原文）：碎片不止出现在工具失败后——turn 开头（"让我拉一下
+    实时数据"）与工具成功后的新 turn（"让我赶紧搜一下最新情况"）都会发生；
+    且前半句可以带数据。判定改为：短正文 + 末句同时含意图词与数据动词。
+    """
+
+    def test_detects_incident_fragments(self):
+        from agent.loop import _looks_like_plan_only
+        # 10-08 现场 1：前半句有数据、末句承诺（57 字）
+        self.assertTrue(_looks_like_plan_only(
+            "今天大盘高开低走，上证微涨0.3%，但科创50跌了1.7%，整体偏震荡。 "
+            "让我拉一下实时数据给你看～", True))
+        # 10-08 现场 2：工具成功后的新 turn 承诺（59 字）
+        self.assertTrue(_looks_like_plan_only(
+            "今天跌这么狠，核心原因是三重打击。 让我赶紧搜一下今天的最新情况～", True))
+        # 10-07 现场同样应被空转闸门直接拦住（不再依赖工具失败上下文）
+        self.assertTrue(_looks_like_plan_only(
+            "好的主人，欧娜这就帮你看看这三只票的情况～", True))
+
+    def test_old_cases_still_detected(self):
+        from agent.loop import _looks_like_plan_only
+        self.assertTrue(_looks_like_plan_only(
+            "我来帮你分析上周五（9月18日）的大盘走势。先调取相关数据和复盘方法论。", True))
+        self.assertTrue(_looks_like_plan_only("让我先查询一下最近的行情数据。", True))
+
+    def test_no_false_positives(self):
+        from agent.loop import _looks_like_plan_only
+        # 过去式汇报（无意图词）：不拦
+        self.assertFalse(_looks_like_plan_only("我查了，明天休市。", True))
+        self.assertFalse(_looks_like_plan_only("我看到了，确实跌了。", True))
+        # 合法短答：不拦
+        self.assertFalse(_looks_like_plan_only("今日大盘收跌。", True))
+        self.assertFalse(_looks_like_plan_only("1 + 1 = 2。", True))
+        # 长正文（>200 字）即便末句是承诺收尾也放行（主体已完整）
+        long_tail = "上证收跌0.89%，主力净流出214亿。" * 12 + " 需要我继续分析吗？让我知道。"
+        self.assertFalse(_looks_like_plan_only(long_tail, True))
+        # 末句是礼貌问句（无"让我+动词"承诺形态）：不拦
+        self.assertFalse(_looks_like_plan_only(
+            "今天大盘跌了。需要我帮你查个股的话告诉我。", True))
+
+    def test_tail_judgment_differs_from_whole_text_scan(self):
+        """末句版与旧"整文扫词"版的**唯一可观测分歧**：承诺词在前句、末句是
+        数据结论的完整回答。旧版（整文搜 INTENT+VERB）会把这类完整回答误判
+        成计划碎片，末句版放行。2026-10-08 实战：末句版写好后旧版没删、在
+        Python 里后定义胜出——新实现成死代码而全部用例保持绿色；这两条用例
+        是让"遮蔽"必然变红的红证。"""
+        from agent.loop import _looks_like_plan_only
+        self.assertFalse(_looks_like_plan_only(
+            "让我先看看数据。上证收跌0.89%，主力净流出214亿。", True))
+        self.assertFalse(_looks_like_plan_only(
+            "我来汇总一下今天的行情：上证收跌0.89%。半导体领涨2.1%，医药跌0.5%。", True))
+
+    def test_single_definition_tripwire(self):
+        """结构哨兵：循环里这些判定函数只允许有一处模块级定义。
+
+        遮蔽型故障（同名函数两份、后者胜出）绿套件看不见——与 2026-10-08
+        的 `_looks_like_plan_only` 死代码同为"提取/重构留双份"这一族。"""
+        import agent.loop as _loop
+        src = Path(_loop.__file__).read_text(encoding="utf-8")
+        for name in ("_looks_like_plan_only", "_finalize_body_is_junk",
+                     "_delivery_fragment_suspect"):
+            with self.subTest(fn=name):
+                self.assertEqual(src.count(f"def {name}("), 1)
+
+    def test_finalize_junk_catches_tail_promise(self):
+        """收口轮 junk 判定须含末句承诺形态（2026-10-08 二次清查）。
+
+        现场碎片 57 字、收口轮模型未再发工具调用 → `stripped_tools=False` +
+        >10 字，旧判定的两档都不命中，会当"有效答案"直接交付。"""
+        from agent.loop import _finalize_body_is_junk
+        self.assertTrue(_finalize_body_is_junk(
+            "今天大盘高开低走，上证微涨0.3%，但科创50跌了1.7%，整体偏震荡。 "
+            "让我拉一下实时数据给你看～", False))
+        # 合法短答不受影响（>10 字；<10 字的空判定是既有口径）
+        self.assertFalse(_finalize_body_is_junk("今日大盘收跌，上证跌0.89%。", False))
+        self.assertFalse(_finalize_body_is_junk("我查了，明天休市，不用等开盘。", False))
+
+    def test_emoji_tail_decoration_not_a_blind_spot(self):
+        """真实语料重放（2026-10-08 二次清查）：结尾装饰"～💋"击穿末句判定。
+
+        模型习惯在句尾加装饰，按标点切句后末段只剩 emoji——库里 4 条真实
+        碎片（含用户报过的"说了三遍"那条）在末句版下漏网，而旧的整文扫描版
+        反而能拦住。切句时丢弃纯装饰段后全部命中；数据型完整回答不受影响。"""
+        from agent.loop import _delivery_fragment_suspect, _looks_like_plan_only
+        # seq=21（10-07 事故原句，带真实结尾装饰）
+        self.assertTrue(_looks_like_plan_only(
+            "好的主人，欧娜这就帮你看看这三只票的情况～💋", True))
+        # seq=10/11（用户报的"说了三遍"那条的两份）
+        self.assertTrue(_looks_like_plan_only(
+            "好的主人，欧娜这就帮你把美股、港股的数据都拉出来，"
+            "再结合最新消息给你分析明天A股的走势～💋", True))
+        # seq=23（工具失败后"马上用 mx_query 帮你查"，94 字）
+        self.assertTrue(_looks_like_plan_only(
+            "哎呀主人别急嘛～刚才 **ak_finance 的东财接口抽风了**（连接被拒绝），"
+            "欧娜没及时切到备用工具，所以卡住了 😘 现在马上用 **mx_query** "
+            "帮你查这三只票的情况！💋", True))
+        self.assertEqual(_delivery_fragment_suspect(
+            "好的主人，欧娜这就帮你看看这三只票的情况～💋"), "tail-promise")
+        # 数据型完整回答 + 装饰结尾：不拦
+        self.assertFalse(_looks_like_plan_only("今日大盘收跌，上证跌0.89%。😢", True))
+        self.assertFalse(_looks_like_plan_only("我查了，明天休市。🍵", True))
+
+    def test_dig_verb_and_do_form_catch_new_variant(self):
+        """10-08 三号现场："让我再深挖一下那份"研报引发的暴跌"的具体内容～"。
+
+        24 字、思考 545 字后只发这一句承诺；动词表没有"挖"，闸门/收口/哨兵三道
+        全漏（生产日志实测：闸门 False、收口 False、哨兵 ""，正文被交付=用户
+        又看到"停了"）。修法：动词表加"挖/扒/捋/梳理"+ 结构兜底"意图词 + 汉字
+        动词 + 一下/一遍/一趟"。两条边界必须保住。"""
+        from agent.loop import _delivery_fragment_suspect, _looks_like_plan_only
+        # 现场原句（动词表外的新动词）
+        self.assertTrue(_looks_like_plan_only(
+            '让我再深挖一下那份"研报引发的暴跌"的具体内容～', True))
+        # 动词表外的动作，靠结构兜底命中
+        self.assertTrue(_looks_like_plan_only("让我核对一下这三只票的资金流向～💋", True))
+        # 边界①：对**用户**的请求（不是模型自己要做事）→ 不算承诺
+        self.assertFalse(_looks_like_plan_only("有结果让我知道一下。", True))
+        # 边界②：带数据信号的汇报式短答（说"总结一下"但正文有数据）→ 放行
+        self.assertFalse(_looks_like_plan_only(
+            "让我总结一下今天的情况：上证收跌0.89%，主力净流出214亿。", True))
+        # 哨兵对现场原句必须响
+        self.assertEqual(_delivery_fragment_suspect(
+            '让我再深挖一下那份"研报引发的暴跌"的具体内容～'), "tail-promise")
+
+    def test_paren_aside_tail_and_action_verb(self):
+        """括号旁白收尾 + 动作动词（2026-10-10 用户实测"任务又断了一次"）。
+
+        现场原句（会话库实拍，138 字）："…应该是 4 到 5 头身才对…我马上改
+        过来～（踮起脚凑近你，呆毛扫过你的手臂）" → 说完就停，用户只好催
+        "快点改"。两个原因叠加：① 动词表缺"改"；② 承诺句后跟**括号动作
+        描写**，把它挤到倒数第二段、末句判定失明。"""
+        from agent.loop import _delivery_fragment_suspect, _looks_like_plan_only
+        # 现场原句（截短到核心形态）
+        self.assertTrue(_looks_like_plan_only(
+            "3 岁小孩哪来的 9 头身，应该是 4 到 5 头身才对，像年画里走出来的福娃娃娃。"
+            " 我马上改过来～（踮起脚凑近你，呆毛扫过你的手臂）", True))
+        # 动词表补"改"后，无括号尾巴的形态也命中
+        self.assertTrue(_looks_like_plan_only("我马上改过来～", True))
+        self.assertTrue(_looks_like_plan_only("让我换成传统花棉袄的版本。", True))
+        self.assertTrue(_looks_like_plan_only("这就把比例调整一下。", True))
+        # 哨兵同口径
+        self.assertEqual(_delivery_fragment_suspect(
+            "我马上改过来～（踮起脚凑近你）"), "tail-promise"
+        )
+        # 对照①：非括号的末段不回看（"承诺在前、数据收尾"仍按设计放行）
+        self.assertFalse(_looks_like_plan_only(
+            "让我先看看数据。上证收跌0.89%，主力净流出214亿。", True))
+        # 对照②：过去式汇报（无意图词）不受新增动词影响
+        self.assertFalse(_looks_like_plan_only("我已经改好了，你看一眼。", True))
+
+    def test_delivery_sentinel_flags_but_is_broader(self):
+        """交付哨兵：只观测不拦截，但要比闸门宽（240 字口径 + 承诺口语词）。"""
+        from agent.loop import _delivery_fragment_suspect
+        self.assertEqual(_delivery_fragment_suspect(
+            "今天大盘高开低走，上证微涨0.3%，但科创50跌了1.7%，整体偏震荡。 "
+            "让我拉一下实时数据给你看～"), "tail-promise")
+        # "这就/马上"同时属两类词表 → 记 tail-promise（标签取先命中者）
+        self.assertEqual(_delivery_fragment_suspect(
+            "好的主人，欧娜这就帮你看看这三只票的情况～"), "tail-promise")
+        # 纯承诺口语（无意图词形态）→ promise-phrase
+        self.assertEqual(_delivery_fragment_suspect(
+            "数据还在拉取中，稍等片刻～"), "promise-phrase")
+        # 干净正文不响：含数据信号的短答 / 过去式汇报 / 空 / 长正文
+        self.assertEqual(_delivery_fragment_suspect("今日大盘收跌，上证 -0.89%。"), "")
+        self.assertEqual(_delivery_fragment_suspect("我查了，明天休市。"), "")
+        self.assertEqual(_delivery_fragment_suspect(""), "")
+        self.assertEqual(_delivery_fragment_suspect(
+            "上证收跌0.89%，主力净流出214亿。" * 20), "")

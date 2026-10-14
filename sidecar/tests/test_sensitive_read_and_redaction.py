@@ -114,15 +114,18 @@ def test_raw_content_tools_log_only_length():
 def test_report_and_progress_writes_are_redacted():
     """接线点检查：进度文件与记忆库写入前都过脱敏。"""
     import inspect
-    import agent_loop
+
     import agent.tool_exec
+    import agent_loop
     # 工具执行簇 2026-09-23 拆到 agent/tool_exec.py：日志/进度/DB 脱敏点在那边
     src = inspect.getsource(agent_loop) + inspect.getsource(agent.tool_exec)
     assert "redact_secrets(json.dumps(args" in src, "进度/参数写入未脱敏"
     assert "_record_tool_call_db(session_id, tool_name, args, redact_secrets(result))" in src, \
         "记忆库写入未脱敏"
     assert "tool_log_preview(tool_name, result)" in src, "工具结果日志未脱敏"
+    # cron 2026-09-29 起走唯一循环（ThinAgentLoop），工具执行与日志都在 tool_exec：
+    # 这里改成**结构性禁令**——定时任务不得自行执行工具，否则又会绕过脱敏与全部闸门。
     import cron
     cron_src = inspect.getsource(cron)
-    assert "tool_log_preview(tool_name, result)" in cron_src, "cron 工具结果日志未脱敏"
-    assert "redact_secrets(str(tool_args))" in cron_src, "cron 工具参数日志未脱敏"
+    assert "await execute_tool(" not in cron_src, "cron 不得自行执行工具（脱敏/闸门都在 tool_exec 与循环里）"
+    assert "execute_tool(" not in cron_src.split("def ")[0], "cron 顶部也不该持有工具执行入口"

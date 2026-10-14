@@ -166,3 +166,46 @@ class TestLoopDeltaShape:
             'data: {"choices":[{"delta":{},"finish_reason":"length"}],"usage":{"a":1}}'
         )
         assert (done, delta) == (False, {"finish_reason": "length"})
+
+
+class TestNullNameInToolCallDeltas:
+    """小米 mimo 的 OpenAI 兼容流在每个参数增量里都带 "name": null（2026-09-28
+    真端点复现）。null ≠ 缺键：.get("name","") 对 null 返回 None，str() 后变
+    字面 "None" 拼进工具名 → 未知工具 'mx_queryNoneNone…'（后台 138 次）。
+    """
+
+    def test_null_name_becomes_empty(self):
+        from model_adapters import OpenAICompatAdapter
+        line = 'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
+        line += '"function":{"name":null,"arguments":"{q}"}}]}}]}'
+        parsed = OpenAICompatAdapter.parse_sse_data_line(line)
+        assert parsed.parse_error is None
+        tc = parsed.chunks[0].tool_call
+        assert tc.name == "", "null name 必须归一成空串，不能变成 'None'"
+        assert tc.arguments == "{q}"
+
+    def test_null_arguments_becomes_empty(self):
+        from model_adapters import OpenAICompatAdapter
+        line = 'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
+        line += '"function":{"name":"mx_query","arguments":null}}]}}]}'
+        parsed = OpenAICompatAdapter.parse_sse_data_line(line)
+        tc = parsed.chunks[0].tool_call
+        assert tc.name == "mx_query"
+        assert tc.arguments == ""
+
+    def test_accumulated_name_not_poisoned(self):
+        """模拟 mimo 流：首个 delta 带真名，后续 args delta 全带 null name ——
+        累积结果必须是 'mx_query' 而不是 'mx_queryNoneNone'。"""
+        from model_adapters import OpenAICompatAdapter
+        acc = ""
+        for line in (
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1",'
+            '"function":{"name":"mx_query","arguments":""}}]}}]}',
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
+            '"function":{"name":null,"arguments":"args-fragment"}}]}}]}',
+        ):
+            parsed = OpenAICompatAdapter.parse_sse_data_line(line)
+            for ch in parsed.chunks:
+                if ch.kind == "tool_call" and ch.tool_call.name:
+                    acc += ch.tool_call.name
+        assert acc == "mx_query", f"累积名被污染: {acc!r}"

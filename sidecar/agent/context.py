@@ -20,6 +20,29 @@ def _extract_last_user_text(messages: list) -> str:
     return ""
 
 
+# ── 尾部附加块：分隔标记与剥离（2026-10-12）────────────────────────────
+# prompt_build 会把"当前时间 / 行情时间锚 / 语气 / 语言"这些**系统附加**的
+# 内容追加到最后一条用户消息尾部（为了保住前缀缓存，见那儿的注释）。问题：
+# 循环里所有"按用户原话判定"的规则都读这条消息的原文，于是全被这截尾巴污染——
+#   · 闲聊快车道（≤24 字的短输入）从 2026-09-23 起一次都没生效过；
+#   · "短消息/寒暄不做知识注入"护栏同样失效（'哈喽' 变成 137 字，被注入 3 条
+#     随机学习；库里还因此混进了 1 条"框架自己的语气尾巴"被学成知识）。
+# 修法：加一个稳定标记，判定侧统一剥掉标记之后的内容。模型**仍然能看到**这些
+# 指令（它们在请求里原样保留）——两者是不同的问题：模型要读它，判定不该读它。
+_TAIL_MARK = "\n\n【系统附加信息，非用户原话】"
+
+
+def _strip_tail_wrapper(text: str) -> str:
+    """剥掉尾部附加块，返回用户原话（无标记时原样返回）。
+
+    只认 `_TAIL_MARK` 这一个标记——它与 prompt_build 的追加处共用同一个常量，
+    不存在"提示词改了标记、剥离器还在找旧标记"的漂移。
+    """
+    if not isinstance(text, str) or not text:
+        return text or ""
+    return text.split(_TAIL_MARK, 1)[0].rstrip()
+
+
 # ═══════════════════════════════════════════════════════
 #  Dynamic Tool Filtering: intent-based tool selection
 # ═══════════════════════════════════════════════════════
@@ -406,7 +429,7 @@ _ANTHROPIC_HINTS = ("claude", "anthropic")
 
 
 def _inject_thinking_disabled(body: dict, model: str, level: str = "high") -> dict:
-    """思考强度三档（对应前端 🧠 选择器）：off / high(默认) / max。
+    """思考档位注入（2026-10-11 起为两档：off / 开(其余值)）。
 
     按模型族正确设置（此前 off 只写 Anthropic 字段 `thinking`，DeepSeek/OpenAI
     忽略该字段 → 用户设"关闭思考"无效）：
@@ -415,6 +438,11 @@ def _inject_thinking_disabled(body: dict, model: str, level: str = "high") -> di
     - deepseek-chat 等非推理: 无需字段（本来就不思考）
     - deepseek-reasoner:  API 层面强制思考、不提供开关 —— 不设无效字段，
       返回 body 并带 _thinking_unsupported 标记，前端据此提示
+
+    "开启"档：给能收敛 effort 的推理系发 reasoning_effort=high；**不再抬
+    max_tokens**——旧实现一律抬到 18432，对 max_tokens 上限不足 16k 的模型
+    （如 deepseek 系 8192）会直接 400。云端各家的输出上限交给调用方的
+    _resolve_max_tokens（按模型名区分）负责，这里只做"思考相关"字段。
     """
     m = (model or "").lower()
     body["_thinking_level"] = level
@@ -426,13 +454,11 @@ def _inject_thinking_disabled(body: dict, model: str, level: str = "high") -> di
         elif any(h in m for h in ("o1", "o3", "o4", "gpt-5")) or "reasoner" in m or "r1" in m:
             body["reasoning_effort"] = "none"
         # 其他非推理模型：不设字段（默认不思考）
-    elif level == "max":
-        # 长推理预算：高于常规推理预算（12288）约 1.5 倍
-        body.setdefault("max_tokens", 12288)
-        if isinstance(body.get("max_tokens"), int) and body["max_tokens"] < 18432:
-            body["max_tokens"] = 18432
-        # OpenAI 兼容推理模型支持 reasoning_effort（DeepSeek 不认则该字段忽略）
-        if "deepseek" not in m and "o1" not in m and "o3" not in m:
+    else:
+        # 开启档：给认 reasoning_effort 的模型要 high effort。DeepSeek 系不认该
+        # 字段（忽略即可：其 reasoner 本来就在思考、chat 系本来就不思考）；
+        # o 系 / gpt-5 / 其他 OpenAI 兼容推理模型正是该字段的目标用户。
+        if "deepseek" not in m:
             body["reasoning_effort"] = "high"
     return body
 
@@ -521,7 +547,9 @@ _NATIVE_LEAN_PROMPT = (
     "不需要工具时直接回复用户。\n"
     "# 输出纪律\n"
     "1. 不要输出执行计划或「我将要…」声明——要么调用工具，要么直接写出完整回答。\n"
-    "2. 工具结果返回后，把完整结论（含关键数字）写进回复正文。"
+    "2. 工具结果返回后，把完整结论（含关键数字）写进回复正文。\n"
+    "3. 反复失败（同一工具/同一校验三次不成）就报告卡点并交回用户，别硬撑到步数上限；"
+    "放宽断言、删掉被检查对象都不算完成。"
 )
 
 _NATIVE_FOLLOWUP_PROMPT = (
@@ -647,6 +675,7 @@ def _custom_engine_max_tokens() -> int:
     """custom_engine.max_tokens（config.json）：第三方引擎需要的生成长度上限。"""
     try:
         import json
+
         from agent_loop import CONFIG_FILE
         cfg = json.loads(CONFIG_FILE.read_text("utf-8")).get("custom_engine") or {}
         return int(cfg.get("max_tokens") or 0)
@@ -691,6 +720,22 @@ def _is_chat_query(text: str) -> bool:
     if not t:
         return True
     return any(m in t for m in _CHAT_MARKERS)
+
+
+def _knowledge_injection_ok(user_text: str) -> bool:
+    """知识注入的短消息护栏（2026-09-20 事故）：短消息/寒暄不做注入。
+
+    事故形态：用户只发一个字（"嗯"）+ 弱模型时，注入的"相关学习"成了唯一可答的
+    素材——它讲起了"电脑速度看 CPU 和内存"（答非所问）。检索本就按消息做，短消息
+    的语义匹配基本是噪声。
+
+    ⚠️ 传参必须是**用户原话**（`_strip_tail_wrapper` 之后）——2026-10-12 前这里直接
+    吃 `ThinAgentLoop.last_user_text`，而那是框架追加过语气/语言尾巴的文本（"哈喽"
+    →137 字），"≥6 字"恒成立 → 护栏自 09-20 起从未生效（库里因此混进 1 条"框架
+    自己的语气尾巴"被学成知识）。
+    """
+    t = (user_text or "").strip()
+    return len(t) >= 6 and not _is_chat_query(t)
 
 
 def _strip_transient_reminders(messages: list) -> list:

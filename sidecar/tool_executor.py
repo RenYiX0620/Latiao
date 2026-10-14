@@ -3,6 +3,7 @@
 Split from main.py (Section 4: Tool Fallbacks + permission helpers). Code is a
 verbatim move from main.py — only imports were adjusted for the module split.
 """
+import contextvars
 import fnmatch
 import json
 import logging
@@ -11,15 +12,99 @@ import platform
 import re
 import shlex
 import subprocess
+import time
 from pathlib import Path
 
 import httpx
 
 # 命令安全不变量单点定义（审计 P0）：插件、本 fallback、插件 seed 共用，
 # 消除三处漂移——fallback 此前缺解释器内联拦截（python3 -c / node -e）。
-from cmd_safety import check_cmd, child_env, reject_sensitive_read
+from cmd_safety import child_env, reject_sensitive_read
 
 logger = logging.getLogger("latiao-sidecar")
+
+# 当前工具调用所属会话（agent/tool_exec.py 在派发前 set；asyncio.to_thread 会
+# 拷贝 context → 线程里的 run_cmd 读得到）。用途：停止键要能杀掉正在跑的命令
+# （2026-10-05：此前取消只影响后续步骤，5 分钟的命令会跑满自己的超时）。
+CURRENT_TOOL_SESSION: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "latiao_tool_session", default="")
+
+# 当前工具调用方的工具白名单（None = 不限制）。delegate_task 派生子代理时
+# 要把它作为 parent_whitelist 传下去（2026-10-11 深审 Medium：parent_whitelist
+# 参数存在但**从没人传**，受限父会话仍能生出全量工具的子代理）。
+CURRENT_TOOL_WHITELIST: contextvars.ContextVar[frozenset | None] = contextvars.ContextVar(
+    "latiao_tool_whitelist", default=None)
+
+
+def _tool_cancel_requested() -> bool:
+    """当前工具所属会话是否已被要求停止（停止键 / 客户端断流）。"""
+    sid = CURRENT_TOOL_SESSION.get("")
+    if not sid:
+        return False
+    try:
+        from agent.session_events import _session_cancel_requested
+        return _session_cancel_requested(sid)
+    except Exception:
+        return False
+
+
+def _kill_proc_tree(proc: subprocess.Popen) -> None:
+    """杀掉命令进程树（POSIX 用进程组，Windows 用 taskkill /T）。"""
+    try:
+        if os.name == "posix":
+            import signal as _signal
+            os.killpg(os.getpgid(proc.pid), _signal.SIGKILL)
+        else:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           capture_output=True, timeout=10)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+class CommandCancelled(Exception):
+    """命令因用户停止（会话取消）被终止——由 run_cmd 转成可读结果。"""
+
+
+def _run_cancellable(tokens: list, timeout: float,
+                     stderr=subprocess.PIPE) -> subprocess.CompletedProcess:
+    """subprocess.run(capture_output=True, text=True, timeout=…) 的可取消版。
+
+    stderr：命令自带 stderr 重定向时传入目标（`2>&1` → STDOUT、`2>/dev/null`
+    → DEVNULL，由 cmd_safety.split_stderr_redirect 解析），默认单独捕获。
+
+    等待期间每 0.5s 轮询一次会话取消标记：用户按停止 → 杀进程组并抛
+    CommandCancelled（此前命令会一直跑到自己的 300s 超时）。超时语义不变
+    （抛 TimeoutExpired，由上层转成既有"超时"结果）。
+    """
+    _kwargs: dict = {}
+    if os.name == "posix":
+        _kwargs["start_new_session"] = True     # 独立进程组：杀树时子进程一起收
+    proc = subprocess.Popen(tokens, shell=False, stdout=subprocess.PIPE,
+                            stderr=stderr, text=True,
+                            env=child_env(), **_kwargs)
+    deadline = time.monotonic() + max(1.0, float(timeout))
+    while True:
+        try:
+            out, err = proc.communicate(timeout=0.5)
+            return subprocess.CompletedProcess(tokens, proc.returncode, out, err)
+        except subprocess.TimeoutExpired:
+            if _tool_cancel_requested():
+                _kill_proc_tree(proc)
+                try:
+                    proc.communicate(timeout=2)
+                except Exception:
+                    pass
+                raise CommandCancelled("用户停止") from None
+            if time.monotonic() >= deadline:
+                _kill_proc_tree(proc)
+                try:
+                    proc.communicate(timeout=2)
+                except Exception:
+                    pass
+                raise subprocess.TimeoutExpired(tokens, timeout) from None
 
 
 def __getattr__(name: str):
@@ -161,11 +246,39 @@ def write_file(path: str, content: str) -> str:
         return "⛔ Blocked: path traversal not allowed"
     if len(content) > 10 * 1024 * 1024:  # 10 MB limit
         return f"⛔ File too large ({len(content)} bytes, max 10 MB)"
+    # 与插件版 write_file.py 同级封印（P0）：此前 fallback 只查 `..`，
+    # 插件目录被删/seed 前走本路径时可写 extensions/*/plugin.py → 下次启动
+    # exec_module 即 RCE。系统目录/敏感目录/敏感文件名/自动加载目录全拒。
     try:
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
+        _rp = os.path.realpath(os.path.expanduser(path))
+    except Exception:
+        return "⛔ Blocked: 路径无效"
+    _blocked_dirs = ("/etc", "/System", "/usr", "/bin", "/sbin", "/var", "/private/etc")
+    if any(_rp == d or _rp.startswith(d + os.sep) for d in _blocked_dirs):
+        return f"⛔ Blocked: 不允许写入系统目录 - {_rp}"
+    # 敏感目录/文件名清单统一走 cmd_safety 单点（此前这里是另一份内联拷贝，
+    # 与插件侧的 5 项清单漂移 —— 2026-09-24 复查修复）
+    from cmd_safety import (
+        _BLOCKED_DIR_SUBSTRINGS,
+        sensitive_write_block,
+        sensitive_write_name_block,
+    )
+    if any(s in _rp for s in _BLOCKED_DIR_SUBSTRINGS):
+        return f"⛔ Blocked: 不允许访问敏感目录 - {_rp}"
+    _fn_block = sensitive_write_name_block(_rp)
+    if _fn_block:
+        return _fn_block
+    try:
+        _blk = sensitive_write_block(_rp)
+        if _blk:
+            return _blk
+    except Exception:
+        return "⛔ Blocked: 写入封印不可用，已拒绝"
+    try:
+        os.makedirs(os.path.dirname(_rp) or ".", exist_ok=True)
+        with open(_rp, "w", encoding="utf-8") as f:
             f.write(content)
-        return f"✅ 已写入：{path}（{len(content)} 字符）"
+        return f"✅ 已写入：{_rp}（{len(content)} 字符）"
     except Exception as e:
         return f"错误：{e}"
 
@@ -183,22 +296,71 @@ def list_dir(path: str) -> str:
         return f"错误：{e}"
 
 
+def _run_pipeline(left: str, right: str, timeout: int) -> str:
+    import shlex as _shlex
+    import subprocess as _sp
+
+    from cmd_safety import child_env, split_stderr_redirect, stderr_target
+    # 管道两侧各自的 stderr 重定向（`A 2>&1 | grep x` / `A | B 2>/dev/null`）
+    left, _lm = split_stderr_redirect(left)
+    right, _rm = split_stderr_redirect(right)
+    p1 = _sp.Popen(_shlex.split(left), shell=False, stdout=_sp.PIPE,
+                   stderr=stderr_target(_lm), text=True, env=child_env())
+    p2 = _sp.Popen(_shlex.split(right), shell=False, stdin=p1.stdout, stdout=_sp.PIPE,
+                   stderr=stderr_target(_rm), text=True, env=child_env())
+    if p1.stdout:
+        p1.stdout.close()
+    # 等待期间响应停止键（与 _run_cancellable 同款轮询）；超时语义不变
+    _deadline = time.monotonic() + max(1.0, float(timeout))
+    while True:
+        try:
+            out, err = p2.communicate(timeout=0.5)
+            break
+        except _sp.TimeoutExpired:
+            if _tool_cancel_requested():
+                p1.kill()
+                p2.kill()
+                return "⏹ 已停止：命令被用户中断（进程已终止）"
+            if time.monotonic() >= _deadline:
+                p1.kill()
+                p2.kill()
+                return "超时"
+    p1.wait(timeout=5)
+    body = (out or "").strip()
+    if p2.returncode != 0:
+        body += f"\n(退出码: {p2.returncode})"
+        if err and err.strip():
+            body += f"\n{err.strip()}"
+    return body or "(无输出)"
+
+
 def run_cmd(cmd: str) -> str:
     # Strip shell comment lines (models sometimes prepend "# comment\n")
     cmd = "\n".join(line for line in cmd.split("\n") if not line.strip().startswith("#")).strip()
     if not cmd:
         return "错误：命令为空（可能只包含注释行）"
-    # Reject unsupported shell operators — with shell=False they are passed as
-    # literal args and the command silently misbehaves (only the 1st runs).
-    m = re.search(r"(&&|\|\||\||;|\$\(|>|<)", cmd)
-    if m:
-        return (
-            f"⛔ 不支持 shell 操作符 '{m.group(1)}'：本工具以 shell=False 执行，"
-            "复合命令会静默失败。请拆成多次调用，每次只运行一条命令"
-            "（不要用 && | ; > < 等）。"
-        )
-    # 统一安全检查（cmd_safety 单点定义——插件/fallback/seed 共用）
-    denied = check_cmd(cmd)
+    # 引号外的 shell 操作符才拦（引号内是脚本内容，shell=False 不会解释）
+    from cmd_safety import (
+        find_unsupported_shell_op,
+        split_pipeline,
+        split_stderr_redirect,
+        split_stdout_redirect,
+        stderr_target,
+        unsupported_op_message,
+    )
+    # 尾部 stderr 重定向（2>&1 / 2>/dev/null）：有精确等价，先剥离并记模式
+    _stderr_mode = ""
+    cmd, _stderr_mode = split_stderr_redirect(cmd)
+    _redir = split_stdout_redirect(cmd)
+    if _redir:
+        cmd, _target, _append = _redir
+    _pipe = None if _redir else split_pipeline(cmd)
+    op = find_unsupported_shell_op(cmd)
+    if op:
+        return unsupported_op_message(op)
+    # 统一安全检查（cmd_safety 单点定义——插件/fallback/seed 共用，含脚本内容审查）
+    from cmd_safety import check_cmd_with_script
+    denied = check_cmd_with_script(cmd)
     if denied:
         return denied
     if len(cmd) > 1000:
@@ -212,20 +374,33 @@ def run_cmd(cmd: str) -> str:
             "  web_search({query: \"你的搜索词\"})\n"
             "对于文件操作，使用 read_file、list_dir、write_file 等工具。"
         )
+    if _pipe:
+        return _run_pipeline(_pipe[0], _pipe[1], 300)
     try:
         try:
             tokens = shlex.split(cmd)
         except ValueError as e:
             return f"命令格式错误: {e}"
-        r = subprocess.run(tokens, shell=False, capture_output=True, text=True, timeout=30,
-                           # ④ 兜底执行器同样过白名单：命令由模型给出，子进程不该拿到
-                           # sidecar token 与云模型密钥（审查时靠 test_spawn_env_guard 抓到）
-                           env=child_env())
+        try:
+            # ④ 兜底执行器同样过白名单：命令由模型给出，子进程不该拿到
+            # sidecar token 与云模型密钥（审查时靠 test_spawn_env_guard 抓到）；
+            # _run_cancellable 内部即 env=child_env()，并在等待中响应停止键。
+            r = _run_cancellable(tokens, timeout=300,
+                                 stderr=stderr_target(_stderr_mode))
+        except CommandCancelled:
+            return "⏹ 已停止：命令被用户中断（进程已终止）"
         out = r.stdout.strip()
         if r.returncode != 0:
             out += f"\n(退出码: {r.returncode})"
-            if r.stderr.strip():
-                out += f"\n{r.stderr.strip()}"
+            if (r.stderr or "").strip():
+                out += f"\n{(r.stderr or '').strip()}"
+        if _redir:
+            body = r.stdout or ""
+            with open(_target, "a" if _append else "w", encoding="utf-8") as _f:
+                _f.write(body)
+            return (f"已写入 {_target}（{len(body)} 字符）"
+                    + (f"\n退出码: {r.returncode}" if r.returncode else "")
+                    + (f"\n{r.stderr.strip()}" if r.stderr and r.stderr.strip() else ""))
         return out or "(无输出)"
     except subprocess.TimeoutExpired:
         return f"超时: {cmd}"
@@ -284,7 +459,7 @@ _SEARCH_EXCLUDE_DIRS = frozenset({
     ".lmstudio", "Library", "node_modules", ".git", ".cache", "__pycache__",
     "site-packages", ".venv", "venv", ".Trash", ".npm", ".cargo", ".rustup",
     "Applications", ".zcode", ".cursor", ".vscode", ".docker", ".gradle", ".m2",
-    ".ollama", ".cache", "Photos Library.photoslibrary", "Movies", "Music",
+    ".ollama", "Photos Library.photoslibrary", "Movies", "Music",
 })
 _SEARCH_MAX_RESULTS = int(os.environ.get("LATIAO_SEARCH_MAX_RESULTS", "200") or 200)
 _SEARCH_MAX_DEPTH = int(os.environ.get("LATIAO_SEARCH_MAX_DEPTH", "6") or 6)
@@ -480,6 +655,18 @@ def _is_readonly_cmd(cmd: str) -> bool:
     first = tokens[0].rsplit("/", 1)[-1]
     if first not in _READONLY_CMD_WORDS:
         return False
+    # 带写/删副作用的 flag（find -delete/-exec/-fprint…）：降级路径同样拒
+    # （2026-10-11 修复：实测 `find . -delete` 在语义层与这里**都判只读**，
+    # 子代理可免确认删除。名单与 safety.rules 共用一份，避免漂移。）
+    try:
+        from safety.rules import READONLY_DANGER_FLAGS
+        if any(t in READONLY_DANGER_FLAGS for t in tokens[1:]):
+            return False
+    except Exception:
+        _danger = {"-delete", "-exec", "-execdir", "-ok", "-okdir",
+                   "-fprint", "-fprintf", "-fls"}
+        if any(t in _danger for t in tokens[1:]):
+            return False
     # 参数必须是简单选项/路径形态——拦截一切嵌套命令与引用花活
     if not all(_READONLY_ARG_RE.fullmatch(t) for t in tokens[1:]):
         return False
@@ -492,10 +679,18 @@ def _is_readonly_cmd(cmd: str) -> bool:
 # delegate 机制已迁至 agent/subagent.py（Stage 5 子代理一等公民）；
 # 这里保留兼容导入（api_routes/tests 的既有引用不变）。
 from agent.subagent import (  # noqa: F401
-    _SUBTASKS, _SUBTASK_EVENTS, _SUBTASK_SEQ, _SUBTASK_TASKS,
-    _SUBAGENT_TOOLS, _prune_subtasks, _delegate_task,
-    _delegate_task_bg, _delegate_task_fg, _run_subtask_bg,
-    _subtask_snapshot,)
+    _SUBAGENT_TOOLS,
+    _SUBTASK_EVENTS,
+    _SUBTASK_SEQ,
+    _SUBTASK_TASKS,
+    _SUBTASKS,
+    _delegate_task,
+    _delegate_task_bg,
+    _delegate_task_fg,
+    _prune_subtasks,
+    _run_subtask_bg,
+    _subtask_snapshot,
+)
 
 # ── Fallback OpenAI Function Calling tool definitions ──
 

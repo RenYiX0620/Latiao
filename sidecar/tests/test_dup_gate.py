@@ -13,7 +13,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from agent.loop import ThinAgentLoop, _DUP_HOLD_SECS, _replay_possible  # noqa: E402
+from agent.loop import _DUP_HOLD_SECS, ThinAgentLoop, _replay_possible  # noqa: E402
 
 LONG_PREV = "根据刚才的目录输出，这个目录里包含 agents、skills、tests 等目录以及若干 python 文件。" * 2
 

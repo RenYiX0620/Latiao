@@ -45,8 +45,9 @@ class TestExploreAgentRegistration(unittest.TestCase):
 
 class TestSubtaskRegistry(unittest.TestCase):
     def test_snapshot_contains_activity_fields(self):
-        from tool_executor import _subtask_snapshot, _delegate_task_bg
         import asyncio
+
+        from tool_executor import _delegate_task_bg, _subtask_snapshot
 
         async def run():
             return await _delegate_task_bg("code-reviewer", "检查 foo.py 的安全性")
@@ -69,7 +70,10 @@ class TestSubtaskRegistry(unittest.TestCase):
         self.assertIn("steps", entry)
         self.assertIn("activity", entry)
         self.assertIn("last_activity", entry)
-        self.assertEqual(entry["status"], "running")
+        # 上面的收尾会 cancel 遗留协程 → 注册表必须落终态（09-24：此前永远
+        # running，用户点停止后子任务详情仍显示「执行中」）
+        self.assertEqual(entry["status"], "error")
+        self.assertIn("中断", entry.get("summary") or "")
 
 
 if __name__ == "__main__":

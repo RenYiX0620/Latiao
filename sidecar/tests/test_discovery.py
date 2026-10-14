@@ -3,12 +3,12 @@
 网络隔离：mock 所有 httpx 调用，不真实打包抓取。聚焦核心逻辑：
 - 树发现 / 指纹缓存 / 索引合并幂等 / 后端接入 merge / 状态
 """
+import io
 import json
 import sys
 import tempfile
 import unittest
 import zipfile
-import io
 from pathlib import Path
 from unittest import mock
 
@@ -158,8 +158,9 @@ class TestDiscoveryApi(unittest.TestCase):
         self.assertEqual(st["repos"], 2)  # 两个都记录（无技能也登记）
 
     def test_fetch_all_merges_discovered(self):
-        import extension_manager
         from unittest import mock
+
+        import extension_manager
         discovery.INDEX_FILE.write_text(json.dumps({
             "repos": {"owner/repo": {"entries": 1}},
             "entries": [{"repo": "owner/repo", "skill_path": "/s/SKILL.md", "source_kind": "openclaw-skill"}],
@@ -319,7 +320,9 @@ class TestClaudePluginAndDeps(unittest.TestCase):
         self._tmp.cleanup()
 
     def _make_zip(self, with_plugin=True, with_skill=True):
-        import io, json as j, zipfile
+        import io
+        import json as j
+        import zipfile
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w") as zf:
             if with_plugin:
@@ -371,6 +374,7 @@ class TestSearchRateLimit(unittest.TestCase):
 
     def test_search_repositories_raises_on_rate_limit(self):
         import httpx
+
         import discovery
 
         class _Resp:
@@ -388,8 +392,9 @@ class TestSearchRateLimit(unittest.TestCase):
         只统计**本线程**的调用：别的测试可能留下仍在跑的后台 discovery 线程
         （main.py 启动钩子 / discover-refresh 端点都会起线程），它的调用会混进同一个 mock。
         """
-        import discovery
         import threading
+
+        import discovery
 
         calls = []
         me = threading.get_ident()

@@ -7,7 +7,7 @@ import time
 
 import pytest
 
-from tests.fake_engine import FakeEngine
+from tests.fake_engine import FakeEngine, _sse
 
 HEADERS = {"Authorization": "Bearer fake"}
 NEUTRAL_TEXT = ("根据刚才的目录输出，这个目录里包含 agents、skills、tests 等目录以及若干 python 文件，"
@@ -26,8 +26,8 @@ async def _collect(agen):
 @pytest.mark.asyncio
 async def test_thin_local_text_round_trip():
     import local_llm
-    from tests.test_loop_scenarios import _StubEngine
     from agent.loop import ThinAgentLoop
+    from tests.test_loop_scenarios import _StubEngine
     with FakeEngine() as engine:
         engine.push(engine.text_response(NEUTRAL_TEXT))
         old = local_llm._engine
@@ -61,8 +61,8 @@ async def test_thin_native_tool_round_trip():
     """原生 tools 下发 → delta.tool_calls 执行 → assistant 携 tool_calls → 完成。"""
     import agent.context as agent_context
     import local_llm
-    from tests.test_loop_scenarios import _StubEngine
     from agent.loop import ThinAgentLoop
+    from tests.test_loop_scenarios import _StubEngine
 
     def _round2(body):
         assert isinstance(body.get("tools"), list) and body["tools"], "第二轮仍应携带 tools"
@@ -88,7 +88,14 @@ async def test_thin_native_tool_round_trip():
         finally:
             local_llm._engine = old
             agent_context._LOCAL_NATIVE_TOOLS_OVERRIDE = None
-        assert isinstance(engine.requests[0].get("tools"), list), "首轮应携带原生 tools"
+        # 2026-10-12「先想后干」：第 1 轮是思考轮——不下发工具表、系统提示换成
+        # 工具名字清单；工具表从第 2 轮（执行阶段）恢复。这里的模型在第 1 轮就发
+        # 原生调用也照常执行（只撤广告、不撤能力），所以轮数与原契约一致。
+        _r0 = engine.requests[0]
+        assert not (_r0.get("tools") or []), "思考轮不下发工具表"
+        assert "本轮先思考规划" in json.dumps(_r0, ensure_ascii=False), "思考轮注入工具名字清单"
+        assert isinstance(engine.requests[1].get("tools"), list) and engine.requests[1]["tools"], \
+            "第 2 轮（执行阶段）应携带完整工具表"
         assert any(e.get("event") == "tool_start" for e in events), events
         assert any("根据刚才的目录输出" in str(e.get("content", "")) for e in events), events
 
@@ -98,8 +105,8 @@ async def test_thin_error_as_result_model_self_corrects():
     """错误即结果：工具失败的结构化错误回填后模型自纠，无 nudge 介入。"""
     import agent.context as agent_context
     import local_llm
-    from tests.test_loop_scenarios import _StubEngine
     from agent.loop import ThinAgentLoop
+    from tests.test_loop_scenarios import _StubEngine
     with FakeEngine() as engine:
         engine.push(engine.native_tool_response("list_dir", {"path": "/nonexistent-dir-xyz"}))
         # 第二轮：请求体应包含失败原文（模型自己看到错误），随后给出纠正
@@ -127,27 +134,45 @@ async def test_thin_error_as_result_model_self_corrects():
 
 
 @pytest.mark.asyncio
-async def test_thin_light_query_fast_path():
+async def test_chat_query_no_longer_takes_a_fast_lane():
+    """闲聊快车道已移除（2026-10-12 用户拍板）：思考只留关/开两态。
+
+    旧契约（本用例前身 test_thin_light_query_fast_path）：短闲聊被插件剥掉
+    tools 并强制 enable_thinking=False。新契约：闲聊与任务一视同仁——第 1 轮
+    走思考轮（无工具表 + 名字清单，见 test_thinking_first.py），思考是否开启
+    只由用户的"思考档位"决定，没有任何旁路替用户关掉它。
+    """
     from agent.loop import ThinAgentLoop
+    from agent.plugins.builtin import BUILTIN_PLUGINS
+    # 移除护栏：谁把快车道加回来，这里先红
+    assert "fastpath" not in BUILTIN_PLUGINS, "闲聊快车道已按用户拍板移除"
+
     with FakeEngine() as engine:
         engine.push(engine.text_response("收到，一切正常！有什么需要帮忙的吗？"))
         events = await _collect(ThinAgentLoop(
             [{"role": "user", "content": "测试"}], "fake-model", engine.url, HEADERS,
             session_id=f"thin-t4-{time.time()}", access_mode="full").run())
         body = engine.requests[0]
-        assert "tools" not in body or not body.get("tools"), "快车道不携带 tools"
-        assert (body.get("chat_template_kwargs") or {}).get("enable_thinking") is False
+        assert not (body.get("tools") or []), "闲聊消息同样走思考轮（不下发工具表）"
+        assert "本轮先思考规划" in json.dumps(body, ensure_ascii=False), \
+            "思考轮注入工具名字清单"
+        assert (body.get("chat_template_kwargs") or {}).get("enable_thinking") is not False, \
+            "不得再有'闲聊强制关思考'的旁路——思考只由档位决定"
         texts = [e.get("content", "") for e in events if "content" in e]
         assert any("收到" in t for t in texts), events
 
 
 @pytest.mark.asyncio
 async def test_thin_native_400_fallback():
-    from tests.test_loop_scenarios import _StubEngine
-    from agent.loop import ThinAgentLoop
     import agent.context as agent_context
     import local_llm
+    from agent.loop import ThinAgentLoop
+    from tests.test_loop_scenarios import _StubEngine
     with FakeEngine() as engine:
+        # 两段式（2026-10-12）：第 1 轮是思考轮（不下发工具表），模型本轮就发原生
+        # 调用会照常执行（只撤广告不撤能力）→ 第 2 轮带表执行，400 落在**带表**的
+        # 那一轮上——这才是"引擎不支持 tools"的真实形态。
+        engine.push(engine.native_tool_response("list_dir", {"path": "."}))
         engine.push(engine.http_error(400, "model does not support tool calling"))
         engine.push(engine.local_tool_response("list_dir", {"path": "."}))
         engine.push(engine.text_response(NEUTRAL_TEXT))
@@ -161,9 +186,10 @@ async def test_thin_native_400_fallback():
         finally:
             local_llm._engine = old
             agent_context._LOCAL_NATIVE_TOOLS_OVERRIDE = None
-        assert "tools" in engine.requests[0], "首次请求带原生 tools"
-        assert "tools" not in engine.requests[1], "回退后不再携带 tools"
-        assert "```tool" in json.dumps(engine.requests[1], ensure_ascii=False), \
+        assert not (engine.requests[0].get("tools") or []), "思考轮不下发工具表"
+        assert "tools" in engine.requests[1], "执行轮带原生 tools"
+        assert "tools" not in engine.requests[2], "回退后不再携带 tools"
+        assert "```tool" in json.dumps(engine.requests[2], ensure_ascii=False), \
             "回退后应注入围栏提示词"
         assert any(e.get("event") == "tool_start" for e in events), events
 
@@ -171,9 +197,9 @@ async def test_thin_native_400_fallback():
 @pytest.mark.asyncio
 async def test_thin_steer_claimed_at_step_boundary():
     """steer：队列中的新消息在 step 边界并入同轮续跑。"""
-    from tests.test_loop_scenarios import _StubEngine
-    from agent.loop import ThinAgentLoop, queue_steer
     import local_llm
+    from agent.loop import ThinAgentLoop, queue_steer
+    from tests.test_loop_scenarios import _StubEngine
     sid = f"thin-t6-{time.time()}"
     with FakeEngine() as engine:
         engine.push(engine.text_response("第一轮回复，内容较长。" * 20))
@@ -199,9 +225,9 @@ async def test_thin_steer_claimed_at_step_boundary():
 @pytest.mark.asyncio
 async def test_thin_think_only_assist():
     """思考-only → 终答提取辅助（弱模型辅助层，仅本地）。"""
-    from tests.test_loop_scenarios import _StubEngine
-    from agent.loop import ThinAgentLoop
     import local_llm
+    from agent.loop import ThinAgentLoop
+    from tests.test_loop_scenarios import _StubEngine
     with FakeEngine() as engine:
         engine.push(engine.thinking_only_response("让我思考一下这个问题……"))
         old = local_llm._engine
@@ -241,10 +267,10 @@ async def test_thin_cloud_body_model_is_cloud_name():
 @pytest.mark.asyncio
 async def test_thin_streams_content_deltas_live():
     """09-06 19:29 反馈回归：正文必须逐段实时流出（不是结束时一次蹦出）。"""
-    from tests.test_loop_scenarios import _StubEngine
-    from agent.loop import ThinAgentLoop
     import agent.transport as transport
     import local_llm
+    from agent.loop import ThinAgentLoop
+    from tests.test_loop_scenarios import _StubEngine
     with FakeEngine() as engine:
         deltas = ["第一段结论。", "第二段展开说明。", "第三段补充细节。"]
         lines = []
@@ -284,8 +310,8 @@ _DRIFT_EN = ('**"嗯～主人要我看 it? Okay then~"** I crawl back onto all f
 async def test_lang_drift_discards_and_retries_local():
     """首段判为漂移 → 丢弃这次生成（不下发）→ 带更强语言要求重试一次。"""
     import local_llm
-    from tests.test_loop_scenarios import _StubEngine
     from agent.loop import ThinAgentLoop
+    from tests.test_loop_scenarios import _StubEngine
     with FakeEngine() as engine:
         engine.push(engine.text_response(_DRIFT_EN))        # 第一次：英文（漂移）
         engine.push(engine.text_response(NEUTRAL_TEXT))      # 第二次：中文（重试成功）
@@ -307,11 +333,60 @@ async def test_lang_drift_discards_and_retries_local():
 
 
 @pytest.mark.asyncio
+async def test_lang_drift_retry_also_drifted_still_delivers_content():
+    """两次都漂移时用户也不能看到空回复（2026-10-08 实测，mimo 云端）。
+
+    现场：用户问"sop是什么"，模型两次都首段漂移 → 早退路径截断生成 → 会话库里
+    content 是**空字符串**（thinking 有、正文没有），而 __result__ 仍带全文，
+    上游以为交付成功。既有用例只断言"不再重试第三次"，断言不到"用户看没看到"。
+
+    注意：必须把交付闸门换成直通——默认 scope 的 deliver 插件会把正文当"语言
+    替换"再发一遍，把"流式层一个字没发"这个事实盖住（生产那轮 handled=False
+    events=0，没有这层兜底，所以是真空白）。"""
+    import local_llm
+    from agent.loop import ThinAgentLoop
+    from tests.test_loop_scenarios import _StubEngine
+    with FakeEngine() as engine:
+        engine.push(engine.text_response(_DRIFT_EN))
+        engine.push(engine.text_response(_DRIFT_EN))
+        old = local_llm._engine
+        local_llm._engine = _StubEngine()
+        loop = ThinAgentLoop(
+            MESSAGES, "fake-model", engine.url, HEADERS,
+            session_id=f"thin-drift3-{time.time()}", access_mode="full")
+
+        async def _passthrough(name, payload):
+            return payload
+        loop.scope.run_waterfall = _passthrough
+        try:
+            events = await _collect(loop.run())
+        finally:
+            local_llm._engine = old
+    streamed = "".join(str(e.get("content", "")) for e in events if isinstance(e, dict))
+    assert "I crawl back onto all fours" in streamed, \
+        "两次都漂移时缓冲内容必须补发——否则用户看到的是空回复"
+
+
+def test_lang_drift_ignores_english_term_preamble():
+    """中文回答以英文术语展开开头，不算漂移（2026-10-08 误杀实测）。
+
+    用户问"sop是什么"，正常的中文回答以 `**SOP = Standard Operating Procedure**`
+    （标准作业程序）开头：30 字窗口里一个汉字都没有 → 旧判据整轮丢弃。窗口放到
+    60 字后首个汉字通常已在样本里，比例判据自然放行；整段英文的真漂移不受影响。"""
+    from agent.loop import _LANG_DRIFT_MIN_CHARS, _looks_like_lang_drift
+    body = ("**SOP = Standard Operating Procedure**（标准作业程序）是把你每天重复做的事"
+            "写成一份谁都照着能做的步骤清单，这样新人也能照着交付。")
+    sample = body[:_LANG_DRIFT_MIN_CHARS]
+    assert not _looks_like_lang_drift(sample, "zh"), f"术语开头被误杀: {sample!r}"
+    assert _looks_like_lang_drift(_DRIFT_EN[:_LANG_DRIFT_MIN_CHARS], "zh"), "真漂移仍要判"
+
+
+@pytest.mark.asyncio
 async def test_lang_drift_retries_only_once_local():
     """重试仍漂移 → 不再重试（只一次），照常交付交给交付闸门翻译。"""
     import local_llm
-    from tests.test_loop_scenarios import _StubEngine
     from agent.loop import ThinAgentLoop
+    from tests.test_loop_scenarios import _StubEngine
     with FakeEngine() as engine:
         engine.push(engine.text_response(_DRIFT_EN))
         engine.push(engine.text_response(_DRIFT_EN))
@@ -331,8 +406,8 @@ async def test_lang_drift_retries_only_once_local():
 async def test_no_retry_when_language_matches():
     """正常中文回复：一次请求，且实时下发（不因早退机制多花一次生成）。"""
     import local_llm
-    from tests.test_loop_scenarios import _StubEngine
     from agent.loop import ThinAgentLoop
+    from tests.test_loop_scenarios import _StubEngine
     with FakeEngine() as engine:
         engine.push(engine.text_response(NEUTRAL_TEXT))
         old = local_llm._engine
@@ -353,8 +428,8 @@ async def test_no_lang_guard_when_language_not_confident():
     """语言判定不确定时不掐生成（detect_language_decision 文档：confident=False
     不得据此判断回答是否符合用户语言）——否则纯符号/短消息会被误掐。"""
     import local_llm
-    from tests.test_loop_scenarios import _StubEngine
     from agent.loop import ThinAgentLoop
+    from tests.test_loop_scenarios import _StubEngine
     with FakeEngine() as engine:
         engine.push(engine.text_response(_DRIFT_EN))      # 只推一次：若误掐就会请求第二次
         old = local_llm._engine
@@ -369,3 +444,697 @@ async def test_no_lang_guard_when_language_not_confident():
             local_llm._engine = old
     assert loop.user_lang_confident is False, "前置条件：这条消息的语言判定应为不确定"
     assert len(_gen_requests(engine)) == 1, "语言不确定时不该掐掉重试"
+
+
+class TestFinalizeBodyIsJunk:
+    """终答轮交付闸（2026-09-28）：25 字计划碎片被当答案交付（mimo 实况）。
+
+    「最后 1 次检索机会，用来补盘面下跌的新闻面解释。」——模型仍发工具调用
+    被剥离后，正文只剩这句自语；旧的 <10 字空判定拦不住。
+    """
+
+    def test_short_fragment_with_stripped_tools_is_junk(self):
+        from agent.loop import _finalize_body_is_junk
+        assert _finalize_body_is_junk(
+            "最后 1 次检索机会，用来补盘面下跌的新闻面解释。", True) is True
+
+    def test_tiny_body_always_junk(self):
+        from agent.loop import _finalize_body_is_junk
+        assert _finalize_body_is_junk("好的。", False) is True
+        assert _finalize_body_is_junk("", False) is True
+
+    def test_legit_short_answer_without_tool_attempt_delivers(self):
+        from agent.loop import _finalize_body_is_junk
+        # 没发工具尝试的短正文不是碎片（合法短答）
+        assert _finalize_body_is_junk("今日大盘收跌，跌幅有限。", False) is False
+
+    def test_legit_short_numeric_answer_with_stripped_tools_delivers(self):
+        from agent.loop import _finalize_body_is_junk
+        # 剥离过工具调用，但正文是含数字的短答、无工具动词 → 不拦
+        assert _finalize_body_is_junk("上证 -0.99%，收 3877 点。", True) is False
+
+    def test_long_body_never_junk(self):
+        from agent.loop import _finalize_body_is_junk
+        long_text = "今天大盘全面收跌。" + "主力资金净流出明显。" * 20
+        assert _finalize_body_is_junk(long_text, True) is False
+
+
+
+# 按真实事故的量级构造（思考 340 字 > 80 字碎片闸上限）：若 body_text 被# 思考污染，碎片闸（<80 字）与 <10 字空判定都拦不住，测试必失败。
+THINK_BODY = ("用户要分析今天大盘。按规则先查行情数据，用 mx_query 查指数、板块、资金流向。"
+              "有指数数据、资金流、涨跌家数、支撑压力、布林线。还差板块涨跌（热点板块）。"
+              "我可以并行调用 mx_query 查三个热门板块的涨跌幅与资金流向，再用 tavily_search 补"
+              "今天盘面下跌的新闻面解释。时间：2026-09-28 星期一。注意 identical call 已经被拒绝过，"
+              "需要换参数。预算：还剩 3 次检索机会，最后一次留给新闻面。")
+assert len(THINK_BODY) > 100
+RECOVERED_ANSWER = "今日大盘收跌：上证指数 -0.99%，主力资金净流出 417 亿元。"
+@pytest.mark.asyncio
+async def test_finalize_round_think_only_tool_call_recovers():
+    """终答轮"思考+工具调用、正文 0 字"必须重采出真答案（2026-09-28 20:11 实况）。
+
+    mimo 链路：同参空转触发收口 → 终答轮模型仍发 1 个工具调用 + 思考若干字 +
+    0 字正文 → 旧实现把含思考的 streamed 赋回 body_text，被判"已交付 340 字"
+    直接收尾，用户只看到思考块。修复后：body_text 保持仅正文口径 → 空判定
+    命中 → 温度抖动重采一次 → 真答案交付。
+
+    脚本按请求内容有状态分派：请求带收口指令（"📣 收尾"）= 终答轮（第一次）
+    返回思考+工具调用、正文 0；重采轮（第二次带指令）返回真答案；其余轮返回
+    同参工具调用以触发收口。对收口触发时机不敏感。
+    """
+    import agent.context as agent_context
+    import local_llm
+    from agent.loop import ThinAgentLoop
+    from tests.test_loop_scenarios import _StubEngine
+
+    DIRECTIVE = "📣 收尾"
+    state = {"final_seen": 0}
+
+    # FakeEngine 的脚本一次一弹（每个请求消费一条），所以每轮推一个 callable，
+    # 由共享状态按"请求里是否带收口指令"分派。
+    def _make_round():
+        def _round(body):
+            has_directive = DIRECTIVE in json.dumps(body["messages"], ensure_ascii=False)
+            if has_directive:
+                state["final_seen"] += 1
+                if state["final_seen"] == 1:
+                    # 终答轮：仿 mimo——思考 + 1 个工具调用（finish 同包）、正文 0 字
+                    return [
+                        _sse({"choices": [{"delta": {"reasoning_content": THINK_BODY}, "index": 0}]}),
+                        _sse({"choices": [{"delta": {"tool_calls": [
+                            {"index": 0, "id": "call_final_1", "type": "function",
+                             "function": {"name": "list_dir",
+                                          "arguments": json.dumps({"path": "."})}},
+                        ]}, "finish_reason": "tool_calls", "index": 0}]}),
+                        "data: [DONE]\n\n",
+                    ]
+                # 温度重采轮：给真答案
+                return engine.text_response(RECOVERED_ANSWER)
+            # 常规轮：同参调用（重复会被拒绝器挡回），把循环推向收口
+            return engine.native_tool_response("list_dir", {"path": "."})
+        return _round
+
+    with FakeEngine() as engine:
+        for _ in range(15):
+            engine.push(_make_round())
+        old = local_llm._engine
+        local_llm._engine = _StubEngine()
+        agent_context._LOCAL_NATIVE_TOOLS_OVERRIDE = True
+        try:
+            events = await _collect(ThinAgentLoop(
+                MESSAGES, "fake-model", engine.url, HEADERS,
+                session_id=f"thin-fin-{time.time()}", access_mode="full").run())
+        finally:
+            local_llm._engine = old
+            agent_context._LOCAL_NATIVE_TOOLS_OVERRIDE = None
+        contents = " ".join(str(e.get("content", "")) for e in events if "content" in e)
+        assert state["final_seen"] >= 1, "脚本应观察到终答轮请求"
+        assert RECOVERED_ANSWER in contents, \
+            f"重采出的真答案必须交付；实际 events 末尾：{events[-6:]}"
+
+
+class TestLoopGaps:
+    """Loop 三缺口（2026-09-29）：工具输出回收 / 预算守卫 / 同错硬升级。"""
+
+    # ── 工具输出回收 ──
+    def test_fold_old_large_tool_results(self):
+        from agent.loop import _FOLD_MARK, _fold_old_tool_results
+        msgs = [{"role": "user", "content": "q"}]
+        for i in range(9):
+            msgs.append({"role": "tool", "content": f"结果{i}：" + "x" * 2000})
+        n = _fold_old_tool_results(msgs, keep_recent=6)
+        assert n == 3, f"应折 9-6=3 条，实际 {n}"
+        folded = [m for m in msgs if str(m.get("content", "")).startswith(_FOLD_MARK)]
+        assert len(folded) == 3
+        # 最近 6 条保持原样
+        tail_tools = [m for m in msgs if m.get("role") == "tool"][-6:]
+        assert all(not str(m["content"]).startswith(_FOLD_MARK) for m in tail_tools)
+
+    def test_fold_is_idempotent_and_skips_small(self):
+        from agent.loop import _FOLD_MARK, _fold_old_tool_results
+        msgs = [{"role": "tool", "content": "小结果"} for _ in range(8)]
+        assert _fold_old_tool_results(msgs, keep_recent=6) == 0, "小结果不值得折"
+        big = [{"role": "tool", "content": "y" * 3000} for _ in range(8)]
+        assert _fold_old_tool_results(big, keep_recent=6) == 2
+        assert _fold_old_tool_results(big, keep_recent=6) == 0, "二次调用必须幂等"
+        assert sum(1 for m in big if str(m["content"]).startswith(_FOLD_MARK)) == 2
+
+    # ── 可丢弃工具名单（gap P3）：按工具类别分档折叠 ──
+    @staticmethod
+    def _call(i, name, n_chars, fill="x"):
+        """一条 assistant(tool_calls) + tool 结果 的配对（带 id→name 映射）。"""
+        cid = f"c{i}"
+        return [{"role": "assistant", "content": "", "tool_calls": [
+                    {"id": cid, "type": "function",
+                     "function": {"name": name, "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": cid, "content": fill * n_chars}]
+
+    def test_fold_policy_by_tool_category(self):
+        from agent.loop import _FOLD_MARK, _fold_old_tool_results
+        msgs = [{"role": "user", "content": "q"}]
+        # ① 读文件类：1000 字符就该折，且只留开头 250（可重拿）
+        msgs += self._call(1, "read_file", 1000, "r")
+        # ② 行情类 2000 字符：**不折**（数字即结论；阈值 2500）
+        msgs += self._call(2, "mx_query", 2000, "m")
+        # ③ 行情类超大：折，但多留数据行（900）
+        msgs += self._call(3, "mx_query", 4000, "n")
+        # ④ 一般工具（run_cmd）：默认档 1500 才折
+        msgs += self._call(4, "run_cmd", 1600, "c")
+        # ⑤…⑱ 十四个读文件类结果充作"更后面的调用"：
+        #      — 一般工具的保护窗是最近 6 条 → ⑤…⑫ 可折（8 条）
+        #      — 行情类的保护窗是最近 6+6=12 条 → ③ 要活下来就得更旧
+        for i in range(5, 19):
+            msgs += self._call(i, "read_file", 900, "z")
+
+        n = _fold_old_tool_results(msgs, keep_recent=6)
+        assert n == 11, f"应折 1(read_file)+1(mx_query 大)+1(run_cmd)+8(read_file 填充)，实际 {n}"
+        tool_msgs = {m["tool_call_id"]: m["content"] for m in msgs if m.get("role") == "tool"}
+        assert str(tool_msgs["c1"]).startswith(_FOLD_MARK), "读文件类结果该被回收"
+        assert str(tool_msgs["c1"]).count("r") < 300, "读文件类只留开头（250）"
+        assert "read_file" in str(tool_msgs["c1"]), "标记里要写明是哪个工具的结果，便于重拿"
+        assert not str(tool_msgs["c2"]).startswith(_FOLD_MARK), "行情类 2000 字符不折"
+        assert str(tool_msgs["c3"]).startswith(_FOLD_MARK), "行情类超大才折"
+        assert str(tool_msgs["c3"]).count("n") >= 900, "行情类多留数据行（900）"
+        assert str(tool_msgs["c4"]).startswith(_FOLD_MARK), "一般工具走默认档（1500）"
+        # 保护窗：最近 6 条一律不动
+        for i in range(13, 19):
+            assert not str(tool_msgs[f"c{i}"]).startswith(_FOLD_MARK), "最近 6 条必须原样"
+
+    def test_fold_data_shape_beats_tool_name(self):
+        """数据形态优先于工具名（2026-10-08，09-30 事故的回归）。
+
+        现场：模型自己 `read_file` 读回一份 mx_data_…_raw.json（10051 字符），
+        因**工具名是 read_file** 被判"可丢弃类"、折到 250 字 → 模型叙述成
+        "JSON 文件被截断了/工具坏了"，用户看到"辣条的工具是坏的"。
+        修法：JSON/表格/CSV 形状一律走保久档（晚折、留 900 字），不管工具名。"""
+        from agent.loop import _FOLD_MARK, _fold_old_tool_results
+        json_data = '{\n  "板块": "半导体",\n' + ',"列": [1234.5, 6789.0],\n' * 80 + "}\n"
+        assert len(json_data) > 1000
+        msgs = [{"role": "user", "content": "q"}]
+        msgs += self._call(1, "read_file", len(json_data), "r")   # 数据文件：须保久
+        msgs += self._call(2, "read_file", 1200, "t")             # 纯文本：照旧快折
+        for i in range(3, 20):
+            msgs += self._call(i, "read_file", 900, "z")
+        # 把 ① 的内容换成真 JSON（_call 只造填充文本，分档看的是内容形状）
+        for m in msgs:
+            if m.get("tool_call_id") == "c1":
+                m["content"] = json_data
+        _fold_old_tool_results(msgs, keep_recent=6)
+        tool_msgs = {m["tool_call_id"]: m["content"] for m in msgs if m.get("role") == "tool"}
+        assert not str(tool_msgs["c1"]).startswith(_FOLD_MARK), \
+            "JSON 数据文件（read_file 读回的）不该被当作文本折到 250 字"
+        assert str(tool_msgs["c2"]).startswith(_FOLD_MARK), "普通文本照旧快折"
+
+    def test_fold_keeps_numeric_results_longer_than_reads(self):
+        """同为 1200 字符、同样旧：读文件被折、行情类保持原样（数字要"更久"）。"""
+        from agent.loop import _FOLD_MARK, _fold_old_tool_results
+        msgs = [{"role": "user", "content": "q"}]
+        msgs += self._call(1, "read_file", 1200, "r")
+        msgs += self._call(2, "mx_query", 1200, "m")
+        for i in range(3, 20):
+            msgs += self._call(i, "read_file", 900, "z")
+        _fold_old_tool_results(msgs, keep_recent=6)
+        tool_msgs = {m["tool_call_id"]: m["content"] for m in msgs if m.get("role") == "tool"}
+        assert str(tool_msgs["c1"]).startswith(_FOLD_MARK), "读文件类该折"
+        assert not str(tool_msgs["c2"]).startswith(_FOLD_MARK), "行情类 1200 字符不折"
+
+    # ── 审计③：恢复的历史里工具结果是 user 形态 `[工具结果] <name> …` ──
+    @staticmethod
+    def _restored(name, n_chars, fill="r"):
+        return {"role": "user",
+                "content": f"[工具结果] {name} {{\"p\":\"x\"}}\n" + fill * n_chars}
+
+    def test_restored_history_results_are_attributed_and_folded(self):
+        """前端保存/回灌的历史没有 role=tool——此前**一条都不折**、也拿不到分档。"""
+        from agent.loop import _FOLD_MARK, _fold_old_tool_results, _restored_tool_name
+        assert _restored_tool_name(self._restored("mx_query", 10)) == "mx_query"
+        assert _restored_tool_name({"role": "user", "content": "[工具结果] 这不是工具名"}) == ""
+        assert _restored_tool_name({"role": "user", "content": "普通消息"}) == ""
+
+        msgs = [{"role": "user", "content": "q"}]
+        msgs += [self._restored("read_file", 900, "r")]      # 可丢弃类 ≥700 → 折
+        msgs += [self._restored("mx_query", 900, "m")]       # 保久类 <2500 → 不折
+        msgs += [self._restored("read_file", 900, "r")]
+        for _ in range(8):                                   # 补足保护窗
+            msgs += [self._restored("read_file", 900, "z"), {"role": "user", "content": "说"}]
+        # 候选共 10 条工具结果（前两条 + 8 条填充），保护窗 6 条 → 可折 4 条；
+        # 其中 mx_query 因 900 < 2500（保久类门槛）被豁免 → 实际折 3 条 read_file… 加第 2 条
+        n = _fold_old_tool_results(msgs, keep_recent=6)
+        folded = [str(m["content"]) for m in msgs if str(m.get("content", "")).startswith(_FOLD_MARK)]
+        assert n == 4, f"候选 10 条 - 保护 6 条 = 4 条可折（mx_query 被门槛豁免但占位）：{n}"
+        assert all("read_file" in f for f in folded), f"折叠标记必须写明工具名：{folded[:1]}"
+        assert not any("mx_query" in f for f in folded), "行情类 900 字符不该折（<2500）"
+        kept = [str(m["content"]) for m in msgs if "mx_query" in str(m.get("content", ""))[:20]]
+        assert kept and kept[0].startswith("[工具结果] mx_query"), "行情结果应原样保留"
+
+    def test_fold_leaves_context_with_a_drop_segment(self):
+        """50 轮长对话：回收造成上下文**下降段**（在压缩阈值兜底之前）。"""
+        from agent.loop import _fold_old_tool_results
+        msgs = [{"role": "user", "content": "q"}]
+        for i in range(50):
+            # 每轮一次读文件（可丢弃类）+ 一次行情（保久类，但 1200 < 2500 不折）
+            msgs += self._call(i * 2, "read_file", 1200)
+            msgs += self._call(i * 2 + 1, "mx_query", 1200)
+        before = sum(len(str(m.get("content") or "")) for m in msgs)
+        assert before > 18000, "先超过压缩阈值，才能说明回收是新的早出口"
+        n = _fold_old_tool_results(msgs, keep_recent=6)
+        after = sum(len(str(m.get("content") or "")) for m in msgs)
+        assert n == 47, f"100 条结果里：行情类 50 条不折、读文件 50 条中 3 条在保护窗 → 应折 47，实际 {n}"
+        assert after < before - 30000, f"下降段应显著（{before} → {after}）"
+
+    # ── 同错硬升级（按轮去重）──
+    def _loop_with_tool_msgs(self, msgs):
+        from agent.loop import ThinAgentLoop
+        loop = ThinAgentLoop.__new__(ThinAgentLoop)
+        loop.current_msgs = msgs
+        loop._fail_sigs = {}
+        loop._fail_scan_from = 0
+        loop._escalated = False
+        return loop
+
+    def _tool_msg(self, content, name="ak_finance", cid="c1"):
+        return [
+            {"role": "assistant", "content": "",
+             "tool_calls": [{"id": cid, "type": "function",
+                             "function": {"name": name, "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": cid, "content": content},
+        ]
+
+    def test_escalates_after_three_rounds_of_same_error(self):
+        err = "Error: 金融数据查询失败: ConnectionError: RemoteDisconnected"
+        loop = self._loop_with_tool_msgs([])
+        for i in range(2):
+            loop.current_msgs.extend(self._tool_msg(err))
+            assert loop._scan_tool_failures() is None, f"第 {i+1} 轮不应升级"
+        loop.current_msgs.extend(self._tool_msg(err))
+        out = loop._scan_tool_failures()
+        assert out and out["n"] == 3 and out["tool"] == "ak_finance"
+        assert loop._scan_tool_failures() is None, "只升级一次"
+
+    def test_one_round_with_three_distinct_failures_is_not_escalated(self):
+        """一轮里 3 个不同查询同时失败 = 合法覆盖查询（test_saturation_gate 的教训）。"""
+        loop = self._loop_with_tool_msgs([])
+        msgs = []
+        for i in range(3):
+            msgs.extend(self._tool_msg(
+                f"Error: 网络不可用，任务 {i}", name="mx_query", cid=f"c{i}"))
+        loop.current_msgs.extend(msgs)
+        assert loop._scan_tool_failures() is None, "同一轮内的多次失败只记一次"
+
+    def test_success_and_guard_replies_not_counted(self):
+        loop = self._loop_with_tool_msgs([])
+        loop.current_msgs.extend(self._tool_msg("查询结果：| date | 上证 |", name="mx_query"))
+        loop.current_msgs.extend(self._tool_msg(
+            "⛔ 该调用与此前已成功执行的调用完全相同（mx_query），已拒绝重复执行", name="mx_query"))
+        assert loop._scan_tool_failures() is None
+        assert loop._fail_sigs == {}, "成功与闸门回复都不该进失败计数"
+
+    def test_varying_numbers_same_error_counts_once_per_round(self):
+        loop = self._loop_with_tool_msgs([])
+        for i in (1, 2, 3):
+            loop.current_msgs.extend(self._tool_msg(f"Error: HTTP 500 after {i * 3} tries"))
+            out = loop._scan_tool_failures()
+        assert out is not None, "错误里的数字变化不应破坏签名"
+
+
+@pytest.mark.asyncio
+async def test_duplicate_narration_withdraws_bubble():
+    """重复叙述抑制要下发空 content_revised（撤回本轮气泡）。
+
+    2026-10-05 occamy 三连复述事故：抑制只改了历史、用户仍看到三遍。
+    回归钉住：两轮相同开场白 + 工具调用 → 第二轮必须出现 content="" 的
+    content_revised 撤回事件；第一轮（首次出现）不撤。
+    """
+    import local_llm
+    from agent.loop import ThinAgentLoop
+    from tests.test_loop_scenarios import _StubEngine
+    with FakeEngine() as engine:
+        NARR = "分析美股走势情况。"
+        engine.push(engine.native_tool_response("list_dir", {"path": "."}, content=NARR))
+        engine.push(engine.native_tool_response("list_dir", {"path": "sidecar"}, content=NARR))
+        engine.push(engine.text_response(NEUTRAL_TEXT))
+        old = local_llm._engine
+        local_llm._engine = _StubEngine()
+        try:
+            events = await _collect(ThinAgentLoop(
+                MESSAGES, "fake-model", engine.url, HEADERS,
+                session_id=f"thin-wd-{time.time()}", access_mode="full").run())
+        finally:
+            local_llm._engine = old
+        withdraws = [e for e in events
+                     if e.get("event") == "content_revised" and not str(e.get("content") or "").strip()]
+        assert len(withdraws) == 1, [e.get("event") for e in events]
+        # 撤回事件之后不应再有该叙述的 content 增量（终答轮不受影响）
+        idx = events.index(withdraws[0])
+        tail_texts = [str(e.get("content") or "") for e in events[idx:]
+                      if e.get("event") != "content_revised" and e.get("content")]
+        assert all(NARR not in t for t in tail_texts), tail_texts
+
+
+def test_round_text_accumulator_withdraw_and_fold():
+    """非流式/cron 的按轮缓冲：撤回丢本轮、折叠换本轮、轮间空行。"""
+    from agent.loop import RoundTextAccumulator
+    acc = RoundTextAccumulator()
+    for ev in [
+        {"event": "round_start", "iteration": 1},
+        {"content": "分析美股走势情况。"},
+        {"event": "tool_start", "tool": "list_dir"},
+        {"event": "tool_end"},
+        {"event": "round_start", "iteration": 2},
+        {"content": "分析美股走势情况。"},
+        {"event": "content_revised", "content": ""},          # 撤回第二轮
+        {"event": "round_start", "iteration": 3},
+        {"content": "美股上周收出小阳周K。"},
+        {"event": "round_start", "iteration": 4},
+        {"content": "超长叙述" * 300},
+        {"event": "content_revised", "content": "（折叠）"},   # 折叠第四轮
+    ]:
+        acc.feed(ev)
+    out = acc.join()
+    assert out == "分析美股走势情况。\n\n美股上周收出小阳周K。\n\n（折叠）"
+    # 空轮（撤光）不产生空段落
+    assert "\n\n\n" not in out
+
+
+@pytest.mark.asyncio
+async def test_cancel_mid_stream_stops_promptly():
+    """停止键要在**生成中**生效（2026-10-05 事故回归）。
+
+    此前取消只在每步开头检查：用户点停止后生成还跑完 108.9s。现在 _sample
+    每 4 行探测一次取消标记，命中即断流（显式 aclose 关引擎连接）+ run 收尾。
+    这里用 10 行流触发 %4 探测路径，断言：只跑 1 轮、以"已停止"收尾。
+    """
+    import time as _t
+
+    import agent_loop as _al
+    import local_llm
+    from agent.loop import ThinAgentLoop
+    from tests.test_loop_scenarios import _StubEngine
+
+    sid = f"thin-cancel-a-{_t.time()}"
+    state = {"n": 0}
+    def fake_cancel(_sid):
+        state["n"] += 1
+        return state["n"] > 1          # 步骤开头第 1 次 False，流中探测起 True
+
+    with FakeEngine() as engine:
+        engine.push([_sse({"choices": [{"delta": {"content": "句子。"}}]} ) for _ in range(10)]
+                    + ["data: [DONE]\n\n"])
+        old = local_llm._engine
+        local_llm._engine = _StubEngine()
+        orig = _al._session_cancel_requested
+        _al._session_cancel_requested = fake_cancel
+        try:
+            t0 = _t.monotonic()
+            events = await _collect(ThinAgentLoop(
+                MESSAGES, "fake-model", engine.url, HEADERS,
+                session_id=sid, access_mode="full").run())
+            elapsed = _t.monotonic() - t0
+        finally:
+            local_llm._engine = old
+            _al._session_cancel_requested = orig
+
+    rounds = [e for e in events if e.get("event") == "round_start"]
+    assert len(rounds) == 1, "取消后不得进入下一轮"
+    texts = "".join(str(e.get("content", "")) for e in events if isinstance(e, dict))
+    assert "已停止" in texts, events
+    assert elapsed < 10, f"取消收尾太慢：{elapsed:.1f}s"
+
+
+@pytest.mark.asyncio
+async def test_cancel_before_tool_execution_skips_tool():
+    """取消到达后模型刚请求的工具**不得执行**（事故里点了停止还写了文件）。
+
+    短响应走"流末兜底探测"路径：__result__ 仍回传，但 run 见 _cancelled
+    直接收尾——不执行 write_file。
+    """
+    import os
+    import time as _t
+
+    import agent_loop as _al
+    import local_llm
+    from agent.loop import ThinAgentLoop
+    from tests.test_loop_scenarios import _StubEngine
+
+    victim = f"/tmp/cancel-skip-{os.getpid()}.txt"
+    if os.path.exists(victim):
+        os.unlink(victim)
+
+    sid = f"thin-cancel-b-{_t.time()}"
+    state = {"n": 0}
+    def fake_cancel(_sid):
+        state["n"] += 1
+        return state["n"] > 1
+
+    with FakeEngine() as engine:
+        engine.push(engine.native_tool_response(
+            "write_file", {"path": victim, "content": "should not exist"}))
+        old = local_llm._engine
+        local_llm._engine = _StubEngine()
+        orig = _al._session_cancel_requested
+        _al._session_cancel_requested = fake_cancel
+        try:
+            events = await _collect(ThinAgentLoop(
+                MESSAGES, "fake-model", engine.url, HEADERS,
+                session_id=sid, access_mode="full").run())
+        finally:
+            local_llm._engine = old
+            _al._session_cancel_requested = orig
+
+    assert not os.path.exists(victim), "取消后工具仍被执行（写了文件）"
+    assert not any(isinstance(e, dict) and e.get("event") == "tool_start" for e in events), events
+    texts = "".join(str(e.get("content", "")) for e in events if isinstance(e, dict))
+    assert "已停止" in texts, events
+
+
+@pytest.mark.asyncio
+async def test_tool_failure_promise_fragment_gets_nudged():
+    """工具失败后的"承诺碎片"不交付（2026-10-07 事故回归）。
+
+    现场：ak_finance 失败（东财拒连）→ 模型连续两轮只说"这就帮你看看"
+    "马上用 mx_query 帮你查"就结束生成（22 字/94 字），任务半途而废。
+    修复：工具失败 + 短承诺正文（无数字/表格）→ 注入 toolfail_nudge 继续。
+    """
+    import time as _t
+
+    import local_llm
+    from agent.loop import ThinAgentLoop
+    from tests.test_loop_scenarios import _StubEngine
+
+    with FakeEngine() as engine:
+        # ① 模型调 read_file（不存在 → Error 结果 = 工具失败）
+        engine.push(engine.native_tool_response("read_file", {"path": "/nonexistent-xyz"}))
+        # ② 模型只说承诺（无工具调用）
+        engine.push(engine.text_response("好的主人，欧娜这就帮你看看这三只票的情况～💋"))
+        # ③ 被 nudge 后给出完整回答
+        engine.push(engine.text_response(NEUTRAL_TEXT))
+        old = local_llm._engine
+        local_llm._engine = _StubEngine()
+        try:
+            events = await _collect(ThinAgentLoop(
+                MESSAGES, "fake-model", engine.url, HEADERS,
+                session_id=f"thin-pf-{_t.time()}", access_mode="full").run())
+        finally:
+            local_llm._engine = old
+
+    texts = "".join(str(e.get("content", "")) for e in events if isinstance(e, dict))
+    # 承诺碎片不能作为终答交付（后续有完整回答 = 循环被续跑）
+    assert "根据刚才的目录输出" in texts, "nudge 后应继续循环并交付完整回答"
+    # 碎片本身也不该出现（它只应作为历史，不当终答下发）——宽松断言：
+    # 交付的最后一条不是碎片
+    assert not texts.rstrip().endswith("💋"), texts[-200:]
+
+
+@pytest.mark.asyncio
+async def test_repeat_promise_after_nudge_forces_finalize():
+    """催促后仍只承诺 → 强制收口作答（2026-10-08 16:13 实测回归）。
+
+    现场：空转闸门催了一次（日志有"空转闸门"行），模型 2.4s（99% 缓存）后
+    又输出一句更具体的承诺（"让我再搜一下几个头部平台（Temu/Shein/TikTok
+    Shop）的最新动态～"42 字）→ 催促额度已用尽 → 当终答交付，用户又看到
+    "断了"。修复：额度提到 2 次，第三次仍是承诺 → _finalize_round=True 转
+    收口轮，基于已有数据作答（该轮自带 junk→重采→数据兜底链）。
+    """
+    import time as _t
+
+    import local_llm
+    from agent.loop import ThinAgentLoop
+    from tests.test_loop_scenarios import _StubEngine
+
+    with FakeEngine() as engine:
+        # 先拿到一次成功的工具结果（= 有数据的现场：模型想再挖但数据已在手）
+        engine.push(engine.native_tool_response("list_dir", {"path": "."}))
+        engine.push(engine.text_response("让我先查一下今天的最新行情数据～"))
+        engine.push(engine.text_response(
+            "让我再搜一下几个头部平台（Temu/Shein/TikTok Shop）的最新动态～"))
+        engine.push(engine.text_response("让我换个来源再核对一下这些数字～"))
+        # 收口轮：必须给出正文
+        engine.push(engine.text_response(NEUTRAL_TEXT))
+        old = local_llm._engine
+        local_llm._engine = _StubEngine()
+        try:
+            events = await _collect(ThinAgentLoop(
+                MESSAGES, "fake-model", engine.url, HEADERS,
+                session_id=f"thin-esc-{_t.time()}", access_mode="full").run())
+        finally:
+            local_llm._engine = old
+
+    texts = "".join(str(e.get("content", "")) for e in events if isinstance(e, dict))
+    # 有数据时催 2 次；第三次承诺必须转收口轮（请求里出现收口指令），不当终答交付
+    assert len(engine.requests) >= 5, f"应继续跑（工具 1+催 2+收口 1），实际请求数 {len(engine.requests)}"
+    last = json.dumps(engine.requests[-1], ensure_ascii=False)
+    assert "收尾：数据已足够" in last, "最后一次请求应是收口轮（尾部带收口指令）"
+    assert "根据刚才的目录输出" in texts, "收口轮应交付完整回答"
+    assert not texts.rstrip().endswith("～"), texts[-200:]
+
+
+@pytest.mark.asyncio
+async def test_repeat_promise_without_data_uses_honest_finalize():
+    """无数据时多催一次，收口轮改用"如实说明"指令（2026-10-08 引擎探测回归）。
+
+    探测实证：把"刚承诺完 + 数据已足够"喂给本地 Hermes，它写了 872 字正文
+    （收口机制有效），但同一探测里**没有任何数据**时它会凭空编造具体细节
+    （"某研报引发暴跌、误差 15-20%"）且不会被任何闸门拦住。所以无数据路径
+    的收口指令必须说破"没有数据"，催的额度也放宽到 3 次（承诺多半是"我要
+    去查"，强行收口等于逼它无数据作答）。
+    """
+    import time as _t
+
+    import local_llm
+    from agent.loop import ThinAgentLoop
+    from tests.test_loop_scenarios import _StubEngine
+
+    with FakeEngine() as engine:
+        engine.push(engine.text_response("让我先查一下最新的数据～"))
+        engine.push(engine.text_response("让我再搜一下头部平台的最新动态～"))
+        engine.push(engine.text_response("让我换个来源再核对一下～"))
+        engine.push(engine.text_response("让我再看看有没有别的入口～"))
+        engine.push(engine.text_response("这次我没能取到数据，先说明这一点。"))
+        old = local_llm._engine
+        local_llm._engine = _StubEngine()
+        try:
+            events = await _collect(ThinAgentLoop(
+                MESSAGES, "fake-model", engine.url, HEADERS,
+                session_id=f"thin-esc-nd-{_t.time()}", access_mode="full").run())
+        finally:
+            local_llm._engine = old
+
+    texts = "".join(str(e.get("content", "")) for e in events if isinstance(e, dict))
+    assert len(engine.requests) >= 5, f"无数据应催 3 次再收口，实际请求数 {len(engine.requests)}"
+    last = json.dumps(engine.requests[-1], ensure_ascii=False)
+    assert "本轮没有取到任何数据" in last, "无数据收口必须用如实说明版指令"
+    assert "数据已足够" not in last, "无数据时不得声称数据已足够（诱发编造）"
+    assert "这次我没能取到数据" in texts
+
+
+def test_promise_regex_matches_incident_fragments():
+    """事故里的两句承诺语必须命中 _PROMISE_RE（正则即回归）。"""
+    from agent.loop import _DATA_SIGNAL_RE, _PROMISE_RE
+    a = "好的主人，欧娜这就帮你看看这三只票的情况～💋"
+    b = ("哎呀主人别急嘛～刚才 ak_finance 的东财接口抽风了（连接被拒绝），"
+         "欧娜没及时切到备用工具，所以卡住了 😘 现在马上用 mx_query 帮你查这三只票的情况！💋")
+    assert _PROMISE_RE.search(a)
+    assert _PROMISE_RE.search(b)
+    assert not _DATA_SIGNAL_RE.search(a)   # 无数字/表格
+    assert not _DATA_SIGNAL_RE.search(b)
+    # 对照：含数据的真答案不该命中承诺信号
+    real = "中天科技 收 12.34 元（+2.5%），领益智造 收 8.90 元\n| a | b |\n|---|---|"
+    assert _DATA_SIGNAL_RE.search(real)
+
+
+# ── 思考泄漏（2026-10-09 occamy 实测"回复两遍"）─────────────────────────
+
+_OCCAMY_LEAK = ("（眼波流转，红唇微勾，指尖缓缓划过你的胸口）\n"
+                '"主人真是的……一开口就叫人家小坏蛋，坏死了～"\n'
+                "（却并没有反驳，反而站起身来，双手抓住领口两侧）\n"
+                "</think>\n"
+                "（眼波如水，红唇微勾，指尖在你胸口轻轻画着圈）\n"
+                '"主人真是的……一开口就叫我小坏蛋，真是坏死了呢～"\n'
+                "（微微俯身，让那对软玉更贴近你的脸庞）\n")
+
+
+@pytest.mark.asyncio
+async def test_think_leak_retracts_first_copy():
+    """孤立 </think> → 撤回前半段、只留正式回复（"回复两遍"的回归）。
+
+    occamy-1.0 把内心戏写进正文、用 </think> 收尾再写一遍正式版：前后两版都当
+    正文下发 → 用户看到两遍。修法：标记前的内容丢弃 + 空 content_revised 撤回
+    已显示的前半段；body_text 同步截断（判定/记账按一遍算）。"""
+    import local_llm
+    from agent.loop import ThinAgentLoop
+    from tests.fake_engine import FakeEngine
+    from tests.test_loop_scenarios import _StubEngine
+    with FakeEngine() as engine:
+        engine.push(engine.text_response(_OCCAMY_LEAK))
+        old = local_llm._engine
+        local_llm._engine = _StubEngine()
+        try:
+            events = await _collect(ThinAgentLoop(
+                MESSAGES, "fake-model", engine.url, HEADERS,
+                session_id=f"thin-leak-{time.time()}", access_mode="full").run())
+        finally:
+            local_llm._engine = old
+    # ① 必须出现一次"撤回"（空 content_revised）
+    revokes = [e for e in events if isinstance(e, dict)
+               and e.get("event") == "content_revised" and not str(e.get("content") or "")]
+    assert revokes, f"孤立 </think> 必须撤回前半段: {[e for e in events if isinstance(e, dict) and e.get('event')][:6]}"
+    # ② 撤回**之后**流出的内容只能是正式回复（前半段是已发过的，靠撤回清掉）
+    idx = next(i for i, e in enumerate(events) if isinstance(e, dict)
+               and e.get("event") == "content_revised"
+               and not str(e.get("content") or ""))
+    after = "".join(str(e.get("content", "")) for e in events[idx + 1:]
+                    if isinstance(e, dict) and not e.get("event"))
+    assert "指尖缓缓划过你的胸口" not in after, f"撤回后不该再出现内心戏: {after[:120]!r}"
+    # ③ 正式回复照常交付；标签本身不落地（无论分块与否）
+    assert "指尖在你胸口轻轻画着圈" in after, "正式回复必须照常交付"
+    streamed = "".join(str(e.get("content", "")) for e in events if isinstance(e, dict)
+                       and not e.get("event"))
+    assert "</think>" not in streamed
+
+
+@pytest.mark.asyncio
+async def test_repetition_retry_emits_event_not_dash_content(monkeypatch):
+    """复读重采不再往正文塞 "---"（2026-10-13 用户实机反馈）。
+
+    实机问题：那串分隔符被前端当正文收进气泡，还被存成一条独立的 assistant 消息
+    （真库里有 3 字的 "---" 气泡）。现在只发 round_retry 事件（前端对未知事件忽略）。
+
+    触发方式：**确定性**地让复读闸门抛 _GenerationLoopError（脚本化"复读"要靠
+    上下文相似度，实测构造不出来——空跑会让断言假绿，这是刻意避开的坑）。
+    """
+    import time as _time
+    import agent.context as agent_context
+    import agent.loop as L
+    import local_llm
+    from agent.text_quality import _GenerationLoopError
+    from tests.test_loop_scenarios import _StubEngine
+
+    calls = {"n": 0}
+    orig_gate = L.ThinAgentLoop._gate_round_content
+
+    def _gate(self, text):
+        out = orig_gate(self, text)
+        # 第一次有正文流出就假装检测到复读（等价于检测器命中）
+        if not calls["n"] and out:
+            calls["n"] += 1
+            raise _GenerationLoopError("输出复读循环，已截断")
+        return out
+
+    monkeypatch.setattr(L.ThinAgentLoop, "_gate_round_content", _gate)
+    with FakeEngine() as engine:
+        engine.push(engine.text_response("（轻笑）主人稍等一下下，人家马上就好～" * 3))
+        engine.push(engine.text_response("（凑近你耳边）嗯，人家知道啦。"))
+        old = local_llm._engine
+        local_llm._engine = _StubEngine()
+        agent_context._LOCAL_NATIVE_TOOLS_OVERRIDE = True
+        try:
+            events = await _collect(L.ThinAgentLoop(
+                MESSAGES, "fake-model", engine.url, HEADERS,
+                session_id=f"thin-dup-{_time.time()}", access_mode="full").run())
+        finally:
+            local_llm._engine = old
+            agent_context._LOCAL_NATIVE_TOOLS_OVERRIDE = None
+    joined = "".join(str(e.get("content") or "") for e in events if "content" in e)
+    assert "---" not in joined, f"分隔符不该进正文：{joined[:200]}"
+    assert calls["n"] == 1, "场景没触发（断言会假绿）"
+    assert any(e.get("event") == "round_retry" for e in events), \
+        "复读重采应发 round_retry 事件（前端忽略、日志留痕）"

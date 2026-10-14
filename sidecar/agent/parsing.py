@@ -1,9 +1,10 @@
 """解析层：SSE delta 行、原生/围栏工具调用解析、kv 参数、循环调试日志。"""
 import json
+import logging
 import os
 import re
 import tempfile
-import logging
+import uuid
 
 logger = logging.getLogger("latiao-sidecar")
 
@@ -87,6 +88,32 @@ def _salvage_tool_args(args_str: str) -> dict:
             if key:
                 result[key] = val
     return result or {"raw": args_str}
+
+
+def _extract_first_json_object(text: str) -> dict | None:
+    r"""从混杂文本提取第一个可解析的 JSON 对象（raw_decode 位置扫描，非正则）。
+
+    标准解析器按真正的 JSON 语法切界：字符串里的花括号、嵌套对象、对象前后
+    的杂物（寒暄、`</think>` 残留、围栏碎片）都不影响；贪婪 `\{.*\}` 在
+    "对象后跟含 } 的尾巴"上会抓错区间、非贪婪 `\{.*?\}` 会被嵌套截断——
+    两类都曾让方言解析整段失效。手法来源：EnSIMem 复现包 llm.py（其注释
+    原话 tolerating markdown and Qwen think blocks）。think 块策略由调用方
+    决定，本函数不剥。
+    """
+    if not text:
+        return None
+    decoder = json.JSONDecoder()
+    i = text.find("{")
+    while i != -1:
+        try:
+            obj, _end = decoder.raw_decode(text, i)
+        except json.JSONDecodeError:
+            i = text.find("{", i + 1)
+            continue
+        if isinstance(obj, dict):
+            return obj
+        i = text.find("{", i + 1)
+    return None
 
 
 def _strip_native_tool_calls(text: str) -> str:
@@ -179,8 +206,11 @@ _PROMPT_TOOL_FENCE_RE = re.compile(
 # Qwen3.8/MoziAI 等 27B 级模型实测输出此格式（工具名在 JSON 内部而非栅栏语言位），
 # 此前 Fenced/XML/Bare/Inline 四层全不认 → 模型反复正确输出工具调用却被当纯文本，
 # nudge 3 次后放弃 → "任务刚开始就停"（09-02 09:14 事故）。
+# 10-04 起：捕获整段栅栏内容（允许前置说明文字），JSON 本体交给
+# _extract_first_json_object——旧 `\{.*?\}` 要求 { 紧跟围栏，栅栏里有一句
+# "好的，这是查询：" 整个方言就失明。
 _PROMPT_JSON_FENCE_RE = re.compile(
-    r'```json\s*(\{.*?\})\s*```',
+    r'```json\s*(.*?)\s*```',
     re.DOTALL,
 )
 
@@ -209,6 +239,11 @@ _PROMPT_TOOL_RE = re.compile(
 # 09-21 收紧（Nous Hermes 立场：工具执行应由模型结构化调用决定，不做散文推断）：
 # 默认关闭；即使开启也只允许只读类工具（可开不可误执行危险性动作）。
 _NL_TOOL_FALLBACK_ENABLED = False
+# 裸 JSON 工具推断（按参数键猜工具名）：默认关。误判面大（正文 JSON → run_cmd）。
+_BARE_JSON_TOOLS_ENABLED = (os.environ.get("LATIAO_BARE_JSON_TOOLS", "0").strip().lower()
+                            in ("1", "on", "true", "yes"))
+_BARE_JSON_READONLY = frozenset({"read_file", "list_dir", "search_files",
+                                 "mx_query", "tavily_search", "headless_read"})
 _NL_TOOL_READONLY = frozenset({"read_file", "list_dir", "search_files", "headless_read",
                                "web_search", "tavily_search", "bing_search"})
 _NL_TOOL_RE = re.compile(
@@ -391,7 +426,7 @@ def _parse_prompt_tool_calls(text: str) -> tuple[str, list[dict]]:
         except json.JSONDecodeError:
             args = _salvage_tool_args(args_str)
         tool_calls.append({
-            "id": f"local_fence_{name}_{idx}",
+            "id": f"local_fence_{name}_{uuid.uuid4().hex[:8]}_{idx}",
             "type": "function",
             "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
         })
@@ -402,9 +437,8 @@ def _parse_prompt_tool_calls(text: str) -> tuple[str, list[dict]]:
     # 被当纯文本，任务"刚开始就停"
     if not tool_calls:
         for idx, jm in enumerate(_PROMPT_JSON_FENCE_RE.finditer(search_text)):
-            try:
-                obj = json.loads(jm.group(1))
-            except json.JSONDecodeError:
+            obj = _extract_first_json_object(jm.group(1))
+            if obj is None:
                 continue
             if not (isinstance(obj, dict) and obj.get("name") and "arguments" in obj):
                 continue
@@ -430,12 +464,9 @@ def _parse_prompt_tool_calls(text: str) -> tuple[str, list[dict]]:
             try:
                 _obj = json.loads(_body)
             except json.JSONDecodeError:
-                _jm = re.search(r"\{.*\}", _body, re.DOTALL)
-                if _jm:
-                    try:
-                        _obj = json.loads(_jm.group(0))
-                    except json.JSONDecodeError:
-                        _obj = _salvage_tool_args(_jm.group(0))
+                _obj = _extract_first_json_object(_body)
+                if _obj is None:
+                    _obj = _salvage_tool_args(_body)
             if not isinstance(_obj, dict):
                 continue
             _wname = str(_obj.get("name") or _obj.get("tool")
@@ -471,14 +502,11 @@ def _parse_prompt_tool_calls(text: str) -> tuple[str, list[dict]]:
                     _fargs[pm.group(1)] = _raw
             if not _fargs:
                 # 混合方言（09-19 实测）：body 直接是 {"query": ...}（可能只带 </parameter> 收尾）
-                _jm = re.search(r"\{.*\}", fm.group(2), re.DOTALL)
-                if _jm:
-                    try:
-                        _obj = json.loads(_jm.group(0))
-                    except json.JSONDecodeError:
-                        _obj = _salvage_tool_args(_jm.group(0))
-                    if isinstance(_obj, dict):
-                        _fargs = _obj
+                # 10-04：raw_decode 扫描替换贪婪 `\{.*\}`——对象后跟含 } 的尾巴时旧
+                # 区间抓错 → 解析出垃圾参数，工具拿烂参数白跑一轮。
+                _obj = _extract_first_json_object(fm.group(2))
+                if _obj is not None:
+                    _fargs = _obj
             tool_calls.append({
                 "id": f"local_qwxml_{_fname}_{f_idx}",
                 "type": "function",
@@ -497,7 +525,7 @@ def _parse_prompt_tool_calls(text: str) -> tuple[str, list[dict]]:
             for kv in _TOOLCALL_KV_RE.finditer(xm.group(2)):
                 _xargs[kv.group(1)] = kv.group(2)
             tool_calls.append({
-                "id": f"local_xml_{_xname}_{x_idx}",
+                "id": f"local_xml_{_xname}_{uuid.uuid4().hex[:8]}_{x_idx}",
                 "type": "function",
                 "function": {"name": _xname, "arguments": json.dumps(_xargs, ensure_ascii=False)},
             })
@@ -507,7 +535,11 @@ def _parse_prompt_tool_calls(text: str) -> tuple[str, list[dict]]:
     # "我来查...{"query": "..."}" 的裸 JSON（无 ```tool 栅栏），解析器不认 →
     # JSON 残留在文本里 → 模型复读同样内容 → 复读检测误判循环截断（22:06 事故）。
     # 这里识别"独立 JSON 对象且参数命中文档化工具名"的裸调用，并剥离。
-    if not tool_calls:
+    #
+    # P0：本层按参数键**猜**工具名（cmd→run_cmd），正文/工具结果里解释 JSON 的
+    # 内容会被误造成可执行调用 = 结果反注入。默认关闭；LATIAO_BARE_JSON_TOOLS=1
+    # 可开，且开启后也只允许只读工具。
+    if not tool_calls and _BARE_JSON_TOOLS_ENABLED:
         _bare_json_re = re.compile(r'\{\s*"(?:query|path|cmd|pattern|url|command)"\s*:\s*"[^"]*"\s*[,}]', re.DOTALL)
         for b_idx, m in enumerate(_bare_json_re.finditer(search_text)):
             # 往前看 30 字符是否有"动/查/读/搜"等动作词（避免误判正文 JSON）
@@ -527,8 +559,11 @@ def _parse_prompt_tool_calls(text: str) -> tuple[str, list[dict]]:
                          else "run_cmd" if key == "cmd"
                          else "tavily_search" if key == "url"
                          else "mx_query")
+            # 即便手动开启，也不猜 run_cmd —— 命令执行不走推断
+            if tool_name not in _BARE_JSON_READONLY:
+                continue
             tool_calls.append({
-                "id": f"local_bare_{tool_name}_{b_idx}",
+                "id": f"local_bare_{tool_name}_{uuid.uuid4().hex[:8]}_{b_idx}",
                 "type": "function",
                 "function": {"name": tool_name, "arguments": json.dumps(args, ensure_ascii=False)},
             })
@@ -556,7 +591,7 @@ def _parse_prompt_tool_calls(text: str) -> tuple[str, list[dict]]:
             if not args:
                 continue
             tool_calls.append({
-                "id": f"local_inline_{name}_{idx}",
+                "id": f"local_inline_{name}_{uuid.uuid4().hex[:8]}_{idx}",
                 "type": "function",
                 "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
             })

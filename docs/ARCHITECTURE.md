@@ -192,12 +192,12 @@ local-ai-os/
 
 ## Key Design Decisions
 
-1. **Stateless sidecar**: Frontend manages all session state (localStorage). Sidecar receives complete message history with every request. This simplifies restart/error recovery.
+1. **Backend-authoritative sessions (2026-09-23)**: The sidecar owns chat history (`sessions`/`session_messages` tables + snapshot-write API); localStorage is demoted to a shadow copy. The frontend still sends full message history per request, and startup races are handled with retry.
 
 2. **Portable Python**: Production .app bundles python-build-standalone (Python 3.11). Users don't need Python installed. See `scripts/setup-portable-python.sh`.
 
 3. **Plugin-first tools**: Tools are defined as plugins in `sidecar/plugins/`. The fallback implementations in main.py Section 4 only activate when the plugins directory is empty (first-run seeding).
 
-4. **Dual agent loops**: Cloud models get native function calling. Local models get prompt-based tool calling (model-agnostic). Both loops share the same tool execution and verification pipeline.
+4. **One thin loop (2026-08)**: `ThinAgentLoop` is the only agent loop — cloud and local share it; local models get native function calling where supported, with a fenced-prompt fallback. Tool execution, gating and verification are plugins/hooks around that single loop.
 
 5. **SSE streaming**: All agent output streams to the UI in real-time via SSE events. No polling. No WebSocket overhead.

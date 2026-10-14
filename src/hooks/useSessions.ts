@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { SessionInfo, Message } from "../types";
 import { sanitizeSessions } from "../utils/storage";
 import {
@@ -101,8 +101,12 @@ export function useSessions() {
   const [backendReady, setBackendReady] = useState(false);
 
   // 变更同步：按会话 diff（内容指纹变了才 PUT），删除的会话 DELETE。
-  const syncRemote = (list: SessionInfo[]) => {
-    if (!backendReady) return;
+  // 稳定引用（useCallback [] + ref 读 backendReady）：否则 App 落盘 effect 依赖它
+  // 每渲染重跑 → 不在流式时每敲一键就写 localStorage（P0 性能）。
+  const _backendReadyRef = useRef(backendReady);
+  useEffect(() => { _backendReadyRef.current = backendReady; }, [backendReady]);
+  const syncRemote = useCallback((list: SessionInfo[]) => {
+    if (!_backendReadyRef.current) return;
     const plan = planSync(_syncedRef.current, list, _backendIdsRef.current);
     _syncedRef.current = plan.nextFingerprints;
     for (const id of plan.puts) {
@@ -124,7 +128,7 @@ export function useSessions() {
       _backendIdsRef.current.delete(id);
       void deleteSessionRemote(id);
     }
-  };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;

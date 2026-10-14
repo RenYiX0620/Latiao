@@ -49,7 +49,7 @@ DEFINITION = {
     "type": "function",
     "function": {
         "name": "ak_finance",
-        "description": "免费金融数据查询（无需 API Key，基于 AKShare/东方财富公开数据）。支持【A股、港股、指数、基金、行业板块】的实时行情与历史数据。适用：问任何 A股/港股个股价格、上证/深证/恒生等指数、基金净值、板块行情。支持用逗号（或顿号）分隔一次查询多个指数或板块（如\"上证指数,深证成指,创业板指\"、\"半导体板块,芯片板块\"；板块名列表如\"半导体,白酒\"无需带\"板块\"二字）。美股指数（道指/标普500/纳指/罗素2000）也支持，走新浪财经日线接口，返回带日期的精确收盘点位；加密货币等仍请用网页搜索。",
+        "description": "免费金融数据查询（无需 API Key，基于 AKShare/东方财富公开数据）。支持【A股、港股、指数、基金、行业板块】的实时行情与历史数据。适用：问任何 A股/港股个股价格、上证/深证/恒生等指数、基金净值、板块行情。支持用逗号（或顿号）分隔一次查询多个指数或板块（如\"上证指数,深证成指,创业板指\"、\"半导体板块,芯片板块\"；板块名列表如\"半导体,白酒\"无需带\"板块\"二字）。美股指数（道指/标普500/纳指/罗素2000）也支持，走新浪财经日线接口，返回带日期的精确收盘点位；加密货币等仍请用网页搜索。⚠️ 本工具只覆盖**行业板块**（不含概念板块），且**不提供资金流向**（主力/净流入等）——概念板块与资金流向请用 mx_query。⚠️ 失败处理：部分网络环境下东财接口会直接拒连（ConnectionError/连接被拒绝）——这不是偶发抖动，**重试大概率仍失败**：失败一次后立即改用 mx_query 查同样的数据，不要重试本工具、更不要只回复\"我这就去查\"之类的承诺。",
         "parameters": {
             "type": "object",
             "properties": {
@@ -304,13 +304,100 @@ _US_INDEX_MAP = (
 
 
 def _us_index_targets(query: str) -> list[tuple[str, str]]:
-    """从 query 里识别美股指数（可一次多个：道指/标普/纳指）。"""
+    """从 query 里识别美股指数（可一次多个：道指/标普/纳指）。
+
+    09-28 补：「美股」单独出现时视为三大指数全查——此前 map 只有具体指数名，
+    「美股现在是啥情况」匹配不到任何目标 → 掉进网页搜索 → 撞上 int_ 假源。
+    """
     q = (query or "").lower()
     out = []
     for keys, sym, name in _US_INDEX_MAP:
         if any(k in q for k in keys):
             out.append((sym, name))
+    if not out and ("美股" in q or "us stock" in q or "美国股市" in q or "wall street" in q):
+        out = [(".DJI", "道琼斯工业平均指数"), (".INX", "标普500指数"), (".IXIC", "纳斯达克综合指数")]
     return out
+
+
+# ── 美股盘中实时（09-28）───────────────────────────────────────────
+# 事故：模型上网搜「美股现在」拿到新浪 int_ 冻结假数据（道指 46247 vs 真实 51828）。
+# gb_ 是带时间戳的活源（实测 2026-09-28 10:51 AM EDT、-0.61% 与行情一致）。
+# 禁止使用 int_dji / int_nasdaq / int_sp500（冻结快照，差 11–20%）。
+_US_RT_MAP = (
+    (("道琼斯", "道指", "dow", "dji"), "gb_dji", "道琼斯工业平均指数"),
+    (("标普", "s&p", "s&p500", "sp500"), "gb_inx", "标普500指数"),
+    (("纳斯达克", "纳指", "nasdaq", "ixic"), "gb_ixic", "纳斯达克综合指数"),
+    (("美股", "us stock", "美国股市", "wall street"), "gb_dji", "道琼斯工业平均指数"),
+)
+_US_RT_KW = ("现在", "实时", "盘中", "最新", "当前", "行情", "多少", "什么价",
+             "today", "now", "realtime", "current", "点位")
+# int_ 冻结源拉黑（在本工具内双保险；全局清洗见 threat_scan.scrub_stale_sina_us）
+_STALE_SINA_US = ("int_dji", "int_nasdaq", "int_sp500", "int_ixic", "int_rut")
+
+
+def _us_rt_targets(query: str) -> list[tuple[str, str, str]]:
+    q = (query or "").lower()
+    out = []
+    # 「美股」泛指 → 一次给三大指数（09-28：此前匹配不到就掉网页搜索撞 int_ 假源）
+    if ("美股" in q or "us stock" in q or "美国股市" in q or "wall street" in q) \
+            and not any(k in q for k in ("道指", "道琼斯", "标普", "纳指", "纳斯达克", "dow", "dji", "sp500", "ixic")):
+        return [("gb_dji", "道琼斯", "道琼斯工业平均指数"),
+                ("gb_inx", "标普500", "标普500指数"),
+                ("gb_ixic", "纳指", "纳斯达克综合指数")]
+    for keys, sym, name in _US_RT_MAP:
+        if any(k in q for k in keys):
+            if not any(t[0] == sym for t in out):
+                out.append((sym, name, name))
+    return out
+
+
+async def _query_us_realtime(query: str) -> str:
+    """美股盘中/实时（新浪 gb_ 活源，带时间戳）。失败返回 "" 让调用方走日线。"""
+    targets = _us_rt_targets(query)
+    if not targets:
+        return ""
+    import requests
+    syms = [t[0] for t in targets]
+    url = "https://hq.sinajs.cn/list=" + ",".join(syms)
+    try:
+        resp = requests.get(url, headers={"Referer": "https://finance.sina.com.cn"}, timeout=6)
+        raw = resp.content.decode("gbk", errors="replace")
+    except Exception as e:
+        return f"（美股实时查询失败：{type(e).__name__}，改用下方带日期的日线数据）"
+    # 禁止引用 int_ 冻结源
+    if any(s in raw for s in _STALE_SINA_US) and "gb_" not in raw:
+        return "（数据源异常：新浪返回冻结快照，已拒用。请改用日线数据并注明来源与日期。）"
+    lines = []
+    # var hq_str_gb_dji="名,价,涨跌%,北京时间,涨跌额,开,高,低,52高,52低,...,美东时间,昨收"
+    for line in raw.splitlines():
+        m = re.search(r'hq_str_(gb_\w+)="([^"]*)"', line)
+        if not m:
+            continue
+        code, body = m.group(1), m.group(2)
+        parts = [p.strip() for p in body.split(",")]
+        if len(parts) < 5:
+            continue
+        name = parts[0] or code
+        try:
+            price = float(parts[1])
+            pct = float(parts[2])
+            ts_bj = parts[3]
+            chg = float(parts[4])
+        except (TypeError, ValueError):
+            continue
+        open_ = parts[5] if len(parts) > 5 else ""
+        prev = parts[-2] if len(parts) > 8 and parts[-2] not in ("", "--") else ""
+        et_ts = ""
+        for p in parts:
+            if "EDT" in p or "EST" in p:
+                et_ts = p
+        lines.append(
+            f"📊 {name} [{code}] 实时 {price:,.2f}（{chg:+,.2f} / {pct:+.2f}%）"
+            f"｜今开 {open_}｜昨收 {prev}\n"
+            f"   时间戳：北京时间 {ts_bj}" + (f"｜美东 {et_ts}" if et_ts else "")
+            + "\n   数据源：新浪 gb_（实时）"
+        )
+    return "\n".join(lines) if lines else ""
 
 
 async def _query_us_index(query: str) -> str:
@@ -355,7 +442,8 @@ async def _query_us_index(query: str) -> str:
             blocks.append("\n".join(lines))
         except Exception as e:
             blocks.append(f"📊 {name} ({sym}): 查询失败（{type(e).__name__}，已重试 3 次）。"
-                          "请改用 tavily_search 获取该指数的报道口径数字，并在答案里写明来源与日期。")
+                          "行情请改用 mx_query（妙想）；只有报道口径的数字才用 tavily_search"
+                          "（须写明来源与日期）。")
     return "\n\n".join(blocks)
 
 
@@ -367,6 +455,11 @@ async def execute(args: dict) -> str:
     try:
         # 0) 美股指数（09-20）：道指/标普/纳指/罗素 → 新浪美股日线（精确收盘点位）
         if _us_index_targets(query):
+            # 0a) 含「现在/实时/盘中」→ 先走 gb_ 活源（09-28：int_ 冻结源事故）
+            if any(k in query for k in _US_RT_KW):
+                rt = await _query_us_realtime(query)
+                if rt and "失败" not in rt and "拒用" not in rt:
+                    return rt + "\n\n（以上为盘中实时；历史收盘点位见下）"
             r = await _query_us_index(query)
             if r and "查询失败" not in r:
                 return r
@@ -396,12 +489,18 @@ async def execute(args: dict) -> str:
         r = await _query_a_share_spot(query)
         if "未找到" in r:
             r += ("\n\n💡 免费接口提示：ak_finance 只支持具体标的（个股/指数/单板块）。"
-                  "全市场汇总或模糊板块排行请改用 tavily_search；"
+                  "全市场汇总或模糊板块排行请改用 **mx_query（妙想）**；"
                   "个股请带 6 位代码（如 '600519 今日行情'）。"
-                  "东财接口偶发拒绝连接，重试一次可能成功。")
+                  "东财部分接口对本机持续拒连，重试无效。")
         return r
     except Exception as e:
-        return f"Error: 金融数据查询失败: {type(e).__name__}: {e}\n💡 接口偶发拒绝连接（东财风控），重试一次或改用 tavily_search。"
+        # 文案必须是真话（2026-09-26 实测 + 09-29 复发）：东财板块/汇总类接口对本机
+        # 是**接口级持续拒连**（同主机 K线/日线 200，clist 一类必挂），"偶发、重试
+        # 一次"是错的，重试只会再撞一次。行情的正确替补是 mx_query（妙想，数据源
+        # 不同、不受此接口影响）；tavily 只能给新闻口径的数字，不能给实时行情。
+        return (f"Error: 金融数据查询失败: {type(e).__name__}: {e}\n"
+                "💡 东财该接口对本机持续拒绝连接（非偶发，重试无效）。"
+                "行情数据请改用 **mx_query（妙想）**；只有新闻/报道口径才用 tavily_search。")
 
 
 if __name__ == "__main__":

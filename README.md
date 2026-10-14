@@ -68,7 +68,10 @@ The agent loop streams its thinking and tool activity in real time via SSE — t
 
 Get the latest release from [GitHub Releases](https://github.com/RenYiX0620/Latiao/releases) — or the China mirror on [Gitee Releases](https://gitee.com/ryxo00/Latiao/releases) (much faster in mainland China).
 
-**macOS**: double-click the `.dmg`, drag `Latiao.app` into `Applications`, launch. If Gatekeeper blocks the unsigned app: right-click → Open.
+**macOS — first launch** (the app isn't notarized yet, so macOS blocks it once):
+1. Double-click the `.dmg`, drag `Latiao.app` into `Applications`.
+2. **On macOS 15 and later, "right-click → Open" no longer works.** Open **System Settings → Privacy & Security**, scroll to the **Security** section, click **Open Anyway**, then confirm with your password.
+3. Terminal users can skip the dialog: `xattr -dr com.apple.quarantine /Applications/Latiao.app` — browser downloads carry a quarantine flag, installs via Homebrew or `curl` do not.
 
 **Windows**: run the `setup.exe` installer. If SmartScreen warns: "More info" → "Run anyway".
 

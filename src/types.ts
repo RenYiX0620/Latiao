@@ -51,11 +51,14 @@ export interface IdentityFile {
   content: string;
 }
 
-export type ViewId = "chat" | "models" | "tools" | "skills" | "cron" | "channels" | "agents" | "settings" | "logs";
+export type ViewId = "chat" | "models" | "tools" | "skills" | "cron" | "channels" | "agents" | "usage" | "settings" | "logs";
 
 export interface CloudModel {
   name: string;
-  key: string;
+  /** 仅在用户刚输入、尚未保存时短暂存在；列表加载后不应持有明文 key */
+  key?: string;
+  /** 服务端是否已存 key（UI 用「已保存/未设置」展示，不回读明文） */
+  has_key?: boolean;
   endpoint: string;
   protocol?: string;
   max_tokens?: number;
@@ -107,6 +110,8 @@ export interface LLMStatus {
   port: number;
   message: string;
   has_image_support: boolean;
+  /** 识图提示：目录里有 mmproj 却没挂上时后端给的"怎么修"文案（2026-09-27） */
+  mmproj_hint?: string;
   token_limit: number;
   platform?: string;
   gpu_layers?: number;

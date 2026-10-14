@@ -1,6 +1,6 @@
 """文本质量守卫：复读检测/截尾、去重、元收尾与工具幻觉识别、think 围栏过滤。"""
-import re
 import logging
+import re
 
 logger = logging.getLogger("latiao-sidecar")
 

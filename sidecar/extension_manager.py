@@ -23,11 +23,11 @@ import json
 import logging
 import os
 import re
+import shutil
+import tempfile
 import threading
 import time
 import uuid
-import shutil
-import tempfile
 import zipfile
 from pathlib import Path
 
@@ -168,18 +168,17 @@ def _download(url: str) -> bytes:
         else:
             url = f"https://codeload.github.com/{owner}/{repo}/zip/refs/heads/main"
     with httpx.Client(timeout=15, follow_redirects=True) as client:
-        try:
-            resp = client.get(url)
-            resp.raise_for_status()
-        except Exception:
-            # 镜像兜底：raw.githubusercontent -> jsDelivr
-            import re as _re
-            _m = _re.match(r"https://raw\.githubusercontent\.com/([^/]+)/([^/]+)/main/(.+)$", url)
-            murl = ("https://cdn.jsdelivr.net/gh/%s/%s@main/%s" % _m.groups()) if _m else ""
-            if not murl:
-                raise
-            resp = client.get(murl)
-            resp.raise_for_status()
+        last_err: Exception | None = None
+        for cand in _url_candidates(url):
+            try:
+                resp = client.get(cand)
+                resp.raise_for_status()
+                break
+            except Exception as e:      # 逐候选回退（含 gh-proxy 镜像）
+                last_err = e
+                logger.info("扩展包候选不可达，换下一个: %s（%s）", cand[:70], e)
+        else:
+            raise last_err or RuntimeError("所有候选 URL 都失败")
         data = resp.content
     # GitHub codeload zip 是仓库整体包：若指定了子目录，需要裁剪
     if m and subdir:
@@ -267,6 +266,22 @@ def _extract_and_validate(zip_bytes: bytes, tmp: Path) -> tuple[Path | None, dic
     has_content = any((pkg_root / f).exists() for f in ("plugin.py", "skills", "agents"))
     if not has_content:
         return None, {}, {"status": "error", "message": "扩展包没有任何内容（plugin.py/skills/agents）"}
+    # 安装前 AST 静态审查（P0）：plugin.py 落盘后会被 tool_system.exec_module 加载执行。
+    # 只拦**安全类**问题（禁调用/语法错误）；NAME/DEFINITION/PERMISSION 缺失是风格约定。
+    plugin_py = pkg_root / "plugin.py"
+    if plugin_py.exists():
+        try:
+            from plugin_creator import validate_plugin_code
+            v = validate_plugin_code(plugin_py.read_text("utf-8", errors="ignore"))
+            sec_errors = [e for e in (v.get("errors") or [])
+                          if ("禁止的调用" in e) or ("语法错误" in e)]
+            if sec_errors:
+                return None, {}, {
+                    "status": "error",
+                    "message": "扩展包 plugin.py 未通过静态安全审查: " + "; ".join(sec_errors),
+                }
+        except Exception as e:
+            return None, {}, {"status": "error", "message": f"扩展包代码审查失败: {e}"}
     return pkg_root, {**manifest, "name": name, "version": version, "permissions": perms}, None
 
 
@@ -484,13 +499,41 @@ def confirm_install(pending_id: str, digest: str, label: str = "") -> dict:
 
 
 # ── 市场（Phase 2a）──
-# jsDelivr CDN 国内可达；raw.githubusercontent 常被屏蔽。fetch 内自动 fallback。
 DEFAULT_MARKETPLACE = "https://cdn.jsdelivr.net/gh/RenYiX0620/latiao-marketplace@main/marketplace.json"
-# 扩展 zip 下载同理：source.url 是 jsDelivr 链接，raw 版本兜底
-MIRROR_SUFFIXES = (
-    ("cdn.jsdelivr.net/gh/", "raw.githubusercontent.com/"),
-)
-_ZIP_URL_RE = __import__("re").compile(r"cdn\.jsdelivr\.net/gh/([^/]+)/([^/]+)@main/(.+)$")
+
+# 可达性回退链（2026-10-13 实测修正）。此前只有"jsDelivr ↔ raw 互相兜底"这一对，
+# 而**本机这两条都不可达**（jsDelivr 连接直接 reset、raw 502）→ 官方市场永远拉不到
+# （用户实测"扩展市场搜不到东西"）。实测可用的只有 gh-proxy 镜像（200）。
+# 注意 gh-proxy **只代理 GitHub 系域名**：给 jsDelivr 加前缀会 404，所以顺序必须是
+# 先做 jsDelivr→raw 改写，再给 GitHub 系主机加前缀。
+_MIRROR_PREFIXES = ("https://gh-proxy.com/",)
+_PROXYABLE_HOSTS = ("raw.githubusercontent.com", "codeload.github.com",
+                    "github.com", "api.github.com")
+# jsDelivr → raw 必须**按格式解析**（`@main` 要变 `/main/`），不能只做字符串替换
+_JSDELIVR_RE = __import__("re").compile(
+    r"cdn\.jsdelivr\.net/gh/([^/]+)/([^/@]+)@([^/]+)/(.+)$")
+_ZIP_URL_RE = _JSDELIVR_RE
+
+
+def _raw_equivalent(url: str) -> str:
+    """jsDelivr 链接 → 对应的 raw.githubusercontent 链接（不是则空串）。"""
+    m = _JSDELIVR_RE.search(url)
+    if not m:
+        return ""
+    owner, repo, ref, path = m.groups()
+    return f"https://raw.githubusercontent.com/{owner}/{repo}/{ref}/{path}"
+
+
+def _url_candidates(url: str) -> list[str]:
+    """按可达性排列的候选 URL：原址 → raw 等价物 → 镜像前缀（去重保序）。"""
+    out = [url]
+    raw = _raw_equivalent(url)
+    if raw:
+        out.append(raw)
+    for u in list(out):
+        if any(h in u for h in _PROXYABLE_HOSTS):
+            out.extend(pfx + u for pfx in _MIRROR_PREFIXES)
+    return list(dict.fromkeys(out))
 
 
 def fetch_marketplace(url: str = "", timeout: float = 6) -> dict:
@@ -499,20 +542,19 @@ def fetch_marketplace(url: str = "", timeout: float = 6) -> dict:
     url = (url or DEFAULT_MARKETPLACE).strip()
     try:
         if url.startswith(("http://", "https://")):
+            last_err: Exception | None = None
             with httpx.Client(timeout=timeout, follow_redirects=True) as client:
-                try:
-                    resp = client.get(url)
-                    resp.raise_for_status()
-                    data = resp.json()
-                except Exception:
-                    # 镜像兜底：jsDelivr -> raw.githubusercontent
-                    _m = _ZIP_URL_RE.match(url)
-                    rurl = "https://raw.githubusercontent.com/%s/%s/main/%s" % _m.groups() if _m else ""
-                    if not rurl:
-                        raise
-                    resp = client.get(rurl)
-                    resp.raise_for_status()
-                    data = resp.json()
+                for cand in _url_candidates(url):
+                    try:
+                        resp = client.get(cand)
+                        resp.raise_for_status()
+                        data = resp.json()
+                        break
+                    except Exception as e:      # 逐候选回退（jsDelivr → raw → gh-proxy 镜像）
+                        last_err = e
+                        logger.info("市场清单候选不可达，换下一个: %s（%s）", cand[:70], e)
+                else:
+                    raise last_err or RuntimeError("所有候选 URL 都失败")
         else:
             p = Path(url).expanduser()
             if not p.exists():
@@ -700,7 +742,7 @@ def list_market_sources() -> list[dict]:
     """市场源列表：内置 + 用户添加。"""
     state = _load_sources()
     user_sources = state.get("sources", [])
-    builtin = [s for s in DEFAULT_SOURCES]
+    builtin = list(DEFAULT_SOURCES)
     user_keys = {s.get("url") for s in user_sources}
     for b in builtin:
         if b["url"] in user_keys:
@@ -749,12 +791,27 @@ _SOURCE_CACHE_TTL = 600.0        # 10 分钟；主动刷新仍会走真抓取
 
 
 def _cached_source_fetch(url: str, fetcher) -> dict:
+    """带 TTL 的源抓取缓存 + **失败回退最近一次成功**（2026-10-13）。
+
+    此前失败也写进缓存、且失败时不留旧数据 → 网络一断，官方市场整块从市场里消失
+    （用户实测"搜不到官方的东西"）。现在只缓存成功结果；失败时若手里有旧的
+    **成功**结果就带着 stale 标记返回（宁愿给可能过时的清单，也不要整块消失），
+    真要什么都没有才原样返回失败。
+    """
     now = time.monotonic()
     hit = _SOURCE_CACHE.get(url)
     if hit and now - hit[0] < _SOURCE_CACHE_TTL:
         return hit[1]
     data = fetcher()
-    _SOURCE_CACHE[url] = (now, data)
+    if isinstance(data, dict) and data.get("status") == "ok":
+        _SOURCE_CACHE[url] = (now, data)
+        return data
+    if hit and isinstance(hit[1], dict) and hit[1].get("status") == "ok":
+        stale = dict(hit[1])
+        stale["stale"] = True
+        stale["stale_age_s"] = int(now - hit[0])
+        logger.warning("源不可达，回退最近一次成功缓存（%d 秒前）: %s", stale["stale_age_s"], url[:70])
+        return stale
     return data
 
 
@@ -808,6 +865,9 @@ def fetch_all_markets() -> dict:
                     for p in data.get("plugins", []):
                         p["market_source"] = src["name"]
                         _append(p)
+                    if data.get("stale"):
+                        errors.append(f"{src['name']}: 网络不可达，用的是最近一次成功缓存"
+                                      f"（{data.get('stale_age_s', '?')} 秒前，可能不是最新）")
                 else:
                     errors.append(f"{src['name']}: {data.get('message', '拉取失败')}")
             else:
@@ -847,8 +907,11 @@ def install_github_item(repo: str, skill_path: str = "", kind: str = "openclaw-s
     调用方（市场清单）若声明 expect_sha256 则必须一致；最后由用户确认时回传摘要
     （confirm_install），保证"下载的内容"与"确认安装的内容"是同一份字节。
     """
-    from adapters import (install_openclaw_skill, install_claude_plugin,
-                          parse_github_repo)
+    from adapters import (
+        install_claude_plugin,
+        install_openclaw_skill,
+        parse_github_repo,
+    )
     repo = parse_github_repo(repo)
     if not repo:
         return {"status": "error", "message": f"无法识别仓库: {repo!r}"}

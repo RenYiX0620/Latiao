@@ -75,7 +75,7 @@ def main() -> int:
         return 0
 
     written = 0
-    for topic, e in plan.items():
+    for _topic, e in plan.items():
         try:
             tool_args = json.loads(e["args"] or "{}")
         except ValueError:

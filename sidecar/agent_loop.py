@@ -13,47 +13,6 @@ import os
 import re
 from pathlib import Path
 
-
-from config import PROGRESS_DIR
-
-# ── 进度读写已拆到 agent/progress.py（2026-09-23 第一块接缝）──
-# 保留同名 re-export：api_routes（_progress_file）、main（_record_progress）与既有
-# 测试（test_language 的 _progress_tail、test_context_stats 的 monkeypatch）都按
-# agent_loop 的旧路径导入；monkeypatch agent_loop._progress_tail 依然生效，因为
-# _build_chat_messages 在本模块内按全局名查表。
-from agent.prompt_build import (  # noqa: F401  —— re-export（api_routes/main/6 个测试按旧路径导入）
-    _build_chat_messages,
-)
-from agent.session_events import (  # noqa: F401  —— re-export（旧导入路径继续可用）
-    _clear_session_cancel,
-    _EVENT_LOGS,
-    _EVENT_LOGS_LOCK,
-    _EVENT_LOGS_MAX,
-    _event_log_for,
-    _request_session_cancel,
-    _session_cancel_requested,
-)
-from agent.mcp_tools import (  # noqa: F401  —— re-export（旧导入路径继续可用）
-    _load_mcp_tools,
-    _mcp_invoke,
-    _mcp_tool_name,
-    ensure_mcp_loaded,
-)
-from agent.verify import (  # noqa: F401  —— re-export（旧导入路径继续可用）
-    _auto_verify,
-    _enhance_auto_verify,
-    _semgrep_scan,
-)
-from agent.reflection import (  # noqa: F401  —— re-export（旧导入路径继续可用）
-    _REFLECT_CHECKLISTS,
-    _find_unverified_numbers,
-    _generate_plan,
-    _reflect_output,
-)
-from agent.routing import (  # noqa: F401  —— re-export（旧导入路径继续可用）
-    _get_best_cloud_config,
-    _resolve_api_target,
-)
 from agent.confirm import (  # noqa: F401  —— re-export（旧导入路径继续可用）
     _await_tool_confirmation,
     _check_pre_hooks,
@@ -66,8 +25,51 @@ from agent.confirm import (  # noqa: F401  —— re-export（旧导入路径继
     _wait_plan_confirmation,
     _wait_tool_confirmation,
 )
+from agent.mcp_tools import (  # noqa: F401  —— re-export（旧导入路径继续可用）
+    _load_mcp_tools,
+    _mcp_invoke,
+    _mcp_tool_name,
+    ensure_mcp_loaded,
+)
+from agent.progress import (  # noqa: F401  —— re-export（兼容旧导入路径）
+    PROGRESS_FILE,  # 规范所有者在 agent.progress：进度路径只留一份定义
+    _clean_progress_tail,
+    _progress_file,
+    _progress_tail,
+    _record_progress,
+    _rotate_progress_file,
+)
+
+# ── 进度读写已拆到 agent/progress.py（2026-09-23 第一块接缝）──
+# 保留同名 re-export：api_routes（_progress_file）、main（_record_progress）与既有
+# 测试（test_language 的 _progress_tail、test_context_stats 的 monkeypatch）都按
+# agent_loop 的旧路径导入；monkeypatch agent_loop._progress_tail 依然生效，因为
+# _build_chat_messages 在本模块内按全局名查表。
+from agent.prompt_build import (  # noqa: F401  —— re-export（api_routes/main/6 个测试按旧路径导入）
+    _build_chat_messages,
+)
+from agent.reflection import (  # noqa: F401  —— re-export（旧导入路径继续可用）
+    _REFLECT_CHECKLISTS,
+    _find_unverified_numbers,
+    _generate_plan,
+    _reflect_output,
+)
+from agent.routing import (  # noqa: F401  —— re-export（旧导入路径继续可用）
+    _get_best_cloud_config,
+    _resolve_api_target,
+)
+from agent.session_events import (  # noqa: F401  —— re-export（旧导入路径继续可用）
+    _EVENT_LOGS,
+    _EVENT_LOGS_LOCK,
+    _EVENT_LOGS_MAX,
+    _clear_session_cancel,
+    _event_log_for,
+    _request_session_cancel,
+    _session_cancel_requested,
+)
 from agent.tool_exec import (  # noqa: F401  —— re-export（旧导入路径继续可用）
     _dispatch_delegate,
+    _dispatch_update_todos,
     _dispatch_use_skill,
     _get_agent_tools,
     _handle_tool_execution,
@@ -76,17 +78,106 @@ from agent.tool_exec import (  # noqa: F401  —— re-export（旧导入路径�
     _stamp_time_sensitive,
     execute_tool,
 )
-from agent.progress import (  # noqa: F401  —— re-export（兼容旧导入路径）
-    PROGRESS_FILE,        # 规范所有者在 agent.progress：进度路径只留一份定义
-    _clean_progress_tail,
-    _progress_file,
-    _progress_tail,
-    _record_progress,
-    _rotate_progress_file,
+from agent.verify import (  # noqa: F401  —— re-export（旧导入路径继续可用）
+    _auto_verify,
+    _enhance_auto_verify,
+    _semgrep_scan,
 )
+from config import PROGRESS_DIR
+
 AGENTS_FILE = PROGRESS_DIR / "agents.json"
 CONFIG_FILE = PROGRESS_DIR / "config.json"
 
+from agent.context import (  # noqa: F401
+    _ANTHROPIC_HINTS,
+    _CHAT_MARKERS,
+    _FORCED_REASONING,
+    _INLINED_FILE_RE,
+    _MARKET_TASK_RE,
+    _NATIVE_COMPLETION_CHECK_PROMPT,
+    _NATIVE_FOLLOWUP_PROMPT,
+    _NATIVE_LEAN_PROMPT,
+    _TASK_KW,
+    _TRANSIENT_REMINDER_MARKERS,
+    AUTO_EDIT_TOOLS,
+    INTENT_PATTERNS,
+    TOOL_CATEGORIES,
+    _candidate_tool_names,
+    _cap_tools,
+    _check_access,
+    _detect_user_language,
+    _ensure_market_tools,
+    _extract_last_user_text,
+    _filter_tools,
+    _filter_tools_by_access,
+    _get_localized_text,
+    _inject_image,
+    _inject_thinking_disabled,
+    _is_chat_query,
+    _is_light_query,
+    _local_native_tools_ok,
+    _maybe_add_inline_file_note,
+    _merge_system_messages,
+    _NativeToolsUnsupported,
+    _normalize_access,
+    _recover_tool_name,
+    _resolve_max_tokens,
+    _sanitize_tool_messages,
+    _slim_history_for_local,
+    _strip_transient_reminders,
+    detect_language_decision,
+    subagent_tool_gate,
+)
+from agent.gates import (  # noqa: F401
+    _LANG_RETRY_HINT,
+    _PENDING_INTENT_PATTERNS,
+    _PLANNING_SIGNALS,
+    _build_local_tools_prompt,
+    _ensure_final_language,
+    _ensure_final_language_with_retry,
+    _final_answer_extraction,
+    _force_translate,
+    _looks_like_planning,
+    _reply_lang_mismatch,
+    _strip_nonprose_for_lang,
+)
+from agent.parsing import (  # noqa: F401
+    _NATIVE_CONTROL_RE,
+    _NATIVE_TOOL_RE,
+    _append_loop_log,
+    _gemma_args_to_json,
+    _parse_delta_line,
+    _parse_kv_args,
+    _parse_native_tool_calls,
+    _parse_prompt_tool_calls,
+    _salvage_tool_args,
+    _strip_native_tool_calls,
+)
+from agent.text_quality import (  # noqa: F401
+    _THINK_FENCE_RE,
+    _deduplicate_response,
+    _detect_text_loop,
+    _extract_magnitude_numbers,
+    _extract_think_body,
+    _find_unsourced_numbers,
+    _GenerationLoopError,
+    _is_meta_wrapup,
+    _looks_like_tool_fantasy,
+    _strip_repeat_tail,
+    _strip_think_fences,
+    _ThinkFenceFilter,
+)
+
+# ── Stage 1 拆分：实现移至 agent/ 包（兼容导入，既有引用继续可用）──
+from agent.transport import (  # noqa: F401
+    _is_local_llm_url,
+    _local_llm_serialized,
+    _local_llm_stream,
+    _safe_cwd,
+    _verify_llm_health,
+    clear_llm_suspect,
+    mark_llm_suspect,
+)
 from cron import _create_cron
 from identity import _load_agent_identity
 from tool_executor import (
@@ -96,46 +187,6 @@ from tool_executor import (
 )
 from tool_system import load_plugins
 
-# ── Stage 1 拆分：实现移至 agent/ 包（兼容导入，既有引用继续可用）──
-from agent.transport import (  # noqa: F401
-    _is_local_llm_url, _local_llm_serialized, _local_llm_stream,
-    _safe_cwd, _verify_llm_health, clear_llm_suspect, mark_llm_suspect,
-)
-from agent.parsing import (  # noqa: F401
-    _NATIVE_CONTROL_RE, _NATIVE_TOOL_RE, _append_loop_log,
-    _gemma_args_to_json, _parse_delta_line, _parse_kv_args,
-    _parse_native_tool_calls, _parse_prompt_tool_calls, _salvage_tool_args,
-    _strip_native_tool_calls,
-)
-from agent.text_quality import (  # noqa: F401
-    _GenerationLoopError, _THINK_FENCE_RE, _ThinkFenceFilter, _deduplicate_response,
-    _detect_text_loop, _extract_magnitude_numbers, _extract_think_body,
-    _find_unsourced_numbers, _is_meta_wrapup, _looks_like_tool_fantasy,
-    _strip_repeat_tail, _strip_think_fences,
-)
-from agent.context import (  # noqa: F401
-    AUTO_EDIT_TOOLS, INTENT_PATTERNS, TOOL_CATEGORIES,
-    _ANTHROPIC_HINTS, _CHAT_MARKERS, _FORCED_REASONING, _INLINED_FILE_RE,
-    _MARKET_TASK_RE, _NATIVE_COMPLETION_CHECK_PROMPT,
-    _NATIVE_FOLLOWUP_PROMPT, _NATIVE_LEAN_PROMPT, _NativeToolsUnsupported,
-    _TASK_KW, _TRANSIENT_REMINDER_MARKERS, _cap_tools, _candidate_tool_names,
-    _check_access, _detect_user_language, _ensure_market_tools,
-    detect_language_decision,
-    _extract_last_user_text, _filter_tools, _filter_tools_by_access,
-    _get_localized_text, _inject_image, _inject_thinking_disabled,
-    _is_chat_query, _is_light_query, _local_native_tools_ok,
-    _maybe_add_inline_file_note, _merge_system_messages, _normalize_access,
-    subagent_tool_gate,
-    _recover_tool_name, _resolve_max_tokens, _sanitize_tool_messages,
-    _slim_history_for_local, _strip_transient_reminders,
-)
-from agent.gates import (  # noqa: F401
-    _LANG_RETRY_HINT, _PENDING_INTENT_PATTERNS, _PLANNING_SIGNALS,
-    _build_local_tools_prompt, _ensure_final_language,
-    _ensure_final_language_with_retry, _final_answer_extraction,
-    _force_translate, _looks_like_planning, _reply_lang_mismatch,
-    _strip_nonprose_for_lang,
-)
 # 不可信内容防护（09-21）：工具结果注入扫描 + 身份文件读取护栏
 
 
@@ -299,7 +350,7 @@ _delegate_tool_def = {
             "type": "object",
             "properties": {
                 "agent": {"type": "string", "enum": ["explore", "code-reviewer", "doc-generator", "debugger", "translator"], "description": "The specialist agent type."},
-                "task": {"type": "string", "description": "The specific task for the sub-agent. Be clear and concise."},
+                "task": {"type": "string", "description": "Self-contained task description — the sub-agent CANNOT see your conversation, so include: (1) the goal, (2) key context it needs (file paths, known facts, what you already tried), (3) the expected output format (e.g. 'list file:line for each finding'). Be specific, not just brief."},
                 "background": {"type": "boolean", "description": "Run in background without blocking the main conversation. Progress appears in the sub-agent panel. Use background=true for long-running work (research, multi-directory scans, >1min) — the result will be automatically delivered back to you when done. Default false."},
             },
             "required": ["agent", "task"],
@@ -313,6 +364,39 @@ if not any(t.get("function", {}).get("name") == "delegate_task" for t in TOOLS):
 
 TOOL_DISPATCH["delegate_task"] = _dispatch_delegate
 TOOL_PERMISSIONS["delegate_task"] = "safe"
+
+# 任务清单（todo 面板，2026-10-04）：多步任务的可视化进度。
+# 照 delegate_task 的"内建工具"模式；存储/快照在 todos.py，渲染走心跳轮询。
+_update_todos_tool_def = {
+    "type": "function",
+    "function": {
+        "name": "update_todos",
+        "description": "Maintain a short task checklist so the user can see progress on multi-step work. Call it when the task needs 3+ distinct steps; skip it for simple one-shot requests. Rules: mark a step in_progress BEFORE starting it, mark completed immediately when done, and add newly discovered follow-up steps as you go. Keep it short — one line per step, max ~8 steps.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "todos": {
+                    "type": "array",
+                    "description": "The full checklist (replaces the previous one).",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "step": {"type": "string", "description": "Short imperative step description."},
+                            "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
+                        },
+                        "required": ["step", "status"],
+                    },
+                },
+            },
+            "required": ["todos"],
+        },
+    },
+}
+if not any(t.get("function", {}).get("name") == "update_todos" for t in TOOLS):
+    TOOLS.append(_update_todos_tool_def)
+
+TOOL_DISPATCH["update_todos"] = _dispatch_update_todos
+TOOL_PERMISSIONS["update_todos"] = "safe"
 # 描述补充 background 参数（模型需要知道才能用）
 
 _create_cron_def = {

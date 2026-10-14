@@ -68,7 +68,10 @@ Agent 通过 SSE 实时流式输出思考和执行过程——思考行、工具
 
 从 [GitHub Releases](https://github.com/RenYiX0620/Latiao/releases) 下载最新版；国内用户推荐 [Gitee Releases](https://gitee.com/ryxo00/Latiao/releases) 镜像（下载快得多）。
 
-- **macOS**：双击 `.dmg`，拖 `Latiao.app` 进应用程序。未签名应用被拦时：右键 → 打开。
+- **macOS 首次打开**（应用尚未公证，macOS 只会拦这一次）：
+  1. 双击 `.dmg`，把 `Latiao.app` 拖进「应用程序」。
+  2. **macOS 15 起「右键 → 打开」已失效**。请打开 **系统设置 → 隐私与安全性**，在**「安全性」**一栏点**「仍要打开」**，输入密码确认。
+  3. 终端用户可直接执行 `xattr -dr com.apple.quarantine /Applications/Latiao.app` 跳过弹窗——浏览器下载的文件带"隔离"标记才会弹窗，用 Homebrew 或 `curl` 安装的不带标记。
 - **Windows**：运行 `setup.exe` 安装。SmartScreen 提示时选"更多信息 → 仍要运行"。
 
 **不需要装 Python、Node.js 或任何依赖。下载即用。**

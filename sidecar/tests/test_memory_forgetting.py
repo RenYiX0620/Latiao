@@ -190,3 +190,52 @@ async def test_skill_synthesis_uses_resolved_endpoint(mem, monkeypatch):
             f"请求发到了 {seen_urls[0]}（写死端点的老毛病）"
     else:
         pytest.fail("没有发出请求——合成路径没跑到（阈值/前缀条件要跟实现保持一致）")
+
+
+class TestTransientToolErrorTTL:
+    """瞬态工具报错学习的 TTL（2026-09-29 事故：9-23 的「mx_query 当日额度用完」
+    学习 6 天后被召回，模型信以为真绕开 mx_query → ak_finance 撞墙）。
+    瞬态失败（额度/限流/网络）隔天就是谎言；结构性失败（不支持某查询）是长期知识。"""
+
+    def _mk(self, mem, content, days_ago):
+        db, memory = mem
+        conn = db._get_db()
+        from datetime import datetime, timedelta
+        ts = (datetime.now() - timedelta(days=days_ago)).isoformat()
+        conn.execute(
+            "INSERT INTO learnings(id, session_id, topic, content, confidence, source_type, created_at, updated_at)"
+            " VALUES(?,?,?,?,?,?,?,?)",
+            (f"l-{abs(hash(content))%10**8}", "s", "t", content, 0.6, "extracted", ts, ts),
+        )
+        conn.commit()
+
+    def test_stale_quota_learning_not_injected_and_deleted(self, mem):
+        self._mk(mem, "mx_query(query=半导体板块 资金流向) 失败：工具 mx_query 执行出错，"
+                       "可能需要重试或调整参数｜特征：Error: mx_query 免费版当日调用次数已用完（150 次/日）", 6)
+        db, memory = mem
+        rows = memory._retrieve_relevant_learnings("半导体板块 资金流向 查询", limit=5)
+        assert all("调用次数已用完" not in r["content"] for r in rows), "过期额度学习必须被过滤"
+        n = db._get_db().execute(
+            "SELECT COUNT(*) FROM learnings WHERE content LIKE '%调用次数已用完%'").fetchone()[0]
+        assert n == 0, "过期瞬态学习应从库里清掉"
+
+    def test_fresh_transient_learning_still_injected(self, mem):
+        self._mk(mem, "mx_query(query=x) 失败：工具 mx_query 执行出错｜特征：Error: mx_query 免费版当日调用次数已用完", 0)
+        db, memory = mem
+        rows = memory._retrieve_relevant_learnings("mx_query 查询 失败", limit=5)
+        assert any("调用次数已用完" in r["content"] for r in rows), "24h 内的瞬态学习仍然有效"
+
+    def test_structural_failure_survives(self, mem):
+        self._mk(mem, "mx_query(query=贵金属板块行情) 失败：查询未返回数据。本工具仅支持 A股/港股/基金/板块/指数，美股请改用其它工具", 30)
+        db, memory = mem
+        rows = memory._retrieve_relevant_learnings("贵金属 行情 查询", limit=5)
+        assert any("未返回数据" in r["content"] for r in rows), "结构性失败是长期知识，不过期"
+
+    def test_network_failure_expired_cleaned(self, mem):
+        self._mk(mem, "ak_finance(query=板块) 失败：工具 ak_finance 执行出错｜特征："
+                      "Error: 金融数据查询失败: ConnectionError: RemoteDisconnected", 3)
+        db, memory = mem
+        memory._retrieve_relevant_learnings("板块 查询 失败", limit=5)
+        n = db._get_db().execute(
+            "SELECT COUNT(*) FROM learnings WHERE content LIKE '%RemoteDisconnected%'").fetchone()[0]
+        assert n == 0, "过期网络报错学习也应被清掉"

@@ -5,8 +5,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from agent_loop import _build_chat_messages, _detect_user_language, _progress_tail
 from agent.context import detect_language_decision as _detect_lang_decision
+from agent_loop import _build_chat_messages, _detect_user_language, _progress_tail
 
 
 class TestDetectUserLanguage(unittest.TestCase):
@@ -87,6 +87,28 @@ class TestLanguageAnchor(unittest.TestCase):
         sys_content = _build_chat_messages(body, body["messages"])[0]["content"]
         self.assertNotIn("覆盖下方所有语言规则", sys_content)
 
+    def test_anchor_has_explicit_other_language_exception(self):
+        """显式要求别的语言时要写纯该语言（09-28：标题「英文版」正文 466 汉字那个 bug）。
+
+        锚此前是"全程必须用 X 语言"的无条件指令，用户明确要英文版也被它压回中文。
+        例外条款必须四语齐备，且默认口径不变（否则会退回 09-19 的漂移问题）。
+        """
+        markers = [
+            ("读取这个文件", "明确要求"),
+            ("read this file for me", "explicitly asks"),
+            ("このファイルを読んで", "明示的"),
+            ("прочитай этот файл", "явно просит"),
+        ]
+        for text, marker in markers:
+            body = {"messages": [{"role": "user", "content": text}]}
+            sys_content = _build_chat_messages(body, body["messages"])[0]["content"]
+            self.assertIn(marker, sys_content, f"{text!r} 的语言锚缺少例外条款（{marker}）")
+
+        body = {"messages": [{"role": "user", "content": "读取这个文件"}]}
+        sys_content = _build_chat_messages(body, body["messages"])[0]["content"]
+        self.assertIn("不夹杂中文", sys_content)      # 用户要的硬口径
+        self.assertIn("一律用简体中文", sys_content)  # 默认仍是中文（防漂移）
+
 
 class TestRussianSupport(unittest.TestCase):
     def test_russian_detected(self):
@@ -97,7 +119,7 @@ class TestRussianSupport(unittest.TestCase):
         self.assertIn("русском", lang_retry_hint("ru"))
         body = {"messages": [{"role": "user", "content": "прочитай файл"}]}
         sys_content = _build_chat_messages(body, body["messages"])[0]["content"]
-        self.assertIn("Три жёстких правила", sys_content)   # 俄语硬规则，而非回落中文
+        self.assertIn("Четыре жёстких правила", sys_content)   # 俄语四条硬规则（含承诺闸门），而非回落中文
 
     def test_retry_hint_languages(self):
         from agent.gates import lang_retry_hint
@@ -187,6 +209,7 @@ def test_translation_request_disables_thinking():
     """翻译请求必须关思考：实测开思考时 6867 字推理吃掉 55s（客户端超时 60s），
     关掉后同一段文本 6.4s。这条用源码断言钉住，防止有人把开关删了。"""
     import pathlib
+
     import agent.gates as gates
     src = pathlib.Path(gates.__file__).read_text("utf-8")
     idx = src.index("_tb = {\"model\": engine_model")
@@ -210,6 +233,7 @@ def test_language_requirement_is_the_last_line(monkeypatch, tmp_path):
     """
     monkeypatch.setenv("LATIAO_TEST_PROGRESS_DIR", str(tmp_path / ".local-ai-os"))
     import importlib
+
     import config
     importlib.reload(config)
     import agent.prompt_build as PB
@@ -224,6 +248,7 @@ def test_language_requirement_is_the_last_line(monkeypatch, tmp_path):
 def test_language_requirement_follows_user_language(monkeypatch, tmp_path):
     monkeypatch.setenv("LATIAO_TEST_PROGRESS_DIR", str(tmp_path / ".local-ai-os"))
     import importlib
+
     import config
     importlib.reload(config)
     import agent.prompt_build as PB
@@ -231,3 +256,73 @@ def test_language_requirement_follows_user_language(monkeypatch, tmp_path):
     out = PB._build_chat_messages(body, list(body["messages"]))
     tail = _tail_of(out)
     assert "English" in tail and "简体中文" not in tail, f"英文用户不该被要求中文：{tail[-160:]!r}"
+
+
+class TestLinkVerificationRule(unittest.TestCase):
+    """链接实测规则（2026-09-29）：实测事故——一篇讲 A 项目的文章末尾地址指向
+    完全无关的项目（Tencent/WeKnora），读者照着走白忙。四语硬规则都要有。"""
+
+    def test_all_langs_have_link_rule(self):
+        cases = [
+            ("读取这个文件", "链接必须实测"),
+            ("read this file for me", "Verify every link"),
+            ("このファイルを読んで", "リンクは必ず実測"),
+            ("прочитай этот файл", "Проверяй каждую ссылку"),
+        ]
+        for text, marker in cases:
+            body = {"messages": [{"role": "user", "content": text}]}
+            sys_content = _build_chat_messages(body, body["messages"])[0]["content"]
+            self.assertIn(marker, sys_content, f"{text!r} 的硬规则缺少链接实测条款")
+
+
+class TestFinalizeToneInjection(unittest.TestCase):
+    """终答轮指令带语气（2026-09-29）：表格型长回答漂回中性——抽样实测同模型同一天
+    一次带语气一次不带。头部身份块与每轮尾注都盖不到终答轮这条尾部指令。"""
+
+    def test_tone_appended_when_present(self):
+        from agent.loop import _finalize_tail_directive
+        out = _finalize_tail_directive("zh", "暧昧露骨")
+        self.assertIn("收尾", out)
+        self.assertIn("暧昧露骨", out)
+        self.assertLess(out.index("收尾"), out.index("暧昧露骨"), "语气行应在收口令之后同一尾部")
+
+    def test_no_tone_no_extra_line(self):
+        from agent.loop import _finalize_tail_directive
+        self.assertEqual(_finalize_tail_directive("zh", ""), _finalize_tail_directive("zh"))
+
+    def test_tone_line_localized(self):
+        from agent.loop import _finalize_tail_directive
+        for lang, marker in (("en", "Tone for this reply"), ("ja", "トーン"), ("ru", "Тон")):
+            self.assertIn(marker, _finalize_tail_directive(lang, "x"),
+                          f"{lang} 语气行未本地化")
+
+    def test_current_tone_reads_soul(self):
+        from agent.prompt_build import current_tone
+        self.assertIsInstance(current_tone(), str)
+
+
+class TestNameFallbackLadder(unittest.TestCase):
+    """「名称不存在时的退路」四语齐备（2026-09-30）。
+
+    事故背景：问"超节点/超算中心 涨跌幅 资金流向"，mx_query 两次空返回（这两个名字不在
+    东财标的库里，正式板块是「算力概念」「液冷服务器」），而错误文案把它导向"换个板块名
+    再查" → 模型在同义名之间打转。提示词里补一条阶梯：正式板块名 → 产业链个股 → tavily
+    搜新闻并注明无结构化数据；本测试保证四语都写进去了（漏一语的症状是那种语言用户
+    得不到这条退路，属于静默降级）。
+    """
+
+    PROBES = {
+        "zh": ("今天超节点板块怎么样", "名称不存在时的退路"),
+        "en": ("How is the supernode sector today", "When a name does not exist"),
+        "ja": ("今日の相場はどうですか", "名称が存在しない場合"),
+        "ru": ("Как дела у рынка сегодня", "Если названия нет в базе"),
+    }
+
+    def test_ladder_present_in_all_languages(self):
+        from agent.prompt_build import _build_chat_messages
+        for lang, (msg, probe) in self.PROBES.items():
+            with self.subTest(lang=lang):
+                msgs = _build_chat_messages({"session_id": "t"},
+                                            [{"role": "user", "content": msg}])
+                blob = "".join(str(m.get("content") or "") for m in msgs)
+                self.assertIn(probe, blob, f"{lang} 缺少「名称不存在时的退路」阶梯")

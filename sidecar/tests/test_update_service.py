@@ -30,6 +30,12 @@ class TestUpdateService(unittest.TestCase):
         us.UPDATE_DIR = Path(self._tmp.name) / "update"
         us.STATE_FILE = us.UPDATE_DIR / "state.json"
         us._state.clear()
+        # 模块级下载线程引用必须每例复位（2026-10-09 实测）：前序用例把
+        # _download_thread 留成 mock 后，.is_alive() 恒真 → start_prepare 会在
+        # 最开头"已在跑"处直接返回，后面的状态机分支一条都进不去
+        # （单独跑绿、全量红）。
+        self._old_thread = us._download_thread
+        us._download_thread = None
         # 真实文件 IO（mkdir/write/replace）在 CI/tmp 环境偶发挂起 →
         # 状态机测试 mock 落盘层，仅验证内存状态流转
         self._io_patcher = mock.patch.object(us, "_save_state", lambda state=None: us._state.update(state or {}))
@@ -43,6 +49,7 @@ class TestUpdateService(unittest.TestCase):
         self._load_patcher.stop()
         us.UPDATE_DIR = self._old_dir
         us.STATE_FILE = self._old_state
+        us._download_thread = self._old_thread
         self._tmp.cleanup()
 
     def test_version_compare(self):
@@ -101,6 +108,41 @@ class TestUpdateService(unittest.TestCase):
         self.assertEqual(st["status"], "up_to_date")
 
     @mock.patch("threading.Thread")
+    def test_resume_selfheals_when_package_complete(self, mock_thread):
+        """下载残留下、目标包其实已完整 → 自愈为 done，不再白续 324MB（2026-10-09）。
+
+        现场：GitHub 下载第 1 次中断（11%）后进程退出，状态残留 downloading；
+        目标包已由官方渠道补齐（大小 == state.total）。旧逻辑下次启动会从 11%
+        续传——白下一整个 324MB。"""
+        mock_thread.side_effect = lambda target=None, daemon=None: (target(), mock.MagicMock())[1]
+        us.UPDATE_DIR.mkdir(parents=True, exist_ok=True)
+        pkg = us.UPDATE_DIR / "Latiao_0.3.6_x64-setup.exe"
+        pkg.write_bytes(b"x" * 100)                      # 完整包（大小 == total）
+        (us.UPDATE_DIR / "Latiao_0.3.6_x64-setup.exe.part").write_bytes(b"partial" * 5)
+        us._save_state({"status": "downloading", "version": "0.3.6", "total": 100,
+                        "url": "https://x/Latiao_0.3.6_x64-setup.exe"})
+        st = us.start_prepare("0.3.4")
+        self.assertEqual(st["status"], "done", "完整包在位时必须自愈为 done")
+        self.assertFalse((us.UPDATE_DIR / "Latiao_0.3.6_x64-setup.exe.part").exists(),
+                         ".part 残片应被清掉")
+
+    @mock.patch("threading.Thread")
+    @mock.patch.object(us, "fetch_remote_manifest", return_value=None)
+    def test_prepare_done_survives_manifest_failure(self, mock_fetch, mock_thread):
+        """包已下完、但远端清单拉不到 → 状态必须保持 done（2026-10-09 用户实测）。
+
+        早先 done 分支拉不到远端时不 return、落到 worker；worker 开头把状态改成
+        checking，于是"保留既有 done"的判断恒假 → 包下完了却被写成 failed，
+        界面报"更新失败"（用户更新 v0.3.73 时正是这个链路）。"""
+        mock_thread.side_effect = lambda target=None, daemon=None: (
+            target(), mock.MagicMock())[1]
+        us._save_state({"status": "done", "version": "0.3.6",
+                        "url": "https://x/a.tar.gz", "signature": "s"})
+        st = us.start_prepare("0.3.4")
+        self.assertEqual(st["status"], "done",
+                         "拉不到远端清单时必须保留 done，不得改写成 failed")
+
+    @mock.patch("threading.Thread")
     @mock.patch.object(us, "_download_worker")
     @mock.patch.object(us, "fetch_remote_manifest")
     def test_prepare_starts_download_for_newer(self, mock_manifest, mock_dl, mock_thread):
@@ -124,6 +166,203 @@ class TestUpdateService(unittest.TestCase):
         p = us.get_progress()
         self.assertEqual(p["downloaded"], 42)
         self.assertEqual(p["total"], 100)
+
+
+class TestDigestVerification(TestUpdateService):
+    """更新包校验（2026-10-11 审计修复）：镜像可换包，下载/自愈都必须验。
+
+    继承 TestUpdateService 的 setUp（UPDATE_DIR/STATE_FILE 重定向 + 落盘 mock）
+    ——**这是我上一版犯过的错**：独立写一个不隔离的测试类，直接落盘到真机
+    state.json，把假状态写进用户更新目录（用户随后看到"下载中 天文数字%"）。
+    """
+
+
+    def test_sha256_file_matches_hashlib(self):
+        import hashlib
+        import tempfile
+        from pathlib import Path
+
+        import update_service as us
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / "x.bin"
+            f.write_bytes(b"hello world")
+            want = "sha256:" + hashlib.sha256(b"hello world").hexdigest()
+            self.assertEqual(us._sha256_file(f), want)
+
+    def test_fetch_digest_missing_version_returns_empty(self):
+        import update_service as us
+        self.assertEqual(us._fetch_expected_digest("", "a.tar.gz"), "")
+
+    def test_download_verifies_and_rejects_tampered_part(self):
+        """下载完成时校验不过 → failed + integrity=mismatch + 坏包删除。"""
+        import tempfile
+        from pathlib import Path
+
+        import update_service as us
+
+        class _Resp:
+            def __init__(self, body): self._b = body; self._done = False
+            def read(self, n=-1):
+                if self._done or not self._b:
+                    return b""          # 读完必须返回空，否则下载循环永不结束
+                self._done = True
+                return self._b
+            def getheader(self, k, d=None): return str(len(self._b))
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        with tempfile.TemporaryDirectory() as d:
+            dest = Path(d) / "pkg.tar.gz"
+            part = dest.with_suffix(dest.suffix + ".part")
+            calls = {"n": 0}
+            def _open(req, timeout=None, context=None):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    return _Resp(b"tampered-bytes")     # 第一次喂坏内容
+                raise RuntimeError("stop")               # 之后立即失败
+            orig_open = us.urllib.request.urlopen
+            orig_sleep = us.time.sleep
+            us.urllib.request.urlopen = _open
+            us.time.sleep = lambda s: None               # 跳过退避，测试不空转 36s
+            us._state.clear()
+            us._state.update({"expected_digest": "sha256:" + "0" * 64})
+            try:
+                us._download_worker("https://x/pkg.tar.gz", dest, "0.3.9")
+            finally:
+                us.urllib.request.urlopen = orig_open
+                us.time.sleep = orig_sleep
+            self.assertEqual(us._state.get("status"), "failed")
+            self.assertEqual(us._state.get("integrity"), "mismatch")
+            self.assertFalse(part.exists(), "坏包必须删除")
+            self.assertFalse(dest.exists())
+
+
+class TestCleanupOldPackages(TestUpdateService):
+    """旧包清理（2026-10-11）：实测堆了 43 个包 13.8GB 且无清理机制。
+
+    只清**可再生的下载缓存**：更早版本的整包与孤儿 .part。必须保住：
+    状态引用的包（安装要用）、版本最高者（状态丢失时兜底）、签名文件、
+    backup/ 之类的非缓存目录。
+    """
+
+    def _make(self, name, size=100):
+        f = us.UPDATE_DIR / name
+        f.write_bytes(b"x" * size)
+        return f
+
+    def test_removes_older_keeps_newest_and_backup(self):
+        us.UPDATE_DIR.mkdir(parents=True, exist_ok=True)
+        self._make("Latiao_0.3.10_aarch64.app.tar.gz")
+        self._make("Latiao_0.3.50_aarch64.app.tar.gz")
+        newest = self._make("Latiao_0.3.77_aarch64.app.tar.gz")
+        (us.UPDATE_DIR / "Latiao_0.3.77_aarch64.app.tar.gz.sig").write_text("sig")
+        (us.UPDATE_DIR / "backup").mkdir(exist_ok=True)
+        (us.UPDATE_DIR / "backup" / "user-snapshot").mkdir(exist_ok=True)
+        us._state.clear()
+        us._state.update({"status": "done",
+                          "url": "https://x/v0.3.77/Latiao_0.3.77_aarch64.app.tar.gz"})
+        r = us.cleanup_old_packages()
+        left = {p.name for p in us.UPDATE_DIR.iterdir()}
+        assert newest.name in left, "最新包必须保留"
+        assert "Latiao_0.3.10_aarch64.app.tar.gz" not in left
+        assert "Latiao_0.3.50_aarch64.app.tar.gz" not in left
+        assert (us.UPDATE_DIR / "Latiao_0.3.77_aarch64.app.tar.gz.sig").exists()
+        assert (us.UPDATE_DIR / "backup" / "user-snapshot").exists(), "用户文件目录不得动"
+        assert r["freed_bytes"] >= 200
+
+    def test_keeps_referenced_package_even_if_not_newest(self):
+        """状态引用的是旧包（装着没装完的场景）→ 也必须保留。"""
+        us.UPDATE_DIR.mkdir(parents=True, exist_ok=True)
+        ref = self._make("Latiao_0.3.70_aarch64.app.tar.gz")
+        self._make("Latiao_0.3.77_aarch64.app.tar.gz")
+        us._state.clear()
+        us._state.update({"status": "downloading",
+                          "url": "https://x/v0.3.70/Latiao_0.3.70_aarch64.app.tar.gz"})
+        us.cleanup_old_packages()
+        left = {p.name for p in us.UPDATE_DIR.iterdir()}
+        assert ref.name in left, "状态引用的包必须保留"
+
+    def test_state_lost_keeps_newest_by_version(self):
+        """状态复位过（无 url）→ 用版本号兜底，别把最新包删了。"""
+        us.UPDATE_DIR.mkdir(parents=True, exist_ok=True)
+        self._make("Latiao_0.3.10_aarch64.app.tar.gz")
+        newest = self._make("Latiao_0.3.77_aarch64.app.tar.gz")
+        us._state.clear()
+        r = us.cleanup_old_packages()
+        left = {p.name for p in us.UPDATE_DIR.iterdir()}
+        assert newest.name in left, f"无状态时必须保最新: {r}"
+
+    def test_removes_orphan_part_keeps_live_one(self):
+        us.UPDATE_DIR.mkdir(parents=True, exist_ok=True)
+        live = self._make("Latiao_0.3.77_aarch64.app.tar.gz.part")
+        orphan = self._make("Latiao_0.3.50_aarch64.app.tar.gz.part")
+        us._state.clear()
+        us._state.update({"status": "downloading",
+                          "url": "https://x/v0.3.77/Latiao_0.3.77_aarch64.app.tar.gz",
+                          "part_path": str(live)})
+        us.cleanup_old_packages()
+        left = {p.name for p in us.UPDATE_DIR.iterdir()}
+        assert live.name in left, "正在续传的 .part 必须保留"
+        # 孤儿（正式包不在、状态也不引用）应被清掉
+        assert orphan.name not in left
+
+
+class TestDownloadByteCap(TestUpdateService):
+    """写盘硬上限（2026-10-12 事故）：无界下载把磁盘写满。
+
+    实测事故：假响应体让 5 个下载任务各写出 20–52GB（合计 172GB）卡在系统
+    临时目录，Finder 显示为「系统数据 253GB」。本测试用**小上限**（打补丁）
+    复现两条闸门，不真写 GB 级数据。
+    """
+
+    def test_rejects_oversized_declared_length(self):
+        with mock.patch.object(us, "_MAX_PKG_BYTES", 1024):
+            class _Resp:
+                def read(self, n=-1): return b""
+                def getheader(self, k, d=None): return str(10 ** 9)   # 声明 1GB
+                def __enter__(self): return self
+                def __exit__(self, *a): return False
+            orig_sleep = us.time.sleep
+            us.time.sleep = lambda s: None          # 跳过 8 次重试退避（否则 ~108s）
+            try:
+                with mock.patch.object(us.urllib.request, "urlopen",
+                                       lambda *a, **k: _Resp()):
+                    us._state.clear()
+                    us._download_worker("https://x/pkg.tar.gz",
+                                        us.UPDATE_DIR / "pkg.tar.gz", "0.3.9")
+            finally:
+                us.time.sleep = orig_sleep
+            assert us._state.get("status") == "failed"
+            assert not (us.UPDATE_DIR / "pkg.tar.gz.part").exists(), "越界声明不得落盘"
+
+    def test_aborts_when_body_exceeds_cap(self):
+        """声明缺失（返回 0）、但实际数据流超过上限 → 中止且不留残片。"""
+        with mock.patch.object(us, "_MAX_PKG_BYTES", 100_000):
+            class _Resp:
+                def __init__(self): self.n = 0
+                def read(self, n=-1):
+                    self.n += 1
+                    if self.n > 1000:
+                        return b""
+                    return b"x" * 65536          # 每块 64KB，很快越过 100KB 上限
+                def getheader(self, k, d=None): return "0"
+                def __enter__(self): return self
+                def __exit__(self, *a): return False
+            orig_sleep = us.time.sleep
+            us.time.sleep = lambda s: None
+            try:
+                with mock.patch.object(us.urllib.request, "urlopen",
+                                       lambda *a, **k: _Resp()):
+                    us._state.clear()
+                    us._download_worker("https://x/pkg.tar.gz",
+                                        us.UPDATE_DIR / "pkg.tar.gz", "0.3.9")
+            finally:
+                us.time.sleep = orig_sleep
+            assert us._state.get("status") == "failed"
+            part = us.UPDATE_DIR / "pkg.tar.gz.part"
+            # 失败路径可能保留残片供续传，但**绝不能**接近或超过上限的离谱体积
+            if part.exists():
+                assert part.stat().st_size < 1_000_000
 
 
 if __name__ == "__main__":

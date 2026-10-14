@@ -353,10 +353,24 @@ class TestThinkingInjection(unittest.TestCase):
         self.assertNotIn("thinking", body)
         self.assertNotIn("reasoning_effort", body)
 
-    def test_max_raises_budget(self):
+    def test_on_sets_high_effort_for_openai_reasoners(self):
+        """两档制（2026-10-11）："开启"档给推理系模型显式 high effort。
+
+        旧版 `test_max_raises_budget` 断言 max_tokens 被抬到 18432——已移除：
+        对 max_tokens 上限不足 16k 的模型（deepseek 系 8192）会直接 400，
+        输出上限由 _resolve_max_tokens 按模型名负责。
+        """
+        import agent_loop
+        body = agent_loop._inject_thinking_disabled({"model": "o3-mini"}, "o3-mini", "max")
+        self.assertEqual(body.get("reasoning_effort"), "high")
+        self.assertNotIn("max_tokens", body)   # 不再由本函数改写生成长度
+
+    def test_on_deepseek_gets_no_effort_field(self):
+        """DeepSeek 不认 reasoning_effort——不写无效字段，也不抬 max_tokens。"""
         import agent_loop
         body = agent_loop._inject_thinking_disabled({"model": "deepseek-chat", "max_tokens": 4096}, "deepseek-chat", "max")
-        self.assertGreaterEqual(body["max_tokens"], 18432)
+        self.assertNotIn("reasoning_effort", body)
+        self.assertEqual(body["max_tokens"], 4096)
 
 
 if __name__ == "__main__":
@@ -368,6 +382,7 @@ class TestPlanConfirmationGate(unittest.TestCase):
 
     def test_plan_confirm_emits_event_and_blocks(self):
         import asyncio
+
         import agent_loop
 
         async def run():
@@ -393,6 +408,7 @@ class TestPlanConfirmationGate(unittest.TestCase):
         现在改成局部 import + 调用方传 lang；这里用 timeout=0.05 真跑一次超时路径。
         """
         import asyncio
+
         import agent_loop
 
         async def run():
@@ -407,6 +423,7 @@ class TestPlanConfirmationGate(unittest.TestCase):
 
     def test_plan_confirm_approve(self):
         import asyncio
+
         import agent_loop
 
         async def run():
@@ -442,6 +459,7 @@ class TestConfirmEventTiming(unittest.TestCase):
 
     def test_tool_confirm_event_available_before_wait(self):
         import asyncio
+
         import agent_loop
 
         async def run():
@@ -464,6 +482,7 @@ class TestConfirmEventTiming(unittest.TestCase):
 
     def test_plan_confirm_event_available_before_wait(self):
         import asyncio
+
         import agent_loop
 
         async def run():
@@ -544,15 +563,32 @@ class TestTransientReminders:
 
 
 class TestSingleFlight:
-    """双发防御：_running_turns 认领/释放语义。"""
+    """双发防御：_running_turns 认领/释放语义。
+
+    2026-09-30 起是 **{session_id: 开始时间}** 的字典（不是 set）：僵尸轮次自愈要按
+    "开始多久"判断超龄（生成器挂住时清理路径不跑，裸集合会把会话永久留在里面 →
+    用户被"上一轮任务仍在运行中"永久挡住）。
+    """
 
     def test_claim_and_release(self):
+        import time
+
         from api_routes import _running_turns
         sid = "sf-test-session"
-        _running_turns.add(sid)
-        assert sid in _running_turns
-        _running_turns.discard(sid)
+        _running_turns[sid] = time.time()
+        assert sid in _running_turns and _running_turns[sid] > 0
+        _running_turns.pop(sid, None)
         assert sid not in _running_turns
+
+    def test_stale_entry_can_be_told_apart(self):
+        """带时间戳的意义：能判断"开始多久"，超龄即可自愈放行（不再永久锁死）。"""
+        import time
+
+        from api_routes import _running_turns
+        sid = "sf-test-stale"
+        _running_turns[sid] = time.time() - 999
+        assert time.time() - _running_turns[sid] > 180
+        _running_turns.pop(sid, None)
 
 
 class TestConfirmationWait:
@@ -560,7 +596,12 @@ class TestConfirmationWait:
 
     def test_infinite_wait_approved(self):
         import asyncio
-        from agent_loop import _pending_confirmations, _pending_lock, _wait_tool_confirmation
+
+        from agent_loop import (
+            _pending_confirmations,
+            _pending_lock,
+            _wait_tool_confirmation,
+        )
 
         async def runner():
             event = asyncio.Event()
@@ -577,7 +618,12 @@ class TestConfirmationWait:
 
     def test_explicit_timeout_still_pauses(self):
         import asyncio
-        from agent_loop import _pending_confirmations, _pending_lock, _wait_tool_confirmation
+
+        from agent_loop import (
+            _pending_confirmations,
+            _pending_lock,
+            _wait_tool_confirmation,
+        )
 
         async def runner():
             event = asyncio.Event()
@@ -600,6 +646,7 @@ class TestLanguageEnsure:
 
     def test_translate_failure_returns_short_hint(self, monkeypatch):
         import asyncio
+
         import agent_loop
 
         async def _fail(*a, **k):
@@ -616,6 +663,7 @@ class TestLanguageEnsure:
 
     def test_translate_success_returns_translation(self, monkeypatch):
         import asyncio
+
         import agent_loop
 
         async def _ok(*a, **k):
@@ -630,6 +678,7 @@ class TestLanguageEnsure:
 
     def test_language_already_ok_passthrough(self):
         import asyncio
+
         import agent_loop
         delivered = asyncio.run(agent_loop._ensure_final_language(
             None, "http://x", {}, "model", "中文回答", "中文用户"

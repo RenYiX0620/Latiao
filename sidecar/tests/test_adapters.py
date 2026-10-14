@@ -14,13 +14,13 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from adapters import (
-    parse_github_repo,
-    parse_frontmatter,
-    discover_openclaw_tree,
-    install_openclaw_skill,
-    discover_claude_marketplace,
-    install_claude_plugin,
     discover_auto,
+    discover_claude_marketplace,
+    discover_openclaw_tree,
+    install_claude_plugin,
+    install_openclaw_skill,
+    parse_frontmatter,
+    parse_github_repo,
 )
 
 

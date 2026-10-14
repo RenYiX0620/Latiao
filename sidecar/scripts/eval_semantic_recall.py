@@ -52,7 +52,7 @@ def embed(port: int, texts: list[str]) -> list[list[float]]:
 
 
 def cos(a, b) -> float:
-    s = sum(x * y for x, y in zip(a, b))
+    s = sum(x * y for x, y in zip(a, b, strict=False))
     na = math.sqrt(sum(x * x for x in a)) or 1.0
     nb = math.sqrt(sum(x * x for x in b)) or 1.0
     return s / (na * nb)

@@ -80,3 +80,10 @@ npx tauri dev
 - `streamChat()` SSE parser must handle all event types.
 - ToolCallBubble receives `onConfirm` callback for permission prompts.
 - Session state is persisted to localStorage key `local_ai_os_sessions`.
+
+## 发版流程（2026-09-25 起固定）
+
+1. 升版本（package.json / src-tauri/tauri.conf.json / Cargo.toml / Cargo.lock 四处一致，`python3 scripts/check_versions.py` 校验）；
+2. 提交 + 打 tag + 推送（`git push origin main && git push origin v<版本>`；origin 一次推 GitHub 与 Gitee）；
+3. 等 CI 出包，核产物齐全与 `latest.json` 指向；
+4. **补发布说明（新步骤）**：写一份"用户视角"的说明 → `gh release edit v<版本> --notes-file <文件>` 写进 Release body，同时 `python3 scripts/changelog_add.py <版本> <文件> [标题]` 追加进 `CHANGELOG.md`（版本已存在会被拒绝，防重复）。

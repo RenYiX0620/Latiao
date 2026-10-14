@@ -9,7 +9,7 @@ DEFINITION = {
     "type": "function",
     "function": {
         "name": "search_files",
-        "description": "Search for files matching a glob pattern in a directory.",
+        "description": "Search for files matching a glob pattern in a directory. Use this to locate files by name before read_file; do NOT use run_cmd (find/ls | grep) for file lookup.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -38,10 +38,10 @@ def _safe_path(path: str) -> str | None:
 
 
 def execute(args: dict) -> str:
-    directory = _safe_path(args["directory"])
+    directory = _safe_path(args.get("directory") or args.get("path") or "")
     if directory is None:
         return "⛔ Blocked: path traversal not allowed"
-    pattern = args["pattern"]
+    pattern = str(args.get("pattern") or args.get("query") or "")
     # pattern 不允许是绝对路径或包含 '..'（否则可逃出 directory）
     if os.path.isabs(pattern) or ".." in pattern.split("/") or ".." in pattern.split("\\"):
         return f"⛔ Blocked: pattern 不允许是绝对路径或包含 '..' - {pattern}"

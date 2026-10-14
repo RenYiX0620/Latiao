@@ -94,6 +94,7 @@ def execute(args: dict) -> str:
     reload_note = ""
     try:
         import asyncio
+
         from main import _hot_reload_extensions
         r = _hot_reload_extensions()          # 异步函数（扩展安装走同一路径）
         if asyncio.iscoroutine(r):

@@ -10,6 +10,7 @@ import {
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import type { Message } from "../types";
+import { ToolConfirmCard, formatToolArgs } from "./ToolConfirmCard";
 
 const MAX_PREVIEW_CHARS = 2000;
 
@@ -35,24 +36,18 @@ export const TOOL_ICONS: Record<string, LucideIcon> = {
   control_audit: History,
 };
 
-function formatToolArgs(args?: Record<string, unknown>): string {
-  if (!args) return "";
-  const entries = Object.entries(args);
-  if (entries.length === 0) return "";
-  const [key, value] = entries[0];
-  const valStr = typeof value === "string" ? value : JSON.stringify(value);
-  return `${key}: ${valStr.length > 50 ? valStr.slice(0, 50) + "..." : valStr}`;
-}
-
 function fmtDur(ms: number, t: (k: string, p?: Record<string, string | number>) => string): string {
   const s = Math.max(0, Math.round(ms / 1000));
   if (s < 60) return t("time.seconds", { n: s });
   return t("time.minutes", { m: Math.floor(s / 60), s: s % 60 });
 }
 
-const ToolCallBubble = memo(function ToolCallBubble({ msg, onConfirm }: {
+const ToolCallBubble = memo(function ToolCallBubble({ msg, onConfirm, sessionId, confirmHidden }: {
   msg: Message;
-  onConfirm?: (callId: string, approved: boolean) => void;
+  sessionId?: string;
+  onConfirm?: (callId: string, approved: boolean, always?: boolean, toolName?: string, sessionId?: string) => void;
+  /** 该条的确认卡已停靠在输入栏上方（ChatView 传入）→ 转录区不再重复渲染按钮。 */
+  confirmHidden?: boolean;
 }) {
   const { t } = useTranslation();
   const [expanded, setExpanded] = useState(false);
@@ -143,14 +138,8 @@ const ToolCallBubble = memo(function ToolCallBubble({ msg, onConfirm }: {
         {msg.toolStatus === "running" && <Loader2 size={13} className="tool-call-spinner" />}
         <span className="tool-call-chevron">{expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}</span>
       </div>
-      {msg.toolStatus === "confirming" && onConfirm && (
-        <div className="tool-call-confirm">
-          <span className="tool-call-confirm-text">{t("tool.confirm_text")}</span>
-          <div className="tool-call-confirm-actions">
-            <button className="btn-allow" onClick={(e) => { e.stopPropagation(); onConfirm(msg.callId!, true); }}>{t("tool.allow")}</button>
-            <button className="btn-deny" onClick={(e) => { e.stopPropagation(); onConfirm(msg.callId!, false); }}>{t("tool.deny")}</button>
-          </div>
-        </div>
+      {!confirmHidden && msg.toolStatus === "confirming" && onConfirm && (
+        <ToolConfirmCard msg={msg} onConfirm={onConfirm} sessionId={sessionId} />
       )}
       {renderedResult}
     </div>

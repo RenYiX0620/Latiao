@@ -4,141 +4,176 @@
 pytest_configure 在收集/导入任何测试模块之前把 PROGRESS_DIR 重定向到
 临时目录（config.py 支持 LATIAO_TEST_PROGRESS_DIR 覆盖），避免污染真机
 ~/.local-ai-os（此前 PROGRESS.md 被场景测试越写越大，见阶段 2b 基线提交）。
+
+**真配置底线守卫（2026-10-11 事故后加）**：某个 fixture 若在 teardown 里
+importlib.reload(config) 而不恢复环境变量，会把 config.CONFIG_FILE 留在**真机
+路径**上——之后任何模块走"兜底持久化"（api_routes 按请求把 cloud_config 写
+config.json）都会覆盖用户真配置。当天实测：test_anon_usage 的 fixture 泄漏 →
+test_app_flow 的假 cloud_config（http://unused）把用户 1100 字节的 config.json
+覆盖成 165 字节。守卫两道：① 每条用例结束时核对真 config 是否被写（写坏就
+还原并让该用例红脸）；② 检测到 CONFIG_FILE 指向真机路径时告警。
 """
 import os
+import shutil
 import tempfile
+from pathlib import Path
+
+_REAL_CONFIG = Path.home() / ".local-ai-os" / "config.json"
+_SESSION_BACKUP = Path(tempfile.gettempdir()) / "latiao-pytest-confighash-backup.json"
 
 
 def pytest_configure(config):
     if not os.environ.get("LATIAO_TEST_PROGRESS_DIR"):
         os.environ["LATIAO_TEST_PROGRESS_DIR"] = tempfile.mkdtemp(
             prefix="latiao-test-progress-")
-
-# ── cron 测试共享夹具（2026-09-23 审计：夹具原先定义在 test_cron_final_round.py、
-#    另一个测试文件靠 import 复用 → ruff F811（参数名遮蔽导入名）。夹具放 conftest
-#    是 pytest 的正规做法：所有测试模块自动可见，无需 import。──
-import asyncio
-import json
-
-import httpx
-import pytest
-
-
-class _Resp:
-    def __init__(self, payload, status=200):
-        self._payload = payload
-        self.status_code = status
-
-    def json(self):
-        if isinstance(self._payload, Exception):
-            raise self._payload
-        return self._payload
-
-    def raise_for_status(self):
-        if self.status_code >= 400:
-            raise httpx.HTTPStatusError(
-                f"HTTP {self.status_code}",
-                request=httpx.Request("POST", "http://127.0.0.1:9999/v1/chat/completions"),
-                response=httpx.Response(self.status_code))
+    # 会话级备份：真 config 在测试开始前的样子（守卫拿它做还原源）
+    try:
+        if _REAL_CONFIG.exists():
+            shutil.copy2(_REAL_CONFIG, _SESSION_BACKUP)
+    except OSError:
+        pass
+    # 真机更新状态同样备份（守卫源；见文件下方 _guard_real_update_state）
+    try:
+        _REAL_UPDATE_STATE.parent.mkdir(parents=True, exist_ok=True)
+        if _REAL_UPDATE_STATE.exists():
+            shutil.copy2(_REAL_UPDATE_STATE, _UPDATE_STATE_BACKUP)
+    except OSError:
+        pass
 
 
-class _FakeClient:
-    """记录每次请求体，按脚本返回响应（脚本按引用共享，见 set_script）。"""
-
-    def __init__(self, script, seen):
-        self._script = script
-        self._seen = seen
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *a):
-        return False
-
-    async def post(self, url, json=None, headers=None, **kw):
-        self._seen.append(json)
-        item = self._script.pop(0) if self._script else {"choices": [{"message": {"content": "x"}}]}
-        if isinstance(item, Exception):
-            raise item
-        # 裸 dict 也要包成响应对象（cron 会调 .status_code/.raise_for_status()）
-        return item if hasattr(item, "raise_for_status") else _Resp(item)
+def _real_config_digest() -> str:
+    import hashlib
+    try:
+        return hashlib.md5(_REAL_CONFIG.read_bytes()).hexdigest()
+    except OSError:
+        return "(missing)"
 
 
-def _tool_call_msg(name="list_dir", args=None, cid="c1"):
-    return {"choices": [{"message": {
-        "role": "assistant", "content": "",
-        "tool_calls": [{"id": cid, "type": "function",
-                        "function": {"name": name,
-                                     "arguments": json.dumps(args or {"path": "."})}}]}}]}
+def pytest_sessionstart(session):
+    session.config._latiao_real_cfg_digest = _real_config_digest()
 
 
-# 一段"够长、不像过渡句"的可交付正文（≥120 字，供收口用例使用）
-_LONG_FINAL = (
-    "该配置包含四项顶层键：cloud_models 用于云端模型接入，custom_engine 用于自定义引擎，"
-    "tts 控制本地语音合成，tavily_api_key 供联网搜索使用。其中 cloud_models 与 "
-    "custom_engine 是数组结构，tts 是对象结构，tavily_api_key 为字符串。")
+def pytest_sessionfinish(session, exitstatus):
+    """会话结束清掉本会话的测试临时目录（2026-10-12 磁盘事故修复）。
+
+    为什么必须清：conftest 每次会话建一个 `latiao-test-progress-*` 目录，
+    其中 `update/` 会带上整包级别的下载残片（每个 ~310MB）。实测积到
+    **322 个目录、约 5.7GB** 一直留在系统临时目录里（Finder 里计入「系统
+    数据」）。此前从不回收——每次 pytest 都加一份。现在会话结束即删。
+    """
+    d = os.environ.get("LATIAO_TEST_PROGRESS_DIR", "")
+    if d and "latiao-test-progress-" in d and os.path.isdir(d):
+        shutil.rmtree(d, ignore_errors=True)
 
 
-def _text_msg(text):
-    return {"choices": [{"message": {"role": "assistant", "content": text}}]}
+import pytest  # noqa: E402
+
+# 真机更新状态（与 config 同级的"测试可污染的生产文件"）：2026-10-11 实测被
+# 一个没走隔离夹具的测试类写进假状态（total=14、part 指向测试临时目录）——
+# 用户随后看到"正在下载新版本 … 天文数字%（断线自动续传）"且永远不会完成。
+_REAL_UPDATE_STATE = Path.home() / ".local-ai-os" / "update" / "state.json"
+_UPDATE_STATE_BACKUP = Path(tempfile.gettempdir()) / "latiao-pytest-update-state-backup.json"
 
 
-@pytest.fixture()
-def cron_env(monkeypatch, tmp_path):
-    """把 cron 变成"本地引擎在跑 + 假 HTTP"的可测环境。"""
-    import agent_loop
-    import cron                      # 夹具内导入：模块级导入会早于 PROGRESS_DIR 重定向
+def _update_state_digest() -> str:
+    import hashlib
+    try:
+        return hashlib.md5(_REAL_UPDATE_STATE.read_bytes()).hexdigest()
+    except OSError:
+        return "(missing)"
+
+
+@pytest.fixture(autouse=True)
+def _ci_parity_engine(monkeypatch):
+    """让本地跑 ≈ CI 跑：把引擎的"原生工具能力"调成 CI 的真值（2026-10-12 加的护栏）。
+
+    为什么需要：CI 在 Linux + 轻量依赖集下 `_local_native_tools_ok()` 为假 → 代码走
+    围栏路径（请求里**没有** tools 键）；而本机装了 mlx-lm，`backend='mlx'` → 探测为真
+    → 走原生路径。这个环境差让 v0.3.79 的 CI **连红两次**：测试本地"侥幸"绿、到 CI 才
+    现形（用户收到红点邮件）。现在统一成 CI 的真值。
+    只改三个决定能力判定的值（CI 上也是**完整引擎、只是没加载模型**，所以不用骨架类——
+    那会缺属性/方法，实测 10 条 AttributeError）；需要真原生路径的用例自己接管：
+    覆盖 `local_llm._engine`（test_thin_loop）或 `_LOCAL_NATIVE_TOOLS_OVERRIDE`
+    （test_thinking_first 的 autouse 覆盖层）。
+    """
     import local_llm
 
-    seen: list[dict] = []
-    recorded: list[tuple] = []
-    script_holder: list = []          # 就地替换脚本（保持 _FakeClient 的引用）
-
-    class _Engine:
-        current_model_id = "stub-model"
-        current_model_name = "stub-model"
-        _launched_slots = 2
-
-        def is_running(self):
-            return True
-
-    class _LLM:
-        _engine = _Engine()
-
-        def get_api_url(self):
-            return "http://127.0.0.1:9999/v1/chat/completions"
-
-    # 只换 AsyncClient：cron 的 except 子句要读 httpx.TransportError/HTTPStatusError，
-    # 整个模块换掉会 AttributeError（首版踩过）
-    import httpx as _real_httpx
-    monkeypatch.setattr(_real_httpx, "AsyncClient",
-                        lambda **kw: _FakeClient(script_holder, seen))
-    monkeypatch.setattr(local_llm, "_engine", _Engine(), raising=False)
-
-    async def _resolve_target(cloud):
-        # ("protocol", "api_url", "headers", "is_local")
-        return ("openai", "http://127.0.0.1:9999/v1/chat/completions", {}, True)
-    monkeypatch.setattr(agent_loop, "_resolve_api_target", _resolve_target, raising=False)
-
-    async def _fake_exec(tool_name, args):
-        return f"[stub {tool_name}]"
-    monkeypatch.setattr(agent_loop, "execute_tool", _fake_exec, raising=False)
-    monkeypatch.setattr(cron, "execute_tool", _fake_exec, raising=False)
-
-    monkeypatch.setattr(cron, "_record_cron_result",
-                        lambda job, status, content: recorded.append((status, content)), raising=False)
-
-    async def _no_sleep(_s):
-        return None
-    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
-
-    def _set_script(items):
-        script_holder[:] = list(items)
-
-    return {"seen": seen, "recorded": recorded, "set_script": _set_script}
+    eng = getattr(local_llm, "_engine", None)
+    if eng is None:
+        return
+    monkeypatch.setattr(eng, "_active_backend", "", raising=False)
+    monkeypatch.setattr(eng, "backend", "none", raising=False)
+    monkeypatch.setattr(eng, "_external_engine", "", raising=False)
+    # 还要中和"本机真的有引擎在跑"这件事：否则路由冒烟测试里的 /v1/chat/completions
+    # 会**真的连上用户 App 的 1235 引擎**去生成（实测卡住 >10 分钟；CI 上没有引擎会
+    # 秒失败）。指向死端口 = CI 的真值：任何真请求立刻连接被拒。
+    monkeypatch.setattr(eng, "server_status", "stopped", raising=False)
+    monkeypatch.setattr(eng, "server_port", 1, raising=False)
 
 
-def _job():
-    return {"id": "job1", "task": "看看目录", "schedule": "0 9 * * *"}
+@pytest.fixture(autouse=True)
+def _guard_real_update_state():
+    """每次用例前后核对真机 update/state.json：被测试改写 → 还原 + 该用例失败。
+
+    为什么需要：update_service 的 STATE_FILE 在**导入时**绑定到 PROGRESS_DIR，
+    而夹具的重定向只改模块属性、救不了"直接调全局落盘路径"的测试；漏一个就会
+    把假状态写进用户更新目录（已真实发生过一次）。
+    """
+    before = _update_state_digest()
+    existed_before = _UPDATE_STATE_BACKUP.exists()
+    yield
+    after = _update_state_digest()
+    if after != before:
+        try:
+            if existed_before:
+                shutil.copy2(_UPDATE_STATE_BACKUP, _REAL_UPDATE_STATE)
+            elif _REAL_UPDATE_STATE.exists():
+                _REAL_UPDATE_STATE.unlink()
+        except OSError:
+            pass
+        raise AssertionError(
+            f"测试改写了真机 update/state.json（{before} → {after}）！已还原；"
+            "请让该测试走 tests/test_update_service.py 的隔离夹具（重定向 "
+            "update_service.STATE_FILE/UPDATE_DIR 并 mock 落盘）。"
+        )
 
 
+@pytest.fixture(autouse=True)
+def _guard_real_config():
+    """每条用例前后核对真 config：被测试写坏 → 还原 + 该用例失败。
+
+    两道检查：
+    ① **开跑前**：config.CONFIG_FILE 若指向真机路径 → 直接让该用例失败
+       （2026-10-11 泄漏事故的预防档：某夹具把 CONFIG_FILE 固化成真机路径后，
+       后续任何走"兜底持久化"的用例都会写真文件——在这里当场拦停在**写之前**，
+       而不是等写坏再还原）。
+    ② **跑完后**：真 config md5 变了 → 从会话备份还原 + 失败。
+    干净的用例零开销（一次属性读取 + 两次 md5）。
+    """
+    import config as _config_mod
+    cfg_path = str(getattr(_config_mod, "CONFIG_FILE", ""))
+    if cfg_path and cfg_path == str(_REAL_CONFIG):
+        raise AssertionError(
+            f"config.CONFIG_FILE 指向真机路径（{cfg_path}）——测试读写的必须是临时目录！"
+            "多半是某个夹具 teardown 里 delenv + reload 留下的；"
+            "正确写法是先恢复 LATIAO_TEST_PROGRESS_DIR 再 reload。"
+        )
+    before = _real_config_digest()
+    existed_before = _SESSION_BACKUP.exists()
+    yield
+    after = _real_config_digest()
+    if after != before:
+        # 还原到会话开始时的样子（宁可回滚，也不让真配置留在测试态）
+        try:
+            if existed_before:
+                shutil.copy2(_SESSION_BACKUP, _REAL_CONFIG)
+                os.chmod(_REAL_CONFIG, 0o600)
+            elif _REAL_CONFIG.exists():
+                # 会话开始时本就没有真配置（CI/新机）→ 测试造出来的要清掉
+                _REAL_CONFIG.unlink()
+        except OSError:
+            pass
+        raise AssertionError(
+            f"测试改写了真机 config.json（{before} → {after}）！"
+            "已还原；请检查是哪个 fixture 没把 LATIAO_TEST_PROGRESS_DIR 隔离好。"
+        )

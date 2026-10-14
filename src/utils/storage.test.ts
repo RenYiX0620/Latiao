@@ -77,14 +77,17 @@ describe("saveSessionsWithFallback（P0-5 配额降级）", () => {
     expect(saved[0].messages[0].imageBase64).toBeUndefined();
   });
 
-  it("配额超限两次 → L2 保留最近 2 会话", () => {
+  it("配额超限两次 → L2 保留最近 2 会话（数组最新在前，取索引 0/1）", () => {
     const kv = memKV(2);
+    // 顺序契约 = 最新在前（App.tsx 用 [ns, ...prev] 新建会话）：s1 最新、s3 最旧。
+    // 2026-10-11 修正：此前断言 s2/s3 把"取尾部＝最旧"的错误语义固化住了。
     const ok = saveSessionsWithFallback(JSON.stringify([bigSession(1, 2), bigSession(2, 2), bigSession(3, 2)]), kv);
     expect(ok).toBe(true);
     const saved = JSON.parse(kv.calls[kv.calls.length - 1]);
     expect(saved.length).toBe(2);
-    expect(saved[0].id).toBe("s2");
-    expect(saved[1].id).toBe("s3");
+    expect(saved[0].id).toBe("s1");
+    expect(saved[1].id).toBe("s2");
+    expect(saved.map((s: { id: string }) => s.id)).not.toContain("s3");
   });
 
   it("配额超限两次 → L3 保最近 1 会话 20 条（L2 需 >=2 会话，单会话时跳过）", () => {

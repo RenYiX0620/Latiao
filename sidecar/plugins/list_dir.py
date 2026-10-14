@@ -8,7 +8,7 @@ DEFINITION = {
     "type": "function",
     "function": {
         "name": "list_dir",
-        "description": "List the contents of a directory.",
+        "description": "List the contents of a directory. Do NOT list directories via run_cmd (ls) — this tool is faster and needs no confirmation.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -44,7 +44,7 @@ def _safe_path(path: str) -> str | None:
 
 
 def execute(args: dict) -> str:
-    p = _safe_path(args["path"])
+    p = _safe_path(args.get("path") or args.get("directory") or ".")
     if p is None:
         return "⛔ Blocked: 路径无效（空路径或包含 .. 穿越片段）"
     try:

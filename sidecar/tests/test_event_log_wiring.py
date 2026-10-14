@@ -47,7 +47,7 @@ async def test_completed_turn(logged_turn, conn):
 
 @pytest.mark.asyncio
 async def test_aborted_turn(logged_turn, conn):
-    from agent_loop import _request_session_cancel, _clear_session_cancel
+    from agent_loop import _clear_session_cancel, _request_session_cancel
 
     async def inner():
         yield {"event": "content", "content": "partial"}
@@ -84,8 +84,7 @@ async def test_clear_before_begin_order_contract(logged_turn, conn):
     本测试模拟正确顺序（clear 先于 begin），验证停止语义完整。
     """
     from agent_loop import _clear_session_cancel, _request_session_cancel
-    from loop_state import turn_state_for
-    from loop_state import Phase
+    from loop_state import Phase, turn_state_for
 
     sid = "sess-order-contract"
 
@@ -131,7 +130,7 @@ async def test_turn_state_paired_with_boundary(logged_turn, conn):
 
 @pytest.mark.asyncio
 async def test_turn_state_aborted_via_cancel(logged_turn, conn):
-    from agent_loop import _request_session_cancel, _clear_session_cancel
+    from agent_loop import _clear_session_cancel, _request_session_cancel
     from loop_state import Phase, turn_state_for
 
     async def inner():

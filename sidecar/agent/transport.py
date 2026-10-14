@@ -1,8 +1,8 @@
 """本地引擎传输层（host）：串行锁、引擎忙注册、健康验证、流封装与恢复。"""
 import asyncio
+import logging
 import os
 import time
-import logging
 import weakref
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -61,6 +61,14 @@ def _engine_slots() -> int:
         return max(1, int(getattr(local_llm._engine, "_launched_slots", 1) or 1))
     except Exception:
         return 1
+
+
+def _engine_wait_max() -> float:
+    """等引擎恢复的总时长上限（秒）。默认压在前端看门狗（180s）之内，见调用点注释。"""
+    try:
+        return max(30.0, float(os.environ.get("LATIAO_ENGINE_WAIT_MAX", "170") or 170))
+    except (TypeError, ValueError):
+        return 170.0
 
 
 def _queue_wait_max() -> float:
@@ -138,6 +146,58 @@ class EngineQueueTimeout(RuntimeError):
     """在闸门队列里等到超过上限仍未轮到（引擎被长时间占用/流泄漏）。"""
 
 
+class TurnCancelled(RuntimeError):
+    """等待引擎/排队期间用户按了停止——由 agent/loop.py 转成正常收尾（不是错误）。
+
+    2026-10-05：停止键此前对"排队等槽位 / 等引擎重载"完全无效——已取消的请求
+    会一直等到放行，然后在流中探测到取消才收尾。这两个等待点现在也查取消标记。
+    """
+
+
+def _session_cancel_check(sid: str) -> bool:
+    """惰性检查会话取消标记（transport 不静态依赖 agent 包，避免环）。"""
+    if not sid:
+        return False
+    try:
+        from agent.session_events import _session_cancel_requested
+        return _session_cancel_requested(sid)
+    except Exception:
+        return False
+
+
+def _set_wait_phase(wait_info: dict | None, phase: str | None) -> None:
+    """回填"正在等引擎"的相位：``queue``=排队等槽位，``reload``=等自动重载。
+
+    调用方（`agent/loop._sample`）据此在**静默期**定期向前端补发进度事件，喂住
+    流式看门狗——否则"后端愿意等 900s、前端 180s 就掐断"（2026-09-24 实测：
+    引擎自动重载期间前端报"流式响应超时"）。传 None 表示等待结束。
+    """
+    if isinstance(wait_info, dict):
+        if phase is None:
+            wait_info.pop("phase", None)
+        else:
+            wait_info["phase"] = phase
+
+
+def _log_engine_death(engine, exc: Exception) -> None:
+    """流中断时记下"引擎为什么死"：退出码 + stderr 尾部 + 当时槽位/上下文。
+
+    此前只抛一句"引擎死亡或连接断开"，日志里查不到原因（引擎 stderr 只留在内存
+    deque 里、成功加载后无人读、也不落盘）——2026-09-24 排查时无法回答"为什么"。
+    """
+    try:
+        proc = getattr(engine, "_process", None)
+        code = proc.poll() if proc is not None else None
+        tail = "".join(list(getattr(engine, "_stderr_tail", []) or [])[-12:])
+        logger.error(
+            "本地引擎流中断诊断：exit_code=%s slots=%s ctx=%s exc=%s；引擎 stderr 尾部:\n%s",
+            code, _engine_slots(), getattr(engine, "model_token_limit", "?"),
+            type(exc).__name__, tail or "(空)",
+        )
+    except Exception:
+        logger.warning("引擎死亡诊断记录失败", exc_info=True)
+
+
 @asynccontextmanager
 async def _local_llm_serialized(api_url: str | None, wait_info: dict | None = None):
     """本地请求按引擎槽位放行（容量 = --parallel N）；云端不设限。
@@ -149,19 +209,34 @@ async def _local_llm_serialized(api_url: str | None, wait_info: dict | None = No
     if _local:
         sem = _stream_lock()
         _t0 = time.monotonic()
+        _sid = str((wait_info or {}).get("session_id") or "")
+        _set_wait_phase(wait_info, "queue")   # 排队中（前端据此报"等待引擎"进度）
         _gate_stats["waiting"] = _gate_stats.get("waiting", 0) + 1
+        _deadline = time.monotonic() + _queue_wait_max()
         try:
-            await asyncio.wait_for(sem.acquire(), timeout=_queue_wait_max())
-        except asyncio.TimeoutError:
-            waited = time.monotonic() - _t0
-            logger.warning("本地引擎排队超时：等待 %.1fs（容量 %d，排队 %d）",
-                           waited, _engine_slots(), int(_gate_stats.get("waiting", 0)))
-            raise EngineQueueTimeout(
-                f"等待本地引擎超过 {int(_queue_wait_max())} 秒仍未轮到；"
-                "另一会话可能正在长生成，可稍后重试或在设置里提高并发槽位") from None
+            while True:
+                # 切片 = min(1s, 剩余预算)：预算比 1s 短时（含测试里的 0.15s）
+                # 不能靠 1s 切片顺延——超时必须由循环头按精确剩余量判定
+                _remaining = _deadline - time.monotonic()
+                if _remaining <= 0:
+                    waited = time.monotonic() - _t0
+                    logger.warning("本地引擎排队超时：等待 %.1fs（容量 %d，排队 %d）",
+                                   waited, _engine_slots(), int(_gate_stats.get("waiting", 0)))
+                    raise EngineQueueTimeout(
+                        f"等待本地引擎超过 {int(_queue_wait_max())} 秒仍未轮到；"
+                        "另一会话可能正在长生成，可稍后重试或在设置里提高并发槽位") from None
+                try:
+                    await asyncio.wait_for(sem.acquire(), timeout=min(1.0, _remaining))
+                    break
+                except asyncio.TimeoutError:
+                    # 排队期间也响应停止键（2026-10-05）：已取消的请求不该继续占队，
+                    # 更不该排到队后再启动一次注定被丢弃的生成
+                    if _session_cancel_check(_sid):
+                        raise TurnCancelled("排队等待期间用户停止") from None
         finally:
             # 放行或超时都要把"排队计数"退掉（只在这里退一次，避免双退）
             _gate_stats["waiting"] = max(0, _gate_stats.get("waiting", 0) - 1)
+            _set_wait_phase(wait_info, None)  # 已放行/已超时：不再报"排队中"
         waited = time.monotonic() - _t0
         if isinstance(wait_info, dict):
             wait_info["waited"] = waited
@@ -260,18 +335,32 @@ async def _local_llm_stream(client, api_url: str, body: dict, headers: dict,
         # 等待恢复的总时长上限：72 次尝试本意覆盖 ~6 分钟重载窗口（每次失败
         # 连接被拒是秒级的），但引擎"挂起"（端口活、不吐响应头）时单次尝试
         # 要耗满读超时 120s——无时间上限理论上可静默拖 2.5 小时。
-        _wait_deadline = time.monotonic() + 600
+        # 等引擎恢复的总时长上限（2026-09-30 修：原本写死 600s，而**前端看门狗是
+        # 180s**——引擎重载/排队期间 `_local_llm_stream` 还没 yield 响应对象，
+        # `_stream` 的泵/队列与心跳都还没开始，`_sample` 一行都收不到 → 前端零字节
+        # 被掐断，后端却继续静默等满 600s（实测：21:30:25 起 5 分钟零日志，用户看到
+        # "180s 无数据"且随后 4 分钟发不出消息）。默认压到 170s：**宁可在看门狗之前
+        # 明确失败并让用户重试**（此时引擎仍在后台重载，重发即成功），也不要静默拖到
+        # 被前端掐断。需要更长等待可用 LATIAO_ENGINE_WAIT_MAX 覆盖。
+        _wait_deadline = time.monotonic() + _engine_wait_max()
         # 引擎挂起判定计数：连续 2 次读超时（端口活但不吐数据）
         _hung_strikes = 0
         try:
             for _attempt in range(72):
+                # 等引擎重载期间响应停止键（2026-10-05）：每轮（5s）查一次，
+                # 用户取消后立即放弃等待（此前会等满整个重载窗口）
+                if _session_cancel_check(str((wait_info or {}).get("session_id") or "")):
+                    raise TurnCancelled("等待引擎恢复期间用户停止")
                 if time.monotonic() >= _wait_deadline:
                     raise httpx.ConnectError(
-                        "等待本地模型恢复超时（10 分钟）。请到模型页检查引擎状态后重发消息。"
+                        f"等待本地模型恢复超时（{int(_engine_wait_max())} 秒）。"
+                        "模型可能仍在加载/重载——稍等片刻后**重发消息**即可；"
+                        "若持续失败，请到模型页检查引擎状态。"
                     )
                 try:
                     async with client.stream("POST", api_url, json=body, headers=headers) as r:
                         r.raise_for_status()  # httpx 不自动抛 4xx/5xx，必须显式检查
+                        _set_wait_phase(wait_info, None)  # 连接已建立：等待结束
                         _yielded = True
                         try:
                             yield r
@@ -318,6 +407,7 @@ async def _local_llm_stream(client, api_url: str, body: dict, headers: dict,
                             except Exception:
                                 pass
                             _request_recovery_reload()
+                        _set_wait_phase(wait_info, "reload")  # 等待自动重载（前端据此报进度）
                         await asyncio.sleep(5)  # 5s × 72 = 最大约 6 分钟等待
                         continue
                     raise
@@ -328,6 +418,7 @@ async def _local_llm_stream(client, api_url: str, body: dict, headers: dict,
                     if _yielded:
                         # 流中途断裂（引擎被杀/系统压力/网络断）：生成器内不能重发，
                         # 抛出明确语义的异常，由 agent 循环的零交付重试接管
+                        _log_engine_death(engine, e)
                         raise httpx.RemoteProtocolError(
                             "本地模型流中断（引擎死亡或连接断开）。"
                             "若本轮尚无输出，任务将自动等待引擎恢复并重试。"
@@ -382,12 +473,14 @@ async def _local_llm_stream(client, api_url: str, body: dict, headers: dict,
                     # 等待重试（自动重载完成即恢复）
                     if _attempt < 71:
                         last_err = e
+                        _set_wait_phase(wait_info, "reload")  # 等待自动重载（前端据此报进度）
                         await asyncio.sleep(5)
                         continue
                     raise
             if last_err is not None:
                 raise last_err
         finally:
+            _set_wait_phase(wait_info, None)  # 无论怎么退出都清掉"等待中"相位
             if _local:
                 engine.mark_stream_exit()
                 engine.mark_engine_idle()

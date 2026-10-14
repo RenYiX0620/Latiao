@@ -21,8 +21,8 @@ def A(monkeypatch, tmp_path):
        agent_loop 只 re-export）。路径常量必须打规范模块——只改 agent_loop 的
        同名属性拦不住写入，会落到别处（拆分后首次跑全量就挂了 2 个用例）。
     """
-    import agent_loop
     import agent.progress as progress
+    import agent_loop
     for mod in (progress, agent_loop):      # 规范模块 + 旧路径同步，兼容两种读法
         monkeypatch.setattr(mod, "PROGRESS_DIR", tmp_path, raising=False)
         monkeypatch.setattr(mod, "PROGRESS_FILE", tmp_path / "PROGRESS.md", raising=False)
@@ -36,8 +36,8 @@ def test_reexport_identity_holds():
     又复制一份同名实现，就会出现两份会各自漂移的代码（正是审计里"静默漂移"的
     成因）。这条断言把模式钉死。
     """
-    import agent_loop
     import agent.progress as progress
+    import agent_loop
     for name in ("_progress_file", "_record_progress", "_rotate_progress_file",
                  "_progress_tail", "_clean_progress_tail"):
         assert getattr(agent_loop, name) is getattr(progress, name), f"{name} 不是同一对象"

@@ -21,6 +21,7 @@ from pathlib import Path
 
 import httpx
 
+
 # 证书校验与 discovery 同源：内置 portable Python 缺系统根证书，必须显式
 # 用导出的 CA bundle（~/.local-ai-os/ca-bundle.pem 或系统 keychain 导出），
 # 否则 jsDelivr/GitHub 全部 CERTIFICATE_VERIFY_FAILED（09-21 启动刷屏根因）。
@@ -285,7 +286,7 @@ def _zip_subset(zip_bytes: bytes, prefix: str) -> dict[str, bytes]:
 
     zip 条目自带外层目录（repo-main/skills/x/...）——匹配前必须先剥掉外层，
     否则命中 0（09-12 事故：前缀 "scrapling-skill/" 对 zip 内
-    "claude-code-skills-main/scrapling-skill/..." 恒不匹配 → 空包 → 
+    "claude-code-skills-main/scrapling-skill/..." 恒不匹配 → 空包 →
     "下载/打包失败（源不可达或格式不符）"）。"""
     out: dict[str, bytes] = {}
     pfx = (prefix or "").lstrip("/")

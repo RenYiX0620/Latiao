@@ -45,7 +45,7 @@ def _cos(a: list[float], b: list[float]) -> float:
     s = 0.0
     na = 0.0
     nb = 0.0
-    for x, y in zip(a, b):
+    for x, y in zip(a, b, strict=False):
         s += x * y
         na += x * x
         nb += y * y
@@ -64,7 +64,8 @@ def load_vectors(force: bool = False) -> int:
             conn = _get_db()
             rows = conn.execute(
                 "SELECT id, embedding, embedding_model FROM learnings "
-                "WHERE embedding IS NOT NULL LIMIT ?", (VECTOR_CACHE_MAX,)).fetchall()
+                "WHERE embedding IS NOT NULL AND COALESCE(archived, 0) = 0 "
+                "LIMIT ?", (VECTOR_CACHE_MAX,)).fetchall()
         except Exception:
             logger.warning("读取语义向量失败", exc_info=True)
             return len(_vectors)
@@ -83,7 +84,8 @@ def missing_count() -> int:
     """还差多少条没有（当前模型下的）向量。"""
     try:
         conn = _get_db()
-        total = conn.execute("SELECT COUNT(*) FROM learnings").fetchone()[0]
+        total = conn.execute(
+            "SELECT COUNT(*) FROM learnings WHERE COALESCE(archived, 0) = 0").fetchone()[0]
     except Exception:
         return 0
     have = sum(1 for _v, mid in _vectors.values() if mid == emb.MODEL_ID)
@@ -101,7 +103,8 @@ def ensure_vectors(allow_cold_start: bool = True, max_batches: int = 200) -> int
             conn = _get_db()
             rows = conn.execute(
                 "SELECT id, topic, content, embedding_model FROM learnings "
-                "WHERE embedding IS NULL OR embedding_model IS NULL OR embedding_model != ? "
+                "WHERE (embedding IS NULL OR embedding_model IS NULL OR embedding_model != ?) "
+                "AND COALESCE(archived, 0) = 0 "
                 "LIMIT ?", (emb.MODEL_ID, BATCH)).fetchall()
         except Exception:
             logger.warning("读取待编码学习失败", exc_info=True)
@@ -114,7 +117,7 @@ def ensure_vectors(allow_cold_start: bool = True, max_batches: int = 200) -> int
             break                       # 服务不可用 / 半截结果：下次再来
         try:
             with _db_write_lock:
-                for (rid, _t, _c, _m), v in zip(rows, vecs):
+                for (rid, _t, _c, _m), v in zip(rows, vecs, strict=False):
                     conn.execute("UPDATE learnings SET embedding = ?, embedding_model = ? WHERE id = ?",
                                  (_pack(v), emb.MODEL_ID, rid))
                 conn.commit()
@@ -122,7 +125,7 @@ def ensure_vectors(allow_cold_start: bool = True, max_batches: int = 200) -> int
             logger.warning("写入语义向量失败", exc_info=True)
             break
         with _lock:
-            for (rid, _t, _c, _m), v in zip(rows, vecs):
+            for (rid, _t, _c, _m), v in zip(rows, vecs, strict=False):
                 _vectors[rid] = (v, emb.MODEL_ID)
         done += len(vecs)
     if done:
@@ -319,6 +322,7 @@ def judge_enabled() -> bool:
         return raw.strip().lower() not in ("0", "false", "no", "off")
     try:
         import json as _json
+
         from config import CONFIG_FILE
         if CONFIG_FILE.exists():
             cfg = _json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
@@ -342,6 +346,7 @@ def judge_relevance(question: str, candidates: list[tuple[str, str]]) -> set[str
         return set()
     try:
         import httpx
+
         from config import SUBAGENT_MODEL
         from local_llm import get_api_url
     except Exception:

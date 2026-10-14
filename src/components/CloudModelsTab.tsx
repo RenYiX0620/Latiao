@@ -1,3 +1,4 @@
+import { useState } from "react";
 import type { CloudModel } from "../types";
 import { useTranslation } from "../i18n";
 
@@ -21,7 +22,7 @@ interface Props {
   setShowAdvanced: (v: boolean) => void;
   testingModel: string | null;
   testResult: string;
-  testConnection: (modelName: string, key: string, endpoint: string, protocol: string) => void;
+  testConnection: (modelName: string, key: string | undefined, endpoint: string, protocol: string) => void;
   recentLearnings: { topic: string; content: string; confidence: number }[];
   showToast: (msg: string, type?: string) => void;
 }
@@ -34,10 +35,32 @@ export default function CloudModelsTab({
   recentLearnings, showToast,
 }: Props) {
   const { t } = useTranslation();
+  const [editingKeyIdx, setEditingKeyIdx] = useState<number | null>(null);
+  const [editKeyVal, setEditKeyVal] = useState("");
+  const updateKey = async (idx: number) => {
+    const val = (editKeyVal || "").trim();
+    if (!val) { showToast(t("cloud.fill_required"), "warn"); return; }
+    const withKey = cloudModels.map((x, j) => j === idx ? { ...x, key: val } : { ...x, key: x.key || "" });
+    try {
+      const { sidecarFetchWithRetry } = await import("../utils/api");
+      await sidecarFetchWithRetry("/v1/settings/cloud-models", "POST", { models: withKey }, 2);
+      setCloudModels(prev => prev.map((x, j) => j === idx ? { ...x, has_key: true, key: undefined } : x));
+      setEditingKeyIdx(null);
+      setEditKeyVal("");
+      showToast(t("cloud.key_updated"));
+    } catch (e) {
+      console.error(e);
+      // 失败：key 仍在输入框，不许先清再靠 debounce 重试（那时 key 已丢）
+      showToast(t("cloud.fill_required"), "warn");
+    }
+  };
   return (
     <div>
-      <div style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 16 }}>
+      <div style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 8 }}>
         {t("cloud.desc")}
+      </div>
+      <div style={{ fontSize: 10, color: "var(--text-muted)", marginBottom: 16 }}>
+        🔒 {t("cloud.key_note")}
       </div>
 
       <div className="settings-group" style={{ marginBottom: 16 }}>
@@ -66,7 +89,7 @@ export default function CloudModelsTab({
                 {m.protocol || "openai"} · {m.endpoint}
               </div>
               <div style={{ fontSize: 10, color: "var(--text-muted)", marginTop: 2 }}>
-                API Key: {m.key ? t("cloud.key_saved") : t("cloud.key_missing")}
+                API Key: {(m.has_key || m.key) ? t("cloud.key_saved") : t("cloud.key_missing")}
                 {hasImage && <span> · 📷 {t("cloud.img_support")}</span>}
               </div>
             </div>
@@ -76,16 +99,38 @@ export default function CloudModelsTab({
                   {t("cloud.set_main")}
                 </button>
               )}
-              <button className="btn btn-sm btn-ghost" onClick={() => testConnection(m.name, m.key, m.endpoint, m.protocol || "openai")} disabled={testingModel === m.name}>
+              <button className="btn btn-sm btn-ghost" onClick={() => { setEditingKeyIdx(editingKeyIdx === i ? null : i); setEditKeyVal(""); }}>
+                {t("cloud.update_key")}
+              </button>
+              <button className="btn btn-sm btn-ghost" onClick={() => testConnection(m.name, undefined, m.endpoint, m.protocol || "openai")} disabled={testingModel === m.name}>
                 {testingModel === m.name ? t("cloud.testing") : t("cloud.test")}
               </button>
               <button className="btn-icon" style={{ fontSize: 14 }} onClick={() => {
-                setCloudModels(prev => prev.filter((_, j) => j !== i));
+                const next = cloudModels.filter((_, j) => j !== i);
+                setCloudModels(next);
+                // 删到空表要显式 clear，否则后端拒绝整表清空
+                if (next.length === 0) {
+                  void import("../utils/api").then(({ sidecarFetchWithRetry }) =>
+                    sidecarFetchWithRetry("/v1/settings/cloud-models", "POST", { models: [], clear: true }, 2)
+                  ).catch(() => { /* debounce 也会重试 */ });
+                }
                 if (isMain) setSelectedModel("");
                 showToast(t("cloud.removed", { name: m.name }));
               }}>✕</button>
             </div>
           </div>
+          {editingKeyIdx === i && (
+            <div className="settings-row" style={{ gap: 6 }}>
+              <input className="form-input" type="password" style={{ flex: 1, margin: 0, fontSize: 11, padding: "6px 10px" }}
+                placeholder={t("cloud.update_key_hint")}
+                value={editKeyVal}
+                onChange={(e) => setEditKeyVal(e.target.value)}
+                autoFocus
+                onKeyDown={(e) => { if (e.key === "Enter") void updateKey(i); }} />
+              <button className="btn btn-sm btn-primary" style={{ flex: "0 0 auto" }} onClick={() => void updateKey(i)}>{t("cloud.add_btn")}</button>
+              <button className="btn btn-sm btn-ghost" style={{ flex: "0 0 auto" }} onClick={() => { setEditingKeyIdx(null); setEditKeyVal(""); }}>✕</button>
+            </div>
+          )}
           <div className="settings-row">
             <span style={{ fontSize: 10, color: "var(--text-muted)" }}>max_tokens:</span>
             <input className="form-input" style={{ width: 80, margin: 0, padding: "4px 8px", fontSize: 11, textAlign: "center", fontFamily: "var(--font-mono)" }}
@@ -118,14 +163,26 @@ export default function CloudModelsTab({
             <input className="form-input" style={{ width: 72, margin: 0, padding: "4px 8px", fontSize: 11, textAlign: "center", fontFamily: "var(--font-mono)" }}
               placeholder="tokens" value={newCloudModel.max_tokens || 32768}
               onChange={e => setNewCloudModel({ ...newCloudModel, max_tokens: parseInt(e.target.value) || 32768 })} />
-            <button className="btn btn-sm btn-primary" style={{ flex: 1 }} onClick={() => {
-              if (!newCloudModel.name || !newCloudModel.key) { showToast(t("cloud.fill_required")); return; }
+            <button className="btn btn-sm btn-primary" style={{ minWidth: 96, flex: "0 0 auto" }} onClick={() => {
+              if (!newCloudModel.name || !newCloudModel.key) { showToast(t("cloud.fill_required"), "warn"); return; }
               const auto = detectProvider(newCloudModel.name);
               const m = { ...newCloudModel };
               if (auto && !m.endpoint) { m.protocol = auto.protocol; m.endpoint = auto.endpoint; }
-              setCloudModels((prev) => [...prev, m]);
-              setNewCloudModel({ name: "", key: "", endpoint: "", protocol: "openai", max_tokens: 32768 });
-              showToast(t("cloud.added", { name: newCloudModel.name }));
+              // key 必须随本次 POST 成功后才能从内存清掉——失败时 debounce 会拿空 key
+              // 再写一遍（服务端沿用旧值）→ 新模型以空 key 入库且界面谎报已保存。
+              const withKey = [...cloudModels.map((x) => ({ ...x, key: x.key || "" })), { ...m }];
+              void (async () => {
+                try {
+                  const { sidecarFetchWithRetry } = await import("../utils/api");
+                  await sidecarFetchWithRetry("/v1/settings/cloud-models", "POST", { models: withKey }, 2);
+                  setCloudModels((prev) => [...prev, { ...m, has_key: true, key: undefined }]);
+                  setNewCloudModel({ name: "", key: "", endpoint: "", protocol: "openai", max_tokens: 32768 });
+                  showToast(t("cloud.added", { name: m.name }));
+                } catch (e) {
+                  console.error(e);
+                  showToast(t("cloud.fill_required"), "warn");
+                }
+              })();
             }}>{t("cloud.add_btn")}</button>
           </div>
           <div style={{ fontSize: 10, color: "var(--text-muted)" }}>

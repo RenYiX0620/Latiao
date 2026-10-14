@@ -1,12 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import {
-  COMPOSE_GRACE_MS,
-  COMPOSING_BACKSTOP_MS,
-  IME_PROCESSING_KEYCODE,
-  isComposingKey,
-  shouldSendOnEnter,
-} from "./composer";
+import { COMPOSE_GRACE_MS, COMPOSING_BACKSTOP_MS, IME_PROCESSING_KEYCODE, isComposingKey, shouldSendOnEnter, truncateToolResult } from "./composer";
 
 const enter = { key: "Enter", shiftKey: false, isComposing: false, keyCode: 13 };
 const NOW = 1_700_000_000_000;
@@ -63,5 +57,34 @@ describe("shouldSendOnEnter", () => {
   it("其他按键不受影响（如字母键、方向键）", () => {
     expect(shouldSendOnEnter(NOW, 0, false, { ...enter, key: "a" })).toBe(false);
     expect(shouldSendOnEnter(NOW, 0, false, { ...enter, key: "ArrowUp" })).toBe(false);
+  });
+});
+
+describe("工具结果回灌的截断（与后端同一策略）", () => {
+  it("短内容原样返回", () => {
+    expect(truncateToolResult("短结果", 100)).toBe("短结果");
+  });
+
+  it("按整行切，不把数字劈成两半", () => {
+    const lines = Array.from({ length: 40 }, (_, i) => `行${i} 金额 1376.5${i % 10} 元`);
+    const out = truncateToolResult(lines.join("\n"), 200);
+    const body = out.split("\n").filter((l) => !l.includes("已省略"));
+    for (const l of body) {
+      expect(lines).toContain(l);                        // 整行都在原文里
+      expect(l.endsWith("1376.5")).toBe(false);          // 没有半截数字
+    }
+    expect(out).toContain("已省略");
+    expect(out).toContain("不要凭记忆引用具体数字");
+  });
+
+  it("标记里写明省略了多少行/字符", () => {
+    const out = truncateToolResult("a\n".repeat(500), 100);
+    expect(out).toMatch(/已省略 \d+ 行 \/ \d+ 字符/);
+  });
+
+  it("单行超长时截断该行（仍然带标记）", () => {
+    const out = truncateToolResult("x".repeat(5000), 100);
+    expect(out.length).toBeLessThan(400);
+    expect(out).toContain("已省略");
   });
 });

@@ -57,7 +57,7 @@ class TestStampTimeSensitive(unittest.TestCase):
     """agent_loop._stamp_time_sensitive 只对时间敏感工具生效。"""
 
     def test_tavily_stamped(self):
-        from agent_loop import _stamp_time_sensitive, _TIME_SENSITIVE_TOOLS
+        from agent_loop import _TIME_SENSITIVE_TOOLS, _stamp_time_sensitive
         self.assertIn("tavily_search", _TIME_SENSITIVE_TOOLS)
         self.assertIn("headless_read", _TIME_SENSITIVE_TOOLS)
         stamp = _stamp_time_sensitive()

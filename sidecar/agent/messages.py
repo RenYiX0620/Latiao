@@ -32,6 +32,16 @@ MESSAGES: dict[str, dict[str, str]] = {
         "ja": "📣 まとめ：データは十分です。今すぐ日本語で完全な分析本文（重要数値を含む）を書いてください。ツールは呼ばず、ツール呼び出し形式も出力せず、書き終えたら停止してください。",
         "ru": "📣 Завершение: данных достаточно — напишите сейчас полный анализ на русском (с ключевыми цифрами и выводами), не вызывайте инструменты, не выводите формат вызова инструментов и остановитесь, когда закончите.",
     },
+    # 无数据收口（2026-10-08）：本轮一个工具结果都没有就触发收口时用这一条。
+    # 实测（本地引擎探测）："数据已足够"这句话在真没数据时会诱发编造——模型
+    # 凭空写出"某研报引发暴跌、误差 15-20%"这类具体细节且不会被任何闸门拦住。
+    # 换成如实说明的指令，把"没数据"这件事说破。
+    "finalize_no_data": {
+        "zh": "📣 收尾：本轮没有取到任何数据（没有成功的工具结果）。请如实说明未能获取数据，不要编造任何数字或事件；可以给出不依赖数据的常识性判断，并明确指出还需要什么信息。写完即停。",
+        "en": "📣 Wrap up: no data was retrieved this turn (no successful tool result). Say honestly that the data could not be fetched, do not invent any figures or events; you may give common-sense notes that do not depend on data and state clearly what is still needed. Stop when done.",
+        "ja": "📣 まとめ：今回はデータを取得できませんでした（成功したツール結果なし）。データが取れなかったことを正直に述べ、数値や出来事を捏造しないでください。データに依存しない常識的な判断と、必要な情報を明示してください。書き終えたら停止してください。",
+        "ru": "📣 Завершение: в этом ходе данные не получены (нет успешных результатов инструментов). Честно скажите, что данные получить не удалось, не выдумывайте цифры и события; можно дать общие соображения без данных и указать, что ещё нужно. Закончили — остановитесь.",
+    },
     # ── 收口轮提问 ──
     "finalize_ask": {
         "zh": "请根据以上数据写出完整分析正文（{lang_name}，包含关键数字与结论）。",
@@ -52,6 +62,12 @@ MESSAGES: dict[str, dict[str, str]] = {
         "en": "⛔ You only announced what you were going to do and did not actually call a tool. Do not restate the plan: call the tool now, or write the complete answer with the key data.",
         "ja": "⛔ 何をするつもりかを述べただけで、実際にはツールを呼んでいません。計画を繰り返さず、今すぐツールを呼ぶか、重要な数値を含む完全な回答を書いてください。",
         "ru": "⛔ Вы только объявили о намерении и не вызвали инструмент. Не повторяйте план: вызовите инструмент сейчас или напишите полный ответ с ключевыми данными.",
+    },
+    "toolfail_nudge": {
+        "zh": "你上一条只说了要做什么但没有实际执行——之前的工具失败了。请改用其他工具重试（换数据源），或基于已有信息给出完整结论；不要再只回复一句承诺。",
+        "en": "Your last message only promised action but nothing was executed — the previous tool failed. Retry with a different tool (switch the data source) or give a complete answer from what you already know; do not reply with just another promise.",
+        "ja": "前回は行動を宣言しただけで実行されていません——直前のツールが失敗しました。別のツールで再試行するか、既存の情報で完全な回答を出してください。約束だけの返信はしないでください。",
+        "ru": "В прошлом сообщении вы только пообещали, но ничего не выполнили — предыдущий инструмент завершился ошибкой. Повторите с другим инструментом (смените источник данных) или дайте полный ответ из имеющегося; не отвечайте одним лишь обещанием.",
     },
     # ── 交互控制 ──
     "task_stopped": {
@@ -85,6 +101,64 @@ MESSAGES: dict[str, dict[str, str]] = {
         "ru": "… (промежуточные заметки этого раунда; скрыто {n} символов)",
     },
     # ── 循环自保 ──
+    # 预算守卫（2026-09-29）：本轮累计输入 token 越线——先把模型赶进终答轮，
+    # 再越线就停手交付，不让长循环无声烧完 token。
+    "budget_wrap_now": {
+        "zh": "💸 本轮已用 {used} 输入 token（预算 {budget}）：请立刻基于已收集的数据写出最终答案，不要再调用任何工具。",
+        "en": "💸 {used} input tokens used this turn (budget {budget}): write the final answer now from the data you have — no more tool calls.",
+        "ja": "💸 今回の入力トークンは {used}（予算 {budget}）：今すぐ収集済みデータで最終回答を書き、ツールは呼ばないでください。",
+        "ru": "💸 Израсходовано {used} входных токенов (бюджет {budget}): напишите финальный ответ по собранным данным, без вызовов инструментов.",
+    },
+    "budget_exhausted": {
+        "zh": "⚠️ 本轮累计输入已达 {used} token（预算 {budget}），已停止继续调用工具。以上为已收集到的内容；需要继续请发新消息。",
+        "en": "⚠️ This turn reached {used} input tokens (budget {budget}); tool calls have stopped. Above is what was collected — send a new message to continue.",
+        "ja": "⚠️ 今回の入力が {used} トークンに達しました（予算 {budget}）。ツール呼び出しは停止しました。続けるには新しいメッセージを送ってください。",
+        "ru": "⚠️ В этом ходе достигнуто {used} входных токенов (бюджет {budget}); вызовы инструментов остановлены. Отправьте новое сообщение, чтобы продолжить.",
+    },
+    # 硬升级（2026-09-29）：同一工具以同一错误连续失败 ≥N 次——不再空转，
+    # 把"试过什么、卡在哪"交回给用户（Loop 三缺口的最后一件）。
+    "stuck_escalation": {
+        "zh": "⚠️ 工具 `{tool}` 连续 {n} 次以相同错误失败（{err}），已停止重试并把问题交回给你。\n已收集的内容在上面；可以换个思路、提供更具体的输入，或改用云端模型再试。",
+        "en": "⚠️ The tool `{tool}` failed {n} times with the same error ({err}); retries have stopped and the problem is handed back to you.\nWhat was collected is above — try a different angle, give more specific input, or retry with a cloud model.",
+        "ja": "⚠️ ツール `{tool}` が同じエラー（{err}）で {n} 回連続失敗しました。再試行を止め、ここであなたに戻します。\n収集済みの内容は上にあります。別の方法や、より具体的な入力、クラウドモデルをお試しください。",
+        "ru": "⚠️ Инструмент `{tool}` {n} раз подряд завершился одной и той же ошибкой ({err}); повторы остановлены, вопрос возвращается к вам.\nСобранное — выше; попробуйте другой подход, дайте более конкретные входные данные или облачную модель.",
+    },
+    # 压缩后提示（2026-09-29）：更早的历史被裁掉后，明确告诉模型**别再凭记忆复述**
+    # 其中的具体数字/文件名（否则会编出半截数字，撞数据诚实规则）。
+    "compaction_notice": {
+        "zh": "（更早的历史已压缩。其中任何具体数字、文件名、票号如需引用，请重新调用工具获取；不要凭记忆复述。）",
+        "en": "(Earlier history was compacted. If you need any specific number, filename or ID from it, re-run the tool to fetch it — do not quote from memory.)",
+        "ja": "（以前の履歴は圧縮されました。具体的な数値・ファイル名・番号が必要なら、ツールを再実行して取得してください。記憶から引用しないこと。）",
+        "ru": "(Более ранняя история сжата. Если нужны конкретные числа, имена файлов или ID — запросите их инструментом заново, не цитируйте по памяти.)",
+    },
+    # 任务级验证器（2026-09-29，gap 清单 P1）：机械校验与"我已完成"的说法矛盾时——
+    # 第一次只要求补齐或如实说明（重采一次），第二次/作弊则明确"不按完成交付"。
+    "task_verify_nudge": {
+        "zh": "⛔ 机械校验未通过：{detail}。你上一条回答宣称完成，与此矛盾——请**补齐并重新验证**，或**如实说明卡在哪里**；不要再次宣称完成。",
+        "en": "⛔ Mechanical check failed: {detail}. Your previous answer claimed completion, which contradicts that — **finish it and verify again**, or **state plainly where it is stuck**; do not claim completion again.",
+        "ja": "⛔ 機械チェックに通りませんでした：{detail}。前回の回答は完了を主張していますが矛盾します。**仕上げて再検証**するか、**どこで止まっているか正直に述べて**ください。再度「完了」と主張しないでください。",
+        "ru": "⛔ Механическая проверка не пройдена: {detail}. В прошлом ответе заявлено о завершении — это противоречит фактам: **доведите и проверьте снова** либо **честно скажите, где застряли**; не заявляйте о завершении снова.",
+    },
+    "task_unverified": {
+        "zh": "⚠️ 这一轮我不按「完成」交付：{detail}。以上是本轮已经拿到的内容，请你决定下一步（补数据 / 调整目标 / 手工处理）。",
+        "en": "⚠️ I am not delivering this turn as complete: {detail}. The above is what this turn produced; the next step is yours to decide (more data / a different goal / handle it manually).",
+        "ja": "⚠️ このターンは「完了」として納品しません：{detail}。以上が今回得られた内容です。次の手順（データ追加／目標の調整／手作業）はご判断ください。",
+        "ru": "⚠️ Я не выдаю этот ход как завершённый: {detail}. Выше — то, что получено в этом ходу; решение о следующем шаге (данные / другая цель / вручную) за вами.",
+    },
+    # 预算近阈提示（gap 第 4 步，2026-09-29）：显式告诉用户与模型"花到哪了"，
+    # 不再要么静默、要么直接收口。
+    "budget_warning": {
+        "zh": "💸 本轮输入已达预算的 {pct}%（{used}/{budget} token）。已请模型收口，优先给出结论；要继续深挖可以发新消息（新一轮预算重新计算）。",
+        "en": "💸 This turn is at {pct}% of its input budget ({used}/{budget} tokens). I have asked the model to wrap up with conclusions; send a new message to dig deeper (the budget resets each turn).",
+        "ja": "💸 このターンの入力は予算の {pct}%（{used}/{budget} token）に達しました。モデルには結論を優先して締めるよう伝えています。さらに掘る場合は新しいメッセージを送ってください（予算はターンごとにリセット）。",
+        "ru": "💸 Ввод в этом ходу достиг {pct}% бюджета ({used}/{budget} токенов). Модель попросили завершать и дать выводы; чтобы копать дальше — отправьте новое сообщение (бюджет сбрасывается каждый ход).",
+    },
+    "budget_warning_tail": {
+        "zh": "⚠️ 本轮预算已用 {pct}%。请立刻收口：直接给出**结论版**答案（关键数字 + 判断），不要再开新的检索/工具轮；确实还缺的项，在答案里写明缺什么。",
+        "en": "⚠️ {pct}% of this turn's budget is used. Wrap up now: give the **conclusion-grade** answer (key figures + judgement), do not open new search/tool rounds; name anything still missing.",
+        "ja": "⚠️ このターンの予算を {pct}% 使用しました。今すぐ締めてください：**結論版**の回答（重要数値＋判断）を書き、新たな検索／ツールラウンドを始めないでください。不足は明記を。",
+        "ru": "⚠️ Израсходовано {pct}% бюджета хода. Завершайте сейчас: дайте **итоговый** ответ (ключевые цифры + вывод), не начинайте новых поисковых/инструментальных раундов; чего не хватает — укажите.",
+    },
     "max_steps": {
         "zh": "⚠️ 已达安全步数上限（{n}）。请发送新消息继续。",
         "en": "⚠️ Safety step limit reached ({n}). Send a new message to continue.",

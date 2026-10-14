@@ -23,13 +23,63 @@ from pathlib import Path
 
 logger = logging.getLogger("latiao-sidecar")
 
-UPDATE_DIR = Path.home() / ".local-ai-os" / "update"
-STATE_FILE = UPDATE_DIR / "state.json"
+_IMPORT_TIME_PROGRESS_DEFAULT = str(Path.home() / ".local-ai-os" / "update")
+_IMPORT_TIME_STATE_DEFAULT = Path.home() / ".local-ai-os" / "update" / "state.json"
+UPDATE_DIR = Path(_IMPORT_TIME_PROGRESS_DEFAULT)
+STATE_FILE = Path(_IMPORT_TIME_STATE_DEFAULT)
+
+# 更新包文件名只允许安全字符（2026-10-11 深审 Medium：manifest 的 url 经镜像可控，
+# `url.split("/")[-1]` 直接拼路径 → Windows 上 `..\..\evil.exe` 可穿越写盘）。
+_ASSET_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,120}$")
+
+
+def _safe_asset_name(url: str) -> str:
+    """从下载 URL 取**纯文件名**（消毒：路径分隔/穿越/可疑字符一律拒绝）。
+
+    只保留最后一个路径段，再校验白名单；不合法则回退到固定名（让后续下载
+    走可控路径，而不是把不可信串拼进文件系统）。
+    """
+    raw = (url or "").split("?")[0].split("#")[0].rsplit("/", 1)[-1]
+    raw = raw.replace("\\", "/").rsplit("/", 1)[-1]   # 兼容反斜杠形式的穿越
+    if raw and _ASSET_NAME_RE.match(raw) and raw not in (".", ".."):
+        return raw
+    logger.warning("更新包文件名不合法，回退为 package.bin: %r", raw[:80])
+    return "package.bin"
+
+
+def _state_paths() -> tuple[Path, Path]:
+    """当前应使用的 (更新目录, 状态文件)——**调用时解析**（2026-10-11 修复）。
+
+    原因：此前 UPDATE_DIR/STATE_FILE 在导入时**冻结**成真机路径——测试把
+    `LATIAO_TEST_PROGRESS_DIR` 指到临时目录并 reload config 也改不动它们，
+    于是多个测试模块在"以为已隔离"的情况下写进了用户的真 state.json
+    （实测：前端随后显示"正在下载 … 天文数字%"）。现在：
+      - 测试若显式设过模块属性（不复等于导入时默认值）→ 尊重它的覆盖；
+      - 否则跟随 config.PROGRESS_DIR 现算现用。
+    """
+    global UPDATE_DIR, STATE_FILE
+    try:
+        from config import PROGRESS_DIR as _pd
+        default_dir = Path(str(_pd)) / "update"
+    except Exception:
+        default_dir = Path.home() / ".local-ai-os" / "update"
+    if str(UPDATE_DIR) != _IMPORT_TIME_PROGRESS_DEFAULT or STATE_FILE != _IMPORT_TIME_STATE_DEFAULT:
+        return UPDATE_DIR, STATE_FILE          # 测试显式覆盖过 → 用它
+    UPDATE_DIR = default_dir
+    STATE_FILE = default_dir / "state.json"
+    return UPDATE_DIR, STATE_FILE
+
+
 GITHUB_LATEST = "https://github.com/RenYiX0620/Latiao/releases/latest/download/latest.json"
 
 # GitHub 直连在国内常 <50KB/s（09-07 事故：214MB 要 95 分钟）。镜像加速：
 # 每个下载/清单请求按 [_直接, 镜像1, 镜像2] 轮换，重试时自动切换。
 _GH_MIRRORS = ["", "https://gh-proxy.com/", "https://ghfast.top/"]
+
+# 更新包写盘硬上限（2026-10-12 事故修复）：当前包 ~330MB，取 12 倍余量。
+# 防御场景：服务端声明/实际返回异常大的体积，把磁盘一路写满（实测 5 个
+# 失控下载各写出 20–52GB，合计 172GB 卡在系统临时目录 = "系统数据 253GB"）。
+_MAX_PKG_BYTES = 4 * 1024 ** 3
 
 
 def _mirror_urls(url: str) -> list:
@@ -57,6 +107,44 @@ def _current_platform() -> str:
     return "linux-x86_64"
 
 
+def _fetch_expected_digest(version: str, asset_name: str) -> str:
+    """从 GitHub 权威接口取目标资产的 sha256（"sha256:<hex>"），取不到返回 ""。
+
+    2026-10-11 审计修复（更新链路的校验缺口）：包可能经镜像（gh-proxy/ghfast）
+    下载，此前**没有任何完整性校验**——坏镜像/中间人可换包且无人发现。而 GitHub
+    Releases API 对每个资产提供 `digest`（实测可用），这是权威源。GitHub 不可达
+    （国内常态）时返回空串，调用方按"未校验"如实标注，不假装校验过。
+    """
+    if not version or not asset_name:
+        return ""
+    v = version.lstrip("vV")
+    url = f"https://api.github.com/repos/RenYiX0620/Latiao/releases/tags/v{v}"
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Latiao/1.0", "Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(req, timeout=20, context=_ssl_context()) as resp:
+            data = json.loads(resp.read().decode("utf-8", "ignore"))
+        for a in (data.get("assets") or []):
+            if a.get("name") == asset_name:
+                return str(a.get("digest") or "")
+    except Exception:
+        logger.info("无法从 GitHub 取资产校验和（%s %s）——本次按未校验处理",
+                    v, asset_name)
+    return ""
+
+
+def _sha256_file(path: Path) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+    except OSError:
+        return ""
+    return "sha256:" + h.hexdigest()
+
+
 def _version_tuple(v: str) -> tuple:
     parts = re.findall(r"\d+", v or "")
     return tuple(int(p) for p in parts[:4]) or (0,)
@@ -73,8 +161,9 @@ def _load_state() -> dict:
             return _state
     # 文件 IO 在锁外（防止写盘慢时阻塞其他线程的锁获取）
     try:
-        if STATE_FILE.exists():
-            data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        _udir, _sfile = _state_paths()
+        if _sfile.exists():
+            data = json.loads(_sfile.read_text(encoding="utf-8"))
             with _state_lock:
                 if not _state:
                     _state = data
@@ -91,29 +180,58 @@ def _save_state() -> None:
         snapshot = {k: v for k, v in _state.items()
                     if isinstance(v, (str, int, float, bool, list))}
     try:
-        UPDATE_DIR.mkdir(parents=True, exist_ok=True)
-        tmp = STATE_FILE.with_suffix(".tmp")
+        _udir, _sfile = _state_paths()
+        _udir.mkdir(parents=True, exist_ok=True)
+        tmp = _sfile.with_suffix(".tmp")
         tmp.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(STATE_FILE)
+        tmp.replace(_sfile)
     except Exception:
         logger.warning("update state save failed", exc_info=True)
 
 
 def get_progress() -> dict:
-    """当前预下载状态（前端轮询）。"""
+    """当前预下载状态（前端轮询）。附**脏状态护栏**（2026-10-11 实测事故）。
+
+    状态文件可能被写脏（实测：测试把 total=14、part_path 指向已删临时目录的
+    假状态写进真文件）——前端照它算就显示「正在下载 … 天文数字%（断线自动
+    续传）」且永远不会完成。这里做自相矛盾检测：downloading 但没有有效的
+    part_path / total，或进度超过总量 2 倍时，按 idle 上报并复位落盘状态
+    （下一次检查更新会干净地重新开始），不再让脏值进入 UI。
+    """
     st = _load_state()
     out = {
         "status": st.get("status", "idle"),
         "version": st.get("version", ""),
-        "downloaded": st.get("downloaded", 0),
-        "total": st.get("total", 0),
+        "downloaded": int(st.get("downloaded") or 0),
+        "total": int(st.get("total") or 0),
+        "part_path": st.get("part_path", ""),
+        "integrity": st.get("integrity", "unchecked"),
         "error": st.get("error", ""),
     }
     if out["status"] == "downloading":
-        # 实时字节数从 .part 文件读（下载线程每秒刷状态，这里读文件更准）
         part = st.get("part_path", "")
-        if part and os.path.exists(part):
+        part_ok = bool(part) and os.path.exists(part)
+        if part_ok:
+            # 实时字节数从 .part 文件读（下载线程每秒刷状态，这里读文件更准）
             out["downloaded"] = os.path.getsize(part)
+        # 脏状态判据（只认**真实矛盾**，别误伤"刚开始、total 未算出"的合法态）：
+        #   a) 声明有 part 文件、文件却不在 → 状态残留（事故形态）
+        #   b) part 在位且**已写出数据**但总量未知/为 0，或进度超出总量 2 倍 → 矛盾
+        #      （"刚启动、total 尚未写入"时 downloaded=0 不算矛盾）
+        #   c) status=downloading 但 part_path 为空且无 url 线索 → 残留
+        _dirty = (bool(part) and not part_ok) or (
+            part_ok and ((out["total"] <= 0 and out["downloaded"] > 0)
+                         or (out["total"] > 0 and out["downloaded"] > out["total"] * 2))) or (
+            not part and out["status"] == "downloading"
+            and not st.get("url") and out["total"] <= 0)
+        if _dirty:
+            logger.warning("更新状态自相矛盾（total=%s part=%r 存在=%s）→ 复位为 idle",
+                           out["total"], str(part)[:80], part_ok)
+            with _state_lock:
+                _state.update({"status": "idle", "downloaded": 0, "total": 0,
+                               "part_path": "", "error": "", "integrity": "unchecked"})
+                _save_state()
+            out.update({"status": "idle", "downloaded": 0, "total": 0, "part_path": ""})
     return out
 
 
@@ -158,7 +276,16 @@ def fetch_remote_manifest() -> dict | None:
 
 
 def _download_worker(url: str, dest: Path, version: str) -> None:
-    """断点续传下载（单线程 Range 续传 + 重试 8 次 + 状态落盘）。"""
+    """断点续传下载（单线程 Range 续传 + 重试 8 次 + 状态落盘）。
+
+    **写盘上限（2026-10-12 事故修复）**：此前对写入没有任何上界——服务端给出
+    异常大的 content-length（或读循环不按预期结束）时会一路写到把磁盘填满。
+    实测事故：一个测试用的假响应体让 5 个下载任务各写出 20–52GB、合计 172GB
+    卡在系统临时目录（Finder 里显示为「系统数据 253GB」）。现在两道闸：
+      ① 声明长度 + 已有偏移超过硬上限 → 立即拒绝（一个字节都不落盘）；
+      ② 读取循环逐块累计，超过硬上限 → 抛错中止并删 .part。
+    上限按"更新包最大合理体积"设（当前包 ~330MB，取 4GB＝12 倍余量）。
+    """
     part = dest.with_suffix(dest.suffix + ".part")
     max_retries = 8
     for attempt in range(max_retries):
@@ -172,38 +299,76 @@ def _download_worker(url: str, dest: Path, version: str) -> None:
                 _state.update({"status": "downloading", "part_path": str(part)})
                 _save_state()
             with urllib.request.urlopen(req, timeout=60, context=_ssl_context()) as resp:
-                total = int(resp.getheader("Content-Length", 0)) + offset
+                _clen = int(resp.getheader("Content-Length", 0) or 0)
+                if _clen + offset > _MAX_PKG_BYTES:
+                    raise RuntimeError(
+                        f"服务端声明的包体积异常（{(_clen + offset) / 1024**3:.1f}GB "
+                        f"> 上限 {_MAX_PKG_BYTES / 1024**3:.0f}GB），拒绝下载")
+                total = _clen + offset
                 with _state_lock:
                     _state["total"] = total
                 mode = "ab" if offset > 0 else "wb"
                 _t0 = time.monotonic()  # 速度哨兵：直连慢而不死时主动切镜像
-                with open(part, mode) as f, _state_lock:
+                # 2026-10-11 修复：锁**只包状态字典写入**，不包网络读——旧实现
+                # `with open(...) as f, _state_lock:` 整个 resp.read() 循环持锁，
+                # 进度轮询（get_progress）全程阻塞。文件写与状态更新分离。
+                with open(part, mode) as f:
                     while True:
                         chunk = resp.read(256 * 1024)
                         if not chunk:
                             break
                         f.write(chunk)
-                        _state["downloaded"] = f.tell()
+                        _pos = f.tell()
+                        if _pos > _MAX_PKG_BYTES:
+                            raise RuntimeError(
+                                f"下载体积超过上限（>{_MAX_PKG_BYTES / 1024**3:.0f}GB），中止")
                         # 速度哨兵：起步 20 秒后平均速度 <200KB/s → 主动放弃本次
                         # 尝试（直连慢而不死，socket 超时按字节间隔算永不触发，
                         # 镜像轮换形同虚设——09-07 实测 25KB/s 要拖 2.3 小时）
                         _elapsed = time.monotonic() - _t0
                         if _elapsed >= 20:
-                            _speed = (f.tell() - offset) / _elapsed
+                            _speed = (_pos - offset) / _elapsed
                             if _speed < 200 * 1024:
                                 raise RuntimeError(
                                     f"下载过慢（{_speed/1024:.0f}KB/s < 200KB/s），切换镜像重试")
-                        # 状态每 2 秒落一次盘（防频繁 IO）
-                        if time.time() - _state.get("_last_flush", 0) > 2:
-                            _state["_last_flush"] = time.time()
-                            _save_state()
+                        with _state_lock:
+                            _state["downloaded"] = _pos
+                            # 状态每 2 秒落一次盘（防频繁 IO）
+                            if time.time() - _state.get("_last_flush", 0) > 2:
+                                _state["_last_flush"] = time.time()
+                                _save_state()
             if part.stat().st_size >= total > 0:
-                # 下载完成：重命名为正式文件
+                # 下载完成：先校验（有权威校验和时）、再重命名为正式文件。
+                # 2026-10-11：包可能经镜像下载，未校验的包不得进入"可安装"状态；
+                # 校验和拿不到（GitHub 不可达）时按未校验放行并在状态里标注。
+                _exp = str(_state.get("expected_digest") or "")
+                if _exp:
+                    _got = _sha256_file(part)
+                    if _got != _exp:
+                        logger.error("更新包校验失败：期望 %s，实际 %s（已丢弃）",
+                                     _exp[:24], _got[:24])
+                        try:
+                            part.unlink()
+                        except OSError:
+                            pass
+                        with _state_lock:
+                            _state.update({"status": "failed", "integrity": "mismatch",
+                                           "error": "更新包校验失败（可能被镜像替换），已丢弃"})
+                            _save_state()
+                        return
+                    with _state_lock:
+                        _state["integrity"] = "verified"
                 os.replace(part, dest)
                 with _state_lock:
                     _state.update({"status": "done", "downloaded": total, "part_path": ""})
                     _save_state()
-                logger.info("更新包预下载完成: %s (%d 字节)", dest.name, total)
+                logger.info("更新包预下载完成: %s (%d 字节，校验=%s)",
+                            dest.name, total, _state.get("integrity", "unchecked"))
+                # 下完就清历史包（2026-10-11）：旧版本整包只有占磁盘的价值
+                try:
+                    cleanup_old_packages(keep_name=dest.name)
+                except Exception:
+                    logger.debug("下载后清理旧包失败（不影响更新）", exc_info=True)
                 return
             raise RuntimeError(f"下载数据不足: {part.stat().st_size}/{total}")
         except Exception as e:
@@ -228,9 +393,50 @@ def start_prepare(current_version: str) -> dict:
             return get_progress()  # 已在跑
         url = st.get("url", "")
         if url:
-            logger.warning("检测到下载状态残留但 worker 已死，续传重启: %s", url.split("/")[-1])
+            # 自愈优先（2026-10-09）：目标包已**完整在位**（大小 == 上次记录的总大小）
+            # 就不续传——否则会往几十 MB 的残片里白续 324MB（用户实测：GitHub 下载
+            # 中断后进程退出，包其实已由别的方式补齐，下次启动却从 11% 重来）。
+            # .part 残片顺手清掉（它是本次下载的临时文件）。
+            _dest = _state_paths()[0] / _safe_asset_name(url)
+            _total = int(st.get("total") or 0)
+            if _total and _dest.exists() and _dest.stat().st_size == _total:
+                # 自愈前也校验（2026-10-11）：大小对不等于内容对——镜像换包后
+                # 进程重启走进这里就会把坏包直接标 done。拿得到权威校验和就验；
+                # 验不过 → 删除坏包并继续走完整下载流程（而不是信任它）。
+                _exp = str(st.get("expected_digest") or "")
+                if _exp:
+                    _got = _sha256_file(_dest)
+                    if _got != _exp:
+                        logger.error("在位更新包校验失败（期望 %s，实际 %s）→ 删除重下",
+                                     _exp[:24], _got[:24])
+                        try:
+                            _dest.unlink()
+                        except OSError:
+                            pass
+                        with _state_lock:
+                            _state.update({"integrity": "mismatch", "total": 0,
+                                           "downloaded": 0})
+                            _save_state()
+                    else:
+                        with _state_lock:
+                            _state["integrity"] = "verified"
+                            _save_state()
+                if _dest.exists() and _dest.stat().st_size == _total:
+                    _part = _dest.with_suffix(_dest.suffix + ".part")
+                    try:
+                        if _part.exists():
+                            _part.unlink()
+                    except OSError:
+                        logger.debug("清理 .part 残片失败", exc_info=True)
+                    logger.info("更新包已在位且完整（%d 字节），跳过续传: %s",
+                                _total, _dest.name)
+                    with _state_lock:
+                        _state.update({"status": "done", "downloaded": _total,
+                                   "error": "", "part_path": ""})
+                    _save_state()
+                return get_progress()
+            logger.warning("检测到下载状态残留但 worker 已死，续传重启: %s", _safe_asset_name(url))
             _ver = st.get("version", "")
-            _dest = UPDATE_DIR / url.split("/")[-1]
 
             def _resume_worker():
                 _download_worker(url, _dest, _ver)
@@ -243,13 +449,23 @@ def start_prepare(current_version: str) -> dict:
         # 复用已预下载的包仅当它就是 GitHub 当前最新版；否则重新下载
         remote = fetch_remote_manifest()
         remote_ver = str((remote or {}).get("version", ""))
-        if remote_ver and st.get("version", "") == remote_ver:
+        if not remote_ver:
+            # 拉不到远端清单（本机访问 GitHub 时好时坏，2026-10-09 实测）：已下完的
+            # 包就是当前可用的更新，**直接保留 done 返回**。早先这里不 return、落到
+            # 下方 worker：worker 开头把状态改成 checking，导致后面"保留既有 done"
+            # 的判断恒假 → 包明明下完了却被改写成 failed（用户更新 v0.3.73 时报
+            # "更新失败"的真因）。
+            return get_progress()
+        if st.get("version", "") == remote_ver:
             if not _is_newer(remote_ver, current_version or "0.0.0"):
                 with _state_lock:
                     _state.update({"status": "up_to_date", "version": remote_ver, "error": ""})
                     _save_state()
             return get_progress()
         # GitHub 有比已预下载更新的版本 → 继续走下方完整流程
+
+    # 进 worker 前的状态快照（worker 会把状态改成 checking，运行态读不到原值）
+    _entry_status = str(st.get("status", ""))
 
     def worker():
         try:
@@ -258,10 +474,10 @@ def start_prepare(current_version: str) -> dict:
                 _save_state()
             manifest = fetch_remote_manifest()
             if not manifest:
-                # 拉不到清单（网络失败）：保留既有 done 状态——
-                # 已预下载的包仍可用于本机安装，下次检查会重试
-                prev = _load_state()
-                if prev.get("status") != "done":
+                # 拉不到清单（网络失败）：保留既有 done 状态——已预下载的包仍可用于
+                # 本机安装，下次检查会重试。判据用**进 worker 前的快照**：
+                # 2026-10-09 实测读运行态（已被改成 checking）会让这个保护永远失效。
+                if _entry_status != "done":
                     with _state_lock:
                         _state.update({"status": "failed", "error": "无法获取更新清单"})
                         _save_state()
@@ -279,10 +495,15 @@ def start_prepare(current_version: str) -> dict:
                     _save_state()
                 return
             url = entry["url"]
-            dest = UPDATE_DIR / url.split("/")[-1]
+            dest = _state_paths()[0] / _safe_asset_name(url)
+            # 校验和：GitHub 权威接口（可达时）。下载完成/已在位时用它验证，
+            # 防镜像换包；不可达则按"未校验"如实标注（不假装校验过）。
+            _digest = _fetch_expected_digest(remote_ver, dest.name)
             with _state_lock:
                 _state.update({"status": "downloading", "version": remote_ver,
                                "url": url, "signature": entry.get("signature", ""),
+                               "expected_digest": _digest,
+                               "integrity": "pending" if _digest else "unchecked",
                                # pub_date 透传：空串会让 tauri updater 的 RFC3339 解析直接失败
                                "pub_date": str(manifest.get("pub_date") or ""),
                                "downloaded": 0, "total": 0})
@@ -322,7 +543,7 @@ def get_tauri_manifest(current_version: str) -> dict | None:
     url = st.get("url", "")
     if not url:
         return None
-    dest = UPDATE_DIR / url.split("/")[-1]
+    dest = _state_paths()[0] / _safe_asset_name(url)
     if not dest.exists():
         return None
     return {
@@ -344,5 +565,76 @@ def get_update_file_path() -> Path | None:
     url = st.get("url", "")
     if not url:
         return None
-    dest = UPDATE_DIR / url.split("/")[-1]
+    dest = _state_paths()[0] / _safe_asset_name(url)
     return dest if dest.exists() else None
+
+
+# ── 旧包清理（2026-10-11）────────────────────────────────────────────
+# 实测：更新目录堆了 43 个历史包、约 13.8GB，且没有任何清理机制——每次检查
+# 更新都会保留下载过的整包，越堆越大。这里只清理**可再生的下载缓存**：
+#   - 更早版本的 *.app.tar.gz / *.exe（安装包，可随时重下）
+#   - 孤儿 *.part（中断的临时文件）
+# **保留**：当前状态引用的包（安装它要用）、版本号最高者（状态丢时的兜底——
+# 用户可能刚下完还没安装）、state.json、backup/ 等一切非下载缓存的目录。
+
+_PKG_SUFFIXES = (".tar.gz", ".exe", ".dmg")
+
+
+def _pkg_version_key(name: str) -> tuple:
+    m = re.search(r"Latiao_(\d+)\.(\d+)\.(\d+)", name or "")
+    return tuple(int(x) for x in m.groups()) if m else (0, 0, 0)
+
+
+def cleanup_old_packages(keep_name: str = "") -> dict:
+    """删除历史更新包，只留最新一个 + 状态引用的那个。返回清理摘要。"""
+    udir, _sfile = _state_paths()
+    removed: list[str] = []
+    freed = 0
+    kept: list[str] = []
+    try:
+        st = _load_state()
+        # 当前状态引用的包名（消毒：与下载路径同一入口，防 ?query 等让 ref 对不上）
+        ref = _safe_asset_name(st.get("url") or "")
+        if ref == "package.bin":
+            ref = ""
+        pkgs = [p for p in udir.glob("Latiao_*")
+                if p.is_file() and p.name.endswith(_PKG_SUFFIXES)]
+        # 保留集 = 状态引用的 + 调用方指定的 + **版本最高者**（恒加，2026-10-11
+        # 修复：旧实现 `if not keep:` 才加最高版本——状态有 url 时只留引用的旧包、
+        # 删掉最新包，与"只留最新一个"的语义相反）。
+        keep = {n for n in (ref, keep_name) if n}
+        versioned = [p for p in pkgs if _pkg_version_key(p.name) > (0, 0, 0)]
+        if versioned:
+            keep.add(max(versioned, key=lambda p: (_pkg_version_key(p.name),
+                                                   p.stat().st_mtime)).name)
+        for p in sorted(pkgs, key=lambda p: (_pkg_version_key(p.name), p.stat().st_mtime)):
+            if p.name in keep:
+                kept.append(p.name)
+                continue
+            try:
+                sz = p.stat().st_size
+                p.unlink()
+                freed += sz
+                removed.append(p.name)
+            except OSError:
+                logger.debug("清理旧更新包失败: %s", p.name, exc_info=True)
+        # 孤儿 .part（正式包不在位、且状态也不再引用的残片；可随时重下）
+        for part in list(udir.glob("*.part")):
+            base = part.name[:-5]
+            base_pkg_exists = (udir / base).exists() and base.endswith(_PKG_SUFFIXES)
+            if base_pkg_exists:
+                continue                      # 正式包在位 → 残片是本次下载残留，删
+            if base == (ref or ""):
+                continue                      # 状态还指着它 → 留给续传
+            try:
+                part.unlink()
+                removed.append(part.name)
+            except OSError:
+                pass
+    except Exception:
+        logger.warning("旧更新包清理异常（不影响更新）", exc_info=True)
+    if removed:
+        logger.info("更新包清理：删除 %d 个（释放 %.1f GB），保留 %s",
+                    len(removed), freed / (1024 ** 3),
+                    ", ".join(kept) or "（无）")
+    return {"removed": removed, "freed_bytes": freed, "kept": kept}

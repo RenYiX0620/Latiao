@@ -1,7 +1,7 @@
 """_ThinkFenceFilter 单元测试：跨 delta 拆分的 ```think 围栏必须剥净。"""
 import unittest
 
-from agent_loop import _ThinkFenceFilter, _strip_think_fences
+from agent_loop import _strip_think_fences, _ThinkFenceFilter
 
 
 class ThinkFenceFilterTest(unittest.TestCase):

@@ -45,6 +45,11 @@ export function sanitizeSessions(
 /**
  * 配额超限降级保存（P0-5 修复的纯函数版）：
  * L0 原样 → L1 剥图片 → L2 最近 2 会话 → L3 最近 1 会话 20 条 → 清空后保底 10 条。
+ *
+ * **数组顺序契约（2026-10-11 修复）**：会话数组是**最新在前**（App.tsx 新建会话用
+ * `[ns, ...prev]`）。此函数此前用 `slice(-2)` / `[length-1]` 取"尾部"，实际拿到的是
+ * **最旧的**几个——quota 紧张时正好丢掉刚聊的会话，而注释写的是"最近"。现在按
+ * 索引 0 取最新；测试同步修正（旧测试把错误语义固化住了）。
  */
 export function saveSessionsWithFallback(raw: string, storage: KVStorage | null = defaultStorage()): boolean {
   const trySave = (s: string): boolean => {
@@ -70,18 +75,18 @@ export function saveSessionsWithFallback(raw: string, storage: KVStorage | null 
       })),
     }));
     if (trySave(JSON.stringify(noImg))) return true;
-    // L2：只保留最近 2 个会话
-    if (arr.length > 1 && trySave(JSON.stringify(noImg.slice(-2)))) return true;
+    // L2：只保留最近 2 个会话（索引 0 = 最新）
+    if (arr.length > 1 && trySave(JSON.stringify(noImg.slice(0, 2)))) return true;
     // L3：最近 1 个会话的最后 20 条
-    const last = noImg[noImg.length - 1];
-    if (last && trySave(JSON.stringify([{ ...last, messages: (last.messages || []).slice(-20) }]))) return true;
+    const newest = noImg[0];
+    if (newest && trySave(JSON.stringify([{ ...newest, messages: (newest.messages || []).slice(-20) }]))) return true;
     // 保底：清空旧数据后保存本次会话最后 10 条
     try {
       storage.removeItem(STORAGE_KEY);
     } catch {
       /* ignore */
     }
-    if (last) trySave(JSON.stringify([{ ...last, messages: (last.messages || []).slice(-10) }]));
+    if (newest) trySave(JSON.stringify([{ ...newest, messages: (newest.messages || []).slice(-10) }]));
     return true;
   } catch {
     return false;

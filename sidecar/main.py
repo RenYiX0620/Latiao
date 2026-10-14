@@ -15,9 +15,9 @@ matching, custom-permission state, shared constants, and facade re-exports so
 """
 from __future__ import annotations
 
-import sys
 import re
 import secrets
+import sys
 import time
 
 if __name__ == "__main__":
@@ -69,7 +69,6 @@ import logging
 import os
 import sys
 from collections import deque
-
 from contextlib import asynccontextmanager
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
@@ -137,10 +136,13 @@ from agent_loop import (  # noqa: F401 — 门面 re-export：保持 main.xxx �
     _strip_native_tool_calls,
     execute_tool,
 )
-from config import PROGRESS_DIR
+
 # SUBAGENT_MODEL 在本文件里没用到，但**是对外 re-export**（测试与 cron 走 `from main import`）。
 # 别被 ruff 的"未用导入"删掉：删了它们会在别处 ImportError。
-from config import SUBAGENT_MODEL  # noqa: F401
+from config import (
+    PROGRESS_DIR,
+    SUBAGENT_MODEL,  # noqa: F401
+)
 from cron import _cron_loop, _seed_default_cron
 from db import _init_db
 from identity import _create_default_identity
@@ -213,17 +215,37 @@ except Exception:
 # argv，ps/ps -E/ps aux 都看不到。环境变量仍作开发/手动启动的兜底（优先级更高）。
 def _read_token_from_stdin(timeout: float = 5.0) -> str:
     """读 Rust 侧通过 stdin 递来的一行 token；读不到返回空串（不阻塞启动）。"""
+    line = ""
     try:
         if sys.stdin is None or sys.stdin.isatty():
             return ""
-        import select
-        try:
-            ready, _, _ = select.select([sys.stdin], [], [], timeout)
-        except (OSError, ValueError):
-            return ""
-        if not ready:
-            return ""
-        line = (sys.stdin.readline() or "").strip()
+        if sys.platform == "win32":
+            # Windows 的 select() 只支持 socket，对 stdin 会抛 OSError(WinError 10038)
+            # → 早返回空串导致鉴权失效。改用线程 + 队列做带超时的阻塞读。
+            import queue as _queue
+            import threading as _threading
+            q: "_queue.Queue[str]" = _queue.Queue()
+
+            def _reader() -> None:
+                try:
+                    q.put((sys.stdin.readline() or "").strip())
+                except Exception:
+                    q.put("")
+
+            _threading.Thread(target=_reader, daemon=True).start()
+            try:
+                line = q.get(timeout=timeout)
+            except _queue.Empty:
+                line = ""
+        else:
+            import select
+            try:
+                ready, _, _ = select.select([sys.stdin], [], [], timeout)
+            except (OSError, ValueError):
+                return ""
+            if not ready:
+                return ""
+            line = (sys.stdin.readline() or "").strip()
     except Exception:
         return ""
     # 只认形如 token 的串，避免把别的东西（如误接的管道内容）当 token
@@ -275,6 +297,10 @@ def _check_auth(request: Request) -> None:
     - /v1/update-latest.json、/v1/update-file 豁免：Tauri updater 插件的
       请求不携带自定义 token（本地回环 + 安装包经 minisign 签名验证，安全）
     """
+    # 失败关闭（fail-closed）：token 未初始化时**一律拒**，连 /health 也不放行
+    # —— tests/test_security.py 的 TestAuthFailClosed 钉的就是这条。
+    # Windows 上 token 读不到属于读取本身的问题，修在 _read_token_from_stdin 的
+    # win32 分支（线程 + 队列），不靠"豁免 /health"兜底（那会放宽安全语义）。
     if not AUTH_TOKEN:
         raise _UnauthorizedError("sidecar 鉴权未初始化：请通过应用启动（Rust 侧经子进程 stdin 送 token），或设置 LATIAO_AUTH_TOKEN 环境变量后手动启动")
     if request.url.path in ("/health", "/v1/update-latest.json", "/v1/update-file"):
@@ -344,6 +370,7 @@ async def lifespan(app: FastAPI):
     # GitHub 生态抓取：启动后台线程（首启全量；24h 内增量跳过），不阻塞启动
     try:
         import threading
+
         from discovery import run_discovery
         def _discovery_worker():
             try:
@@ -374,6 +401,11 @@ async def lifespan(app: FastAPI):
                             shutdown_engine()
                         except Exception:
                             logger.warning("退出清理时停止引擎失败", exc_info=True)
+                        try:
+                            from tts_local_service import stop as _stop_tts
+                            _stop_tts()
+                        except Exception:
+                            logger.warning("退出清理时停止语音服务失败", exc_info=True)
                         os._exit(0)
                 except Exception:
                     break
@@ -395,6 +427,7 @@ async def lifespan(app: FastAPI):
         import embedding_service as _emb
         if _emb.available():
             import threading as _th
+
             import semantic as _sem
             _th.Thread(target=_sem.warmup, name="semantic-warmup", daemon=True).start()
             logger.info("语义检索已启用（模型 %s；预热中）", _emb.MODEL_ID)
@@ -404,9 +437,31 @@ async def lifespan(app: FastAPI):
         logger.warning("语义检索预热启动失败", exc_info=True)
 
     _orphan_watchdog()
+
+    # 本机语音服务（Qwen3-TTS shim，2026-10-14）：配了 tts.service_dir 才管理——
+    # 辣条启动即后台拉起（不阻塞启动；幂等，已拉起则跳过），退出/被强杀由
+    # 下面关闭段与孤儿看门狗收掉（见 tts_local_service.py 的三层保障）。
+    try:
+        import tts_local_service as _tts_local
+        if _tts_local.available():
+            _tts_local.start_in_background()
+            logger.info("本机语音服务已配置（%s），后台启动中", _tts_local.service_dir())
+        else:
+            logger.info("本机语音服务未配置（tts.service_dir 为空或缺 start.sh）——朗读按外部服务处理")
+    except Exception:
+        logger.warning("本机语音服务启动失败", exc_info=True)
+
     cron_task = asyncio.create_task(_cron_loop())
     catchup_task = asyncio.create_task(run_cron_catchup())  # 补跑关闭期间错过的任务
     logger.info("Sidecar 启动 — cron loop started")
+
+    # 通道（2026-09-29）：飞书走长连接（无需公网）；微信等经 /v1/channels/inbound。
+    # 未启用/未装 lark-oapi/未配置凭据时只留一条日志，不影响其它功能。
+    try:
+        from channels import feishu as _feishu
+        _feishu.start()
+    except Exception:
+        logger.warning("飞书通道启动失败", exc_info=True)
 
     # 工具调用历史保留策略（2026-09-23，用户定 30 天）：启动跑一次 + 之后每天一次。
     # 放线程池/后台任务里做，VACUUM 是同步阻塞操作，不能在事件循环里跑。
@@ -414,33 +469,82 @@ async def lifespan(app: FastAPI):
         while True:
             try:
                 from starlette.concurrency import run_in_threadpool
+
                 import db
                 await run_in_threadpool(db.prune_tool_calls)
                 # ⑦（09-23）：反思保留 + learnings 超限淘汰（与工具历史同一轮里做）
                 await run_in_threadpool(db.prune_reflections)
                 await run_in_threadpool(db.prune_learnings)
                 await run_in_threadpool(db.prune_injections)
+                # 2026-10-11：memory 表（cron 产出全文）与会话表兜底清理——
+                # 此前两者都只增不减（prune_sessions 写好了但从没人调用）。
+                # 默认 memory 180 天、会话保留 1000 个（MAX_SESSIONS），均保守。
+                await run_in_threadpool(db.prune_memory)
+                try:
+                    import sessions as _sess
+                    await run_in_threadpool(_sess.prune_sessions)
+                except Exception:
+                    logger.debug("会话清理失败（不影响其它清理）", exc_info=True)
+                # 每轮指标保留期（2026-09-29）：一行一轮，默认 180 天
+                import turn_metrics as _tm
+                await run_in_threadpool(_tm.prune)
                 # ⑥：空闲就停掉嵌入服务（腾内存）；下次检索按需再起
                 try:
                     import embedding_service as _emb
                     await run_in_threadpool(_emb.maybe_stop_idle)
                 except Exception:
                     pass
+                # 匿名使用数据（2026-10-11）：每 24h 最多一次上报；没配
+                # endpoint 或开关关 → 空操作（数据只留本机）。放线程池，
+                # 网络慢/离线不阻塞事件循环。
+                try:
+                    import anon_usage as _anon
+                    await run_in_threadpool(_anon.send_if_due)
+                except Exception:
+                    logger.debug("匿名数据上报跳过", exc_info=True)
+                # 更新包清理（2026-10-11）：历史整包只有占磁盘的价值（实测堆到
+                # 13.8GB）。启动首轮就会跑到，清掉除最新一个之外的全部。
+                try:
+                    import update_service as _us
+                    await run_in_threadpool(_us.cleanup_old_packages)
+                except Exception:
+                    logger.debug("更新包清理跳过", exc_info=True)
             except Exception:
                 logger.warning("工具历史清理任务失败", exc_info=True)
             await asyncio.sleep(24 * 3600)
 
     prune_task = asyncio.create_task(_prune_loop())
+
+    async def _cleanup_update_packages_once():
+        """启动即清一次历史更新包（2026-10-11）：每日循环要等 24h 才轮到，
+        而积压可能很大（实测 13.8GB）——启动就清，用户立刻看到磁盘回血。"""
+        try:
+            from starlette.concurrency import run_in_threadpool
+
+            import update_service as _us
+            await run_in_threadpool(_us.cleanup_old_packages)
+        except Exception:
+            logger.debug("启动清理更新包跳过", exc_info=True)
+
+    cleanup_task = asyncio.create_task(_cleanup_update_packages_once())
     yield
     # 正常退出（应用关窗/托盘退出，Rust 端发 SIGTERM）：停掉本地模型引擎，
     # 释放显存/内存。sidecar 单独重启走 detach+SIGKILL，不会经过这里。
-    for _t in (cron_task, catchup_task, prune_task):
+    for _t in (cron_task, catchup_task, prune_task, cleanup_task):
         _t.cancel()
     try:
         from local_llm import shutdown_engine
         shutdown_engine()
     except Exception:
         logger.warning("Sidecar 关闭 — 停止引擎失败", exc_info=True)
+    # 本机语音服务（2026-10-14）：与引擎同理，退出就把拉起过的服务收掉。
+    # 放在引擎之后：stop() 最多等 1.5s（SIGTERM→强杀），Rust 关闭预算是 3s；
+    # 即便被强杀打断，shim 侧父进程看门狗（PPID 变化）也会自灭兜底。
+    try:
+        from tts_local_service import stop as _stop_tts
+        _stop_tts()
+    except Exception:
+        logger.warning("Sidecar 关闭 — 停止本机语音服务失败", exc_info=True)
     SIDECAR_PID.unlink(missing_ok=True)
     cron_task.cancel()
     catchup_task.cancel()
@@ -489,7 +593,6 @@ app.add_middleware(
 )
 
 TAVILY_API_URL = os.environ.get("TAVILY_API_URL", "https://api.tavily.com/search")
-MAX_UPLOAD_SIZE = 50 * 1024 * 1024  # 50 MB
 
 # ═══════════════════════════════════════════════════════
 #  Harness: 工具权限分级 + 状态持久化
@@ -529,6 +632,10 @@ async def _hot_reload_extensions() -> dict:
     重新注册 MCP 工具——刚装完的扩展立即可用，无需重启（此前只写磁盘
     配置，插件/MCP 工具要重启才生效）。"""
     import agent_loop
+
+    # 1) 能力表同步：技能三来源 + 工具注册表（prune 清理已卸载扩展的能力行）
+    import capability_registry
+
     # fallback 定义实际在 tool_executor（此前误 import tool_system，从未触发过
     # 直至生态安装路径真正调用才暴露）
     from tool_executor import (
@@ -537,8 +644,6 @@ async def _hot_reload_extensions() -> dict:
         _FALLBACK_TOOLS,
     )
     from tool_system import load_plugins
-    # 1) 能力表同步：技能三来源 + 工具注册表（prune 清理已卸载扩展的能力行）
-    import capability_registry
     capability_registry.sync_skills()
     capability_registry.sync_tools(agent_loop.TOOLS, agent_loop.TOOL_PERMISSIONS,
                                    agent_loop.TOOL_DISPATCH, prune=True)
@@ -575,7 +680,8 @@ if __name__ == "__main__":
     # ── 防双实例：已有 sidecar 监听 8765 时直接退出 ──
     # 两个 sidecar 同时管理引擎 = 双份模型加载（内存 95% 尖峰）+ 状态互踩。
     # 应用正常重启由 Rust 端先 kill 旧进程，这里拦的是绕过应用的手动启动。
-    import socket, time as _time
+    import socket
+    import time as _time
     _port = int(os.environ.get("LATIAO_PORT", "8765"))
     _dup = False
     for _try in range(3):

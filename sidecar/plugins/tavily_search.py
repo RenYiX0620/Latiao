@@ -98,7 +98,7 @@ async def execute(args: dict) -> str:
             "免费注册：https://tavily.com"
         )
 
-    query = args["query"]
+    query = str(args.get("query") or args.get("q") or "")
     search_depth = args.get("search_depth", "basic")
     # 模型常给 "high"/"deep" 等非法值 → 映射为 advanced，避免 HTTP 400 整轮失败
     if search_depth not in ("basic", "advanced"):

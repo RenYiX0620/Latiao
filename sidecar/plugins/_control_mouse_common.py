@@ -129,8 +129,27 @@ def screen_capture(save_path: str = "", x: int = 0, y: int = 0, w: int = 0, h: i
         return "⛔ 截屏暂仅支持 macOS"
     if not tcc_screen_capture_ok():
         return screen_guide()
+    screens_dir = (Path.home() / ".local-ai-os" / "screens").resolve()
     if not save_path:
-        save_path = str(Path.home() / ".local-ai-os" / "screens" / f"cap_{int(__import__('time').time())}.png")
+        save_path = str(screens_dir / f"cap_{int(__import__('time').time())}.png")
+    else:
+        try:
+            p_in = Path(save_path).expanduser()
+            if not p_in.is_absolute():
+                p_in = screens_dir / p_in
+            p_res = p_in.resolve()
+        except Exception:
+            return "⛔ Blocked: save_path 无效"
+        if not (p_res == screens_dir or screens_dir in p_res.parents):
+            return f"⛔ Blocked: 截屏只允许写入 {screens_dir} 下: {p_res}"
+        try:
+            from cmd_safety import sensitive_write_block
+            _blk = sensitive_write_block(str(p_res))
+            if _blk:
+                return _blk
+        except Exception:
+            pass
+        save_path = str(p_res)
     p = Path(save_path)
     p.parent.mkdir(parents=True, exist_ok=True)
     try:

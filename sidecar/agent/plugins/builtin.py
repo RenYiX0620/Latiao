@@ -1,7 +1,13 @@
-"""内置插件：薄循环的既有能力表达为 scope 注册（fastpath/assists/planning/compaction）。
+"""内置插件：薄循环的既有能力表达为 scope 注册（assists/planning/compaction）。
 
 每个插件 = setup(scope) -> None，向容器注册 waterfall 钩子。
 启用条件在钩子内部自检（引擎能力/档位），保持 Scope 通用。
+
+闲聊快车道（原 fastpath 插件：短闲聊剥工具 + 强制关思考）**2026-10-12 按用户
+拍板移除**——思考档位只留"关/开"两态，开的时候所有消息一视同仁走思考轮
+（详见 agent/loop.py `_thinking_first_round`）。历史事实：它自 2026-09-19 起
+在真机就从未生效过（`last_user_text` 含框架追加的语气/语言尾巴，"短输入 ≤24 字"
+判据永不成立；sidecar.log 2026-09-23→10-12 共 15920 行里"快车道"出现 0 次）。
 """
 import logging
 import uuid
@@ -9,29 +15,12 @@ import uuid
 import httpx
 
 from agent.context import (
-    _is_light_query,
     _normalize_access,
     _slim_history_for_local,
 )
 from agent.gates import _final_answer_extraction, _force_translate, _reply_lang_mismatch
 
 logger = logging.getLogger("latiao-sidecar")
-
-
-# ══ fastpath：闲聊快车道（request 钩子）══════════════════════════════
-def setup_fastpath(scope):
-    """本地引擎 + 闲聊短消息：不挂工具、关思考——秒级直达（27B 实测 1.3s）。"""
-    async def request_hook(body, ctx):
-        loop = ctx.get_service("loop") if ctx is not None else None
-        if loop is None or not getattr(loop, "is_local", False):
-            return body
-        if not _is_light_query(loop.last_user_text, loop.current_msgs):
-            return body
-        body.pop("tools", None)
-        body["chat_template_kwargs"] = {"enable_thinking": False}
-        return body
-
-    scope.waterfall("request").register(request_hook, order=10, name="fastpath")
 
 
 # ══ assists：弱模型辅助（deliver 钩子，仅本地引擎）══════════════════
@@ -65,6 +54,11 @@ def setup_assists(scope):
         # 辅助 2：语言交付闸门（本地引擎英文漂移）——正文已实时流出，
         # 用 content_revised 整体替换（前端把最后一条回答替换为译文）
         if _reply_lang_mismatch(payload["user_text"], text, payload.get("user_lang", "")):
+            try:
+                import anon_usage
+                anon_usage.note("gate_lang")
+            except Exception:
+                logger.debug("anon_usage 语言闸门记账失败", exc_info=True)
             try:
                 async with httpx.AsyncClient(timeout=httpx.Timeout(60)) as c2:
                     translated = await _force_translate(
@@ -126,6 +120,63 @@ def setup_planning(scope):
 
 
 # ══ compaction：上下文压缩（pre_step 钩子）══════════════════════════
+# 首尾整行已覆盖全部内容时，小体量不值得动刀（省几百字符却要冒切开数字/键值的风险）
+_KEEP_HARD_MAX = 2000
+
+
+def _truncate_keep_lines(c: str, head_chars: int = 300, tail_chars: int = 100) -> str:
+    """按**整行**截断工具结果，并写明丢弃量（2026-09-29）。
+
+    旧实现 `c[:300] + "…" + c[-100:]` 会**从行中间切开**——表格行/数字/文件名被劈成
+    两半，模型可能把 "1376.55" 引用成 "137" 或贴出半个路径。改为在行边界切，并在
+    标记里说明省略了多少行/字符（模型据此知道该重新调用，而不是凭半截数字复述）。"""
+    if len(c) <= head_chars + tail_chars + 40:
+        return c
+    lines = c.splitlines() or [c]
+    head: list[str] = []
+    used = 0
+    for ln in lines:
+        if head and used + len(ln) + 1 > head_chars:
+            break
+        head.append(ln)
+        used += len(ln) + 1
+    tail: list[str] = []
+    used_t = 0
+    for ln in reversed(lines):
+        if tail and used_t + len(ln) + 1 > tail_chars:
+            break
+        tail.append(ln)
+        used_t += len(ln) + 1
+    tail.reverse()
+    kept = "\n".join(head + tail)
+    dropped_lines = max(0, len(lines) - len(head) - len(tail))
+    dropped_chars = max(0, len(c) - len(kept))
+    if not dropped_chars:
+        # 一行都没丢：说明首尾整行就把内容覆盖完了（少则一两行长内容）。
+        # 若总量本来就不大，动刀只会徒增风险（切开数字/键值、加噪音标记）→ 原样返回。
+        if len(kept) <= max(_KEEP_HARD_MAX, (head_chars + tail_chars) * 2):
+            return c
+        # 极长行主导（压缩过的 JSON / 单行 CSV）——整行取等于没压。
+        # 退化为**就近分隔符**切；切点取窗口内最靠边界的那个，尽量多留内容。
+        def _cut(s: str, limit: int, from_end: bool = False) -> str:
+            if len(s) <= limit:
+                return s
+            seg = s[-limit:] if from_end else s[:limit]
+            for sep in (",", "，", "；", ";", "\t", "|", " "):
+                i = seg.find(sep) if from_end else seg.rfind(sep)
+                # 尾部取最靠前的分隔符但别贴到窗口末端；头部取最靠后的但别贴到窗口前端
+                if (0 <= i < limit * 0.5) if from_end else (i > limit * 0.5):
+                    return seg[i + 1:] if from_end else s[:i + 1]
+            return seg
+        head_s, tail_s = _cut(c, head_chars), _cut(c, tail_chars, from_end=True)
+        marker = (f"…(轮内已压缩：单行内容共 {len(c)} 字符，按分隔符取首尾；"
+                  "需要其中任何具体数字或文件名，请重新调用该工具，不要凭记忆复述)…")
+        return head_s + "\n" + marker + "\n" + tail_s
+    marker = (f"…(轮内已压缩：省略 {dropped_lines} 行 / {dropped_chars} 字符；"
+              "需要其中任何具体数字或文件名，请重新调用该工具，不要凭记忆复述)…")
+    return "\n".join(head) + "\n" + marker + "\n" + "\n".join(tail)
+
+
 def _collapse_duplicate_assistants(msgs: list) -> list:
     """完全相同的 assistant 声明折叠为一条（结构性去重，不猜内容）。
 
@@ -207,16 +258,23 @@ def setup_compaction(scope, *, local_threshold=18000, cloud_threshold=80000):
             _sys = [m for m in msgs if m.get("role") == "system"]
             _rest = [m for m in msgs if m.get("role") != "system"]
             _turns = [i for i, m in enumerate(_rest) if m.get("role") == "user"]
+            _dropped_turns = 0
             if len(_turns) > 3:
+                _dropped_turns = len(_turns) - 3
                 msgs = _sys + _rest[_turns[-3]:]
-            # 轮内压缩：当前 turn 的工具结果链——保留最近 2 条完整，更早的
-            # 压到 400 字符（头 300 + 尾 100）；中间轮 <50 字的过渡正文清空
-            # （assistant 的 tool_calls 字段原样保留，模板兼容）。
+            # 轮内压缩：当前 turn 的工具结果链——保留最近 2 条完整，更早的按
+            # **整行**截断（`_truncate_keep_lines`：头 ~300 + 尾 ~100 字符，
+            # 行边界优先、极长单行退化为分隔符切，并写明丢弃量）；中间轮
+            # <50 字的过渡正文清空（assistant 的 tool_calls 字段原样保留，模板兼容）。
             tool_idx = [i for i, m in enumerate(msgs) if m.get("role") == "tool"]
+            _dropped = 0
             for i in tool_idx[:-2]:
                 c = str(msgs[i].get("content") or "")
                 if len(c) > 420:
-                    msgs[i] = {**msgs[i], "content": c[:300] + "\n…(轮内已压缩)…" + c[-100:]}
+                    _t = _truncate_keep_lines(c)
+                    if _t != c:
+                        _dropped += 1
+                    msgs[i] = {**msgs[i], "content": _t}
             last_asst = max((i for i, m in enumerate(msgs) if m.get("role") == "assistant"), default=-1)
             for i, m in enumerate(msgs):
                 if m.get("role") == "assistant" and i != last_asst:
@@ -241,20 +299,40 @@ def setup_compaction(scope, *, local_threshold=18000, cloud_threshold=80000):
                     _seen_sig = c
             loop.current_msgs = msgs
             loop._last_compact_total = sum(len(str(m.get("content") or "")) for m in msgs)
-            logger.info("compaction: 本地历史 %d → %d 字符（含轮内压缩）", total, loop._last_compact_total)
+            if _dropped or _dropped_turns:
+                # 尾部追加（不改中段 → 前缀缓存只多算这截尾巴），提醒别再凭记忆复述
+                try:
+                    from agent.loop import _note_msg
+                    from agent.messages import msg as _m
+                    loop.current_msgs.append(
+                        _note_msg(_m("compaction_notice", getattr(loop, "user_lang", "zh"))))
+                except Exception:
+                    logger.debug("压缩提示注入失败", exc_info=True)
+            logger.info("compaction: 本地历史 %d → %d 字符（含轮内压缩，工具结果截断 %d 条、丢轮 %d）",
+                        total, loop._last_compact_total, _dropped, _dropped_turns)
         else:
             sys = [m for m in msgs if m.get("role") == "system"]
             rest = [m for m in msgs if m.get("role") != "system"]
+            _kept = max(0, len(rest) - 8)
             loop.current_msgs = sys + rest[-8:]
             loop._last_compact_total = 0
-            logger.info("compaction: 云端历史 %d 字符超阈值，保留最近 8 条", total)
+            if _kept:
+                try:
+                    from agent.loop import _note_msg
+                    from agent.messages import msg as _m
+                    loop.current_msgs.append(
+                        _note_msg(_m("compaction_notice", getattr(loop, "user_lang", "zh"))))
+                except Exception:
+                    logger.debug("压缩提示注入失败", exc_info=True)
+            logger.info("compaction: 云端历史 %d 字符超阈值，保留最近 8 条（丢 %d 条）", total, _kept)
         return payload
 
     scope.waterfall("pre_step").register(pre_step_hook, order=20, name="compaction")
 
 
+# 快车道（fastpath）已于 2026-10-12 移除（用户拍板）：思考只留关/开两态，
+# 开的时候没有"闲聊例外"。git 历史里的 setup_fastpath 可作参考，不要盲加回来。
 BUILTIN_PLUGINS = {
-    "fastpath": setup_fastpath,
     "assists": setup_assists,
     "planning": setup_planning,
     "compaction": setup_compaction,
