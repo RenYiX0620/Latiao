@@ -509,6 +509,13 @@ _PROMISE_RE = re.compile(r"这就|马上|立刻|我这就|帮你(查|看|搜)|�
 # 有实质内容的信号：多个数字/百分号/表格行——含这些的短正文是"真答案"，不拦
 _DATA_SIGNAL_RE = re.compile(r"(?:\d[.,]?\d){2,}|%|^\|", re.M)
 
+# <tool_code> 伪调用块（2026-10-14「卸载 app」事故，真机原样）：Hermes 系模型在
+# 思考轮（没有 JSON 工具表）时把要执行的命令写成 python 伪代码块
+# `<tool_code>print(run_cmd("ls /Applications | grep -i zhipu"))</tool_code>`。
+# 解析器不认这个方言（不执行、也不清洗），但它是明确的"我要动手"声明——按
+# 计划信号推进执行轮（真正的执行由第 2 轮的原生调用完成，这里只是别当终答交付）。
+_TOOL_CODE_RE = re.compile(r"<tool_code\b", re.I)
+
 
 def _needs_length_retry(finish_reason, native_calls, empty_body: bool,
                         retry_used: bool, body_chars: int = -1,
@@ -1233,7 +1240,13 @@ class ThinAgentLoop:
         # （真机端到端抓到）。真汇报的特征是**多个**数字事实 / 百分号 / 表格行。
         if "%" in t or t.startswith("|"):
             return False
-        if len(re.findall(r"\d[\d.,]*", t)) >= 2:
+        # 列表编号不是数据（2026-10-14「卸载 app」事故，真机端到端）：模型给计划
+        # 写"1. 查找… 2. 删除… 3. 清理…"时，编号里的数字被下面的 `\d[\d.,]*`
+        # 数成"多个数字事实"（实测 5 个片段：1. 2. 3. 1. 2.）→ 整条计划按"像真
+        # 报告"放行、被当终答交付。剥离行首/空格后的"1." "2、" "(3)" 形态再数；
+        # 真汇报的数字（行情/价格/代码）不受影响（"（600519）"这类多位数不匹配）。
+        _t_nomarker = re.sub(r"(?m)(^|\s)[（(]?\d{1,2}[)）.、）]\s*", r"\1", t)
+        if len(re.findall(r"\d[\d.,]*", _t_nomarker)) >= 2:
             return False
         try:
             from agent_loop import TOOLS
@@ -1241,6 +1254,10 @@ class ThinAgentLoop:
         except Exception:
             names = []
         if any(n and n in t for n in names):
+            return True
+        # <tool_code> 伪代码块（2026-10-14 同事故）：解析器不认这个方言（不执行），
+        # 但它就是"我要动手"的声明 → 计划信号（推进执行轮，不是执行它）。
+        if _TOOL_CODE_RE.search(t):
             return True
         # 请求侧判据（高精度）：**行情/数据类**请求不可能不需要实时数据——这类请求
         # 拿到"短正文 + 无数据 + 没点名工具"的回答，就是在空手说话（见方法 docstring
@@ -2718,17 +2735,29 @@ class ThinAgentLoop:
                         # 只对**任务型请求**要求实质数据（闲聊短答是合法终答）。
                         # 请求侧判据与 _thinking_round_plan_leak 同源：行情/数据类
                         # 请求不可能不需要实时数据——短正文+无数据就是空手说话。
+                        # 2026-10-14「卸载 app」事故后扩到第二类：**命令动作词**
+                        # （卸载/删除/安装/打开…，_ACTION_KW_RE）——"把智谱清言 app
+                        # 完整卸载掉"不带任何行情词，原先整条闸门不生效，第 1 轮的
+                        # 计划（含假代码块）被当终答交付、假报"已删除"。桌面/文件
+                        # 任务和行情任务同型：不可能靠嘴完成。
                         _task_like = False
+                        _why = ""
                         try:
-                            from agent.prompt_build import _MARKET_KW_RE
-                            _task_like = bool(_MARKET_KW_RE.search(self.last_user_text or ""))
+                            from agent.prompt_build import _ACTION_KW_RE, _MARKET_KW_RE
+                            _req = self.last_user_text or ""
+                            if _MARKET_KW_RE.search(_req):
+                                _task_like, _why = True, "行情"
+                            elif _ACTION_KW_RE.search(_req):
+                                _task_like, _why = True, "动作词"
                         except Exception:
                             pass
                         _has_substance = bool(_DATA_SIGNAL_RE.search(body_text or "")) \
                             and len((body_text or "").strip()) >= 80
                         if _task_like and not _has_substance:
+                            # 日志带上判据来源（行情/动作词）：既是诊断信息，也是
+                            # "新代码是否真的被进程执行"的廉价判别信号（见 10-13 规约）。
                             self._step_log("思考轮转执行",
-                                           f"任务型请求无工具调用且无实质数据（正文 "
+                                           f"任务型请求（{_why}）无工具调用且无实质数据（正文 "
                                            f"{len((body_text or '').strip())} 字）"
                                            f"→ 恢复工具表进第 2 轮")
                             # 计划句不进交付气泡（与空转闸门同一手法）

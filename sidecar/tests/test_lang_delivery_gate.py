@@ -44,3 +44,27 @@ def test_chunked_translation_never_joins_half_translated():
     assert _join_translations(["AAA", "BBB", "CCC"], ["甲", "BBB", "丙"], original) == original
     # 首块失败同理（就是"英文开头保留 + 后面中文"的事故形态）
     assert _join_translations(["AAA", "BBB"], ["AAA", "乙"], original) == original
+
+
+def test_plan_with_command_block_is_not_language_drift():
+    """2026-10-14「卸载 app」事故：中文回复尾部是编号计划 + run_cmd/<tool_code>
+    命令块，非散文计数把字母拉成占优 → 误判"模型漂移"→ 翻译（失败）→ 交付被塞
+    一句"没用中文作答"（真机复现：尾两段剥离后 汉字 6 / 字母 88）。
+
+    代码块（围栏 ``` / <tool_code>）整体是代码不是语言——剥离后汉字仍占优，
+    不判漂移。正控：真英文回复照旧判漂移（原有行为不变）。
+    """
+    from agent.gates import _reply_lang_mismatch
+    plan = ("（轻咬下唇，指尖在键盘上轻轻划过）主人想把它赶出家门呀？人家这就帮你～"
+            "（凑近屏幕）找到了！那人家就不客气了～\n\n**子任务：**\n"
+            "1. 查找应用。\n2. 删除该应用。\n3. 清理残留。\n\n**执行：**\n"
+            "1. `run_cmd`: `ls /Applications | grep -i zhipu`\n"
+            "2. `run_cmd`: `grep -i chatglm`\n\n"
+            '<tool_code>\nprint(run_cmd("ls /Applications | grep -i zhipu"))\n</tool_code>')
+    assert _reply_lang_mismatch("把智谱清言app完整卸载掉", plan, "zh") is False
+    # 围栏代码块同理：中文答案 + 长英文代码块（此前尾段字母占优 → 误判）
+    mixed = ("这是你要的脚本，直接保存成文件就能用，先看看说明再执行。\n\n"
+             "```python\n" + "import os\nprint('hello world')\n" * 8 + "```")
+    assert _reply_lang_mismatch("帮我写个脚本", mixed, "zh") is False
+    # 正控：真英文回复仍判漂移
+    assert _reply_lang_mismatch("你好", "Here is the analysis you asked for. " * 6, "zh") is True

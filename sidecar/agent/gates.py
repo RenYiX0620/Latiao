@@ -44,17 +44,25 @@ def _looks_like_planning(text: str) -> bool:
 
 
 def _strip_nonprose_for_lang(t: str) -> str:
-    """语言计数前剥离非散文 token：URL、行内代码、路径、文件名。
+    """语言计数前剥离非散文 token：URL、代码块/行内代码、路径、文件名。
 
     09-06 13:27 事故：桌面文件清单的英文件名（.DS_Store、
     10Eros_T2V_Simple.json…）把纯中文答案的字母计数拉到 en>zh，
     误判成英文回复 → 强制翻译（返回原文）→ 语言修正轮重跑全模型，
-    正确答案被扔掉、180s 看门狗超时。文件名/路径/代码是数据不是语言。"""
+    正确答案被扔掉、180s 看门狗超时。文件名/路径/代码是数据不是语言。
+
+    10-14 补：**围栏代码块与 <tool_code> 伪调用块**此前不在剥离范围——中文回复
+    的尾部两段是编号计划 + `run_cmd`/裸命令（<tool_code>print(run_cmd("ls …"))），
+    剥离后尾段汉字 6、字母 88（真机复现）→ 触发 tail_en_heavy → 误判"模型漂移"
+    → 翻译（失败）→ 交付被塞一句"没用中文作答"。代码块整体是代码，不是语言。
+    """
     try:
         from agent.parsing import _scrub_tool_markup
         t = _scrub_tool_markup(t)                                # 任意形状的调用标记
     except Exception:
         t = re.sub(r"<tool_call>.*?</tool_call>", " ", t, flags=re.DOTALL)
+    t = re.sub(r"```.*?```", " ", t, flags=re.DOTALL)           # 围栏代码块
+    t = re.sub(r"<tool_code\b.*?(?:</tool_code>|\Z)", " ", t, flags=re.DOTALL | re.I)
     t = re.sub(r"https?://\S+|www\.\S+", " ", t)            # URL
     t = re.sub(r"`[^`\n]*`", " ", t)                        # 行内代码
     t = re.sub(r"(?<![\w])[\w.\-]*[\w\-]/[\w.\-/]{1,}", " ", t)   # 路径

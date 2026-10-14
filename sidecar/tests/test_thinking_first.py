@@ -282,6 +282,83 @@ async def test_two_phase_plan_then_execute_end_to_end():
         assert "目录里有" in acc.join(), "终答必须交付"
 
 
+@pytest.mark.asyncio
+async def test_desktop_task_reaches_execution_round_145_incident(caplog):
+    """端到端（2026-10-14「卸载 app」真机事故复刻）：桌面任务思考轮"只表态"→
+    动作词闸门推进执行轮 → run_cmd 真执行 → 终答交付；计划句不得进交付文本。
+
+    与上一条 E2E 的区别：计划体**不带工具名、不带 <tool_code>**——能救它的只有
+    ①b 的动作词闸门（请求"把智谱清言app完整卸载掉"），专门锁这条新判据的端到端。
+    真机现场（修复前）：四轮 tools=0、工具调用=0，模型编了"已删除"报完成。
+    """
+    import logging
+    import time
+
+    import agent.context as agent_context
+    import local_llm
+    from agent.loop import RoundTextAccumulator, ThinAgentLoop
+    from tests.fake_engine import FakeEngine
+    from tests.test_loop_scenarios import _StubEngine
+
+    caplog.set_level(logging.INFO, logger="latiao-sidecar")
+
+    plan = ("（轻咬下唇，指尖在键盘上轻轻划过）主人想把这个叫智谱清言的东西彻底"
+            "赶出家门呀？没问题，人家这就帮你把它连根拔起～（凑近屏幕，眼神专注）"
+            "人家先翻遍应用程序的每个角落把它揪出来，再把它体面地请出去，最后连它"
+            "藏在书房角落里的那些小零碎也一并收拾干净，保证一点痕迹都不给主人留下"
+            "哦～（指尖在屏幕上轻快地游走）主人只管坐着等成果就好啦，人家心里早就"
+            "把步骤排得清清楚楚，一步都不会落下，保管做得又利索又干净，比新装的还"
+            "清爽呢～（回头冲你眨眨眼，等你夸人家一句）")
+    assert len(plan) > 200, "计划体必须长过空转闸门的两百字上限（专测动作词闸门）"
+    answer = "已按主人吩咐处理完毕：应用本体与相关残留都已清理干净。" * 3
+
+    with FakeEngine() as engine:
+        engine.push(engine.text_response(plan))
+        engine.push(engine.native_tool_response("run_cmd", {"cmd": "ls /Applications"}))
+        engine.push(engine.text_response(answer))
+        old = local_llm._engine
+        _old_override = agent_context._LOCAL_NATIVE_TOOLS_OVERRIDE
+        local_llm._engine = _StubEngine()
+        agent_context._LOCAL_NATIVE_TOOLS_OVERRIDE = True
+        import agent.confirm as _CF
+        import agent.tool_exec as TE
+        _orig_wait = TE._wait_tool_confirmation
+
+        async def _auto_approve(call_id, tool_name, event_obj, timeout=0):
+            # run_cmd 在 full 档也走确认（_FULL_ALWAYS_CONFIRM）：测试里自动批准，
+            # 并像真实路径一样清掉 pending 条目（真实函数在 finally 里 pop）。
+            _CF._pending_confirmations.pop(call_id, None)
+            return True, []
+
+        TE._wait_tool_confirmation = _auto_approve
+        try:
+            loop = ThinAgentLoop([{"role": "user", "content": "把智谱清言app完整卸载掉"}],
+                                 "fake-model", engine.url, {},
+                                 session_id=f"uninstall-e2e-{time.time()}",
+                                 access_mode="full", thinking_level="max")
+            acc = RoundTextAccumulator()
+            events = []
+            async for ev in loop.run():
+                acc.feed(ev)
+                events.append(ev)
+        finally:
+            TE._wait_tool_confirmation = _orig_wait
+            local_llm._engine = old
+            agent_context._LOCAL_NATIVE_TOOLS_OVERRIDE = _old_override
+
+        assert not (engine.requests[0].get("tools") or []), "思考轮不下发工具表"
+        _r1 = engine.requests[1].get("tools") or []
+        assert isinstance(_r1, list) and _r1, "动作词闸门必须推进到执行轮（恢复工具表）"
+        assert {t["function"]["name"] for t in _r1} == _exec_tool_names()
+        assert "思考轮转执行" in caplog.text, "本用例锁的是动作词闸门，不是空转闸门"
+        assert any(e.get("event") == "content_revised" and not e.get("content")
+                   for e in events), "计划句必须撤回气泡"
+        assert any(e.get("event") == "tool_start" and e.get("tool") == "run_cmd"
+                   for e in events), events
+        assert plan not in acc.join(), "计划句不得进交付文本"
+        assert "已按主人吩咐处理完毕" in acc.join(), "终答必须交付"
+
+
 def test_config_switch_defaults_on_and_can_turn_off(tmp_path, monkeypatch):
     """config.json 的 agent.local_thinking_first 是权威开关（默认 true）。
 
