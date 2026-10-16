@@ -149,10 +149,60 @@ def _looks_like_tool_failure(result: str) -> bool:
     return False
 
 
+def _required_args_hint(tool_name: str, args: dict) -> str | None:
+    """按注册表 schema 校验必填参数；缺了返回带正确用法的纠正提示（否则 None）。
+
+    为什么需要（2026-10-16 修，源自 10-15 真机）：两段式第 1 轮不下发工具表
+    （只有名字清单），模型只能**猜**参数名——mx_query 被猜成 {"market":"A股",
+    "type":"大盘指数"}，工具照跑一遍才回一句干巴巴的
+    `Error: query parameter is required`：白做一轮，界面还留一个红报错泡，
+    看起来像"任务执行一半断了"。这里在**执行前**按 schema 挡住并回纠正提示，
+    模型下一轮（拿到工具表）一次改对。
+
+    只查 `required` 列表（缺失/空值即提示），不做完整 JSON-Schema 校验——
+    注册表里的 required 都是真必填（path/query/cmd/url…，2026-10-16 全表核对）。
+    查不到该工具（插件未注册）时返回 None：校验层绝不比执行层更严格。
+    """
+    try:
+        from agent_loop import TOOLS
+    except Exception:
+        return None
+    spec = None
+    for t in TOOLS or []:
+        f = (t or {}).get("function") or {}
+        if f.get("name") == tool_name:
+            spec = f
+            break
+    if not spec:
+        return None
+    params = spec.get("parameters") or {}
+    required = [p for p in (params.get("required") or []) if isinstance(p, str)]
+    missing = [p for p in required if args.get(p) in (None, "", [], {})]
+    if not missing:
+        return None
+    props = params.get("properties") or {}
+    lines = []
+    for p in required:
+        info = props.get(p) or {}
+        desc = str(info.get("description") or "").strip()
+        typ = info.get("type") or "string"
+        mark = "　← 缺" if p in missing else ""
+        lines.append(f"  - {p} ({typ})" + (f"：{desc}" if desc else "") + mark)
+    example = ", ".join(f'"{p}": …' for p in required)
+    return (
+        f"⛔ 参数不完整：{tool_name} 缺少必填参数 {', '.join(missing)}。\n"
+        f"正确的参数（{tool_name}）：\n" + "\n".join(lines) + "\n"
+        f"示例：{tool_name}({{{example}}})\n"
+        "请用上面的参数名重新调用——本轮若是「先思考」轮（手里没有工具表），"
+        "猜的参数名不作数，以本提示为准。"
+    )
+
+
 async def _handle_tool_execution(tc: dict, current_msgs: list, session_id: str,
                                  agent_id: str, access_mode: str = "confirm",
                                  pre_started: dict | None = None,
-                                 tool_whitelist: set | None = None) -> tuple[bool, list[dict]]:
+                                 tool_whitelist: set | None = None,
+                                 probe_round: bool = False) -> tuple[bool, list[dict]]:
     """事件日志包装（阶段 1，灰度）：tool/call + tool/result 单点入日志。
 
     _handle_tool_execution_inner 是全循环唯一的工具执行入口（云/本地两个
@@ -186,7 +236,7 @@ async def _handle_tool_execution(tc: dict, current_msgs: list, session_id: str,
         verify_failed, events = await asyncio.wait_for(
             _handle_tool_execution_inner(
                 tc, current_msgs, session_id, agent_id, access_mode, pre_started,
-                tool_whitelist),
+                tool_whitelist, probe_round),
             timeout=_tlimit,
         )
     except asyncio.TimeoutError:
@@ -226,7 +276,8 @@ async def _handle_tool_execution(tc: dict, current_msgs: list, session_id: str,
 async def _handle_tool_execution_inner(tc: dict, current_msgs: list, session_id: str,
                                        agent_id: str, access_mode: str = "confirm",
                                        pre_started: dict | None = None,
-                                       tool_whitelist: set | None = None) -> tuple[bool, list[dict]]:
+                                       tool_whitelist: set | None = None,
+                                       probe_round: bool = False) -> tuple[bool, list[dict]]:
     """Execute a single tool call within the agent loop. Returns (verify_failed, events).
 
     pre_started: SSE 调用方已通过 _start_tool_confirmation 启动确认并发出
@@ -235,6 +286,9 @@ async def _handle_tool_execution_inner(tc: dict, current_msgs: list, session_id:
 
     tool_whitelist: 非 None 时**执行前硬拒**名单外的工具名（子代理/cron 隔离）。
     目录过滤（loop 组 tools）只是软约束，fence 解析出的名字不经过它。
+
+    probe_round: 本轮是否"先思考"轮（未下发工具表，工具调用都是盲猜）。该轮的
+    必填参数校验失败只回灌纠正提示、**不发事件**——聊天里不留红泡（2026-10-16）。
     """
     # 依赖仍留在 agent_loop 的定义 → 函数内惰性导入（避免循环依赖）
     from agent_loop import (
@@ -312,6 +366,20 @@ async def _handle_tool_execution_inner(tc: dict, current_msgs: list, session_id:
         )
         current_msgs.append({"role": "tool", "tool_call_id": call_id, "content": result})
         return True, [{"event": "tool_end", "call_id": call_id, "tool": tool_name, "result": result, "ts": int(time.time() * 1000)}]
+
+    # ── 必填参数预校验（2026-10-16，见 _required_args_hint 的来龙去脉）──
+    # 放在重复判定之前：缺参数的调用不该被计为"已成功的重复"。
+    # 计划轮（盲猜）失败：只回灌纠正提示、不发事件 → 前端不留红报错泡；
+    # 执行轮的失败：照旧发 tool_end（用户能看到"这次调用参数不对"的真实过程）。
+    _arg_hint = _required_args_hint(tool_name, args)
+    if _arg_hint:
+        current_msgs.append({"role": "tool", "tool_call_id": call_id, "content": _arg_hint})
+        logger.info("工具参数预校验：%s 缺必填参数，已回纠正提示（不执行%s）",
+                    tool_name, "；计划轮不进气泡" if probe_round else "")
+        if probe_round:
+            return False, []
+        return True, [{"event": "tool_end", "call_id": call_id, "tool": tool_name,
+                       "result": _arg_hint, "ts": int(time.time() * 1000)}]
 
     # ── 相同调用防重复（14:26 事故：模型被 nudge 后每轮重跑启动协议、
     # 反复重读 PROGRESS.md 陷入循环；今早还有同 3 条搜索词 35 连搜）──
