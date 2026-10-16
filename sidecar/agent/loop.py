@@ -2909,7 +2909,8 @@ class ThinAgentLoop:
                     _del_results = await _aio.gather(*[
                         _handle_tool_execution(
                             tc, self.current_msgs, self.session_id, "latiao",
-                            self.access_mode, tool_whitelist=self.tool_whitelist)
+                            self.access_mode, tool_whitelist=self.tool_whitelist,
+                            probe_round=self._thinking_first_round())
                         for tc in tool_calls
                     ])
                     try:
@@ -2952,7 +2953,8 @@ class ThinAgentLoop:
                     _safe_results = await _aio2.gather(*[
                         _handle_tool_execution(
                             tc, self.current_msgs, self.session_id, "latiao",
-                            self.access_mode, tool_whitelist=self.tool_whitelist)
+                            self.access_mode, tool_whitelist=self.tool_whitelist,
+                            probe_round=self._thinking_first_round())
                         for tc in tool_calls
                     ])
                     for _vf, _evts in _safe_results:
@@ -3023,7 +3025,8 @@ class ThinAgentLoop:
                     verify_failed, events = await _handle_tool_execution(
                         tc, self.current_msgs, self.session_id, "latiao",
                         self.access_mode, pre_started=pre,
-                        tool_whitelist=self.tool_whitelist)
+                        tool_whitelist=self.tool_whitelist,
+                        probe_round=self._thinking_first_round())
                     try:
                         import context_stats
                         context_stats.record_tool_time(self.session_id, time.monotonic() - _t_tool)
