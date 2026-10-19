@@ -694,10 +694,15 @@ def _retrieve_relevant_learnings(query: str, limit: int = MAX_LEARNINGS_INJECT,
         return []
 
 
-def _store_learning(session_id: str, topic: str, content: str, confidence: float = 0.5, source_type: str = "extracted"):
+def _store_learning(session_id: str, topic: str, content: str, confidence: float = 0.5,
+                    source_type: str = "extracted", approved: bool = False):
     """Store a new learning. If a similar topic already exists, update confidence.
 
     入库前统一脱敏（P2）：高置信度学习会被注入后续会话，密钥不能进记忆库。
+
+    2026-10-19（外部审计报告收口）：memory.review_writes=true 时**新条目**先入
+    memory_pending 待审（approved=True 只给审批回写用，避免自锁）；每次变更写审计；
+    写后检查行数/字符预算。更新已有条目不受审批影响（它本来就在库里）。
     """
     try:
         from cmd_safety import redact_secrets
@@ -706,7 +711,19 @@ def _store_learning(session_id: str, topic: str, content: str, confidence: float
     except Exception:
         topic = str(topic or "")[:200]
         content = str(content or "")[:4000]
+    if review_writes_enabled() and not approved:
+        # 审批只管**新条目**：已有条目靠重复出现累加置信度，不能被卡住。
+        try:
+            conn = _get_db()
+            exists = conn.execute(
+                "SELECT 1 FROM learnings WHERE topic = ? LIMIT 1", (topic,)).fetchone()
+        except Exception:
+            exists = None
+        if not exists:
+            _queue_pending("learning", topic, content, confidence, source_type, session_id)
+            return
     _mark_tfidf_dirty()
+    action, row_id = "add", ""
     try:
         conn = _get_db()
         now = datetime.now().isoformat()
@@ -725,6 +742,7 @@ def _store_learning(session_id: str, topic: str, content: str, confidence: float
                     "UPDATE learnings SET confidence = ?, updated_at = ? WHERE id = ?",
                     (new_conf, now, existing[0]),
                 )
+                action, row_id = "update", str(existing[0])
             else:
                 lid = str(uuid.uuid4())
                 conn.execute(
@@ -732,9 +750,18 @@ def _store_learning(session_id: str, topic: str, content: str, confidence: float
                        VALUES(?, ?, ?, ?, ?, ?, ?, ?)""",
                     (lid, session_id, topic, content, confidence, source_type, now, now),
                 )
+                action, row_id = "add", lid
             conn.commit()
     except Exception:
         logger.warning("Failed to store learning in memory DB", exc_info=True)
+        return
+    try:
+        import db as _db
+        _db.audit_memory("learning", action, row_id=row_id, topic=topic,
+                         preview=content[:160], source=source_type)
+        _db.prune_learnings()      # 行数/字符预算；未超限时零写入
+    except Exception:
+        logger.debug("学习记忆审计/预算检查失败", exc_info=True)
 
 
 # ── 偏好键的稳定化（2026-09-23，审查①）────────────────────────────
@@ -777,8 +804,11 @@ def _resolve_preference_key(matched_text: str) -> str:
     return base
 
 
-def _store_preference(key: str, value: str, confidence: float = 0.5):
-    """Store a learned user preference. Boosts confidence if already exists."""
+def _store_preference(key: str, value: str, confidence: float = 0.5, approved: bool = False):
+    """Store a learned user preference. Boosts confidence if already exists.
+
+    2026-10-19：与学习同口径——可选的写入审批（仅新键）、审计流水、写后预算检查。
+    """
     try:
         from cmd_safety import redact_secrets
         key = redact_secrets(str(key or ""))[:120]
@@ -786,6 +816,18 @@ def _store_preference(key: str, value: str, confidence: float = 0.5):
     except Exception:
         key = str(key or "")[:120]
         value = str(value or "")[:500]
+    if review_writes_enabled() and not approved:
+        # 与学习同口径：只拦新键，已有键的置信度累加照常进行。
+        try:
+            conn = _get_db()
+            exists = conn.execute(
+                "SELECT 1 FROM preferences WHERE key = ? LIMIT 1", (key,)).fetchone()
+        except Exception:
+            exists = None
+        if not exists:
+            _queue_pending("preference", key, value, confidence, "inferred", "")
+            return
+    action, row_id = "add", ""
     try:
         conn = _get_db()
         now = datetime.now().isoformat()
@@ -799,6 +841,7 @@ def _store_preference(key: str, value: str, confidence: float = 0.5):
                     "UPDATE preferences SET value = ?, confidence = ?, updated_at = ? WHERE id = ?",
                     (value, new_conf, now, existing[0]),
                 )
+                action, row_id = "update", str(existing[0])
             else:
                 lid = str(uuid.uuid4())
                 conn.execute(
@@ -806,9 +849,149 @@ def _store_preference(key: str, value: str, confidence: float = 0.5):
                        VALUES(?, ?, ?, ?, 'inferred', ?, ?)""",
                     (lid, key, value, confidence, now, now),
                 )
+                action, row_id = "add", lid
             conn.commit()
     except Exception:
         logger.warning("Failed to store preference in memory DB", exc_info=True)
+        return
+    try:
+        import db as _db
+        _db.audit_memory("preference", action, row_id=row_id, topic=key,
+                         preview=value[:160], source="inferred")
+        _db.prune_preferences()    # 行数/字符预算；未超限时零写入
+    except Exception:
+        logger.debug("偏好记忆审计/预算检查失败", exc_info=True)
+
+
+# ── 记忆写入审批（2026-10-19，可选开关）────────────────────────────
+def review_writes_enabled() -> bool:
+    """写入是否先过审：LATIAO_MEMORY_REVIEW > config.json memory.review_writes > 关。
+
+    默认关闭——现有护栏（提取器规则、置信度门槛、入库前脱敏、可 forget）已够用；
+    打开后**新增**记忆进 memory_pending，经 /v1/memory/pending/{id}/approve 才生效。
+    """
+    raw = os.environ.get("LATIAO_MEMORY_REVIEW")
+    if raw is not None:
+        return raw.strip().lower() not in ("0", "false", "no", "off", "")
+    try:
+        from config import CONFIG_FILE
+        if CONFIG_FILE.exists():
+            cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            mem = cfg.get("memory") if isinstance(cfg, dict) else None
+            if isinstance(mem, dict) and mem.get("review_writes") is not None:
+                return bool(mem.get("review_writes"))
+    except Exception:
+        pass
+    return False
+
+
+def _queue_pending(kind: str, topic: str, content: str, confidence: float,
+                   source: str, session_id: str) -> None:
+    """把一条待审记忆放进 memory_pending（同 kind+topic 已存在则更新值）。"""
+    try:
+        conn = _get_db()
+        now = datetime.now().isoformat()
+        with _db_write_lock:
+            existing = conn.execute(
+                "SELECT id FROM memory_pending WHERE kind = ? AND topic = ? LIMIT 1",
+                (kind, topic)).fetchone()
+            if existing:
+                conn.execute(
+                    "UPDATE memory_pending SET content = ?, confidence = ?, created_at = ? "
+                    "WHERE id = ?", (content, confidence, now, existing[0]))
+            else:
+                conn.execute(
+                    "INSERT INTO memory_pending(id, kind, topic, content, confidence, source, "
+                    "session_id, created_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+                    (str(uuid.uuid4()), kind, topic, content, confidence,
+                     str(source or "")[:40], str(session_id or "")[:64], now))
+            conn.commit()
+    except Exception:
+        logger.warning("写入待审记忆失败", exc_info=True)
+        return
+    try:
+        import db as _db
+        _db.audit_memory(kind, "pending", topic=topic, preview=content[:160],
+                         source=source)
+    except Exception:
+        logger.debug("待审记忆审计失败", exc_info=True)
+
+
+def list_pending(limit: int = 100) -> list[dict]:
+    """待审记忆列表（最新在前）。"""
+    try:
+        conn = _get_db()
+        rows = conn.execute(
+            "SELECT id, kind, topic, content, confidence, source, session_id, created_at "
+            "FROM memory_pending ORDER BY created_at DESC LIMIT ?",
+            (max(1, min(int(limit or 100), 500)),)).fetchall()
+        return [{"id": r[0], "kind": r[1], "topic": r[2], "content": r[3],
+                 "confidence": r[4], "source": r[5], "session_id": r[6],
+                 "created_at": r[7]} for r in rows]
+    except Exception:
+        return []
+
+
+def approve_pending(pending_id: str) -> dict:
+    """批准一条待审记忆：按原 kind 落库（走 approved=True 绕过审批），并留审计。"""
+    try:
+        conn = _get_db()
+        row = conn.execute(
+            "SELECT kind, topic, content, confidence, source, session_id "
+            "FROM memory_pending WHERE id = ?", (str(pending_id),)).fetchone()
+        if not row:
+            return {"status": "error", "message": "待审条目不存在"}
+        kind, topic, content, confidence, source, session_id = row
+        if kind == "learning":
+            _store_learning(session_id or "", topic, content, confidence or 0.5,
+                            source or "approved", approved=True)
+        else:
+            _store_preference(topic, content, confidence or 0.5, approved=True)
+        with _db_write_lock:
+            conn.execute("DELETE FROM memory_pending WHERE id = ?", (str(pending_id),))
+            conn.commit()
+        import db as _db
+        _db.audit_memory(kind, "approve", row_id=str(pending_id), topic=topic,
+                         preview=str(content or "")[:160], source=source or "")
+        return {"status": "ok", "approved": True}
+    except Exception as e:
+        logger.warning("审批记忆失败: %s", e, exc_info=True)
+        return {"status": "error", "message": str(e)}
+
+
+def reject_pending(pending_id: str) -> dict:
+    """驳回一条待审记忆（只删队列 + 审计，不落库）。"""
+    try:
+        conn = _get_db()
+        row = conn.execute(
+            "SELECT kind, topic, content FROM memory_pending WHERE id = ?",
+            (str(pending_id),)).fetchone()
+        if not row:
+            return {"status": "error", "message": "待审条目不存在"}
+        with _db_write_lock:
+            conn.execute("DELETE FROM memory_pending WHERE id = ?", (str(pending_id),))
+            conn.commit()
+        import db as _db
+        _db.audit_memory(row[0], "reject", row_id=str(pending_id), topic=row[1],
+                         preview=str(row[2] or "")[:160])
+        return {"status": "ok", "rejected": True}
+    except Exception as e:
+        logger.warning("驳回记忆失败: %s", e, exc_info=True)
+        return {"status": "error", "message": str(e)}
+
+
+def list_audit(limit: int = 100) -> list[dict]:
+    """记忆变更流水（最新在前；只含脱敏摘要）。"""
+    try:
+        conn = _get_db()
+        rows = conn.execute(
+            "SELECT ts, kind, action, row_id, topic, preview, source FROM memory_audit "
+            "ORDER BY id DESC LIMIT ?",
+            (max(1, min(int(limit or 100), 500)),)).fetchall()
+        return [{"ts": r[0], "kind": r[1], "action": r[2], "row_id": r[3],
+                 "topic": r[4], "preview": r[5], "source": r[6]} for r in rows]
+    except Exception:
+        return []
 
 
 def _retrieve_preferences() -> list[dict]:

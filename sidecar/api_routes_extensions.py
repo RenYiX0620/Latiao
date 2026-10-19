@@ -64,6 +64,19 @@ async def api_sessions_list(limit: int = Query(default=500, ge=1, le=2000),
     return await run_in_threadpool(_sessions.list_sessions, limit, offset)
 
 
+@router.get("/v1/sessions/search")
+async def api_sessions_search(q: str = Query(default=""),
+                              limit: int = Query(default=20, ge=1, le=50)):
+    """全文检索历史会话消息（2026-10-19）。
+
+    **必须声明在 /v1/sessions/{session_id} 之前**：Starlette 按声明顺序匹配，
+    否则 "search" 会被当成 session_id。模型侧由 session_search 工具消费。
+    """
+    logger.info("会话检索请求: %s", str(q)[:60])
+    import sessions as _sessions
+    return await run_in_threadpool(_sessions.search_sessions, q, limit)
+
+
 @router.get("/v1/sessions/{session_id}")
 async def api_sessions_get(session_id: str):
     logger.info("会话内容请求: %s", session_id[:18])

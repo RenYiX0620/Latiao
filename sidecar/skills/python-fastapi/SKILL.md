@@ -1,6 +1,6 @@
 ---
 name: python-fastapi
-description: Python FastAPI 最佳实践 — Pydantic、异步、错误处理
+description: Use when 写或改 FastAPI 服务。遵循 Pydantic、异步与错误处理约定
 ---
 # Python FastAPI Best Practices
 

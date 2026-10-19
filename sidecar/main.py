@@ -406,6 +406,13 @@ async def lifespan(app: FastAPI):
                             _stop_tts()
                         except Exception:
                             logger.warning("退出清理时停止语音服务失败", exc_info=True)
+                        try:
+                            # 2026-10-19 P0：嵌入服务此前不在任何退出路径里 →
+                            # 宿主被强杀后它带着 ~600MB 常驻（实测 1 天 9 小时）。
+                            from embedding_service import stop as _stop_embed
+                            _stop_embed()
+                        except Exception:
+                            logger.warning("退出清理时停止嵌入服务失败", exc_info=True)
                         os._exit(0)
                 except Exception:
                     break
@@ -425,6 +432,11 @@ async def lifespan(app: FastAPI):
     # 检索路径本身不会等冷启动（embedding_service.embed 默认后台起服务、本次返回 None）。
     try:
         import embedding_service as _emb
+        # 2026-10-19 P0：启动先收掉上一进程遗留的嵌入服务。此前它不在任何退出
+        # 路径（见下方关闭段），孤儿会常驻——实测一个在 8897 上跑了 1 天 9 小时。
+        # stop() 的"按端口"分支自带进程身份校验（2026-10-11 修过误杀），不会碰
+        # 无关监听者；没东西可停时它不再打"已停止"日志。
+        _emb.stop()
         if _emb.available():
             import threading as _th
 
@@ -475,6 +487,8 @@ async def lifespan(app: FastAPI):
                 # ⑦（09-23）：反思保留 + learnings 超限淘汰（与工具历史同一轮里做）
                 await run_in_threadpool(db.prune_reflections)
                 await run_in_threadpool(db.prune_learnings)
+                # 偏好预算（2026-10-19）：此前 preferences **没有任何回收路径**
+                await run_in_threadpool(db.prune_preferences)
                 await run_in_threadpool(db.prune_injections)
                 # 2026-10-11：memory 表（cron 产出全文）与会话表兜底清理——
                 # 此前两者都只增不减（prune_sessions 写好了但从没人调用）。
@@ -488,12 +502,9 @@ async def lifespan(app: FastAPI):
                 # 每轮指标保留期（2026-09-29）：一行一轮，默认 180 天
                 import turn_metrics as _tm
                 await run_in_threadpool(_tm.prune)
-                # ⑥：空闲就停掉嵌入服务（腾内存）；下次检索按需再起
-                try:
-                    import embedding_service as _emb
-                    await run_in_threadpool(_emb.maybe_stop_idle)
-                except Exception:
-                    pass
+                # 嵌入服务的空闲回收不在这里（2026-10-19 P0）：挂在 24h 循环里等于
+                # 永不生效（启动那轮 _last_use=0 也让它空转）——已独立成
+                # _embed_idle_loop（5 分钟检查一轮，15 分钟空闲即停）。
                 # 匿名使用数据（2026-10-11）：每 24h 最多一次上报；没配
                 # endpoint 或开关关 → 空操作（数据只留本机）。放线程池，
                 # 网络慢/离线不阻塞事件循环。
@@ -526,11 +537,29 @@ async def lifespan(app: FastAPI):
         except Exception:
             logger.debug("启动清理更新包跳过", exc_info=True)
 
+    async def _embed_idle_loop():
+        """嵌入服务空闲回收（2026-10-19 P0）。
+
+        它是 on-demand 服务、不该常驻：此前唯一的调用点挂在 24 小时一轮的 prune
+        循环里，而启动那轮 _last_use=0 又恒不触发——"空闲 15 分钟自动停"实际从未
+        生效。独立成 5 分钟检查一轮（maybe_stop_idle 自己判 15 分钟空闲）。
+        """
+        while True:
+            await asyncio.sleep(300)
+            try:
+                from starlette.concurrency import run_in_threadpool
+
+                import embedding_service as _emb
+                await run_in_threadpool(_emb.maybe_stop_idle)
+            except Exception:
+                logger.debug("嵌入服务空闲回收失败", exc_info=True)
+
+    embed_idle_task = asyncio.create_task(_embed_idle_loop())
     cleanup_task = asyncio.create_task(_cleanup_update_packages_once())
     yield
     # 正常退出（应用关窗/托盘退出，Rust 端发 SIGTERM）：停掉本地模型引擎，
     # 释放显存/内存。sidecar 单独重启走 detach+SIGKILL，不会经过这里。
-    for _t in (cron_task, catchup_task, prune_task, cleanup_task):
+    for _t in (cron_task, catchup_task, prune_task, cleanup_task, embed_idle_task):
         _t.cancel()
     try:
         from local_llm import shutdown_engine
@@ -545,6 +574,14 @@ async def lifespan(app: FastAPI):
         _stop_tts()
     except Exception:
         logger.warning("Sidecar 关闭 — 停止本机语音服务失败", exc_info=True)
+    # 嵌入服务（2026-10-19 P0）：与引擎/语音同理，退出必须收掉——否则它成为
+    # 孤儿常驻（实测 1 天 9 小时、669MB）。它不在 3s 预算的关键路径上：
+    # SIGTERM 立即送达，最多等 10s 的 wait 会被 Rust 的强杀打断，但进程已收到信号。
+    try:
+        from embedding_service import stop as _stop_embed
+        _stop_embed()
+    except Exception:
+        logger.warning("Sidecar 关闭 — 停止嵌入服务失败", exc_info=True)
     SIDECAR_PID.unlink(missing_ok=True)
     cron_task.cancel()
     catchup_task.cancel()

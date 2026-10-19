@@ -1,6 +1,6 @@
 ---
 name: git-workflow
-description: Git 工作流约束 — 分支管理、commit 规范
+description: Use when 涉及提交、分支或合并。给出分支管理与 commit 规范
 ---
 # Git Workflow
 

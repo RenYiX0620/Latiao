@@ -1,6 +1,6 @@
 ---
 name: code-review
-description: 代码审查清单 — 检查 import、硬编码、异常处理、函数长度
+description: Use when 要审查代码、找缺陷或验收改动。按清单检查 import、硬编码、异常处理与函数长度
 ---
 # Code Review Checklist
 

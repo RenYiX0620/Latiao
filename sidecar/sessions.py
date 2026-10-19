@@ -12,6 +12,7 @@
 """
 import json
 import logging
+import re
 from datetime import datetime
 
 from db import _db_write_lock, _get_db
@@ -31,6 +32,148 @@ def _now() -> str:
 def _clip(text: str, limit: int) -> str:
     s = str(text or "")
     return s if len(s) <= limit else s[:limit] + "…(已截断)"
+
+
+# ── 会话检索（2026-10-19）──────────────────────────────────────
+# 为什么不用 FTS5 自带分词：unicode61 把连续的 CJK 当一个 token（"今天大盘"整体
+# 一个词），"大盘"永远搜不到。做法是入库与查询都先逐字空格切分（CJK 一字一
+# token、ASCII 词保持整词，unicode61 自己处理大小写）。snippet 也不交给 FTS5
+# （切分后的文本带空格），命中后在 Python 侧按真实正文截取。
+_CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
+
+
+def _fts_tokenize(text: str) -> str:
+    """正文 → FTS token 串：CJK 逐字、ASCII 词整词、其余作分隔。"""
+    parts: list[str] = []
+    buf: list[str] = []
+
+    def _flush():
+        if buf:
+            parts.append("".join(buf))
+            buf.clear()
+
+    for ch in str(text or ""):
+        if _CJK_RE.match(ch):
+            _flush()
+            parts.append(ch)
+        elif ch.isalnum() or ch in "_'’":
+            buf.append(ch)
+        else:
+            _flush()
+    _flush()
+    return " ".join(parts)
+
+
+def _fts_query(query: str) -> str:
+    """查询 → FTS 表达式：每个空白词切分后作为短语，多词之间 AND。"""
+    phrases = []
+    for word in str(query or "").split():
+        tok = _fts_tokenize(word).strip()
+        if tok:
+            phrases.append('"' + tok.replace('"', '""') + '"')
+    return " AND ".join(phrases)
+
+
+def _fts_sync(conn, session_id: str, msgs: list) -> None:
+    """重建该会话的检索索引（快照式写入 → 整段替换最省心）。"""
+    conn.execute("DELETE FROM session_messages_fts WHERE session_id = ?", (session_id,))
+    rows = []
+    for i, m in enumerate(msgs):
+        if str(m.get("role") or "") not in ("user", "assistant"):
+            continue
+        text = str(m.get("content") or "").strip()
+        if text:
+            rows.append((_fts_tokenize(text), session_id,
+                         str(m.get("id") or f"{session_id}_{i}")))
+    if rows:
+        conn.executemany(
+            "INSERT INTO session_messages_fts(content_tok, session_id, msg_id) "
+            "VALUES (?, ?, ?)", rows)
+
+
+def _ensure_fts_backfill(conn) -> None:
+    """把历史消息灌进检索索引（只在索引为空且库里有消息时跑一次）。"""
+    if conn.execute("SELECT COUNT(*) FROM session_messages_fts").fetchone()[0]:
+        return
+    total = conn.execute("SELECT COUNT(*) FROM session_messages").fetchone()[0]
+    if not total:
+        return
+    logger.info("会话检索索引首次构建：%d 条消息…", total)
+    rows = []
+    for sid, mid, role, data in conn.execute(
+            "SELECT session_id, id, role, data FROM session_messages"):
+        if role not in ("user", "assistant"):
+            continue
+        try:
+            text = str(json.loads(data).get("content") or "").strip()
+        except Exception:
+            continue
+        if text:
+            rows.append((_fts_tokenize(text), sid, mid))
+    if rows:
+        with _db_write_lock:
+            conn.executemany(
+                "INSERT INTO session_messages_fts(content_tok, session_id, msg_id) "
+                "VALUES (?, ?, ?)", rows)
+            conn.commit()
+    logger.info("会话检索索引构建完成：%d 条", len(rows))
+
+
+def _snippet(text: str, query: str, radius: int = 40) -> str:
+    """在真实正文里定位查询词并截取片段（定位不到就取开头一段）。"""
+    t = " ".join(str(text or "").split())
+    if not t:
+        return ""
+    pos = t.find(query)
+    if pos < 0:
+        pos = t.lower().find(str(query).lower())
+    if pos < 0:
+        head = t[: radius * 2]
+        return head + ("…" if len(t) > len(head) else "")
+    start = max(0, pos - radius)
+    end = min(len(t), pos + len(query) + radius)
+    return ("…" if start > 0 else "") + t[start:end] + ("…" if end < len(t) else "")
+
+
+def search_sessions(query: str, limit: int = 20) -> dict:
+    """全文检索历史会话消息（2026-10-19）。只搜 user/assistant 正文。"""
+    q = str(query or "").strip()
+    if not q:
+        return {"status": "error", "message": "query required", "results": []}
+    expr = _fts_query(q)
+    if not expr:
+        return {"status": "ok", "query": q, "total": 0, "results": []}
+    limit = max(1, min(int(limit or 20), 50))
+    try:
+        conn = _get_db()
+        _ensure_fts_backfill(conn)
+        hits = conn.execute(
+            "SELECT session_id, msg_id FROM session_messages_fts "
+            "WHERE session_messages_fts MATCH ? ORDER BY rank LIMIT ?",
+            (expr, limit)).fetchall()
+        results = []
+        for sid, mid in hits:
+            row = conn.execute(
+                "SELECT role, data, created_at FROM session_messages WHERE id = ?",
+                (mid,)).fetchone()
+            if not row:
+                continue
+            try:
+                text = str(json.loads(row[1]).get("content") or "")
+            except Exception:
+                text = ""
+            meta = conn.execute("SELECT name FROM sessions WHERE id = ?", (sid,)).fetchone()
+            results.append({
+                "session_id": sid,
+                "session_name": (meta[0] if meta else "") or "",
+                "role": row[0],
+                "snippet": _snippet(text, q),
+                "created_at": row[2],
+            })
+    except Exception as e:
+        logger.warning("会话检索失败: %s", e, exc_info=True)
+        return {"status": "error", "message": str(e), "results": []}
+    return {"status": "ok", "query": q, "total": len(results), "results": results}
 
 
 def save_session(session_id: str, name: str = "", selected_model: str = "",
@@ -87,6 +230,12 @@ def save_session(session_id: str, name: str = "", selected_model: str = "",
             conn.executemany(
                 "INSERT OR REPLACE INTO session_messages(id, session_id, seq, role, data, created_at) "
                 "VALUES(?, ?, ?, ?, ?, ?)", rows)
+            # 检索索引跟随快照重建（2026-10-19）。独立 try：索引失败不能拖垮
+            # 会话保存——用户数据优先，索引可下次重建。
+            try:
+                _fts_sync(conn, sid, msgs)
+            except Exception:
+                logger.warning("会话检索索引更新失败（不影响保存）: %s", sid[:16], exc_info=True)
             conn.commit()
     except Exception as e:
         logger.warning("保存会话失败: %s", e, exc_info=True)
