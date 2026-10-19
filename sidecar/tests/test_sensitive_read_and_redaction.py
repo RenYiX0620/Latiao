@@ -56,7 +56,7 @@ def test_allows_normal_paths(path):
     assert not _blk(path), f"不该拦：{path}"
 
 
-def test_read_file_plugin_uses_shared_check():
+def test_read_file_plugin_uses_shared_check(tmp_path):
     """插件路径与命令路径同源：插件里不再有自己一套不一致的黑名单。"""
     import importlib.util
     from pathlib import Path
@@ -66,13 +66,11 @@ def test_read_file_plugin_uses_shared_check():
     spec.loader.exec_module(mod)
     out = mod.execute({"path": os.path.expanduser("~/.local-ai-os/config.json")})
     assert "⛔" in out and "config" in out.lower()
-    # 正常文件仍可读
-    tmp = Path(__file__).resolve().parent / "_tmp_readable.txt"
+    # 正常文件仍可读。临时文件放 pytest 的 tmp_path，别写进仓库测试目录——
+    # workspace-write 沙箱里那条路径不可写，会假红（2026-10-19 外部核验报修）。
+    tmp = tmp_path / "_tmp_readable.txt"
     tmp.write_text("hello", encoding="utf-8")
-    try:
-        assert mod.execute({"path": str(tmp)}) == "hello"
-    finally:
-        tmp.unlink()
+    assert mod.execute({"path": str(tmp)}) == "hello"
 
 
 def test_tool_executor_fallback_also_blocks():

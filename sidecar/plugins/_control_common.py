@@ -8,7 +8,15 @@ import sys
 import time
 from pathlib import Path
 
-RUNLOGS = Path.home() / ".local-ai-os" / "runlogs"
+# runlogs 必须跟随 PROGRESS_DIR（2026-10-19 跟进）：写死 Path.home() 时，
+# conftest 的 LATIAO_TEST_PROGRESS_DIR 重定向管不到它——测试会往用户真机目录写字
+# （实测在 workspace-write 沙箱里跑套件直接 `[Errno 1] Operation not permitted`，
+# 4 个启动类用例假红）。
+try:
+    from config import PROGRESS_DIR
+except Exception:                      # 独立加载/极端情况下退回旧路径
+    PROGRESS_DIR = Path.home() / ".local-ai-os"
+RUNLOGS = PROGRESS_DIR / "runlogs"
 
 
 def is_windows() -> bool:

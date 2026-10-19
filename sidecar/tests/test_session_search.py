@@ -74,14 +74,16 @@ def test_no_match_returns_empty():
     assert res["status"] == "ok" and res["results"] == []
 
 
-def test_backfill_indexes_preexisting_messages():
-    """索引为空时，首次检索从 session_messages 回填（老库升级路径）。"""
+def test_backfill_indexes_preexisting_messages(monkeypatch):
+    """索引里没有该会话时，首次检索从 session_messages 回填（老库升级路径）。"""
     sid = "sess-search-004"
     _save(sid, [_msg("assistant", f"老消息里的{MARK}标记", f"{sid}_a")])
     conn = db_mod._get_db()
     with db_mod._db_write_lock:
-        conn.execute("DELETE FROM session_messages_fts")
+        conn.execute("DELETE FROM session_messages_fts WHERE session_id = ?", (sid,))
+        conn.execute("DELETE FROM session_message_digests WHERE session_id = ?", (sid,))
         conn.commit()
+    monkeypatch.setattr(sessions, "_fts_backfill_done", False)   # 回填每进程只跑一次
     res = sessions.search_sessions(MARK)
     assert any(r["session_id"] == sid for r in res["results"])
 

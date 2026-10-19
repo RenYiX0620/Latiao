@@ -10,9 +10,11 @@
 列表页只需要元数据 + 预览（侧边栏显示"最后一条消息前 30 字"），所以 list 接口
 不回消息体——消息按需按 id 取（lazy load），启动不用把全部历史读进内存。
 """
+import hashlib
 import json
 import logging
 import re
+import threading
 from datetime import datetime
 
 from db import _db_write_lock, _get_db
@@ -74,64 +76,173 @@ def _fts_query(query: str) -> str:
     return " AND ".join(phrases)
 
 
-def _fts_sync(conn, session_id: str, msgs: list) -> None:
-    """重建该会话的检索索引（快照式写入 → 整段替换最省心）。"""
+def _digest(text: str) -> str:
+    return hashlib.sha1(str(text or "").encode("utf-8")).hexdigest()
+
+
+def _delete_fts_rows(conn, msg_ids: list) -> None:
+    """按 msg_id 删索引行（分块避开 SQLite 变量上限）。"""
+    ids = [str(m) for m in msg_ids if m]
+    for i in range(0, len(ids), 400):
+        chunk = ids[i:i + 400]
+        conn.execute(
+            "DELETE FROM session_messages_fts WHERE msg_id IN (%s)"
+            % ",".join("?" * len(chunk)), chunk)
+
+
+def _purge_fts_session(conn, session_id: str) -> None:
+    """删掉一个会话的全部索引与摘要（会话删除/清理/整体替换时调用）。"""
     conn.execute("DELETE FROM session_messages_fts WHERE session_id = ?", (session_id,))
-    rows = []
+    conn.execute("DELETE FROM session_message_digests WHERE session_id = ?", (session_id,))
+
+
+def _fts_sync(conn, session_id: str, msgs: list) -> None:
+    """**增量**同步该会话的检索索引（2026-10-19 跟进修正）。
+
+    旧实现每次快照都整段重建：每条新消息保存一次，就把整段历史重新逐字切分
+    一遍 → 长会话 O(n²) 分词。现在按 (msg_id, 内容摘要) 做差集，只处理新增/
+    内容变化的消息，删掉已不存在的；摘要表记录已索引的版本。
+    """
+    want = {}
     for i, m in enumerate(msgs):
         if str(m.get("role") or "") not in ("user", "assistant"):
             continue
         text = str(m.get("content") or "").strip()
         if text:
-            rows.append((_fts_tokenize(text), session_id,
-                         str(m.get("id") or f"{session_id}_{i}")))
-    if rows:
+            want[str(m.get("id") or f"{session_id}_{i}")] = text
+    indexed = {mid: dig for mid, dig in conn.execute(
+        "SELECT msg_id, digest FROM session_message_digests WHERE session_id = ?",
+        (session_id,))}
+    stale = [mid for mid in indexed if mid not in want]
+    changed = [mid for mid in want if indexed.get(mid) != _digest(want[mid])]
+    if stale or changed:
+        _delete_fts_rows(conn, stale + changed)
+    if stale:
+        conn.executemany("DELETE FROM session_message_digests WHERE msg_id = ?",
+                         [(mid,) for mid in stale])
+    if changed:
         conn.executemany(
             "INSERT INTO session_messages_fts(content_tok, session_id, msg_id) "
-            "VALUES (?, ?, ?)", rows)
+            "VALUES (?, ?, ?)",
+            [(_fts_tokenize(want[mid]), session_id, mid) for mid in changed])
+        conn.executemany(
+            "INSERT OR REPLACE INTO session_message_digests(msg_id, session_id, digest) "
+            "VALUES (?, ?, ?)",
+            [(mid, session_id, _digest(want[mid])) for mid in changed])
+
+
+_fts_backfill_done = False
+_fts_backfill_lock = threading.Lock()
+
+
+def _message_text(data: str) -> str:
+    try:
+        return str(json.loads(data).get("content") or "").strip()
+    except Exception:
+        return ""
 
 
 def _ensure_fts_backfill(conn) -> None:
-    """把历史消息灌进检索索引（只在索引为空且库里有消息时跑一次）。"""
-    if conn.execute("SELECT COUNT(*) FROM session_messages_fts").fetchone()[0]:
+    """把**缺失的消息**补进检索索引（2026-10-19 跟进修正 v2）。
+
+    两处修正（外部核验指出）：
+    ① 并发竞态：标志检查在锁外，两个并发搜索可能都判定"没回填"并各插一份——
+       FTS 表没有唯一约束 → 重复索引行、重复命中。现在整段（检查+扫描+插入）
+       串行化，并在锁内二次检查标志。
+    ② 粒度从 session 级改为 **msg 级**（`f.msg_id = m.id`）：会话只有部分索引行
+       时也能补缺；顺带为"已索引但没有摘要"的消息补摘要（0.3.85 旧索引 + 新摘要
+       表的组合），这样下次保存不用整段重分词。最后做一次幂等去重（历史并发
+       首搜可能留下的重复行）。
+    """
+    global _fts_backfill_done
+    if _fts_backfill_done:
         return
-    total = conn.execute("SELECT COUNT(*) FROM session_messages").fetchone()[0]
-    if not total:
-        return
-    logger.info("会话检索索引首次构建：%d 条消息…", total)
-    rows = []
-    for sid, mid, role, data in conn.execute(
-            "SELECT session_id, id, role, data FROM session_messages"):
-        if role not in ("user", "assistant"):
-            continue
+    with _fts_backfill_lock:
+        if _fts_backfill_done:
+            return
         try:
-            text = str(json.loads(data).get("content") or "").strip()
+            missing = list(conn.execute(
+                "SELECT m.id, m.session_id, m.role, m.data FROM session_messages m "
+                "LEFT JOIN session_messages_fts f ON f.msg_id = m.id "
+                "WHERE f.msg_id IS NULL AND m.role IN ('user', 'assistant')"))
         except Exception:
-            continue
-        if text:
-            rows.append((_fts_tokenize(text), sid, mid))
-    if rows:
-        with _db_write_lock:
-            conn.executemany(
-                "INSERT INTO session_messages_fts(content_tok, session_id, msg_id) "
-                "VALUES (?, ?, ?)", rows)
-            conn.commit()
-    logger.info("会话检索索引构建完成：%d 条", len(rows))
+            logger.warning("扫描待回填消息失败", exc_info=True)
+            return
+        if missing:
+            logger.info("会话检索索引回填：%d 条消息…", len(missing))
+            rows, digs = [], []
+            for mid, sid, _role, data in missing:
+                text = _message_text(data)
+                if text:
+                    rows.append((_fts_tokenize(text), sid, mid))
+                    digs.append((mid, sid, _digest(text)))
+            with _db_write_lock:
+                if rows:
+                    conn.executemany(
+                        "INSERT INTO session_messages_fts(content_tok, session_id, msg_id) "
+                        "VALUES (?, ?, ?)", rows)
+                if digs:
+                    conn.executemany(
+                        "INSERT OR REPLACE INTO session_message_digests(msg_id, session_id, digest) "
+                        "VALUES (?, ?, ?)", digs)
+                conn.commit()
+            logger.info("会话检索索引回填完成：%d 条", len(rows))
+        # 已索引但没有摘要的消息：补摘要（省掉下次保存时的整段重分词）
+        try:
+            need_digest = list(conn.execute(
+                "SELECT m.id, m.session_id, m.data FROM session_messages m "
+                "JOIN session_messages_fts f ON f.msg_id = m.id "
+                "LEFT JOIN session_message_digests d ON d.msg_id = m.id "
+                "WHERE d.msg_id IS NULL AND m.role IN ('user', 'assistant')"))
+        except Exception:
+            need_digest = []
+        if need_digest:
+            digs = []
+            for mid, sid, data in need_digest:
+                text = _message_text(data)
+                if text:
+                    digs.append((mid, sid, _digest(text)))
+            if digs:
+                with _db_write_lock:
+                    conn.executemany(
+                        "INSERT OR REPLACE INTO session_message_digests(msg_id, session_id, digest) "
+                        "VALUES (?, ?, ?)", digs)
+                    conn.commit()
+                logger.info("会话检索摘要补齐：%d 条", len(digs))
+        # 一次性去重：FTS 无唯一约束，历史上并发首搜可能留下重复行
+        try:
+            with _db_write_lock:
+                conn.execute(
+                    "DELETE FROM session_messages_fts WHERE rowid NOT IN "
+                    "(SELECT MIN(rowid) FROM session_messages_fts GROUP BY msg_id)")
+                conn.commit()
+        except Exception:
+            logger.debug("索引去重跳过", exc_info=True)
+        _fts_backfill_done = True
 
 
 def _snippet(text: str, query: str, radius: int = 40) -> str:
-    """在真实正文里定位查询词并截取片段（定位不到就取开头一段）。"""
+    """在真实正文里定位查询词并截取片段（定位不到就取开头一段）。
+
+    2026-10-19：多词查询（"大盘 资金"）时真实正文里通常没有带空格的整串——旧
+    实现 find 整串失败后退化成"取开头"。改成按词逐个找，取最靠前的命中位置。
+    """
     t = " ".join(str(text or "").split())
     if not t:
         return ""
-    pos = t.find(query)
-    if pos < 0:
-        pos = t.lower().find(str(query).lower())
+    low = t.lower()
+    pos, hit = -1, ""
+    for word in [w for w in str(query or "").split() if w.strip()]:
+        i = t.find(word)
+        if i < 0:
+            i = low.find(word.lower())
+        if i >= 0 and (pos < 0 or i < pos):
+            pos, hit = i, word
     if pos < 0:
         head = t[: radius * 2]
         return head + ("…" if len(t) > len(head) else "")
     start = max(0, pos - radius)
-    end = min(len(t), pos + len(query) + radius)
+    end = min(len(t), pos + len(hit) + radius)
     return ("…" if start > 0 else "") + t[start:end] + ("…" if end < len(t) else "")
 
 
@@ -293,6 +404,9 @@ def delete_session(session_id: str) -> dict:
         conn = _get_db()
         with _db_write_lock:
             conn.execute("DELETE FROM session_messages WHERE session_id = ?", (sid,))
+            # 索引/摘要同步清掉（2026-10-19 跟进：此前删会话不删 FTS 行 →
+            # 已删对话的正文仍留在索引里，占空间且违反"删掉就删掉"）
+            _purge_fts_session(conn, sid)
             cur = conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
             conn.commit()
     except Exception as e:
@@ -313,6 +427,9 @@ def import_sessions(sessions: list, replace: bool = False) -> dict:
             with _db_write_lock:
                 conn.execute("DELETE FROM session_messages")
                 conn.execute("DELETE FROM sessions")
+                # 整体替换：索引与摘要一起清（否则旧对话正文残留可被搜到）
+                conn.execute("DELETE FROM session_messages_fts")
+                conn.execute("DELETE FROM session_message_digests")
                 conn.commit()
         except Exception as e:
             return {"status": "error", "message": str(e)}
@@ -351,6 +468,7 @@ def prune_sessions(keep: int = MAX_SESSIONS) -> dict:
                 (int(keep),))]
             for sid in victims:
                 conn.execute("DELETE FROM session_messages WHERE session_id = ?", (sid,))
+                _purge_fts_session(conn, sid)
             if victims:
                 conn.execute("DELETE FROM sessions WHERE id IN (%s)" % ",".join("?" * len(victims)),
                              victims)

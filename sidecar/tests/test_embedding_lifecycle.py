@@ -94,3 +94,15 @@ def test_stop_is_quiet_when_nothing_to_stop(monkeypatch, caplog):
     with caplog.at_level("INFO", logger="latiao-sidecar"):
         emb.stop()
     assert "嵌入服务已停止" not in caplog.text
+
+
+def test_start_records_last_use_for_background_instance(monkeypatch):
+    """后台冷启动（只起服务、没再检索）的实例也要记 _last_use（2026-10-19 跟进）。
+
+    否则 maybe_stop_idle 看到 `_last_use <= 0` 永远不认领它——"空闲 15 分钟停"
+    对这个最常见的路径依然不生效。
+    """
+    monkeypatch.setattr(emb, "_last_use", 0.0)
+    monkeypatch.setattr(emb, "is_up", lambda *a, **k: True)
+    assert emb.start() is True
+    assert emb._last_use > 0

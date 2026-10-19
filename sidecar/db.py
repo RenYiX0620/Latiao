@@ -176,6 +176,16 @@ def _init_db():
             # 噪音高）；片段在 Python 侧按真实正文截取（索引里带切分空格）。
             conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS session_messages_fts USING fts5("
                 "content_tok, session_id UNINDEXED, msg_id UNINDEXED)")
+            # 增量同步的版本记录（2026-10-19 跟进）：save_session 每次快照都全量重建
+            # 索引，长会话会变成 O(n²) 分词；按 (msg_id, 内容 sha1) 差集只处理新增/
+            # 变更的消息。摘要表独立于 FTS（FTS5 不能 ALTER 加列）。
+            _create_table(conn, "session_message_digests",
+                "msg_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, digest TEXT NOT NULL")
+            try:
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_smd_digests_sid "
+                             "ON session_message_digests(session_id)")
+            except Exception:
+                logger.debug("session_message_digests index failed", exc_info=True)
         except Exception:
             logger.error("Failed to create sessions tables", exc_info=True)
 
