@@ -98,12 +98,19 @@ def is_up(timeout: float = 1.5) -> bool:
 
 
 def start() -> bool:
-    """按需启动嵌入服务；已在跑/刚失败过/缺文件都直接返回。"""
-    global _proc, _start_failed_at
+    """按需启动嵌入服务；已在跑/刚失败过/缺文件都直接返回。
+
+    2026-10-19：成功（含复用已在跑的实例）时记一次 `_last_use`——此前只有真正
+    发过一次 embed 请求才记，于是"后台冷启动、之后没再检索"的实例 `_last_use`
+    恒为 0，空闲回收永远不认领它（会常驻到应用退出）。
+    """
+    global _proc, _start_failed_at, _last_use
     if is_up():
+        _last_use = time.time()
         return True
     with _lock:
         if is_up():
+            _last_use = time.time()
             return True
         if time.time() - _start_failed_at < _START_RETRY_COOLDOWN:
             return False
@@ -136,6 +143,7 @@ def start() -> bool:
         deadline = time.time() + START_TIMEOUT
         while time.time() < deadline:
             if is_up():
+                _last_use = time.time()
                 logger.info("嵌入服务就绪: %s（端口 %d）", MODEL_ID, EMBED_PORT)
                 return True
             time.sleep(0.4)
