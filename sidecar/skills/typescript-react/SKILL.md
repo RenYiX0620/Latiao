@@ -1,6 +1,6 @@
 ---
 name: typescript-react
-description: TypeScript React 最佳实践 — 类型安全、Hooks、组件规范
+description: Use when 写或改 React/TS 代码。遵循类型安全、Hooks 与组件规范
 ---
 # TypeScript React Best Practices
 

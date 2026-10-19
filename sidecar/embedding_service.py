@@ -146,8 +146,13 @@ def start() -> bool:
 
 
 def stop() -> None:
-    """停掉嵌入服务（空闲自动停 / 关闭应用时调用）。"""
+    """停掉嵌入服务（空闲自动停 / 关闭应用 / 启动回收遗留时调用）。
+
+    只在**确实停了什么**时打 info：启动回收会在每次启动时调用一次，没事可停时
+    不该往日志里写"已停止"（2026-10-19）。
+    """
     global _proc
+    stopped = False
     with _lock:
         if _proc is not None:
             try:
@@ -159,6 +164,7 @@ def stop() -> None:
                 except Exception:
                     pass
             _proc = None
+            stopped = True
         else:
             # 不是本进程启的（例如上一轮遗留）：按端口清理。
             # 2026-10-11：只杀本引擎形态的进程（llama-server 跑 --embeddings），
@@ -185,11 +191,13 @@ def stop() -> None:
                         continue
                     try:
                         os.kill(pid_i, signal.SIGTERM)
+                        stopped = True
                     except (ValueError, ProcessLookupError, PermissionError):
                         continue
             except Exception:
                 pass
-    logger.info("嵌入服务已停止")
+    if stopped:
+        logger.info("嵌入服务已停止")
 
 
 _warm_thread: threading.Thread | None = None

@@ -512,25 +512,70 @@ async def learn_from_conversation(request: Request):
 
 @router.post("/v1/memory/forget")
 async def forget_learning(request: Request):
-    """Delete a learning by id or topic. Also decrements confidence for corrections."""
+    """Delete a learning by id or topic. Also decrements confidence for corrections.
+
+    2026-10-19：删除也留审计流水（此前删掉就没了，连删过什么都无从查起）。
+    """
     body = await _json_body(request)
     lid = body.get("id", "")
     topic = body.get("topic", "")
     try:
         conn = _get_db()
+        victim = None
         with _db_write_lock:  # 快速 sqlite 操作，持锁时间短，用同步锁即可
             if lid:
+                victim = conn.execute(
+                    "SELECT topic, content FROM learnings WHERE id = ?", (lid,)).fetchone()
                 conn.execute("DELETE FROM learnings WHERE id = ?", (lid,))
                 from memory import _mark_tfidf_dirty
                 _mark_tfidf_dirty()   # 删行必须让检索索引失效（此前不置脏 → 删掉的仍在结果里）
             elif topic:
+                victim = conn.execute(
+                    "SELECT topic, content FROM learnings WHERE topic = ? LIMIT 1",
+                    (topic,)).fetchone()
                 conn.execute("DELETE FROM learnings WHERE topic = ?", (topic,))
                 from memory import _mark_tfidf_dirty
                 _mark_tfidf_dirty()
             conn.commit()
+        try:
+            import db as _db
+            _db.audit_memory("learning", "delete", row_id=str(lid or ""),
+                             topic=(victim[0] if victim else str(topic or "")),
+                             preview=(str(victim[1]) if victim else "")[:160],
+                             source="/v1/memory/forget")
+        except Exception:
+            logger.debug("记忆删除审计失败", exc_info=True)
         return {"status": "ok", "deleted": True}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+
+@router.get("/v1/memory/audit")
+async def memory_audit_list(limit: int = Query(default=100, ge=1, le=500)):
+    """记忆变更流水（2026-10-19）：add/update/delete/prune/approve/reject，只含脱敏摘要。"""
+    from memory import list_audit
+    return {"status": "ok", "items": await run_in_threadpool(list_audit, limit)}
+
+
+@router.get("/v1/memory/pending")
+async def memory_pending_list(limit: int = Query(default=100, ge=1, le=500)):
+    """待审记忆（仅 memory.review_writes 打开时才有内容）。"""
+    from memory import list_pending, review_writes_enabled
+    return {"status": "ok",
+            "review_enabled": await run_in_threadpool(review_writes_enabled),
+            "items": await run_in_threadpool(list_pending, limit)}
+
+
+@router.post("/v1/memory/pending/{pending_id}/approve")
+async def memory_pending_approve(pending_id: str):
+    from memory import approve_pending
+    return await run_in_threadpool(approve_pending, pending_id)
+
+
+@router.post("/v1/memory/pending/{pending_id}/reject")
+async def memory_pending_reject(pending_id: str):
+    from memory import reject_pending
+    return await run_in_threadpool(reject_pending, pending_id)
 
 
 @router.get("/v1/memory/preferences")

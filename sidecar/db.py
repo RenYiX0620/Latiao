@@ -112,6 +112,25 @@ def _init_db():
         except Exception:
             logger.debug("drop legacy preferences_fts failed", exc_info=True)
 
+        # ── 记忆审计 / 写入待审（2026-10-19，外部审计报告的三项收口）──────
+        # memory_audit   记忆变更流水（**只存脱敏摘要**）：给"删除历史/可追溯"一个
+        #                入口——此前 forget 删掉就没了、连删过什么都不知道。
+        # memory_pending 写入待审队列：仅当 memory.review_writes=true（env
+        #                LATIAO_MEMORY_REVIEW）时使用，默认关闭，不影响现有行为。
+        _create_table(conn, "memory_audit",
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, kind TEXT NOT NULL, "
+            "action TEXT NOT NULL, row_id TEXT DEFAULT '', topic TEXT DEFAULT '', "
+            "preview TEXT DEFAULT '', source TEXT DEFAULT ''")
+        try:
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_audit_ts "
+                         "ON memory_audit(ts DESC)")
+        except Exception:
+            logger.debug("memory_audit index failed", exc_info=True)
+        _create_table(conn, "memory_pending",
+            "id TEXT PRIMARY KEY, kind TEXT NOT NULL, topic TEXT NOT NULL, content TEXT NOT NULL, "
+            "confidence REAL DEFAULT 0.5, source TEXT DEFAULT '', session_id TEXT DEFAULT '', "
+            "created_at TEXT NOT NULL")
+
         # ── 统一能力模型：工具与技能合并为一张能力表（capability registry）──
         # kind: 'tool'（代码插件）| 'skill'（markdown 提示词）
         # source: 'builtin' | 'extension:<名>' | 'user'
@@ -151,6 +170,12 @@ def _init_db():
                 "ON session_messages(session_id, seq)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_active "
                 "ON sessions(last_active DESC)")
+            # 会话检索（2026-10-19）：user/assistant 正文建 FTS5。中文先逐字切分
+            # 再入库（见 sessions._fts_tokenize）——unicode61 会把整句中文当成
+            # 一个 token，不切分则"大盘"永远搜不到。工具结果不入索引（体量大、
+            # 噪音高）；片段在 Python 侧按真实正文截取（索引里带切分空格）。
+            conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS session_messages_fts USING fts5("
+                "content_tok, session_id UNINDEXED, msg_id UNINDEXED)")
         except Exception:
             logger.error("Failed to create sessions tables", exc_info=True)
 
@@ -309,51 +334,130 @@ def learnings_max() -> int:
         return DEFAULT_LEARNINGS_MAX
 
 
+# ── 记忆预算（2026-10-19）：行数之外再给"总字符"上限 ──────────────
+# 为什么补字符：行数上限挡不住"几条超长记录"把注入预算吃光（单条内容上限 4000）。
+# 偏好此前**没有任何上限**——键会随意图识别与近重复合并慢慢累积。两者都可经
+# env / config.json 的 memory 段覆盖（与 learnings_max 同一口径）。
+DEFAULT_LEARNINGS_MAX_CHARS = 500_000
+DEFAULT_PREFERENCES_MAX = 200
+DEFAULT_PREFERENCES_MAX_CHARS = 60_000
+
+
+def _budget_cfg(env_key: str, cfg_key: str, default: int) -> int:
+    raw = os.environ.get(env_key)
+    if raw is None:
+        try:
+            import json as _json
+
+            from config import CONFIG_FILE
+            if CONFIG_FILE.exists():
+                cfg = _json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+                mem = cfg.get("memory") if isinstance(cfg, dict) else None
+                if isinstance(mem, dict) and mem.get(cfg_key) is not None:
+                    raw = mem.get(cfg_key)
+        except Exception:
+            raw = None
+    try:
+        return int(raw) if raw is not None else default
+    except (TypeError, ValueError):
+        return default
+
+
+def learnings_max_chars() -> int:
+    return _budget_cfg("LATIAO_LEARNINGS_MAX_CHARS", "learnings_max_chars",
+                       DEFAULT_LEARNINGS_MAX_CHARS)
+
+
+def preferences_max() -> int:
+    return _budget_cfg("LATIAO_PREFERENCES_MAX", "preferences_max", DEFAULT_PREFERENCES_MAX)
+
+
+def preferences_max_chars() -> int:
+    return _budget_cfg("LATIAO_PREFERENCES_MAX_CHARS", "preferences_max_chars",
+                       DEFAULT_PREFERENCES_MAX_CHARS)
+
+
+def audit_memory(kind: str, action: str, row_id: str = "", topic: str = "",
+                 preview: str = "", source: str = "") -> None:
+    """记忆变更审计（只存摘要；调用方保证已脱敏）。失败绝不抛出。
+
+    注意：本函数自己拿 _db_write_lock，**不能在持锁的 with 块里调用**（锁不可重入）。
+    """
+    try:
+        conn = _get_db()
+        with _db_write_lock:
+            conn.execute(
+                "INSERT INTO memory_audit(ts, kind, action, row_id, topic, preview, source) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?)",
+                (datetime.now().isoformat(), str(kind)[:20], str(action)[:20],
+                 str(row_id or "")[:64], str(topic or "")[:200],
+                 str(preview or "")[:200], str(source or "")[:40]))
+            conn.commit()
+    except Exception:
+        logger.debug("记忆审计写入失败", exc_info=True)
+
+
 def prune_learnings(max_rows: int | None = None) -> dict:
-    """超出上限时淘汰价值最低的 learnings。返回 {deleted, kept, max}。
+    """超出预算时淘汰价值最低的 learnings。返回 {deleted, kept, max, max_chars}。
 
     价值 = confidence × (1 + hit_count) × 新近度（180 天半衰期）。
     为什么是这三项：置信度是写入侧给的（重复出现会累加），hit_count 是"被检索到过"
     （唯一的需求侧信号，目前只在 TF-IDF 主路径与 FTS 回退里加），新近度防"一次满分
     永久占位"。**只在超限时淘汰**——未超限时不动任何一行。
+
+    2026-10-19：预算从"只限行数"扩到 **行数 + 总字符**——行数挡不住几条超长记录
+    把注入预算吃光。两档都可在 env / config.json 的 memory 段覆盖；淘汰在一条事务
+    里批量删除（批量原子），并留审计流水。
     """
     cap = learnings_max() if max_rows is None else int(max_rows)
-    if cap <= 0:
-        return {"deleted": 0, "kept": -1, "max": cap, "skipped": "cap disabled"}
+    char_cap = learnings_max_chars()
+    if max_rows is not None and cap <= 0:
+        # 历史契约：显式传 0/负数 = 关掉淘汰（即使字符预算非零也不动数据）
+        return {"deleted": 0, "kept": -1, "max": cap, "max_chars": char_cap,
+                "skipped": "cap disabled"}
+    if cap <= 0 and char_cap <= 0:
+        return {"deleted": 0, "kept": -1, "max": cap, "max_chars": char_cap,
+                "skipped": "caps disabled"}
     conn = _get_db()
     with _db_write_lock:
         try:
-            total = conn.execute("SELECT COUNT(*) FROM learnings").fetchone()[0]
-        except Exception:
-            logger.warning("统计 learnings 失败", exc_info=True)
-            return {"deleted": 0, "kept": -1, "max": cap, "skipped": "error"}
-        if total <= cap:
-            return {"deleted": 0, "kept": total, "max": cap}
-        try:
             rows = conn.execute(
-                "SELECT id, confidence, hit_count, MAX(created_at, updated_at) AS ts "
-                "FROM learnings").fetchall()
+                "SELECT id, confidence, hit_count, MAX(created_at, updated_at) AS ts, "
+                "LENGTH(content) AS n FROM learnings").fetchall()
         except Exception:
             logger.warning("读取 learnings 失败", exc_info=True)
-            return {"deleted": 0, "kept": total, "max": cap, "skipped": "error"}
+            return {"deleted": 0, "kept": -1, "max": cap, "max_chars": char_cap,
+                    "skipped": "error"}
+        total = len(rows)
+        total_chars = sum((r[4] or 0) for r in rows)
+        over_rows = max(0, total - cap) if cap > 0 else 0
+        over_chars = max(0, total_chars - char_cap) if char_cap > 0 else 0
+        if over_rows == 0 and over_chars == 0:
+            return {"deleted": 0, "kept": total, "max": cap, "max_chars": char_cap}
         now = time.time()
         scored = []
-        for rid, conf, hits, ts in rows:
+        for rid, conf, hits, ts, n in rows:
             try:
                 t = datetime.fromisoformat(ts).timestamp()
             except (TypeError, ValueError):
                 t = now
             age_days = max(0.0, (now - t) / 86400)
             recency = 0.5 ** (age_days / 180.0)          # 180 天半衰期
-            scored.append(((conf or 0.0) * (1.0 + (hits or 0)) * recency, rid))
+            scored.append(((conf or 0.0) * (1.0 + (hits or 0)) * recency, rid, n or 0))
         scored.sort()                                     # 最低价值在前
-        victims = [rid for _score, rid in scored[: total - cap]]
+        victims = []
+        for _score, rid, n in scored:
+            if len(victims) >= over_rows and over_chars <= 0:
+                break
+            victims.append(rid)
+            over_chars -= n
         try:
             conn.executemany("DELETE FROM learnings WHERE id = ?", [(v,) for v in victims])
             conn.commit()
         except Exception:
             logger.warning("淘汰 learnings 失败", exc_info=True)
-            return {"deleted": 0, "kept": total, "max": cap, "skipped": "error"}
+            return {"deleted": 0, "kept": total, "max": cap, "max_chars": char_cap,
+                    "skipped": "error"}
         deleted = len(victims)
         kept = total - deleted
     try:
@@ -361,8 +465,75 @@ def prune_learnings(max_rows: int | None = None) -> dict:
         _mark_tfidf_dirty()                               # 淘汰后必须让检索索引失效
     except Exception:
         pass
-    logger.info("learnings 超限淘汰: %d 条（上限 %d，保留 %d）", deleted, cap, kept)
-    return {"deleted": deleted, "kept": kept, "max": cap}
+    audit_memory("learning", "prune",
+                 preview=f"淘汰 {deleted} 条（行预算 {cap} / 字符预算 {char_cap}）")
+    logger.info("learnings 超限淘汰: %d 条（行预算 %d、字符预算 %d，保留 %d）",
+                deleted, cap, char_cap, kept)
+    return {"deleted": deleted, "kept": kept, "max": cap, "max_chars": char_cap}
+
+
+def prune_preferences(max_rows: int | None = None) -> dict:
+    """偏好预算（2026-10-19）：行数 + 总字符，超限按 价值=confidence×新近度 淘汰。
+
+    为什么需要：learnings 早就有行数上限，preferences **一条回收路径都没有**——
+    键会随意图识别与近重复合并慢慢累积。与 learnings 同口径：只在超限时动数据，
+    一条事务批量删除，留审计流水。
+    """
+    cap = preferences_max() if max_rows is None else int(max_rows)
+    char_cap = preferences_max_chars()
+    if max_rows is not None and cap <= 0:
+        return {"deleted": 0, "kept": -1, "max": cap, "max_chars": char_cap,
+                "skipped": "cap disabled"}
+    if cap <= 0 and char_cap <= 0:
+        return {"deleted": 0, "kept": -1, "max": cap, "max_chars": char_cap,
+                "skipped": "caps disabled"}
+    conn = _get_db()
+    with _db_write_lock:
+        try:
+            rows = conn.execute(
+                "SELECT id, key, confidence, MAX(created_at, updated_at) AS ts, "
+                "LENGTH(value) AS n FROM preferences").fetchall()
+        except Exception:
+            logger.warning("读取 preferences 失败", exc_info=True)
+            return {"deleted": 0, "kept": -1, "max": cap, "max_chars": char_cap,
+                    "skipped": "error"}
+        total = len(rows)
+        total_chars = sum((r[4] or 0) for r in rows)
+        over_rows = max(0, total - cap) if cap > 0 else 0
+        over_chars = max(0, total_chars - char_cap) if char_cap > 0 else 0
+        if over_rows == 0 and over_chars == 0:
+            return {"deleted": 0, "kept": total, "max": cap, "max_chars": char_cap}
+        now = time.time()
+        scored = []
+        for rid, key, conf, ts, n in rows:
+            try:
+                t = datetime.fromisoformat(ts).timestamp()
+            except (TypeError, ValueError):
+                t = now
+            age_days = max(0.0, (now - t) / 86400.0)
+            recency = 0.5 ** (age_days / 180.0)
+            scored.append(((conf or 0.0) * recency, rid, n or 0, key))
+        scored.sort()
+        victims = []
+        for _score, rid, n, _key in scored:
+            if len(victims) >= over_rows and over_chars <= 0:
+                break
+            victims.append(rid)
+            over_chars -= n
+        try:
+            conn.executemany("DELETE FROM preferences WHERE id = ?", [(v,) for v in victims])
+            conn.commit()
+        except Exception:
+            logger.warning("淘汰 preferences 失败", exc_info=True)
+            return {"deleted": 0, "kept": total, "max": cap, "max_chars": char_cap,
+                    "skipped": "error"}
+        deleted = len(victims)
+        kept = total - deleted
+    audit_memory("preference", "prune",
+                 preview=f"淘汰 {deleted} 条（行预算 {cap} / 字符预算 {char_cap}）")
+    logger.info("preferences 超限淘汰: %d 条（行预算 %d、字符预算 %d，保留 %d）",
+                deleted, cap, char_cap, kept)
+    return {"deleted": deleted, "kept": kept, "max": cap, "max_chars": char_cap}
 
 
 def prune_injections(retention_days: int = 90) -> dict:
