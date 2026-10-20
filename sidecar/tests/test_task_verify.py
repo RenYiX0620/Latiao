@@ -259,14 +259,22 @@ async def test_loop_open_qa_unaffected():
         return [c async for c in agen]
 
     with FakeEngine() as engine:
-        engine.push(engine.text_response("今天大盘收跌，成交额 2.1 万亿。"))
+        # 够数据、够长度的记忆型直答（任务型请求允许第 1 轮直接交付；
+        # 2026-10-20 起这类正文经防闪现缓冲在轮末一次性放出——原来的单句
+        # 17 字 1 个数字事实版本本就该进执行轮，旧断言是被撤回前的闪现
+        # 文本碰巧满足的）
+        engine.push(engine.text_response(
+            "今天大盘收跌，上证指数跌0.89%收于3735点，深证成指跌0.34%，"
+            "两市成交额约2.1万亿，较昨日有所缩量。整体呈现震荡格局，权重股"
+            "护盘但题材股分化明显，主力资金小幅净流出。"))
         events = await _collect(ThinAgentLoop(
             [{"role": "user", "content": "今天大盘怎么样"}], "fake-model", engine.url,
             {"Authorization": "Bearer fake"},
             session_id=f"tv-qa-{time.time()}", access_mode="full").run())
     joined = json.dumps(events, ensure_ascii=False)
     assert "机械校验" not in joined and "不按「完成」交付" not in joined
-    assert any("成交额" in (e.get("content") or "") for e in events)
+    assert any("成交额" in (e.get("content") or "") for e in events), \
+        "记忆型数据直答必须经释放点交付（防闪现缓冲不得吞掉终答）"
 
 
 # ══ 数字溯源哨兵（2026-10-08）：先只记日志，观察误伤率后决定拦截 ═══════════

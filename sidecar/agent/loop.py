@@ -445,6 +445,18 @@ _PLAN_INTENT_RE = re.compile(
     # 结构（承诺替你做某事），不收裸"帮"——"我帮你改好了"是完成时，别误伤。
     r"|帮(你|您|主人|人家)[^。～~！!？?\n]{0,12}把")
 _PLAN_TAIL_SPLIT_RE = re.compile(r"[。～~！!？?\n]+")
+# 「自我宣告要动手」的末句形态（2026-10-20 17:25 真机）：
+# 完整分析以人设客套收尾（"…人家随时帮你查嘛～"/"要不要人家帮你深入看看"）时，
+# 宽口径的 _PLAN_INTENT_RE（人家 + 查/看）会把它误判成计划，催着模型重写三遍。
+# 校准过的承诺碎片（10-07/08 语料）全部带**第一人称将来动作**——让我/我来/这就/
+# 马上/赶紧/先调取…；客套邀请（要不要/随时/需要）不是。故末句判定改用这份更窄的
+# 集合：只认"宣告"，不认"邀请"。`帮X…把…`保留（17:06 的"帮主人把…找出来"）。
+_PLAN_ANNOUNCE_RE = re.compile(
+    r"我来|让我|我先|我将|我会|接下来|下面我|这就|马上|赶紧|这就来"
+    r"|先(去|来)?(查|调|搜|读|看看)"
+    r"|(人家|咱们|咱|俺)(会|要|这就|马上|先|来|去)"
+    r"|现在(就|马上|立刻)(去|来)?(查|调|搜|读|看看|执行|动手)"  # 19:30 真机"现在就去调数据啦"
+    r"|帮(你|您|主人|人家)[^。～~！!？?\n]{0,12}把")
 # 结构兜底："意图词 + 汉字动词 + 一下/一遍/一趟"——动词永远列不全（多次加词
 # 都是新动词），凡这个形态的末句同算承诺。排除两类：①"让我知道一下"这类是
 # **对用户**的请求（不是模型打算自己做的事）；②整段已带数据信号（是在汇报，
@@ -494,12 +506,17 @@ def _looks_like_plan_only(text: str, has_tools: bool) -> bool:
     if not has_tools:
         return False
     t = re.sub(r"\s+", " ", (text or "")).strip()
-    if not t or len(t) > 200:
+    # 长度上限 200 → 600（2026-10-20）：人设化的承诺句实测 253 字（"主人想看今天
+    # 的大盘呀……人家这就帮主人查一下"），被 200 字护栏整条挡在门外；与思考轮另一道
+    # 闸门的 600 口径对齐。600 以上（真汇报动辄上千字）仍走"长正文放行"。
+    if not t or len(t) > 600:
         return False
     tail = _plan_tail(t)
     if not tail or len(tail) > 120:   # 末句太长：不是一句轻飘飘的承诺
         return False
-    if not _PLAN_INTENT_RE.search(tail):
+    # 用"宣告式"集合（不是宽口径的 _PLAN_INTENT_RE）：完整分析 + 客套邀请
+    # （"人家随时帮你查嘛"）不是计划；10-07/08 校准的片段全是让我/这就/马上。
+    if not _PLAN_ANNOUNCE_RE.search(tail):
         return False
     if _PLAN_VERB_RE.search(tail):
         return True
@@ -515,6 +532,37 @@ _PROMISE_RE = re.compile(r"这就|马上|立刻|我这就|帮你(查|看|搜)|�
 # 有实质内容的信号：多个数字/百分号/表格行——含这些的短正文是"真答案"，不拦
 _DATA_SIGNAL_RE = re.compile(r"(?:\d[.,]?\d){2,}|%|^\|", re.M)
 
+# 日期/时刻不是"数据事实"（2026-10-20 19:30 真机，"还是一样啊"）：计划句
+# "获取2026-10-20的三大指数行情"里的**一个日期**被 `\d[\d.,]*` 数成 3 个数字
+# 事实（2026/10/20）→ 计划漏网闸按"多个数字事实＝真汇报"整条放行（还把排
+# 在后面的 mx_query 点名判据挡住）；任务型兜底闸（_has_substance）里的
+# _DATA_SIGNAL_RE 也命中（4 位数"2026"）→ 任务型请求带着纯承诺直接交付，
+# 第 2 轮（真正的工具执行）永远不来。真汇报的实质在价格/百分比/成交量，
+# 不在日期与时刻。只收无歧义形态：4 位年开头的数字日期、年月日、时分；
+# "3.5"这类小数和"10-20"这类区间不碰。
+_DATE_LIKE_RE = re.compile(
+    r"\d{4}[-/.年]\d{1,2}[-/.月]\d{1,2}日?"    # 2026-10-20 / 2026年10月20日 / 2026/10/20
+    r"|\d{1,2}月\d{1,2}日"                      # 10月20日
+    r"|\d{1,2}:\d{2}")                           # 19:30（时刻同样不是事实）
+
+
+def _prose_data_fact_count(text: str) -> int:
+    """散文里的"数据事实"个数——计划类闸门的统一口径。
+
+    只数散文（围栏/行内代码/URL/路径先剥掉，与语言闸门同源），剥掉列表编号
+    （"1. 查找…"的编号不是数据，2026-10-14 事故），再把日期/时刻归一后数
+    数字串。两处调用（_thinking_round_plan_leak / 任务型兜底闸的
+    _has_substance）此前各数各的，且都不剥日期——这次统一到一份实现。
+    """
+    try:
+        from agent.gates import _strip_nonprose_for_lang
+        prose = _strip_nonprose_for_lang(text or "")
+    except Exception:
+        prose = text or ""
+    prose = _DATE_LIKE_RE.sub(" ", prose)
+    prose = re.sub(r"(?m)(^|\s)[（(]?\d{1,2}[)）.、）]\s*", r"\1", prose)
+    return len(re.findall(r"\d[\d.,]*", prose))
+
 # <tool_code> 伪调用块（2026-10-14「卸载 app」事故，真机原样）：Hermes 系模型在
 # 思考轮（没有 JSON 工具表）时把要执行的命令写成 python 伪代码块
 # `<tool_code>print(run_cmd("ls /Applications | grep -i zhipu"))</tool_code>`。
@@ -524,8 +572,10 @@ _TOOL_CODE_RE = re.compile(r"<tool_code\b", re.I)
 
 # 栅栏里的"工具调用形状"（2026-10-20）：```json {"tool": "<在册工具>", "params": {...}} ```
 # —— 计划信号（思考轮里是"我要动手"的声明，不是终答）。
+# 闭合引号**可选**（2026-10-20 17:06 真机）：模型写出过 `"tool": "tavily_search,`
+# ——名字后的引号丢了、整段 JSON 不合法；严格引号的判据因此全灭，正文被当终答交付。
 _FENCED_CALL_RE = re.compile(
-    r"```[A-Za-z0-9_-]*\s*\{[\s\S]{0,500}?\"(?:tool|name|function|tool_name)\"\s*:\s*\"([\w.-]+)\"",
+    r"```[A-Za-z0-9_-]*\s*\{[\s\S]{0,500}?\"(?:tool|name|function|tool_name)\"\s*:\s*\"?([\w.-]+)",
     re.DOTALL | re.IGNORECASE)
 
 
@@ -568,24 +618,27 @@ def _anon_note(key: str) -> None:
 
 
 def _delivery_fragment_suspect(text: str) -> str:
-    """交付哨兵（2026-10-08）：正文是否"疑似承诺碎片"——只观测、不拦截。
+    """交付哨兵（2026-10-08）：正文是否"疑似承诺碎片/调用形状"——只观测、不拦截。
 
-    闸门必然是有限的（末句形态 + 200 字口径 + 特定路径），漏网变体不该等用户
+    闸门必然是有限的（末句形态 + 长度口径 + 特定路径），漏网变体不该等用户
     抱怨才被发现。交付时命中就 warning 留痕，把"变体发现"从被动转主动。
-    比闸门更宽：口径放到 240 字、并额外认纯承诺口语词（"这就帮你看看"）。
+    口径与闸门对齐到 600 字（2026-10-20：253 字的承诺句此前落在 240 的缝里，
+    连痕迹都没有），并新增"围栏调用形状"信号（含坏引号的围栏调用）。
     返回命中的信号名（""=干净），便于日志聚合。
     """
     t = re.sub(r"\s+", " ", (text or "")).strip()
-    if not t or len(t) > 240:
+    if not t or len(t) > 600:
         return ""
+    if _FENCED_CALL_RE.search(t):
+        return "fenced-call"
     tail = _plan_tail(t)
-    if tail and _PLAN_INTENT_RE.search(tail) and _PLAN_VERB_RE.search(tail):
+    if tail and _PLAN_ANNOUNCE_RE.search(tail) and _PLAN_VERB_RE.search(tail):
         return "tail-promise"
     if tail and _PROMISE_RE.search(tail) and not _DATA_SIGNAL_RE.search(t):
         return "promise-phrase"
-    # 最宽的一档（10-08 三号现场"让我再深挖一下…"倒逼）：末句短 + 含意图词 +
+    # 最宽的一档（10-08 三号现场"让我再深挖一下…"倒逼）：末句短 + 含宣告词 +
     # 无数据信号。动词表永远追不上，这一档让"新动词"变体在日志里先现形。
-    if (tail and len(tail) <= 30 and _PLAN_INTENT_RE.search(tail)
+    if (tail and len(tail) <= 30 and _PLAN_ANNOUNCE_RE.search(tail)
             and not _DATA_SIGNAL_RE.search(t)):
         return "intent-short"
     return ""
@@ -1121,6 +1174,7 @@ class ThinAgentLoop:
         self._empty_gen_retry_used = False     # 引擎空生成重试（每 turn 一次）
         self._tool_rounds_no_answer = 0        # 连续工具轮（无实质正文交付）计数
         self._finalize_round = False           # 停滞闸门收口轮：无工具直接作答
+        self._finalize_digest = False          # 收口重采改走"摘要视图"（无 tools/无工具形态）
         self._plan_nudge_used = 0              # 空转闸门：只声明计划不行动的纠正次数
         self._turn_tool_ok = False             # 本轮是否拿到过成功的工具结果（升级档分叉）
         self._toolfail_nudge_used = 0          # 工具失败闸门：承诺碎片的一次纠正
@@ -1163,6 +1217,7 @@ class ThinAgentLoop:
         self._round_buf_t0 = 0.0               # 缓冲起点（时限放行判定用）
         self._round_dup = False
         self._round_dup_decided = False
+        self._think_hold: list = []            # 思考轮正文缓冲（判成终答才释放）
         self._retry_freq = None                # 重试轮频率惩罚（压制重复 token）
         # Scope：工具目录 + waterfall 宿主；loop 自身作为服务供钩子读取
         self.scope = Scope(name=f"agent:{session_id or uuid.uuid4().hex[:8]}")
@@ -1265,15 +1320,22 @@ class ThinAgentLoop:
         # 「有数据信号」用比 _DATA_SIGNAL_RE 更严的口径：后者把**单个**数字串也算
         # 数据，而实测原句里的股票代码"（600519）"正好命中 → 计划句整条漏网
         # （真机端到端抓到）。真汇报的特征是**多个**数字事实 / 百分号 / 表格行。
-        if "%" in t or t.startswith("|"):
+        # 2026-10-20 17:06 真机：这些判据此前看**整段正文**，于是工具调用里的
+        # 日期/参数（"2026-10-20"、max_results=5）被当成"多个数字事实" → 提前
+        # return False，把正文里明明写着的 `tavily_search` 判据挡在后面。
+        # 现在数据事实**只数散文**：围栏/行内代码/URL/路径先剥掉（复用语言闸门那份）。
+        try:
+            from agent.gates import _strip_nonprose_for_lang
+            prose = _strip_nonprose_for_lang(t)
+        except Exception:
+            prose = t
+        if "%" in prose or prose.strip().startswith("|"):
             return False
-        # 列表编号不是数据（2026-10-14「卸载 app」事故，真机端到端）：模型给计划
-        # 写"1. 查找… 2. 删除… 3. 清理…"时，编号里的数字被下面的 `\d[\d.,]*`
-        # 数成"多个数字事实"（实测 5 个片段：1. 2. 3. 1. 2.）→ 整条计划按"像真
-        # 报告"放行、被当终答交付。剥离行首/空格后的"1." "2、" "(3)" 形态再数；
-        # 真汇报的数字（行情/价格/代码）不受影响（"（600519）"这类多位数不匹配）。
-        _t_nomarker = re.sub(r"(?m)(^|\s)[（(]?\d{1,2}[)）.、）]\s*", r"\1", t)
-        if len(re.findall(r"\d[\d.,]*", _t_nomarker)) >= 2:
+        # 多个数字事实才算"像真报告"；列表编号与**日期/时刻**不算（编号：
+        # 2026-10-14「卸载 app」事故；日期：2026-10-20 19:30 真机——"获取
+        # 2026-10-20的行情"被数成 3 个事实，把 mx_query 点名判据挡在后面，
+        # 见 _DATE_LIKE_RE）。统一走 _prose_data_fact_count，别再各数各的。
+        if _prose_data_fact_count(t) >= 2:
             return False
         try:
             from agent_loop import TOOLS
@@ -1409,6 +1471,30 @@ class ThinAgentLoop:
     # ── 请求组装（request waterfall 之前的宿主编排）──────────
     def _build_request(self, engine_model: str) -> dict:
         import local_llm  # 懒加载：与文件内其它用法一致，避免模块级循环依赖
+        if self._finalize_digest:
+            # 收口重采的兜底视图（2026-10-20 真机）：模型在收口轮仍反复发同一个
+            # 工具调用（工具形态锁定）→ 旧版只做温度抖动 + 尾部指令，模型照样只出
+            # 调用，最后落成"⚠️ 模型未能生成分析 + 数据堆"。改用 09-08 验证过的
+            # 摘要视图：无 tools、无 tool 角色/tool_calls 历史，只留【数据N】+ 提问
+            # ——结构上不可能续写调用（实测同数据 56s 产出 873 字完整分析）。
+            # 代价：该轮必然 0% 缓存；它是最后的兜底，值得。
+            self.native_tools = False
+            msgs = _build_finalize_digest(self.current_msgs, lang=self.user_lang)
+            if self._tone and msgs:
+                _td = _finalize_tail_directive(self.user_lang, self._tone)
+                if "\n" in _td:
+                    msgs[-1]["content"] = (str(msgs[-1].get("content") or "") + "\n"
+                                           + _td.split("\n", 1)[1])
+            return {
+                "model": engine_model,
+                "messages": msgs,
+                "stream": True,
+                "temperature": self._retry_temp if self._retry_temp is not None else 0.0,
+                "frequency_penalty": self._retry_freq if self._retry_freq is not None else 0.6,
+                "max_tokens": _resolve_max_tokens(self.model, local=self.is_local,
+                                                  override=_custom_engine_max_tokens()),
+                "stop": ["<|im_end|>", "<|endoftext|>", "<|end_of_turn>", "<eos>"],
+            }
         light = self.is_local and _is_light_query(self.last_user_text, self.current_msgs)
         native_ok = self.is_local and _local_native_tools_ok() and not self.native_fallback_used
         # 工具表必须**逐轮一致**：它渲染在提示头，而缓存（尤其混合/线性注意力模型，
@@ -1568,6 +1654,12 @@ class ThinAgentLoop:
             _fdir = (_finalize_tail_directive(self.user_lang, self._tone)
                      if self._turn_tool_ok else _msg("finalize_no_data", self.user_lang))
             body["messages"] = _append_tail_note(body["messages"], _fdir)
+            # 收口轮清空工具表（2026-10-20 真机 17:17）：旧实现为保缓存保留
+            # tools=33，模型看见工具表就在收口轮继续发同一个 tavily_search
+            # （工具形态锁定）→ 正文永远是一句废话。收口轮语义就是"只许写正文"，
+            # 工具表留着只提供错误出口；缓存代价可接受（已是最后一轮）。
+            body.pop("tools", None)
+            self.native_tools = False
             body["parallel_tool_calls"] = False
             body["chat_template_kwargs"] = {"enable_thinking": False}
             if (self.thinking_level or "").lower() != "off":
@@ -2065,8 +2157,42 @@ class ThinAgentLoop:
         carry, self._think_carry = getattr(self, "_think_carry", ""), ""
         return carry
 
+    def _request_task_like(self) -> tuple[bool, str]:
+        """请求是否"任务型"（行情/数据类或命令动作类）——不可能靠嘴完成的请求。
+
+        转执行闸与思考轮正文缓冲（防闪现）共用的请求侧判据；来源与
+        边界见 _MARKET_KW_RE / _ACTION_KW_RE 的注释。
+        """
+        try:
+            from agent.prompt_build import _ACTION_KW_RE, _MARKET_KW_RE
+            _req = self.last_user_text or ""
+            if _MARKET_KW_RE.search(_req):
+                return True, "行情"
+            if _ACTION_KW_RE.search(_req):
+                return True, "动作词"
+        except Exception:
+            pass
+        return False, ""
+
     def _gate_round_content(self, text: str) -> str | None:
         """返回要下发的文本；None = 暂不发送（缓冲中/判定为复读）。"""
+        try:
+            # 半成品实例（dup 闸单测的 object.__new__ 台架）没有 is_local 等
+            # 属性：探测失败按"无缓冲"处理，dup 判定路径不受影响。
+            _hold = (self._thinking_first_round() and self._request_task_like()[0])
+        except Exception:
+            _hold = False
+        if _hold:
+            # 任务型请求的思考轮正文不实时下发（2026-10-20 19:49 真机"闪现
+            # 消息"）：这类请求第 1 轮的正文绝大多数是计划句，注定要被撤回——
+            # 先流进气泡再撤，用户看到的就是"打了一段字然后闪没了"（实测 437
+            # 字流了 70 秒然后消失）。缓冲到轮末由 _release_think_hold 处置：
+            # 判成终答（有数据的记忆型回答）→ 一次性放出；判成计划 → 不出现。
+            # 期间用户看到的是思考面板在滚动（reasoning 通道不受影响）。
+            # 刻意**不含闲聊直答**：那类第 1 轮就是终答，实时流出是 09-06 的
+            # 契约（test_thin_streams_content_deltas_live）。每轮开头清空缓冲。
+            self._think_hold.append(text)
+            return None
         if self._round_dup_decided:
             return None if self._round_dup else text
         # 没有可比基准时不缓冲（09-21）：上一轮正文不足 60 字时判定必然为 False，
@@ -2100,6 +2226,16 @@ class ThinAgentLoop:
             self._round_dup = _looks_like_replay(self._last_round_text, "".join(self._round_buf))
             return "" if self._round_dup else "".join(self._round_buf)
         return ""
+
+    def _release_think_hold(self) -> str:
+        """思考轮缓冲正文的释放：判成终答时一次性下发（否则整轮丢弃）。
+
+        与撤回（content_revised ""）配对：撤回保住"最终只留一个答案"，
+        缓冲保住"过程不闪现"。返回后清空，防止同一份文本二次下发。
+        """
+        held = "".join(getattr(self, "_think_hold", None) or [])
+        self._think_hold = []
+        return held
 
     async def _stagnation_gate(self, tool_calls: list):
         """同参空转 ≥5 轮 → 强制终答轮收口。返回要下发的事件或 None。
@@ -2343,6 +2479,7 @@ class ThinAgentLoop:
                 self._round_buf_t0 = 0.0
                 self._round_dup = False
                 self._round_dup_decided = False
+                self._think_hold = []
                 t_first_token = None
                 result = None
                 raw_deltas = 0
@@ -2387,7 +2524,12 @@ class ThinAgentLoop:
                         yield evt
                     _leftover = (self._flush_round_gate() or "") + self._take_think_carry()
                     if _leftover:
-                        yield {"content": _leftover}
+                        if (self._thinking_first_round()
+                                and self._request_task_like()[0]):
+                            # 任务型思考轮的残余（think 标签尾巴等）同样进缓冲
+                            self._think_hold.append(_leftover)
+                        else:
+                            yield {"content": _leftover}
                     if result is None:
                         return
                     streamed, body_text, reasoning, native, finish_reason, _first_delta_at = result
@@ -2625,6 +2767,10 @@ class ThinAgentLoop:
                     if _finalize_body_is_junk(body_text, _stripped_tools):
                         self._step_log("终答轮",
                                        f"正文非答案（{len(body_text.strip())} 字）→ 重采/数据兜底")
+                        # 收口轮的这份正文也要撤回（2026-10-20 17:25 真机：同一个答案
+                        # 的四次改写各留一个气泡）——重采或数据兜底会重新下发正文，
+                        # 旧的气泡不该留在聊天里。
+                        yield {"event": "content_revised", "content": ""}
                         # 终答轮仍空 → 温度抖动重采一次（0.0 温度下模型被
                         # 工具调用形态锁定（09-08 17:43 实况：tools=[] 仍只
                         # 输出 1 个工具调用、正文 0 字））；再空才交付警告。
@@ -2634,18 +2780,31 @@ class ThinAgentLoop:
                             self._retry_temp, self._retry_freq = 0.6, 1.5
                             if self.steps >= self.max_steps:
                                 self.steps = self.max_steps - 1
-                            # 追加为**尾部用户消息**：system 角色会改提示头 → 缓存全丢
-                            self.current_msgs.append({
-                                "role": "user",
-                                "content": _finalize_tail_directive(self.user_lang, self._tone)})
+                            if _stripped_tools:
+                                # 收口轮里仍在发工具调用 = 工具形态锁定（2026-10-20 真机：
+                                # Hermes 在收口轮连续发同一个 tavily_search，正文只有一句
+                                # "让人家整理一下"）。温度抖动救不了——换摘要视图（无
+                                # tools / 无工具形态历史，见 _build_request 的分支）。
+                                self._finalize_digest = True
+                                self._step_log("终答轮", "工具形态锁定 → 改走摘要视图重采")
+                            else:
+                                # 追加为**尾部用户消息**：system 角色会改提示头 → 缓存全丢
+                                self.current_msgs.append({
+                                    "role": "user",
+                                    "content": _finalize_tail_directive(self.user_lang, self._tone)})
                             self._step_log("终答轮", "空生成 → 温度抖动重采（一次）")
                             yield {"event": "heartbeat"}
                             continue
                         _fb = _collect_finalize_data(self.current_msgs, max_results=8)
+                        # 兜底交付也记账（2026-10-20：第二次 junk 后此路径无任何
+                        # 日志——17:18 真机上无法判断用户看到的是数据堆还是没收到）
                         if _fb:
+                            self._step_log("终答轮", f"数据兜底交付（{len(_fb)} 块，"
+                                           f"共 {sum(len(x) for x in _fb)} 字）")
                             yield {"content": ("\n\n" + _msg("data_only", self.user_lang)
                                                + "\n\n" + "\n\n".join(_fb))[:6000]}
                         else:
+                            self._step_log("终答轮", "无可用数据 → 交付未能生成分析")
                             yield {"content": "\n\n" + _msg("no_final_answer", self.user_lang)}
                     else:
                         # 正文已在 _sample 逐字流式下发，不再重复交付全文
@@ -2699,31 +2858,26 @@ class ThinAgentLoop:
                     # 交付。改为可催 2-3 次，仍不改则强制收口，见下一段）
                     self._plan_nudge_used += 1
                     self.current_msgs.append(_note_msg(_msg("plan_nudge", self.user_lang)))
+                    # 催促必须升温（2026-10-20 真机 14:44 四连复读）：temperature=0 +
+                    # 前缀缓存 100% → 模型对同一提示必然复读同一句承诺，催 3 次产出
+                    # 逐字节相同（40→41→41→41 字）。只加尾注不够——温度才是打破
+                    # 确定性采样的开关（与 length_retry/收口重采同款手法）。
+                    self._retry_temp, self._retry_freq = 0.6, 1.5
                     self._step_log("空转闸门",
                                    f"只有计划声明、无工具调用 → 要求直接行动"
-                                   f"（{self._plan_nudge_used}/{_plan_cap}）")
+                                   f"（{self._plan_nudge_used}/{_plan_cap}，升温破复读）")
                     _anon_note("gate_idle_nudge")
-                    # 近重复判定**每轮都要记录**（2026-10-20）：思考轮那条虽然会被
-                    # 撤回，也得进"最近叙述"库——否则执行段第一句同样的承诺又算"首次"，
-                    # 漏撤回一次（真机四连复读的复刻测试就是这么抓到的）。
+                    # 近重复判定每轮都要记录（2026-10-20）：思考轮那条虽然会被
+                    # 撤回，也得进"最近叙述"库——否则执行段第一句同样的承诺又算
+                    # "首次"，漏撤回一次（真机四连复读的复刻测试就是这么抓到的）。
                     _dup_narr = bool(body_text.strip()) and _narration_seen(
                         self.session_id, body_text)
-                    if self._thinking_first_round():
-                        # 思考轮的计划句只是过程自语（正文/思考面板都还在，见
-                        # _thinking_round_plan_leak 的注释），且点名的工具未必是最后
-                        # 真正调用的那个（真机实测：预告 ak_finance、实调 mx_query）
-                        # → 与"重复叙述抑制"同一手法撤回气泡；历史里本就没写这轮正文
-                        # （nudge 分支 continue 在 asst 入史之前），无需再改。
-                        # 只在思考轮撤回：经典闸门（09-08/10-08 校准）行为不动。
-                        yield {"event": "content_revised", "content": ""}
-                    elif _dup_narr:
-                        # 催促轮里的复读（2026-10-20 真机）：occamy 在 3 次催促中把
-                        # 同一句承诺原样说了四遍（"主人想在 Mac 上部署呀～让我帮你
-                        # 查一下有没有相关案例嘛"），每轮的气泡都留在前端 → 用户看到
-                        # 四个一模一样的"马上帮你查"。与工具轮的"重复叙述抑制"同一
-                        # 手法：近重复就撤回本轮气泡；首次已由上一支撤回，所以交付
-                        # 里不会剩任何承诺句。
-                        yield {"event": "content_revised", "content": ""}
+                    # 「被判不是答案 → 撤回本轮气泡」（2026-10-20 17:25 真机，一问回
+                    # 三条）：此前只有思考轮/近重复才撤；完整分析因末句的客套话被误判
+                    # 时，每个重写版本都会在聊天里留下一个气泡。现在催促轮**一律**撤回，
+                    # 一轮提问最多只留最终那一条（过程仍留在 Think/工具面板与日志里）。
+                    yield {"event": "content_revised", "content": ""}
+                    if not self._thinking_first_round() and _dup_narr:
                         self._step_log("重复叙述抑制",
                                        f"{len(body_text)}字 近重复（催促轮气泡已撤回）")
                     yield {"event": "heartbeat"}
@@ -2782,19 +2936,27 @@ class ThinAgentLoop:
                         # 完整卸载掉"不带任何行情词，原先整条闸门不生效，第 1 轮的
                         # 计划（含假代码块）被当终答交付、假报"已删除"。桌面/文件
                         # 任务和行情任务同型：不可能靠嘴完成。
-                        _task_like = False
-                        _why = ""
+                        _task_like, _why = self._request_task_like()
+                        # 「有实质数据」＝真报告特征（≥2 个数字事实 / 百分号 /
+                        # 表格行，只看散文，日期不数）。2026-10-20 19:30 真机：
+                        # 原来的单个 _DATA_SIGNAL_RE 把计划句里的日期"2026"当
+                        # 成实质数据 → 兜底闸整条绕过，326 字纯承诺被当终答交付
+                        # （任务又断）。与 _thinking_round_plan_leak 同一口径。
                         try:
-                            from agent.prompt_build import _ACTION_KW_RE, _MARKET_KW_RE
-                            _req = self.last_user_text or ""
-                            if _MARKET_KW_RE.search(_req):
-                                _task_like, _why = True, "行情"
-                            elif _ACTION_KW_RE.search(_req):
-                                _task_like, _why = True, "动作词"
+                            from agent.gates import _strip_nonprose_for_lang
+                            _ps = _strip_nonprose_for_lang(body_text or "")
                         except Exception:
-                            pass
-                        _has_substance = bool(_DATA_SIGNAL_RE.search(body_text or "")) \
-                            and len((body_text or "").strip()) >= 80
+                            _ps = body_text or ""
+                        # 门槛收紧（2026-10-20 真机 19:30）：326 字 + 2 个数字
+                        # 就被判"有实质"直接交付——但那是凭印象写的半截分析、
+                        # 一个工具都没调。真汇报的特征是**多个**数据事实（价格/涨跌幅），
+                        # 不是长度——短而数据密的直答（95 字 4 个数字）是合法终答。
+                        _fact_n = _prose_data_fact_count(body_text or "")
+                        _has_substance = (
+                            _fact_n >= 3
+                            or ("%" in _ps and _fact_n >= 2)
+                            or bool(re.search(r"(?m)^\|", _ps))
+                        ) and len((body_text or "").strip()) >= 80
                         if _task_like and not _has_substance:
                             # 日志带上判据来源（行情/动作词）：既是诊断信息，也是
                             # "新代码是否真的被进程执行"的廉价判别信号（见 10-13 规约）。
@@ -2823,6 +2985,9 @@ class ThinAgentLoop:
                         if _tv.get("hard") or self._task_verify_used:
                             self._step_log("任务级验证",
                                            f"{_tv['kind']} → 交回用户（{_td}）")
+                            _held = self._release_think_hold()
+                            if _held.strip():
+                                yield {"content": _held}
                             yield {"content": "\n\n" + _msg("task_unverified", self.user_lang,
                                                             detail=_td)}
                             return
@@ -2834,7 +2999,13 @@ class ThinAgentLoop:
                         yield {"event": "heartbeat"}
                         continue
                     # deliver waterfall：弱模型辅助（思考-only/空响应诊断/语言替换）
-                    # 正文已实时流出——辅助只能"替换"（content_revised）或补充，不得重复
+                    # 辅助只能"替换"（content_revised）或补充，不得重复。执行轮
+                    # 的正文已实时流出；思考轮的正文在此前刚经 _release_think_hold
+                    # 一次性放出（不实时下发，防"闪现"），两种情况对瀑布的契约
+                    # 相同：进入瀑布前正文都已完整到达前端。
+                    _held = self._release_think_hold()
+                    if _held.strip():
+                        yield {"content": _held}
                     payload = {
                         "text": body_text, "streamed": streamed,
                         "client": client, "api_url": self.api_url,
