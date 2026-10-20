@@ -436,17 +436,38 @@ def _parse_prompt_tool_calls(text: str) -> tuple[str, list[dict]]:
     # json 栅栏（Qwen3.8/MoziAI 27B 实测输出格式），此前四层全不认 → 工具调用
     # 被当纯文本，任务"刚开始就停"
     if not tool_calls:
+        _known = _known_tool_names()
         for idx, jm in enumerate(_PROMPT_JSON_FENCE_RE.finditer(search_text)):
             obj = _extract_first_json_object(jm.group(1))
-            if obj is None:
+            if not isinstance(obj, dict):
                 continue
-            if not (isinstance(obj, dict) and obj.get("name") and "arguments" in obj):
+            _name = obj.get("name")
+            _args = obj.get("arguments", {})
+            _ok = bool(_name) and "arguments" in obj
+            if not _ok:
+                # 2026-10-20 真机（occamy）：```json {"tool": "mx_query", "params": {...}} ```
+                # ——键名是 tool/params，旧判据要求 name+arguments → 整段被当纯文本，
+                # 工具调用=0，一句"人家这就帮你查一下"被当终答交付（用户："又断了"）。
+                # 别名容错（与 <tool_call> 分支同口径）；**非标准键名要求点在册工具**，
+                # 避免把正文里的任意 JSON 误判成调用。
+                _alias_name = obj.get("tool") or obj.get("function") or obj.get("tool_name")
+                if _alias_name and str(_alias_name).strip() in _known:
+                    _name = _alias_name
+                    _args = next((obj[k] for k in ("params", "parameters", "args", "input")
+                                  if k in obj), {})
+                    _ok = True
+            if not _ok:
                 continue
+            if isinstance(_args, str):
+                try:
+                    _args = json.loads(_args)
+                except json.JSONDecodeError:
+                    _args = _salvage_tool_args(_args)
             tool_calls.append({
-                "id": f"local_json_{obj['name']}_{idx}",
+                "id": f"local_json_{_name}_{idx}",
                 "type": "function",
-                "function": {"name": str(obj["name"]),
-                             "arguments": json.dumps(obj["arguments"], ensure_ascii=False)},
+                "function": {"name": str(_name),
+                             "arguments": json.dumps(_args, ensure_ascii=False)},
             })
             used_ranges.append((jm.start(), jm.end()))
 

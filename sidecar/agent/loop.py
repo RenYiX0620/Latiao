@@ -522,6 +522,12 @@ _DATA_SIGNAL_RE = re.compile(r"(?:\d[.,]?\d){2,}|%|^\|", re.M)
 # 计划信号推进执行轮（真正的执行由第 2 轮的原生调用完成，这里只是别当终答交付）。
 _TOOL_CODE_RE = re.compile(r"<tool_code\b", re.I)
 
+# 栅栏里的"工具调用形状"（2026-10-20）：```json {"tool": "<在册工具>", "params": {...}} ```
+# —— 计划信号（思考轮里是"我要动手"的声明，不是终答）。
+_FENCED_CALL_RE = re.compile(
+    r"```[A-Za-z0-9_-]*\s*\{[\s\S]{0,500}?\"(?:tool|name|function|tool_name)\"\s*:\s*\"([\w.-]+)\"",
+    re.DOTALL | re.IGNORECASE)
+
 
 def _needs_length_retry(finish_reason, native_calls, empty_body: bool,
                         retry_used: bool, body_chars: int = -1,
@@ -1241,6 +1247,21 @@ class ThinAgentLoop:
         # 长度只当宽松的上界（真汇报动辄上千字）。
         if not t or len(t) > 600:
             return False
+        # 栅栏里的"工具调用形状"（2026-10-20 真机）：模型在思考轮把调用写成
+        # ```json {"tool": "mx_query", "params": {...}} ```。旧解析器只认
+        # name+arguments 这一组键名 → 工具调用=0；而正文带日期数字（"2026-10-20"）
+        # 又被下面的数字判据当成"多个数字事实" → 闸门整条放行，一句"人家这就帮你
+        # 查一下" + 一段 JSON 被当终答交付（用户："又断了"）。解析器已补别名
+        # （parsing.py），这里留一道**兜底**：栅栏点名在册工具 = 我要动手的计划信号。
+        _fm = _FENCED_CALL_RE.search(t)
+        if _fm:
+            try:
+                from agent_loop import TOOLS as _T
+                _known = {str((x.get("function") or {}).get("name") or "") for x in _T}
+            except Exception:
+                _known = set()
+            if _fm.group(1) in _known:
+                return True
         # 「有数据信号」用比 _DATA_SIGNAL_RE 更严的口径：后者把**单个**数字串也算
         # 数据，而实测原句里的股票代码"（600519）"正好命中 → 计划句整条漏网
         # （真机端到端抓到）。真汇报的特征是**多个**数字事实 / 百分号 / 表格行。
