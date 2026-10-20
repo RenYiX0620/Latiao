@@ -10,6 +10,7 @@
    在 3 次催促里原样重复，每轮气泡都留在前端 → 四个一模一样的"马上帮你查"。
    原因：催促轮只有**思考轮**会撤回气泡，执行段的催促轮不撤、也不做近重复抑制。
 """
+import json
 import time
 
 import pytest
@@ -113,3 +114,65 @@ async def test_repeated_promise_bubbles_retracted_2026_10_20():
     assert len(retractions) >= 3, f"重复的承诺气泡必须撤回（实际 {len(retractions)} 次）"
     assert promise not in delivered, "承诺句不得进交付文本"
     assert "没有找到 Mac 部署" in delivered, "终答必须交付"
+
+
+# ── 第三种方言：```json {"tool": ..., "params": {...}} ```（2026-10-20 16:25 现场）
+_REAL_FENCE_BODY = """（凑近屏幕，指尖轻点着下巴）主人想看今天的大盘呀……人家这就帮主人查一下，**保证把数据看得明明白白的～** ✨
+
+（打开工具面板，眼神专注）让我先看看三大指数今天的表现……
+
+调用 `mx_query` 查询 A 股大盘行情。
+
+```json
+{
+  "tool": "mx_query",
+  "params": {
+    "query": "A股大盘 今日 上证指数 深证成指 创业板指 涨跌幅 成交额",
+    "date": "2026-10-20"
+  }
+}
+```
+"""
+
+
+def test_fenced_tool_params_dialect_is_parsed():
+    """真机原文：{"tool","params"} 方言必须解析成一次调用，且围栏从正文剥掉。"""
+    from agent.parsing import _parse_prompt_tool_calls
+    clean, calls = _parse_prompt_tool_calls(_REAL_FENCE_BODY)
+    assert len(calls) == 1
+    fn = calls[0]["function"]
+    assert fn["name"] == "mx_query"
+    assert "上证指数" in json.loads(fn["arguments"])["query"]
+    assert "```json" not in clean, "围栏必须剥掉（别把 JSON 当回答交付）"
+
+
+def test_fenced_dialect_requires_known_tool():
+    """非标准键名必须点在册工具：正文里的任意 JSON 不能变成一次调用。"""
+    from agent.parsing import _parse_prompt_tool_calls
+    text = '示例：```json\n{"tool": "not_a_real_tool", "params": {"x": 1}}\n```'
+    _clean, calls = _parse_prompt_tool_calls(text)
+    assert calls == []
+
+
+def test_thinking_round_gate_catches_fenced_call():
+    """思考轮兜底：正文带日期数字（会被当成"数据"）时，栅栏点名在册工具仍算计划信号。"""
+    from tests.test_thinking_first import _loop
+    loop = _loop("max", "分析今天大盘")
+    assert loop._thinking_round_plan_leak(_REAL_FENCE_BODY) is True
+
+
+@pytest.mark.asyncio
+async def test_fenced_dialect_runs_the_tool_end_to_end():
+    """端到端：思考轮用 {"tool","params"} 方言下调用 → 真执行 → 终答交付。"""
+    body = ('（打开工具面板，眼神专注）让我先看看目录里有什么……\n\n'
+            '```json\n{"tool": "list_dir", "params": {"path": "."}}\n```\n')
+    answer = "目录里有 agents、skills、tests 等。" * 2
+    from tests.fake_engine import FakeEngine
+    events, delivered, _requests = await _run_loop(
+        "看看当前目录里有什么",
+        [FakeEngine.text_response(body),
+         FakeEngine.text_response(answer)],
+        "fence-e2e")
+    assert any(e.get("event") == "tool_start" and e.get("tool") == "list_dir"
+               for e in events), "方言必须被解析并执行（不能只当文本交付）"
+    assert "目录里有" in delivered
