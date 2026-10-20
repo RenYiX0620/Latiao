@@ -513,7 +513,12 @@ async def test_finalize_round_think_only_tool_call_recovers():
     # 由共享状态按"请求里是否带收口指令"分派。
     def _make_round():
         def _round(body):
-            has_directive = DIRECTIVE in json.dumps(body["messages"], ensure_ascii=False)
+            # 2026-10-20：收口轮"仍发工具调用"（工具形态锁定）时，重采改走**摘要视图**
+            # （见 _build_request 的 _finalize_digest 分支），它的系统指令是
+            # "📣 任务收尾：…" 而不是尾部那条 "📣 收尾"——两种都算收口轮请求，
+            # 否则脚本会把重采轮误当成常规轮、一直喂同参调用。
+            _text = json.dumps(body["messages"], ensure_ascii=False)
+            has_directive = (DIRECTIVE in _text) or ("📣 任务收尾" in _text)
             if has_directive:
                 state["final_seen"] += 1
                 if state["final_seen"] == 1:

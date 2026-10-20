@@ -147,9 +147,16 @@ def test_action_verbs_generalize_task_like_gate():
     idx = src.find("思考轮转执行")
     assert start > 0 and idx > start
     seg = src[start:idx + 200]
-    assert "_MARKET_KW_RE" in seg and "_ACTION_KW_RE" in seg, \
+    # 2026-10-20 收进 _request_task_like 助手（转执行闸与防闪现缓冲共用）
+    assert "_request_task_like" in seg, "转执行闸的任务型判据丢了"
+    h = src.find("def _request_task_like")
+    helper = src[h:h + 900] if h > 0 else ""
+    assert "_MARKET_KW_RE" in helper and "_ACTION_KW_RE" in helper, \
         "任务型判据丢了动作词（卸载/删除/安装/打开…）"
-    assert "_t_nomarker" in src, "列表编号剥离被删了"
+    # 列表编号/日期的剥离 2026-10-20 收进 _prose_data_fact_count 统一口径
+    # （原先各闸门自己的 _t_nomarker 数各的，日期被数成 3 个"事实"骗过两道闸）
+    assert "_prose_data_fact_count" in src, \
+        "列表编号/日期剥离（_prose_data_fact_count）被删了"
     assert "<tool_code" in src, "<tool_code> 计划信号被删了"
 
     from agent.prompt_build import _ACTION_KW_RE

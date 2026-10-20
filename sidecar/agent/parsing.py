@@ -213,6 +213,11 @@ _PROMPT_JSON_FENCE_RE = re.compile(
     r'```json\s*(.*?)\s*```',
     re.DOTALL,
 )
+# 容错取"围栏里点名的工具"（2026-10-20 17:06 真机）：模型把工具名后的闭合引号
+# 丢了（`"tool": "tavily_search,`）→ 外层 JSON 不合法，严格解析只能回退到内层
+# params（没有工具名）→ 工具调用=0，一句"这就去查"被当终答交付。引号做成可选。
+_TOLERANT_FENCE_NAME_RE = re.compile(
+    r'"(?:tool|name|function|tool_name)"\s*:\s*"?([\w.-]+)', re.IGNORECASE)
 
 # Hermes 风格 XML：Qwen3 系在 prompt-based 模式下常输出
 # <tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>
@@ -471,8 +476,36 @@ def _parse_prompt_tool_calls(text: str) -> tuple[str, list[dict]]:
             })
             used_ranges.append((jm.start(), jm.end()))
 
-    # Priority 1.25: <tool_call>{"name": …, "arguments": {…}}</tool_call>
-    # —— 模型自带的原生 JSON 形态（09-20 实测 Qwen3.8-27B-NEO-CODER 系）。
+    # Priority 1.2b: 坏 JSON 的围栏调用（2026-10-20 17:06 真机）：工具名后的闭合
+    # 引号丢了（`"tool": "tavily_search,`）→ 外层对象不合法，上面的严格解析只能
+    # 回退到内层 params（没有工具名）→ 工具调用=0。这里容错取名字（引号可选）+
+    # 内层参数对象；名字必须**在册**才接受（正文里随便一段 JSON 不会变调用）。
+    if not tool_calls:
+        try:
+            from agent_loop import TOOLS as _T
+            _known_fence = {str((x.get("function") or {}).get("name") or "") for x in _T}
+        except Exception:
+            _known_fence = set()
+        for idx, jm in enumerate(_PROMPT_JSON_FENCE_RE.finditer(search_text)):
+            fence = jm.group(1)
+            fm = _TOLERANT_FENCE_NAME_RE.search(fence)
+            if not fm:
+                continue
+            _name = fm.group(1).strip()
+            if _name not in _known_fence:
+                continue
+            _args = _extract_first_json_object(fence)
+            if not isinstance(_args, dict):
+                _args = _salvage_tool_args(fence)
+            tool_calls.append({
+                "id": f"local_salvage_{_name}_{idx}",
+                "type": "function",
+                "function": {"name": _name,
+                             "arguments": json.dumps(_args, ensure_ascii=False)},
+            })
+            used_ranges.append((jm.start(), jm.end()))
+
+    # Priority 1.25: <tool_call>{"name": …, "arguments": {…}}</tool_call>    # —— 模型自带的原生 JSON 形态（09-20 实测 Qwen3.8-27B-NEO-CODER 系）。
     # 此前不认这种方言：标记被流式清洗当成工具标记**丢掉**，只剩前后那句
     # "我来帮你分析…先调取数据"，循环于是把"预告"当终答交付 → 用户看到
     # "执行到一半就停"。参数名做容错（name/tool/function、arguments/parameters/args），
