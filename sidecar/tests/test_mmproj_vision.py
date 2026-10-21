@@ -143,3 +143,40 @@ def test_status_no_hint_when_vision_on(tmp_path, monkeypatch):
     st = e.get_status()
     assert st["mmproj_hint"] == ""
     assert "重新加载模型" not in (st["message"] or "")
+
+
+def test_main_model_resolver_skips_mmproj(tmp_path, monkeypatch):
+    """2026-10-21 启动失败：模型名不带 -GGUF 时被解析成 mmproj。
+
+    mmproj 的文件名里嵌着主模型名，模糊匹配两边都命中；rglob 的遍历顺序
+    取决于文件系统（APFS 上 mmproj 排在前面）→ llama.cpp 报
+    "CLIP cannot be used as main model"。解析器必须跳过 mmproj。
+    """
+    import local_llm_engine as eng_mod
+    models = tmp_path / "models"
+    d = models / "nvidia:NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF"
+    d.mkdir(parents=True)
+    main = d / "NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf"
+    main.write_bytes(b"GGUF")
+    (d / "mmproj-NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf").write_bytes(b"x")
+    monkeypatch.setattr(eng_mod, "MODELS_DIR", models)
+
+    e = eng_mod.EngineProcess()
+    hit = e._find_gguf("NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB")
+    assert hit == str(main), f"必须解析到主模型，不能是 mmproj：{hit}"
+
+
+def test_engine_process_hf_endpoint_delegates():
+    """启动器直接拿 EngineProcess 调 _get_hf_endpoint（0.3.89 回退 python
+    引擎时的 AttributeError）：挂下载器则委托，独立实例退到环境变量/官方站。"""
+    import local_llm_engine as eng_mod
+    e = eng_mod.EngineProcess()
+    ep = e._get_hf_endpoint()
+    assert isinstance(ep, str) and ep.startswith("http")
+
+    class _D:
+        def _get_hf_endpoint(self):
+            return "https://mirror.example"
+
+    e.downloader = _D()
+    assert e._get_hf_endpoint() == "https://mirror.example"
