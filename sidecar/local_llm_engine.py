@@ -117,6 +117,21 @@ class EngineProcess:
         # 才生效，transport 用这个而不是配置值，避免"配置已改、引擎还是旧参数"的不一致。
         self._launched_slots = 1
 
+    def _get_hf_endpoint(self) -> str:
+        """HF 镜像端点（启动器/门面共用）。
+
+        方法本体在 ModelDownloader 上；组合门面（LocalLLMEngine）会把
+        downloader 挂到本对象供删除记录用，但启动器 local_llm_launch_*.py
+        拿到的是**裸 EngineProcess**，此前直接调这个方法 → 回退 python 引擎
+        时 'EngineProcess' object has no attribute '_get_hf_endpoint'
+        （2026-10-21 启动失败的第二层原因）。这里做一次委托：挂了下载器就
+        用它的探测结果，独立实例退到环境变量/官方站。
+        """
+        d = getattr(self, "downloader", None)
+        if d is not None and hasattr(d, "_get_hf_endpoint"):
+            return d._get_hf_endpoint()
+        return os.environ.get("HF_ENDPOINT") or "https://huggingface.co"
+
 
 
     def get_backend(self) -> str:
@@ -732,13 +747,22 @@ class EngineProcess:
         key_short = model_id.rsplit("/", 1)[-1].replace(".gguf", "").lower()
 
         def _search_dir(root: Path):
-            """rglob a directory for a gguf file fuzzy-matching the key."""
+            """rglob a directory for a gguf file fuzzy-matching the key.
+
+            视觉投影器（mmproj*.gguf）不是主模型，必须跳过（2026-10-21 启动
+            失败事故）：mmproj 的文件名里通常嵌着主模型名，模糊匹配两边都
+            命中，而 rglob 的遍历顺序取决于文件系统（APFS 上 mmproj 常排在
+            前面）→ 曾把 mmproj 当主模型交给 llama.cpp，报 "CLIP cannot be
+            used as main model"。排序只为让结果确定（同一目录可复现）。
+            """
             if not root or not root.exists():
                 return None
-            for f in root.rglob("*.gguf"):
+            for f in sorted(root.rglob("*.gguf")):
                 if not f.is_file():
                     continue
                 stem = f.stem.lower()
+                if stem.startswith("mmproj"):
+                    continue
                 if key in stem or stem in key or key_short in stem:
                     return str(f)
             return None
