@@ -240,6 +240,15 @@ else
 fi
 ok "Tagged $TAG"
 
+# ─── Push（必须在 gh release create 之前）───────────────────────────────
+# 2026-10-24 v0.3.91 实战：脚本原来把 push 放在最后——release create 的
+# --target 指向本地 HEAD，而远端还不认识这个 commit → HTTP 422
+# "Release.target_commitish is invalid"，脚本在中途死掉、产物没传。
+echo ""
+info "Pushing commits + tag $TAG (before release create)..."
+git push origin HEAD 2>/dev/null && ok "Commits pushed" || warn "Commit push failed"
+git push origin "$TAG" 2>/dev/null && ok "Tag pushed" || warn "Tag push failed"
+
 # ─── GitHub Release ──────────────────────────────────────────────────────
 echo ""
 # 幂等：同名 release 已存在则先删掉，让脚本可重跑
@@ -272,9 +281,7 @@ ok "GitHub release: https://github.com/$GH_REPO/releases/tag/$TAG"
 
 # ─── Push tag ────────────────────────────────────────────────────────────
 echo ""
-info "Pushing tag $TAG..."
-git push origin "$TAG" 2>/dev/null && ok "Tag pushed" || warn "Tag push failed"
-git push origin HEAD 2>/dev/null || true
+# （push 已在 release create 之前完成——见上方 2026-10-24 注释）
 
 # ─── Cleanup ─────────────────────────────────────────────────────────────
 # latest.json 保留：已 git commit（第 5 步），且作为仓库最新清单供参考
