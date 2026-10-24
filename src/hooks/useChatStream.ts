@@ -354,20 +354,32 @@ export function useChatStream(deps: ChatStreamDeps) {
                   thinkingAttached = true; // 后续 flush 不再跑（否则 revised 被重复 push）
                   writeMessages((prev) => {
                     const msgs = [...prev];
+                    // 2026-10-24：与 content_revised 同款修复——按本轮 round 定位，
+                    // 防止本轮气泡未落成时误改上一任务的回复
                     for (let i = msgs.length - 1; i >= 0; i--) {
-                      if (msgs[i].role === "assistant" && msgs[i].content && msgs[i].content.trim()) {
+                      if (msgs[i].role === "assistant" && msgs[i].round === currentRound
+                          && msgs[i].content && msgs[i].content.trim()) {
                         msgs[i] = { ...msgs[i], content: revised + "\n\n" + t("app.self_reviewed") };
-                        break;
+                        return msgs;
                       }
                     }
+                    msgs.push({ id: msgId(), role: "assistant",
+                                content: revised + "\n\n" + t("app.self_reviewed"),
+                                round: currentRound || undefined, ts: Date.now() });
                     return msgs;
                   });
                 }
               } else if (parsed.event === "content_revised") {
-                // 追问续写轮：把最后一条 assistant 消息替换为当前累积文本。
+                // 追问续写轮：把**本轮** assistant 气泡替换为当前累积文本。
                 // 与 reflection_revised 的区别：不加"已自查修正"角标。
                 // 空内容 = 撤回本轮气泡（后端"重复叙述抑制"：该轮只有近重复
                 // 叙述，真流式已闪现一次，这里撤掉——三连复述事故的收口）。
+                // 2026-10-24 真机事故：两分支原来都从末尾找"最后一条有正文的
+                // assistant"——第二个任务刚开流就被近重复撤回时，本轮气泡还没
+                // 落成（正文仍在 full 缓冲），循环往前摸到的是**上一个任务的
+                // 回复**，把它删/换掉了（"第一个回复消失"）。改为按本轮 round
+                // 定位：只动 round === currentRound 的气泡；本轮没有气泡就只清
+                // 缓冲，历史消息一律不碰。
                 flushStream();
                 const revised = String(parsed.content ?? "");
                 if (revised.trim()) {
@@ -377,16 +389,22 @@ export function useChatStream(deps: ChatStreamDeps) {
                   writeMessages((prev) => {
                     const msgs = [...prev];
                     for (let i = msgs.length - 1; i >= 0; i--) {
-                      if (msgs[i].role === "assistant" && msgs[i].content && msgs[i].content.trim()) {
+                      if (msgs[i].role === "assistant" && msgs[i].round === currentRound
+                          && msgs[i].content && msgs[i].content.trim()) {
                         msgs[i] = { ...msgs[i], content: revised };
-                        break;
+                        return msgs;
                       }
                     }
+                    // 本轮还没有气泡（续写文本先于 round_start 落地等场景）：
+                    // 定稿文本照常展示，append 而不是去改历史轮的气泡
+                    msgs.push({ id: msgId(), role: "assistant", content: revised,
+                                round: currentRound || undefined, ts: Date.now() });
                     return msgs;
                   });
                 } else {
-                  // 撤回本轮气泡：删掉最后一条有正文的 assistant 消息（round_start
-                  // 已按轮切片，它就是本轮自己的叙述；工具消息在其后，不受影响）
+                  // 撤回本轮气泡：只删 round === currentRound 且有正文的那条。
+                  // 本轮气泡没落成（正文在缓冲里闪现过）→ 什么都不删——
+                  // 撤的是"本轮叙述"，不是"上一条回复"。
                   full = "";
                   streamFinalized = false;
                   pendingThinking = "";
@@ -394,7 +412,8 @@ export function useChatStream(deps: ChatStreamDeps) {
                   writeMessages((prev) => {
                     const msgs = [...prev];
                     for (let i = msgs.length - 1; i >= 0; i--) {
-                      if (msgs[i].role === "assistant" && String(msgs[i].content || "").trim()) {
+                      if (msgs[i].role === "assistant" && msgs[i].round === currentRound
+                          && String(msgs[i].content || "").trim()) {
                         msgs.splice(i, 1);
                         break;
                       }
