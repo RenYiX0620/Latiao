@@ -276,8 +276,9 @@ async def test_two_phase_plan_then_execute_end_to_end():
         assert {t["function"]["name"] for t in _r1} == _exec_tool_names()
         assert any(e.get("event") == "tool_start" and e.get("tool") == "list_dir"
                    for e in events), events
-        assert any(e.get("event") == "content_revised" and not e.get("content")
-                   for e in events), "思考轮计划句必须撤回气泡"
+        # 2026-10-24 撤回合同：计划句被缓冲未流出 → 不发空撤回（防旧前端误删）
+        assert not any(e.get("event") == "content_revised" and not e.get("content")
+                       for e in events), "未流出的计划句不发空撤回"
         assert plan not in acc.join(), "计划句不得进交付文本"
         assert "目录里有" in acc.join(), "终答必须交付"
 
@@ -351,8 +352,9 @@ async def test_desktop_task_reaches_execution_round_145_incident(caplog):
         assert isinstance(_r1, list) and _r1, "动作词闸门必须推进到执行轮（恢复工具表）"
         assert {t["function"]["name"] for t in _r1} == _exec_tool_names()
         assert "思考轮转执行" in caplog.text, "本用例锁的是动作词闸门，不是空转闸门"
-        assert any(e.get("event") == "content_revised" and not e.get("content")
-                   for e in events), "计划句必须撤回气泡"
+        # 2026-10-24 撤回合同：计划句被缓冲未流出 → 不发空撤回（防旧前端误删）
+        assert not any(e.get("event") == "content_revised" and not e.get("content")
+                       for e in events), "未流出的计划句不发空撤回"
         assert any(e.get("event") == "tool_start" and e.get("tool") == "run_cmd"
                    for e in events), events
         assert plan not in acc.join(), "计划句不得进交付文本"

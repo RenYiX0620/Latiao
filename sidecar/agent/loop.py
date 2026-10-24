@@ -212,6 +212,17 @@ def _replay_possible(prev_text: str) -> bool:
     return len(re.sub(r"\s+", "", (prev_text or ""))) >= 60
 
 
+# 承诺句开头探测（2026-10-24 闪现修复，缓冲触发用——不是拦截判据）：
+# 第一人称（含人设"人家/咱"）+ 立即行动口吻。宽匹配无妨：误命中只是
+# 缓冲到轮末由闸门判定，实质正文会放出；漏匹配由"已流出保留"兜底。
+_PROMISE_OPEN_RE = re.compile(
+    r"让我|先看看|稍后|这就帮|这就查|这就去|这就把|人家先|人家就|人家这就|"
+    r"我就帮|我就查|我就去|我来查|我来帮|我来读|马上帮|马上查|马上用|"
+    r"先查一下|先帮|先读|先用.*查|那我就|"
+    # 2026-10-24 two_phase 用例补：无第一人称的"工具使用声明"形态
+    r"(使用|用)\s*[a-zA-Z_]{2,}[^，。]{0,24}?(查询|查一|搜索|搜一|读取|读一|获取|看一下?|调)")
+
+
 def _looks_like_replay(prev_text: str, current_prefix: str) -> bool:
     """本轮开头是否在复读上一轮正文（逐字复读实测为完全一致）。
 
@@ -2194,6 +2205,21 @@ class ThinAgentLoop:
             # 半成品实例（dup 闸单测的 object.__new__ 台架）没有 is_local 等
             # 属性：探测失败按"无缓冲"处理，dup 判定路径不受影响。
             _hold = (self._thinking_first_round() and self._request_task_like()[0])
+            # 2026-10-24 16:06 闪现事故：非任务型请求（"找找看"不含动作/行情词）
+            # 的承诺句开头此前**不缓冲**直接流出，轮末被空转闸撤回 = 闪现
+            # （328/592 字两连）。补第二条触发：正文以承诺口吻开头（含人设
+            # "人家"形态——gates 词表全是"我"开头，对人设漏判）也缓冲。
+            # 粘性标志：本轮一旦触发，后续 chunk 全部缓冲（否则只拦开头、
+            # 后半漏出照旧闪现）；攒过 120 字仍未命中 → 实质正文，不再探测。
+            if (not _hold and not getattr(self, "_round_in_hold", False)):
+                # 不限第 1 轮：16:06 事故的 592 字在第 3 轮——任何轮的承诺
+                # 开头都可能被空转闸撤回（闪现）。工具轮的 held 由"过程叙述
+                # 折叠"路径处置（下一轮首清空），不影响工具执行。
+                _probe = "".join(getattr(self, "_think_hold", None) or []) + (text or "")
+                if len(_probe) <= 120 and _PROMISE_OPEN_RE.search(_probe[:60]):
+                    self._round_in_hold = True
+            if getattr(self, "_round_in_hold", False):
+                _hold = True
         except Exception:
             _hold = False
         if _hold:
@@ -2215,6 +2241,18 @@ class ThinAgentLoop:
         if not _replay_possible(self._last_round_text):
             self._round_dup_decided = True
             self._round_dup = False
+            # 短句逐字复读例外（2026-10-24；occamy 8 字三连的补漏）：上一轮
+            # 正文不足 60 字时相似度判定不启用（09-21：无条件缓冲会扣每轮开头
+            # 0.9s），此前唯一防线是"流出后撤回"——撤回事件已按新合同取消，
+            # 改为流中轻量比对：本轮已放行文本与上一轮正文（≥6 字）前缀完全
+            # 一致 → 判复读扣留（命中后由顶部 decided 分支接管后续 chunk）。
+            self._round_out = (getattr(self, "_round_out", "") or "") + (text or "")
+            _pv = (self._last_round_text or "")[:60]
+            if len(_pv) >= 6 and self._round_out.startswith(_pv):
+                self._round_dup = True
+                self._step_log("重复叙述拦截",
+                               f"短句逐字复读：本轮开头与上一轮正文（{len(_pv)}字）一致，不再下发")
+                return None
             return text
         if not self._round_buf:
             self._round_buf_t0 = time.monotonic()
@@ -2494,6 +2532,8 @@ class ThinAgentLoop:
                 self._round_dup = False
                 self._round_dup_decided = False
                 self._think_hold = []
+                self._round_in_hold = False
+                self._round_out = ""
                 # 本轮正文是否以任何形式到达过前端（流式/leftover）——
                 # 交付兜底判据（2026-10-24 两起静默断流：复读扣留 + 思考轮丢弃）
                 self._round_delivered_any = False
@@ -2891,11 +2931,20 @@ class ThinAgentLoop:
                     # "首次"，漏撤回一次（真机四连复读的复刻测试就是这么抓到的）。
                     _dup_narr = bool(body_text.strip()) and _narration_seen(
                         self.session_id, body_text)
-                    # 「被判不是答案 → 撤回本轮气泡」（2026-10-20 17:25 真机，一问回
-                    # 三条）：此前只有思考轮/近重复才撤；完整分析因末句的客套话被误判
-                    # 时，每个重写版本都会在聊天里留下一个气泡。现在催促轮**一律**撤回，
-                    # 一轮提问最多只留最终那一条（过程仍留在 Think/工具面板与日志里）。
-                    yield {"event": "content_revised", "content": ""}
+                    # 「被判不是答案 → 处置本轮气泡」（2026-10-20 17:25 真机，一问回
+                    # 三条；2026-10-24 16:06 闪现修正）：撤回事件的语义按正文是否已
+                    # 到达前端二分——
+                    # · 已流出：**保留不撤**。撤掉用户看了 45 秒的字=闪现（实测
+                    #   328/592 字两连闪现）；计划句气泡留着是"多一条"，删掉是
+                    #   "凭空消失"，两害取其轻。多泡防线靠 think_hold（任务型思考
+                    #   轮根本不流出）。
+                    # · 从未流出：**不发撤回事件**。气泡本来就不存在；且旧前端
+                    #   （≤0.3.91）收到空撤回会删"最后一条有正文的 assistant"，
+                    #   误删上一个任务的回复（15:11 真机事故）。
+                    if getattr(self, "_round_delivered_any", False):
+                        self._step_log("空转闸门",
+                                       f"{len((body_text or '').strip())} 字已流出，保留气泡"
+                                       f"（防闪现；催促 {self._plan_nudge_used}/{_plan_cap} 照发）")
                     if not self._thinking_first_round() and _dup_narr:
                         self._step_log("重复叙述抑制",
                                        f"{len(body_text)}字 近重复（催促轮气泡已撤回）")
@@ -2917,8 +2966,10 @@ class ThinAgentLoop:
                                    f"强制收口（{_what}）")
                     _anon_note("gate_force_final")
                     if self._thinking_first_round():
-                        # 同上：思考轮的计划句不进交付气泡（历史里也未写入）
-                        yield {"event": "content_revised", "content": ""}
+                        # 思考轮计划句不进交付气泡（历史里也未写入）。2026-10-24：
+                        # think_hold 缓冲的正文从未流出 → 不发撤回事件（无气泡可删，
+                        # 且旧前端会误删上一条回复）。
+                        pass
                     continue
                 if (not tool_calls and not self._finalize_round
                         and self._last_round_tool_failed
@@ -2983,8 +3034,12 @@ class ThinAgentLoop:
                                            f"任务型请求（{_why}）无工具调用且无实质数据（正文 "
                                            f"{len((body_text or '').strip())} 字）"
                                            f"→ 恢复工具表进第 2 轮")
-                            # 计划句不进交付气泡（与空转闸门同一手法）
-                            yield {"event": "content_revised", "content": ""}
+                            # 计划句不进交付气泡。2026-10-24：think_hold 缓冲的计划句
+                            # 从未流出——不发空撤回（旧前端会误删上一条回复）；万一
+                            # 非任务型路径流出过，保留不撤（防闪现）。
+                            if getattr(self, "_round_delivered_any", False):
+                                self._step_log("思考轮转执行",
+                                               f"{len((body_text or '').strip())} 字已流出，保留气泡（防闪现）")
                             yield {"event": "heartbeat"}
                             # 标记思考轮已过：下一轮 _thinking_first_round 返回 False
                             self._thinking_round_done = True
@@ -3137,8 +3192,10 @@ class ThinAgentLoop:
                     #    所以历史里不放任何省略标记：空正文+工具调用是最自然的
                     #    模型行为，无可模仿之物。
                     asst = {"role": "assistant", "content": ""}
-                    yield {"event": "content_revised", "content": ""}
-                    self._step_log("重复叙述抑制", f"{len(_narr_text)}字 近重复（气泡已撤回，历史置空）")
+                    # 2026-10-24：被复读闸拦下的叙述从未流出——不发空撤回事件
+                    # （15:11 真机事故正主：旧前端收到会误删上一个任务的回复；
+                    # 新前端按 round 定位删不到未建气泡，同样无意义）。
+                    self._step_log("重复叙述抑制", f"{len(_narr_text)}字 近重复（未流出，不发撤回；历史置空）")
                 else:
                     asst = {"role": "assistant", "content": clean_text or ""}
                 # 无论 native/fence，解析出的 tool_calls 都要入史：

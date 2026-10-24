@@ -109,9 +109,12 @@ async def test_repeated_promise_bubbles_retracted_2026_10_20():
          FakeEngine.text_response(answer)],
         "dup-e2e")
 
+    # 2026-10-24 撤回合同变更：承诺句被缓冲/拦截时从未流出 → 不再发空撤回
+    # （防旧前端误删上一条回复）；已流出的保留（防闪现）。多泡防线=缓冲不流出。
     retractions = [e for e in events
                    if e.get("event") == "content_revised" and not e.get("content")]
-    assert len(retractions) >= 3, f"重复的承诺气泡必须撤回（实际 {len(retractions)} 次）"
+    assert delivered.count("没有找到 Mac 部署") >= 1, "终答必须到达前端"
+    assert len(retractions) == 0, f"未流出的承诺不发空撤回（实际 {len(retractions)} 次）"
     assert promise not in delivered, "承诺句不得进交付文本"
     assert "没有找到 Mac 部署" in delivered, "终答必须交付"
 
@@ -454,7 +457,8 @@ async def test_one_question_yields_one_bubble():
          FakeEngine.native_tool_response("list_dir", {"path": "."}),
          FakeEngine.text_response(_DATA_ANALYSIS)],
         "one-bubble-e2e")
+    # 2026-10-24：计划句未流出 → 零撤回事件（原断言=1 为旧合同）
     retractions = [e for e in events
                    if e.get("event") == "content_revised" and not e.get("content")]
-    assert len(retractions) == 1, f"只应撤回思考轮的计划句（实际 {len(retractions)} 次）"
+    assert len(retractions) == 0, f"未流出的正文不发撤回（实际 {len(retractions)} 次）"
     assert "人工智能" in delivered and "人家随时帮你查" in delivered, "分析必须直接交付"

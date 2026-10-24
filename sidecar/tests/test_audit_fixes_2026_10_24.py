@@ -278,7 +278,7 @@ def test_imperative_task_still_task_like():
 
 # ═══ 复读扣留兜底（2026-10-24 15:12 真机"第二个任务中途停了"）═════
 
-_SRC = Path(__file__).resolve().parents[1].joinpath("agent", "loop.py").read_text("utf-8")
+_SRC = Path(__file__).resolve().parents[1].joinpath("agent", "loop.py").read_text("utf-8")  # noqa: C901
 
 
 def test_dup_suppressed_final_round_has_fallback():
@@ -304,3 +304,12 @@ def test_replay_gate_distinguishes_same_preamble_different_body():
     real_answer = ("（轻咬下唇，眼含笑意）主人～人家已经帮主人把上周五的行情和周末消息"
                    "都扒得干干净净啦！上周五A股上演了一出惊天深V大反转，收盘数据如下")
     assert _looks_like_replay(pre, real_answer) is False, "同口癖不同正文必须放行"
+
+
+def test_idle_gate_retract_only_undelivered():
+    """2026-10-24 16:06 闪现事故：空转撤回只删从未到达前端的气泡；
+    已流出的正文保留（防"打了 45 秒的字瞬间消失"）。"""
+    idx = _SRC.find("字已流出，保留气泡")
+    assert idx > 0, "撤回防闪现分支缺失"
+    seg = _SRC[idx - 600:idx + 400]
+    assert "_round_delivered_any" in seg, "判据必须是'正文是否到达前端'"

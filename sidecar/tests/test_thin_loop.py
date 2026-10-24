@@ -787,12 +787,11 @@ async def test_duplicate_narration_withdraws_bubble():
             local_llm._engine = old
         withdraws = [e for e in events
                      if e.get("event") == "content_revised" and not str(e.get("content") or "").strip()]
-        assert len(withdraws) == 1, [e.get("event") for e in events]
-        # 撤回事件之后不应再有该叙述的 content 增量（终答轮不受影响）
-        idx = events.index(withdraws[0])
-        tail_texts = [str(e.get("content") or "") for e in events[idx:]
-                      if e.get("event") != "content_revised" and e.get("content")]
-        assert all(NARR not in t for t in tail_texts), tail_texts
+        # 2026-10-24 撤回合同：复读闸扣下的叙述从未流出 → 不发空撤回（防
+        # 旧前端误删上一条回复）。防三连复述的保证 = 重复叙述只下发一次。
+        assert len(withdraws) == 0, [e.get("event") for e in events]
+        _texts = [str(e.get("content") or "") for e in events if e.get("content")]
+        assert sum(t.count(NARR) for t in _texts) <= 1, _texts
 
 
 def test_round_text_accumulator_withdraw_and_fold():
