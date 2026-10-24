@@ -494,9 +494,19 @@ def _parse_prompt_tool_calls(text: str) -> tuple[str, list[dict]]:
             _name = fm.group(1).strip()
             if _name not in _known_fence:
                 continue
+            # 2026-10-24 审计 P2：文档/示例 JSON 不算调用——正文里"引用某个在册
+            # 工具的说明文档"（只有 name/description、没有任何参数结构）此前会被
+            # 1.2b 构造成真实调用（垃圾参数、真执行），与 v0.3.88"正文里随便
+            # 一段 JSON 不会被误当成调用"的承诺相悖。判据：围栏带 description
+            # 键，或解析出的参数恰好只有 name/tool/description/type 这类自述键。
+            if re.search(r'"description"\s*:', fence):
+                continue
             _args = _extract_first_json_object(fence)
             if not isinstance(_args, dict):
                 _args = _salvage_tool_args(fence)
+            if isinstance(_args, dict) and _args and set(_args) <= {
+                    "name", "tool", "tool_name", "function", "description", "type"}:
+                continue
             tool_calls.append({
                 "id": f"local_salvage_{_name}_{idx}",
                 "type": "function",

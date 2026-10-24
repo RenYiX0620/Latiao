@@ -182,7 +182,11 @@ async def upload_local(request: Request):
         if _blk:
             return JSONResponse({"status": "error", "message": _blk}, status_code=403)
     except Exception:
-        logger.debug("upload_local 敏感读判定失败（按放行继续）", exc_info=True)
+        # 2026-10-24 审计 P2：判定器异常时不能按放行继续（fail-open 会让任意
+        # 路径绕过敏感读保护）——改为 fail-closed 拒绝。
+        logger.warning("upload_local 敏感读判定异常（fail-closed 拒绝）", exc_info=True)
+        return JSONResponse({"status": "error", "message": "敏感读判定异常，已拒绝（fail-closed）"},
+                            status_code=403)
     try:
         size = os.path.getsize(path)
         if size > MAX_UPLOAD_SIZE:

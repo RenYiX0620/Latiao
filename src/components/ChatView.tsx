@@ -426,7 +426,10 @@ export default memo(function ChatView({
             // 拆分"用户输入文本 + 📎 文件…内容如下：```…```"结构：
             // 文本正常显示，文件内容默认折叠（点击展开）——模型仍收到完整内容，
             // 气泡不再整段刷屏。
-            const fm = msg.content.match(/^([\s\S]*?)\n*📎 [^\n]{1,80}\n\s*```\n([\s\S]*?)\n```\s*$/);
+            // 2026-10-24 审计 P0：v0.3.41 把 3 组正则改成 2 组时漏改用点——fm[3]
+            // 恒为 undefined，fbody.length 直接抛错（附件消息渲染必崩全屏）。
+            // 恢复 3 组：fm[1]=正文、fm[2]=文件名、fm[3]=文件体。
+            const fm = msg.content.match(/^([\s\S]*?)\n*📎 ([^\n]{1,80})\n\s*```\n([\s\S]*?)\n```\s*$/);
             const textPart = fm ? fm[1].trim() : "";
             const fname = fm ? fm[2] : msg.filename || "";
             const fbody = fm ? fm[3] : msg.content;

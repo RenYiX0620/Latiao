@@ -16,10 +16,6 @@ interface SettingsViewProps {
   selectedModel: string;
   cloudModels: { name: string }[];
   setActiveView: (v: string) => void;
-  autoLaunch: boolean;
-  setAutoLaunch: (v: boolean) => void;
-  autoStartGateway: boolean;
-  setAutoStartGateway: (v: boolean) => void;
   anonymousData: boolean;
   setAnonymousData: (v: boolean) => void;
   autoCheckUpdate: boolean;
@@ -155,7 +151,6 @@ export default function SettingsView({
   sidecarStatus, restartingSidecar, onRestartSidecar, active,
   gatewayLogsOpen, setGatewayLogsOpen, gatewayLogs,
   selectedModel, cloudModels, setActiveView,
-  autoLaunch, setAutoLaunch, autoStartGateway, setAutoStartGateway,
   anonymousData, setAnonymousData, autoCheckUpdate, setAutoCheckUpdate,
   appVersion, checkingUpdate, onCheckUpdate,
   reflectionMode, setReflectionMode,
@@ -244,13 +239,9 @@ export default function SettingsView({
               <option value="ru">{t("settings.lang_ru")}</option>
             </select>
           </div>
-          <div className="settings-row">
-            <div><div className="settings-row-label">{t("settings.auto_launch")}</div><div className="settings-row-desc">{t("settings.auto_launch_desc")}</div></div>
-            <label className="toggle">
-              <input type="checkbox" checked={autoLaunch} onChange={toggleOnChange(setAutoLaunch, "latiao_auto_launch")} />
-              <span className="toggle-slider"></span>
-            </label>
-          </div>
+          {/* 2026-10-24 审计：autoLaunch（开机自启）在此前版本是"有 UI 无消费方"的
+              假开关（Rust 侧无 autostart 插件，checkbox 不产生任何行为）——已移除。
+              真正实现自启时再连 @tauri-apps/plugin-autostart 重新上 UI。 */}
           <div className="settings-row">
             <div><div className="settings-row-label">{t("settings.tts")}</div><div className="settings-row-desc">{t("settings.tts_desc")}</div></div>
             <label className="toggle">
@@ -388,13 +379,8 @@ export default function SettingsView({
               )}
             </div>
           )}
-          <div className="settings-row">
-            <div><div className="settings-row-label">{t("settings.auto_gateway")}</div><div className="settings-row-desc">{t("settings.auto_gateway_desc")}</div></div>
-            <label className="toggle">
-              <input type="checkbox" checked={autoStartGateway} onChange={toggleOnChange(setAutoStartGateway, "latiao_auto_gateway")} />
-              <span className="toggle-slider"></span>
-            </label>
-          </div>
+          {/* 2026-10-24 审计：autoStartGateway 同为假开关——sidecar 由 Rust 侧
+              start_sidecar() 无条件拉起，checkbox 无任何消费方。已移除。 */}
         </div>
 
         <div className="settings-group">

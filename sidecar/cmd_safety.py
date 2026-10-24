@@ -122,9 +122,16 @@ def reject_sensitive_read(cmd: str) -> str | None:
 # 但**不**直接套用 SENSITIVE_READ_RE：它按子串匹配 `config.json`，会把项目的
 # `tsconfig.json` 一起拦掉（子串命中），那是能力回归。
 _BLOCKED_DIR_SUBSTRINGS = ("/.ssh", "/.aws", "/.gnupg", "/Library/Keychains",
-                           "/.kube", "/.docker")
+                           "/.kube", "/.docker",
+                           # 2026-10-24 审计：gh（hosts.yml 含 GitHub OAuth token）与
+                           # gcloud（application_default_credentials.json）的凭据目录
+                           "/.config/gh", "/.config/gcloud")
 _BLOCKED_FILE_NAMES = (".env", "id_rsa", "id_ed25519", "id_ecdsa", "known_hosts",
-                       ".netrc", ".git-credentials", "credentials", "_netrc")
+                       ".netrc", ".git-credentials", "credentials", "_netrc",
+                       # 2026-10-24 审计：包管理器/云凭据与辣条自家库文件
+                       ".npmrc", ".pypirc", "credentials.json",
+                       "application_default_credentials.json",
+                       "local-ai-os.db", "memory.db")
 # .env 家族（.env.local / .env.production…）全拦；模板类放行（无密钥、开发要看）
 _ENV_FAMILY_RE = re.compile(r"^\.env(\.[\w.-]+)?$", re.IGNORECASE)
 _ENV_TEMPLATE_SUFFIXES = (".example", ".sample", ".template", ".dist", ".defaults", ".md")
@@ -667,6 +674,25 @@ def _looks_like_path_str(s: str) -> bool:
     return False
 
 
+def _flat_sensitive_scan(code: str) -> str | None:
+    """拼接归一化扫描（2026-10-24 审计 P1 兜底）。
+
+    `'/.s'+'sh/id_rsa'` 这类拆分字面量在归一化（去掉引号/加号/空白）后恢复
+    成 `/.ssh/id_rsa`——AST 逐字面量判据对"每个片段单独看都不敏感"的组合
+    无能为力，非 Python 代码（node -e）更是整体走不到 AST。这里按确定敏感
+    的目录/文件名子串匹配：命中即拒，未命中不额外设限（正常 JS 不受影响）。
+    """
+    flat = re.sub(r"['\"`\+\s]+", "", code or "").lower()
+    for pat in ("/.ssh", "/.aws", "/.gnupg", "/.kube", "/.docker", "/keychains",
+                "/.config/gh", "/.config/gcloud", ".local-ai-os/config.json",
+                ".local-ai-os/memory.db", "permissions.json", "agents.json",
+                "id_rsa", "id_ed25519", ".netrc", ".git-credentials",
+                "credentials.json"):
+        if pat in flat:
+            return f"⛔ Blocked: 内联代码引用了受保护路径的拼接形态: {pat}"
+    return None
+
+
 def _inline_path_audit(code: str) -> str | None:
     """内联代码/脚本的**路径审查**（2026-10-11 第四轮修复）。
 
@@ -676,13 +702,15 @@ def _inline_path_audit(code: str) -> str | None:
     两种写法两种结局，且解释器能把路径在运行期拼出来，黑名单永远追不上。
     修法：AST 抽字符串字面量 → 逐个过**已有**的读/写封印判据
     （sensitive_read_block / sensitive_write_block），路径形态与内联形态同判据。
-    非法语法/非 Python 代码返回 None（交给上层既有黑名单处理，不重复兜底）。
+    2026-10-24 审计 P1：非法语法/非 Python 代码（node -e）不再静默返回 None——
+    AST 失效时退化到拼接归一化扫描（fail-closed 的窄面）；AST 路径无命中时
+    也再扫一遍兜底拆分字面量。
     """
     import ast
     try:
         tree = ast.parse(code)
     except (SyntaxError, ValueError):
-        return None
+        return _flat_sensitive_scan(code)
     lits: list[str] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
@@ -707,7 +735,7 @@ def _inline_path_audit(code: str) -> str | None:
             hit = sensitive_read_block(cand) or sensitive_write_block(cand)
             if hit:
                 return (f"⛔ Blocked: 代码中引用了受保护的路径（内联/脚本路径审查）: {cand}")
-    return None
+    return _flat_sensitive_scan(code)
 
 
 def check_inline_code(code: str) -> str | None:
@@ -768,6 +796,25 @@ def check_cmd(cmd: str) -> str | None:
             logger.warning("命令语义层不可用（tree-sitter 未安装），使用正则层")
     except Exception:
         logger.warning("命令语义层异常，回退正则层", exc_info=True)
+    # rm/chown 旗标过程式检查（2026-10-24 审计 P1）：正则层只匹配紧跟动词的
+    # 旗标（`rm -i -rf x`/`rm x -rf` 均不命中），语义层能接住但 tree-sitter
+    # 缺失的部署会 fail-open 回到正则层。这里按 token 逐个查——旗标在任何
+    # 位置都算（与语义层 rules.py 同口径），不依赖 tree-sitter。
+    try:
+        import shlex as _sh
+        try:
+            _toks = _sh.split(cmd)
+        except ValueError:
+            _toks = cmd.split()
+        if _toks and os.path.basename(_toks[0]).lower() == "rm":
+            if any(re.fullmatch(r"-[a-zA-Z]*[rRfF]", t) or t in ("--recursive", "--force", "--no-preserve-root")
+                   for t in _toks[1:]):
+                return f"⛔ Blocked destructive command: {cmd}（rm 递归/强制）"
+        if _toks and os.path.basename(_toks[0]).lower() == "chown":
+            if any(t in ("-R", "--recursive", "-r") for t in _toks[1:]):
+                return f"⛔ Blocked destructive command: {cmd}（递归属主变更）"
+    except Exception:
+        logger.debug("rm/chown 旗标检查异常（继续走正则层）", exc_info=True)
     # 正则兜底层（纵深防御；语义层 fail-open 时的唯一防线）
     low = cmd.lower()
     for pattern in DESTRUCTIVE_PATTERNS:
@@ -933,13 +980,28 @@ def reject_sensitive_write(cmd: str) -> str | None:
         if hit:
             return (f"⛔ 不允许用命令写入自动加载目录/配置（写进去的代码会被执行、"
                     f"配置含 API 密钥）: {hit}")
-    if verb in _READ_ONLY_VERBS:
-        return None
-    for tok in tokens[1:]:
-        hit = _protected_write_target(tok)
-        if hit:
-            return (f"⛔ 不允许用命令写入自动加载目录/配置（写进去的代码会被执行、"
-                    f"配置含 API 密钥）: {hit}")
+    # ③ 管道逐段审查（2026-10-24 审计 P1）：此前整条管道只看首动词——
+    # `cat x | tee ~/.zshrc` 因 cat 在只读白名单里整体短路，右半侧的写目标
+    # 从不被检查（tee 进 extensions/plugin.py 即 RCE）。现在按 "|" 切段
+    # （shlex 已把引号内的 | 留在 token 里，不会误切），逐段适用同一规则：
+    # 只读动词段跳过（读不受限），其余段扫全部 token 的写目标。
+    _segs: list[list[str]] = [[]]
+    for _tok in tokens:
+        if _tok == "|":
+            _segs.append([])
+        else:
+            _segs[-1].append(_tok)
+    for _seg in _segs:
+        if not _seg:
+            continue
+        _sverb = os.path.basename(_seg[0]).lower()
+        if _sverb in _READ_ONLY_VERBS:
+            continue
+        for _tok in _seg[1:]:
+            hit = _protected_write_target(_tok)
+            if hit:
+                return (f"⛔ 不允许用命令写入自动加载目录/配置（写进去的代码会被执行、"
+                        f"配置含 API 密钥）: {hit}")
     return None
 
 

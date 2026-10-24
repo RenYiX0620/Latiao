@@ -250,4 +250,12 @@ def start_llama_native(engine, model_path: str, port: int,
     engine.status_message = (f"{engine.current_model_name} 运行中"
                            + (f"（自定义引擎 {backend_name}）" if _custom else ""))
     engine._active_backend = backend
+    # 2026-10-24 审计 P2：native 是 macOS/Windows 的默认后端，此前只有 mlx/
+    # llamacpp 落盘 engine_state——sidecar 重启后自动重载恢复链（get_api_url
+    # 按 engine_state 里的 model_id 判断要不要拉起引擎）对 native 失明。
+    # 容错调用：引擎已正常运行，状态落盘失败不该让启动报错（测试桩引擎没有该方法）。
+    try:
+        engine._save_engine_state()
+    except Exception:
+        logger.debug("native: engine_state 落盘失败（不影响本次启动）", exc_info=True)
     return engine.get_status()

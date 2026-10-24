@@ -72,10 +72,17 @@ def _engine_wait_max() -> float:
 
 
 def _queue_wait_max() -> float:
+    """排队等待上限（2026-10-24 审计 P2：独立环境变量 + 默认压到看门狗之内）。
+
+    此前与 _engine_wait_max 共用 LATIAO_ENGINE_WAIT_MAX 且默认 900s——排队相位
+    放行前零字节，超过前端 180s 看门狗必被客户端掐死（900s 实际永远达不到，
+    且调大 engine 等待会静默把排队也带过线）。默认 170s 让超时先由本侧以
+    EngineQueueTimeout 的清晰错误给出；确需更长排队用 LATIAO_QUEUE_WAIT_MAX。
+    """
     try:
-        return max(5.0, float(os.environ.get("LATIAO_ENGINE_WAIT_MAX", "900")))
-    except ValueError:
-        return 900.0
+        return max(5.0, float(os.environ.get("LATIAO_QUEUE_WAIT_MAX", "170") or 170))
+    except (TypeError, ValueError):
+        return 170.0
 
 
 def _stream_lock() -> asyncio.Semaphore:
@@ -213,27 +220,47 @@ async def _local_llm_serialized(api_url: str | None, wait_info: dict | None = No
         _set_wait_phase(wait_info, "queue")   # 排队中（前端据此报"等待引擎"进度）
         _gate_stats["waiting"] = _gate_stats.get("waiting", 0) + 1
         _deadline = time.monotonic() + _queue_wait_max()
+        # 2026-10-24 审计 P2：不再用 1s 切片的 wait_for(acquire) 反复"超时取消
+        # 再重排"——捆绑的 Python 3.11 上"release 唤醒与 acquire 被取消同时发生"
+        # 有信号量槽位流失竞态（gh-90155，3.12 才修；每次流失不可恢复）。
+        # 改为一次性 acquire 挂成任务 + 每秒 asyncio.wait 探测（不取消获取
+        # 本身）：停止键仍然每秒可响应，槽位不流失。
+        _acq = asyncio.ensure_future(sem.acquire())
         try:
             while True:
-                # 切片 = min(1s, 剩余预算)：预算比 1s 短时（含测试里的 0.15s）
-                # 不能靠 1s 切片顺延——超时必须由循环头按精确剩余量判定
                 _remaining = _deadline - time.monotonic()
-                if _remaining <= 0:
+                _done, _ = await asyncio.wait({_acq}, timeout=min(1.0, max(0.05, _remaining)))
+                if _done:
+                    _acq.result()
+                    break
+                if _session_cancel_check(_sid):
+                    # 排队期间也响应停止键（2026-10-05）：已取消的请求不该继续占队，
+                    # 更不该排到队后再启动一次注定被丢弃的生成
+                    _acq.cancel()
+                    try:
+                        await _acq
+                    except BaseException:
+                        pass
+                    raise TurnCancelled("排队等待期间用户停止") from None
+                if time.monotonic() >= _deadline:
+                    _acq.cancel()
+                    try:
+                        await _acq
+                    except BaseException:
+                        pass
                     waited = time.monotonic() - _t0
                     logger.warning("本地引擎排队超时：等待 %.1fs（容量 %d，排队 %d）",
                                    waited, _engine_slots(), int(_gate_stats.get("waiting", 0)))
                     raise EngineQueueTimeout(
                         f"等待本地引擎超过 {int(_queue_wait_max())} 秒仍未轮到；"
                         "另一会话可能正在长生成，可稍后重试或在设置里提高并发槽位") from None
-                try:
-                    await asyncio.wait_for(sem.acquire(), timeout=min(1.0, _remaining))
-                    break
-                except asyncio.TimeoutError:
-                    # 排队期间也响应停止键（2026-10-05）：已取消的请求不该继续占队，
-                    # 更不该排到队后再启动一次注定被丢弃的生成
-                    if _session_cancel_check(_sid):
-                        raise TurnCancelled("排队等待期间用户停止") from None
         finally:
+            if not _acq.done():
+                _acq.cancel()
+                try:
+                    await _acq
+                except BaseException:
+                    pass
             # 放行或超时都要把"排队计数"退掉（只在这里退一次，避免双退）
             _gate_stats["waiting"] = max(0, _gate_stats.get("waiting", 0) - 1)
             _set_wait_phase(wait_info, None)  # 已放行/已超时：不再报"排队中"

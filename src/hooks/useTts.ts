@@ -24,7 +24,6 @@ export function useTts(deps: Deps) {
     showToast, t, ttsEnabled, ttsRate, ttsVoice, ttsTimeoutMs,
     ttsLocalVoices, ttsLocalVoice, ttsPitch, ttsEmotion, ttsVoices, lang, session,
   } = deps;
-  void ttsVoice; // 系统语音当前用默认音色，保留参数供后续
   const speakingIdRef = useRef<string | null>(null);
   const ttsAudioRef = useRef<HTMLAudioElement | null>(null);
   const [speakingId, setSpeakingId] = useState<string | null>(null);
@@ -43,7 +42,10 @@ export function useTts(deps: Deps) {
   const systemSpeak = useCallback((text: string) => {
     const chunks = splitSentences(text);
     if (!chunks.length) { speakingIdRef.current = null; setSpeakingId(null); return; }
-    const voice = pickVoice(ttsVoices, lang);
+    // 2026-10-24 审计（假开关转真）：用户在设置里选的系统音色优先——
+    // 此前 ttsVoice 从未被读（void ttsVoice），下拉是空转的。
+    const voice = (ttsVoice && ttsVoices.find((v) => v.name === ttsVoice))
+      || pickVoice(ttsVoices, lang);
     chunks.forEach((chunk, idx) => {
       const utter = new SpeechSynthesisUtterance(chunk);
       if (voice) utter.voice = voice;
@@ -59,7 +61,7 @@ export function useTts(deps: Deps) {
       }
       window.speechSynthesis.speak(utter);
     });
-  }, [ttsVoices, lang, ttsRate, ttsPitch]);
+  }, [ttsVoices, ttsVoice, lang, ttsRate, ttsPitch]);
 
   /** 朗读一条回复。同一个消息再点一次＝停止。 */
   const speak = useCallback(async (raw: string, id?: string) => {

@@ -108,7 +108,10 @@ export function useSessions() {
   const syncRemote = useCallback((list: SessionInfo[]) => {
     if (!_backendReadyRef.current) return;
     const plan = planSync(_syncedRef.current, list, _backendIdsRef.current);
-    _syncedRef.current = plan.nextFingerprints;
+    // 2026-10-24 审计：指纹不再"发出前"整表采纳——PUT 失败的那次变更会因
+    // "指纹已一致"而漏发。改为：成功后才按**当时发送的内容**记指纹（内容在
+    // 发送后又变了的话指纹对不上，下一轮 planSync 会再 PUT）。deletes 无重试
+    // 载体（会话已从内存消失），指纹立即清。
     for (const id of plan.puts) {
       const s0 = list.find((x) => x.id === id);
       if (!s0) continue;
@@ -116,16 +119,24 @@ export function useSessions() {
         id: s0.id, name: s0.name, selectedModel: s0.selectedModel || "",
         lastActive: s0.lastActive || 0, messages: s0.messages,
       };
+      const fp = sessionFingerprint(s0);
       const timer = _pendingRef.current[id];
       if (timer) clearTimeout(timer);
       // 每会话独立防抖：流式期间内容一直变，避免每个 token 都发一次
       _pendingRef.current[id] = setTimeout(() => {
         delete _pendingRef.current[id];
-        void putSession(payload);
+        void putSession(payload).then((ok) => {
+          if (ok) _syncedRef.current[id] = fp;
+        });
       }, 1200);
     }
     for (const id of plan.deletes) {
       _backendIdsRef.current.delete(id);
+      delete _syncedRef.current[id];
+      // 删除要先取消在途的防抖 PUT——否则 1.2s 前排队的快照会把刚删的会话
+      // 在后端"复活"（2026-10-24 审计）。
+      const timer = _pendingRef.current[id];
+      if (timer) { clearTimeout(timer); delete _pendingRef.current[id]; }
       void deleteSessionRemote(id);
     }
   }, []);
@@ -192,7 +203,23 @@ export function useSessions() {
       metas.forEach((m) => _backendIdsRef.current.add(m.id));
       // 未载入的会话不参与同步（否则空消息会覆盖后端）——由 planSync 保证；
       // 标记 backendReady 之前先把 id 登记好
-      setSessions(metas);
+      // 2026-10-24 审计 P1：不能用空消息元数据**整体覆盖**内存——fetchSessionList
+      // 的重试窗口（冷启动可达数十秒）里用户向既有会话发的消息只在内存里，
+      // 整体覆盖会把它们丢掉（内存/影子/后端三处皆无）。改为合并：保留内存里
+      // 已有的消息与 loaded 态；窗口内新建的会话（后端还没有）追加在后面。
+      setSessions((prev) => {
+        const merged = metas.map((m) => {
+          const ex = prev.find((p) => p.id === m.id);
+          if (ex && ex.messages.length > 0) {
+            return { ...m, messages: ex.messages, loaded: true,
+                     message_count: Math.max(m.message_count || 0, ex.messages.length) };
+          }
+          return m;
+        });
+        const mergedIds = new Set(merged.map((m) => m.id));
+        const newcomers = prev.filter((p) => !mergedIds.has(p.id));
+        return newcomers.length ? [...merged, ...newcomers] : merged;
+      });
       setCurrentIdx(0);
       // 启动时把消息**全部**载入（上限 EAGER_LOAD_LIMIT）：
       // 为什么不用懒加载——localStorage 影子副本是按内存状态写的，未载入的会话

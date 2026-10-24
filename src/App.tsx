@@ -303,8 +303,6 @@ const [timeFilter, setTimeFilter] = useState("all");
   const [toastType, setToastType] = useState<string>("info");
   const [gatewayLogsOpen, setGatewayLogsOpen] = useState(false);
   const [gatewayLogs, setGatewayLogs] = useState<{ time: string; level: string; message: string }[]>([]);
-  const [autoLaunch, setAutoLaunch] = useState(() => localStorage.getItem("latiao_auto_launch") === "true");
-  const [autoStartGateway, setAutoStartGateway] = useState(() => localStorage.getItem("latiao_auto_gateway") !== "false");
   const [anonymousData, setAnonymousData] = useState(() => localStorage.getItem("latiao_anonymous_data") !== "false");
   // 匿名使用数据（2026-10-11 由假开关转真）：localStorage 仍是本地主存储，
   // 但每次 sidecar 就绪/开关变化都把总闸推给后端（config.json
@@ -356,11 +354,14 @@ const [timeFilter, setTimeFilter] = useState("all");
   const enWaitersRef = useRef<Set<() => void>>(new Set());
   useEffect(() => { pendingFileRef.current = pendingFile; }, [pendingFile]);
 
-  // Strip large fields before persisting to avoid localStorage bloat
-  const stripForStorage = useCallback((s: SessionInfo[]) => {
+  // Strip large fields before handing sessions to storage / backend sync.
+  // 2026-10-24 审计 P0：后端同步载荷**不再截断**——此前 slice(-200) 的同一份数组
+  // 被 PUT 给后端，而 save_session 是替换语义 → 超 200 条的会话被确定性裁剪。
+  // 截断只保留给 localStorage 影子（配额保护）；后端侧另有"快照变少即拒绝"守卫。
+  const stripForSync = useCallback((s: SessionInfo[]) => {
     return s.map(session => ({
       ...session,
-      messages: session.messages.slice(-200).map(m => ({
+      messages: session.messages.map(m => ({
         ...m,
         imageBase64: undefined,       // don't persist base64 images
         // imagePreview 也是完整 data URL（~100-300KB/张）——不剥离的话几张截图
@@ -370,6 +371,14 @@ const [timeFilter, setTimeFilter] = useState("all");
       })),
     }));
   }, []);
+
+  // localStorage 影子仍截 200 条（配额），但只写本地、绝不发给后端
+  const stripForStorage = useCallback((s: SessionInfo[]) => {
+    return stripForSync(s).map(session => ({
+      ...session,
+      messages: session.messages.slice(-200),
+    }));
+  }, [stripForSync]);
 
   // Save sessions to localStorage with quota-exceeded fallback
   const saveSessions = useCallback((data: string) => {
@@ -382,7 +391,7 @@ const [timeFilter, setTimeFilter] = useState("all");
     const data = JSON.stringify(stripped);
     // ⑩：后端为权威存储（localStorage 保留为降级路径）。syncRemote 内部按会话
     // diff + 每会话防抖，流式期间不会每个 token 都发一次。
-    syncRemote(stripped);
+    syncRemote(stripForSync(sessions));
     if (anyProcessing) {
       // Streaming: debounce to 1s to avoid thrashing
       const timer = setTimeout(() => saveSessions(data), 1000);
@@ -391,7 +400,7 @@ const [timeFilter, setTimeFilter] = useState("all");
       // Not streaming: save immediately
       saveSessions(data);
     }
-  }, [sessions, anyProcessing, stripForStorage, saveSessions, syncRemote]);
+  }, [sessions, anyProcessing, stripForStorage, stripForSync, saveSessions, syncRemote]);
 
   // Auto-scroll chat to bottom（instant，内容高度未定时 smooth 会滚错位）
   useEffect(() => {
@@ -1435,7 +1444,8 @@ const [timeFilter, setTimeFilter] = useState("all");
         <div className={`view-panel${activeView === "agents" ? " active" : ""}`} id="view-agents" style={sidecarStatus === "offline" ? { display: "none" } : undefined}>
           <div className="page-header">
             <div><div className="page-title">{t("page.agents")}</div><div className="page-desc">{t("page.agents_desc")}</div></div>
-            <button className="btn btn-md btn-primary" style={{ marginLeft: "auto" }} onClick={() => showToast(t("agent.created_simple"))}>{t("agent.new_btn")}</button>
+            {/* 2026-10-24 审计：此按钮此前只弹 toast 假称"已创建"（不建任何
+                Agent）。真正的创建入口在 AgentView 内部的"新建"表单——移除假按钮。 */}
           </div>
           <div className="page-body">
             <AgentView key={lang} activeAgent={activeAgent} setActiveAgent={setActiveAgent} showToast={showToast} active={activeView === "agents"} />
@@ -1464,8 +1474,6 @@ const [timeFilter, setTimeFilter] = useState("all");
             selectedModel={session.selectedModel}
             cloudModels={cloudModels}
             setActiveView={(v) => setActiveView(v as ViewId)}
-            autoLaunch={autoLaunch} setAutoLaunch={setAutoLaunch}
-            autoStartGateway={autoStartGateway} setAutoStartGateway={setAutoStartGateway}
             anonymousData={anonymousData} setAnonymousData={setAnonymousData}
             autoCheckUpdate={autoCheckUpdate} setAutoCheckUpdate={setAutoCheckUpdate}
             appVersion={appVersion} checkingUpdate={checkingUpdate} onCheckUpdate={() => runUpdateCheck(false)}

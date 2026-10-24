@@ -51,11 +51,16 @@ def _slug(name: str) -> str:
 
 
 def _exec(sql: str, params: tuple = ()) -> sqlite3.Cursor:
+    # 2026-10-24 审计 P1：连接是全模块共享的单连接——自己的 _write_lock 只串行
+    # 化了本模块，拦不住它把别的线程持 _db_write_lock 中的半事务提前 commit。
+    # 写库一律同时持 db 的写锁（先自有锁再 db 锁，无反向获取点，不会死锁）。
     with _write_lock:
-        conn = _get_db()
-        cur = conn.execute(sql, params)
-        conn.commit()
-        return cur
+        from db import _db_write_lock
+        with _db_write_lock:
+            conn = _get_db()
+            cur = conn.execute(sql, params)
+            conn.commit()
+            return cur
 
 
 def _query(sql: str, params: tuple = ()) -> list[tuple]:
@@ -74,25 +79,27 @@ def _upsert_row(name: str, kind: str, display_name: str, description: str = "",
     if permission not in _VALID_PERMS:
         permission = "safe"
     with _write_lock:
-        conn = _get_db()
-        row = conn.execute("SELECT enabled, usage_count FROM capabilities WHERE name=?",
-                           (name,)).fetchone()
-        if row is not None and preserve_state:
-            enabled, usage = row[0], row[1]
-        else:
-            enabled, usage = 1, 0
-        conn.execute(
-            "INSERT INTO capabilities (name, kind, display_name, description, definition, "
-            "content, permission, perm_override, enabled, source, source_path, usage_count, "
-            "created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
-            "ON CONFLICT(name) DO UPDATE SET kind=excluded.kind, display_name=excluded.display_name, "
-            "description=excluded.description, definition=excluded.definition, "
-            "content=excluded.content, permission=excluded.permission, "
-            "perm_override=excluded.perm_override, source=excluded.source, "
-            "source_path=excluded.source_path, updated_at=excluded.updated_at",
-            (name, kind, display_name, description, definition, content, permission,
-             perm_override, enabled, source, source_path, usage, _now(), _now()))
-        conn.commit()
+        from db import _db_write_lock
+        with _db_write_lock:
+            conn = _get_db()
+            row = conn.execute("SELECT enabled, usage_count FROM capabilities WHERE name=?",
+                               (name,)).fetchone()
+            if row is not None and preserve_state:
+                enabled, usage = row[0], row[1]
+            else:
+                enabled, usage = 1, 0
+            conn.execute(
+                "INSERT INTO capabilities (name, kind, display_name, description, definition, "
+                "content, permission, perm_override, enabled, source, source_path, usage_count, "
+                "created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(name) DO UPDATE SET kind=excluded.kind, display_name=excluded.display_name, "
+                "description=excluded.description, definition=excluded.definition, "
+                "content=excluded.content, permission=excluded.permission, "
+                "perm_override=excluded.perm_override, source=excluded.source, "
+                "source_path=excluded.source_path, updated_at=excluded.updated_at",
+                (name, kind, display_name, description, definition, content, permission,
+                 perm_override, enabled, source, source_path, usage, _now(), _now()))
+            conn.commit()
 
 
 # ═══════════════════════════════════════════════════════
@@ -161,7 +168,8 @@ def sync_tools(tools: list[dict], permissions: dict[str, str], dispatch: dict,
         )
     if prune:
         try:
-            with _write_lock:
+            from db import _db_write_lock
+            with _write_lock, _db_write_lock:
                 conn = _get_db()
                 rows = conn.execute("SELECT name FROM capabilities WHERE kind='tool'").fetchall()
                 stale = [r[0] for r in rows if r[0] not in names]
@@ -289,7 +297,8 @@ def sync_skills() -> int:
 
     # 清理：builtin/extension 源的文件已消失的行
     try:
-        with _write_lock:
+        from db import _db_write_lock
+        with _write_lock, _db_write_lock:
             conn = _get_db()
             rows = conn.execute(
                 "SELECT name, source FROM capabilities WHERE kind='skill' "
@@ -457,7 +466,8 @@ def delete_skill(name: str) -> bool:
 def remove_extension_caps(ext_name: str) -> int:
     """卸载扩展时移除其工具/技能能力行。"""
     try:
-        with _write_lock:
+        from db import _db_write_lock
+        with _write_lock, _db_write_lock:
             conn = _get_db()
             cur = conn.execute("DELETE FROM capabilities WHERE source=?", (f"extension:{ext_name}",))
             conn.commit()

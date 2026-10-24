@@ -231,36 +231,42 @@ class SessionLog:
 
     def _persist_event(self, event: SessionEvent) -> None:
         assert self._conn is not None
-        self._conn.execute(
-            "INSERT OR IGNORE INTO session_events "
-            "(session_id, seq, type, time_ms, data, surface_op, source_seqs) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (
-                self.session_id,
-                event.seq,
-                event.type,
-                event.time_ms,
-                json.dumps(event.data, ensure_ascii=False),
-                event.surface_op,
-                json.dumps(event.source_seqs) if event.source_seqs else None,
-            ),
-        )
-        self._conn.commit()
+        # 2026-10-24 审计 P1：缺省连接就是 db 的共享单连接——裸 commit 会把
+        # 别的线程持 _db_write_lock 中的半事务提前持久化。写事件同样走写锁。
+        from db import _db_write_lock
+        with _db_write_lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO session_events "
+                "(session_id, seq, type, time_ms, data, surface_op, source_seqs) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    self.session_id,
+                    event.seq,
+                    event.type,
+                    event.time_ms,
+                    json.dumps(event.data, ensure_ascii=False),
+                    event.surface_op,
+                    json.dumps(event.source_seqs) if event.source_seqs else None,
+                ),
+            )
+            self._conn.commit()
 
 
 def _ensure_table_for(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS session_events ("
-        "session_id TEXT NOT NULL, "
-        "seq INTEGER NOT NULL, "
-        "type TEXT NOT NULL, "
-        "time_ms INTEGER NOT NULL, "
-        "data TEXT NOT NULL, "
-        "surface_op TEXT, "
-        "source_seqs TEXT, "
-        "UNIQUE(session_id, seq))"
-    )
-    conn.commit()
+    from db import _db_write_lock
+    with _db_write_lock:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS session_events ("
+            "session_id TEXT NOT NULL, "
+            "seq INTEGER NOT NULL, "
+            "type TEXT NOT NULL, "
+            "time_ms INTEGER NOT NULL, "
+            "data TEXT NOT NULL, "
+            "surface_op TEXT, "
+            "source_seqs TEXT, "
+            "UNIQUE(session_id, seq))"
+        )
+        conn.commit()
 
 
 def _persist_enabled() -> bool:

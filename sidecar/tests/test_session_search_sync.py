@@ -32,8 +32,10 @@ def _msg(role, content, mid):
     return {"id": mid, "role": role, "content": content, "ts": 1}
 
 
-def _save(sid, msgs, last_active=0):
-    res = sessions.save_session(sid, name="同步测试", last_active=last_active, messages=msgs)
+def _save(sid, msgs, last_active=0, allow_shrink=False):
+    # 2026-10-24：快照变少默认被拒（审计 P0）；"删除消息"场景显式 allow_shrink=True
+    res = sessions.save_session(sid, name="同步测试", last_active=last_active,
+                                messages=msgs, allow_shrink=allow_shrink)
     assert res.get("status") == "ok", res
 
 
@@ -81,7 +83,7 @@ def test_incremental_sync_handles_edit_and_removal():
         _msg("assistant", "原始内容 ALPHAONLY", f"{sid}_a"),
         _msg("user", "第二条 BETAONLY", f"{sid}_u"),
     ])
-    _save(sid, [_msg("assistant", "改过的内容 GAMMAONLY", f"{sid}_a")])
+    _save(sid, [_msg("assistant", "改过的内容 GAMMAONLY", f"{sid}_a")], allow_shrink=True)
     assert any(r["session_id"] == sid for r in sessions.search_sessions("GAMMAONLY")["results"])
     assert not any(r["session_id"] == sid for r in sessions.search_sessions("ALPHAONLY")["results"])
     assert not any(r["session_id"] == sid for r in sessions.search_sessions("BETAONLY")["results"])
@@ -99,9 +101,14 @@ def test_import_replace_clears_index():
     """整体替换导入（localStorage 迁移）必须连索引一起清。"""
     sid = "sess-sync-import"
     _save(sid, [_msg("assistant", "导入替换前的标记 IMPONLY", f"{sid}_a")])
-    sessions.import_sessions([], replace=True)
-    assert _count("SELECT COUNT(*) FROM session_messages_fts") == 0
-    assert _count("SELECT COUNT(*) FROM session_message_digests") == 0
+    # 2026-10-24：replace 空载荷被拒（审计 P1）。清库用一条哑会话整体替换。
+    sessions.import_sessions(
+        [{"id": "sess-sync-dummy", "name": "哑", "selectedModel": "", "lastActive": 0,
+          "messages": [{"id": "d1", "role": "user", "content": "占位"}]}],
+        replace=True)
+    # 旧会话的索引/摘要必须清空；只剩哑会话自己的 1 行
+    assert _count("SELECT COUNT(*) FROM session_messages_fts") == 1
+    assert _count("SELECT COUNT(*) FROM session_message_digests") == 1
 
 
 def test_backfill_repairs_partial_session_index():

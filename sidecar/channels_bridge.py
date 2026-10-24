@@ -35,8 +35,16 @@ def channel_session_id(channel: str, chat_id: str) -> str:
     return f"channel:{ch}:{cid}"
 
 
+_MODEL_CONTEXT_TURNS = 40   # 给模型只带最近 20 轮（通道对话多为短问答，长历史只烧 token）
+
+
 def _load_history(session_id: str) -> list[dict]:
-    """读该通道会话的历史消息（失败返回空——通道消息不该因为读不到历史就发不出去）。"""
+    """读该通道会话的**完整**历史（保留原消息 dict，含 id）。
+
+    2026-10-24 审计 P0：此前这里直接返回 `out[-40:]` 的截断视图，而 _save_turn
+    把它当完整快照写回（save_session 是替换语义）→ 通道会话每轮永久丢最老
+    2 条。截断只属于"给模型的上下文窗口"（_model_context），不属于存储。
+    """
     try:
         import sessions as _sessions
         got = _sessions.get_session(session_id)
@@ -44,25 +52,34 @@ def _load_history(session_id: str) -> list[dict]:
             out = []
             for m in got.get("messages") or []:
                 if m.get("role") in ("user", "assistant") and isinstance(m.get("content"), str):
-                    out.append({"role": m["role"], "content": m["content"]})
-            return out[-40:]   # 只带最近 20 轮：通道对话多为短问答，长历史只烧 token
+                    out.append(m)
+            return out
     except Exception:
         logger.debug("通道历史读取失败（按新会话继续）", exc_info=True)
     return []
 
 
+def _model_context(history: list[dict], limit: int = _MODEL_CONTEXT_TURNS) -> list[dict]:
+    """模型上下文视图：截到最近 limit 条，且只保留 role/content。"""
+    return [{"role": m["role"], "content": m["content"]} for m in history[-limit:]]
+
+
 def _save_turn(session_id: str, channel: str, user_text: str,
                reply: str, history: list[dict]) -> None:
-    """把这一轮写进会话表（快照式，与前端同一入口）。"""
+    """把这一轮写进会话表（快照式，与前端同一入口；history 必须是完整历史）。"""
     try:
         import sessions as _sessions
+        _now_ms = int(time.time() * 1000)
         msgs = list(history) + [
-            {"id": f"msg_{int(time.time() * 1000)}_u", "role": "user",
+            {"id": f"msg_{_now_ms}_u", "role": "user",
              "content": user_text},
-            {"id": f"msg_{int(time.time() * 1000)}_a", "role": "assistant",
+            {"id": f"msg_{_now_ms}_a", "role": "assistant",
              "content": reply},
         ]
-        _sessions.save_session(session_id, name=f"{channel} 通道", messages=msgs)
+        # last_active 跟着走（2026-10-24 审计 P3）：此前恒 0，prune_sessions
+        # 按 last_active 排序时活跃的通道会话最先被清。
+        _sessions.save_session(session_id, name=f"{channel} 通道",
+                               last_active=int(time.time()), messages=msgs)
     except Exception:
         logger.warning("通道会话落库失败（回复仍会发出）", exc_info=True)
 
@@ -91,7 +108,8 @@ async def run_channel_turn(channel: str, chat_id: str, text: str, *,
         # 称呼/名字——2026-09-29 审计的同一类问题）
         body = {"agent": agent, "session_id": session_id, "non_interactive": True,
                 "messages": [{"role": "system", "content": _hint}]
-                            + history + [{"role": "user", "content": text}]}
+                            + _model_context(history)
+                            + [{"role": "user", "content": text}]}
         msgs = _build_chat_messages(body, body["messages"])
         from agent.loop import ThinAgentLoop
         parts: list[str] = []

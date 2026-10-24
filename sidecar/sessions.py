@@ -288,8 +288,15 @@ def search_sessions(query: str, limit: int = 20) -> dict:
 
 
 def save_session(session_id: str, name: str = "", selected_model: str = "",
-                 last_active: int = 0, messages: list | None = None) -> dict:
-    """快照式 upsert：写元数据 + **替换**该会话的消息（一个事务内完成）。"""
+                 last_active: int = 0, messages: list | None = None,
+                 allow_shrink: bool = False) -> dict:
+    """快照式 upsert：写元数据 + **替换**该会话的消息（一个事务内完成）。
+
+    2026-10-24 审计 P0：快照条数少于已存条数时默认**拒绝**——此前前端
+    slice(-200) 与通道桥的截断视图都把"部分快照"当完整快照发来，替换语义
+    会把长会话确定性裁剪。确需裁剪（未来的"清空会话"类功能）显式传
+    allow_shrink=True。
+    """
     sid = str(session_id or "").strip()
     if not sid:
         return {"status": "error", "message": "session id required"}
@@ -317,6 +324,17 @@ def save_session(session_id: str, name: str = "", selected_model: str = "",
                     anon_usage.note("sessions_started")
                 except Exception:
                     logger.debug("anon_usage 会话记账失败", exc_info=True)
+            if row is not None and not allow_shrink:
+                _have = conn.execute(
+                    "SELECT COUNT(*) FROM session_messages WHERE session_id = ?", (sid,)
+                ).fetchone()[0]
+                if len(msgs) < int(_have or 0):
+                    logger.warning(
+                        "拒绝覆盖会话 %s：快照 %d 条 < 已存 %d 条（防截断/未加载快照清空权威库）",
+                        sid[:16], len(msgs), int(_have or 0))
+                    return {"status": "error",
+                            "message": (f"拒绝覆盖：快照 {len(msgs)} 条 < 已存 {int(_have)} 条"
+                                        "（防截断快照清空权威库）；确需裁剪传 allow_shrink=True")}
             conn.execute(
                 """INSERT INTO sessions(id, name, selected_model, last_active, created_at,
                                         updated_at, message_count, preview)
@@ -421,6 +439,11 @@ def import_sessions(sessions: list, replace: bool = False) -> dict:
     幂等：默认只补不覆盖（同 id 且已存在则跳过），除非 replace=True。
     """
     out = {"status": "ok", "imported": 0, "skipped": 0, "errors": []}
+    if replace and not sessions:
+        # 2026-10-24 审计 P1：replace 先清空全会话库——空载荷直接进来等于
+        # 一次性蒸发全部会话且不回滚。拒绝。
+        return {"status": "error",
+                "message": "拒绝 replace 导入：载荷为空（会清空全部会话且不可回滚）"}
     if replace:
         try:
             conn = _get_db()

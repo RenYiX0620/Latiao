@@ -371,8 +371,14 @@ async def _execute_cron_job(job: dict, force_local: bool = False):
     cloud = None if (force_local or _local_ready) else _get_best_cloud_config()
     protocol, api_url, headers, is_local = await _resolve_api_target(cloud)
     if is_local and not _local_ready:
-        # 引擎没跑但走了本地分支（cloud 为 None）：触发自动重载，请求在串行闸里排队等就绪
-        _llm.get_api_url()
+        # 引擎没跑但走了本地分支（cloud 为 None）：触发自动重载，请求在串行闸里排队等就绪。
+        # 2026-10-24 审计 P1：get_api_url 内含同步健康探测（20s + 3s sleep + 复验
+        # 20s），此前直接在事件循环上调用——引擎挂起场景会把整个 sidecar（SSE/
+        # API/cron tick）冻结半分钟。与 agent/routing.py 同路径的正规写法：线程池。
+        # 注意：返回值**丢弃**（与原语义一致）——引擎不可用时它会返回"标准占位
+        # URL"，拿来覆盖 api_url 会让"无模型→skipped"变成"拿着死 URL 跑→error"。
+        from starlette.concurrency import run_in_threadpool
+        await run_in_threadpool(_llm.get_api_url)
     if not api_url:
         logger.warning("Cron job skipped: no API target（云端未配置且本地模型未运行）: %s", task[:50])
         _record_cron_result(job, "skipped", "跳过：无可用模型（云端未配置且本地模型未运行）")

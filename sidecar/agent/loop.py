@@ -1485,12 +1485,17 @@ class ThinAgentLoop:
                 if "\n" in _td:
                     msgs[-1]["content"] = (str(msgs[-1].get("content") or "") + "\n"
                                            + _td.split("\n", 1)[1])
+            # 消费一次（2026-10-24 审计 P2）：温度/频率抖动只作用于紧随其后的那一次
+            # 重试轮——此前设置后永不复位，泄漏到本轮全部后续轮（含终答），
+            # frequency_penalty=1.5 会惩罚行情数字的合法重复、破坏缓存确定性。
+            _rt, _rf = self._retry_temp, self._retry_freq
+            self._retry_temp = self._retry_freq = None
             return {
                 "model": engine_model,
                 "messages": msgs,
                 "stream": True,
-                "temperature": self._retry_temp if self._retry_temp is not None else 0.0,
-                "frequency_penalty": self._retry_freq if self._retry_freq is not None else 0.6,
+                "temperature": _rt if _rt is not None else 0.0,
+                "frequency_penalty": _rf if _rf is not None else 0.6,
                 "max_tokens": _resolve_max_tokens(self.model, local=self.is_local,
                                                   override=_custom_engine_max_tokens()),
                 "stop": ["<|im_end|>", "<|endoftext|>", "<|end_of_turn>", "<eos>"],
@@ -1528,12 +1533,15 @@ class ThinAgentLoop:
             for m in msgs)
         if _has_image and self.is_local:
             self.native_tools = False
+        # 消费一次（2026-10-24 审计 P2）：同上——抖动只作用于一次重试请求。
+        _rt, _rf = self._retry_temp, self._retry_freq
+        self._retry_temp = self._retry_freq = None
         body = {
             "model": engine_model,
             "messages": msgs,
             "stream": True,
-            "temperature": self._retry_temp if self._retry_temp is not None else 0.0,
-            "frequency_penalty": self._retry_freq if self._retry_freq is not None else 0.6,
+            "temperature": _rt if _rt is not None else 0.0,
+            "frequency_penalty": _rf if _rf is not None else 0.6,
             "max_tokens": _resolve_max_tokens(self.model, local=self.is_local,
                                               override=_custom_engine_max_tokens()),
             "stop": ["<|im_end|>", "<|endoftext|>", "<end_of_turn>", "<eos>"],
@@ -2168,6 +2176,12 @@ class ThinAgentLoop:
             _req = self.last_user_text or ""
             if _MARKET_KW_RE.search(_req):
                 return True, "行情"
+            # 疑问句豁免（2026-10-24 审计 P2）："怎么卸载微信？/如何删除X？"是
+            # 知识问答（要的是步骤说明），不是指令——此前词表不分祈使/疑问，
+            # 这类问答被强推执行轮并下发工具表，工具倾向强的模型可能真去删。
+            # 只豁免动作词；行情疑问句（"今天大盘怎么样？"）仍按任务型处理。
+            if re.search(r"[？?]\s*[\"'”』」]?\s*$", _req.strip()):
+                return False, ""
             if _ACTION_KW_RE.search(_req):
                 return True, "动作词"
         except Exception:

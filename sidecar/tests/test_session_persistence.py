@@ -39,14 +39,18 @@ def test_snapshot_roundtrip(sess):
     # 额外字段（thinking/toolResult…）整体保留：前端 Message 字段多，逐列建表会漂移
     sess.save_session("s1", "会话一", "hermes", 111,
                       [{"id": "a", "role": "assistant", "content": "x",
-                        "thinking": "思考", "toolResult": "结果", "type": "tool_call"}])
+                        "thinking": "思考", "toolResult": "结果", "type": "tool_call"}],
+                      allow_shrink=True)
     m = sess.get_session("s1")["messages"][0]
     assert m["thinking"] == "思考" and m["toolResult"] == "结果" and m["type"] == "tool_call"
 
 
 def test_snapshot_replaces_messages(sess):
+    # 2026-10-24 合同变更：快照变少默认被拒（防截断快照清空权威库，审计 P0）；
+    # "替换语义"的验证改为显式 allow_shrink=True，等长替换不受影响。
     sess.save_session("s1", "标题A", "", 1, _msgs(5))
-    sess.save_session("s1", "标题B", "", 2, _msgs(2))
+    assert sess.save_session("s1", "标题B", "", 2, _msgs(2))["status"] == "error"
+    sess.save_session("s1", "标题B", "", 2, _msgs(2), allow_shrink=True)
     got = sess.get_session("s1")
     assert len(got["messages"]) == 2, "快照语义：写几次就是几次的内容，不追加"
     assert got["session"]["name"] == "标题B"
@@ -95,7 +99,7 @@ def test_prune_keeps_most_recent(sess):
 
 def test_message_cap_trims_oldest(sess, monkeypatch):
     monkeypatch.setattr(sess, "MAX_MESSAGES_PER_SESSION", 3)
-    r = sess.save_session("s1", "x", "", 1, _msgs(5))
+    r = sess.save_session("s1", "x", "", 1, _msgs(5), allow_shrink=True)
     assert r["message_count"] == 3
     assert [m["content"] for m in sess.get_session("s1")["messages"]] == ["消息2", "消息3", "消息4"]
 
