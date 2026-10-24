@@ -2494,6 +2494,9 @@ class ThinAgentLoop:
                 self._round_dup = False
                 self._round_dup_decided = False
                 self._think_hold = []
+                # 本轮正文是否以任何形式到达过前端（流式/leftover）——
+                # 交付兜底判据（2026-10-24 两起静默断流：复读扣留 + 思考轮丢弃）
+                self._round_delivered_any = False
                 t_first_token = None
                 result = None
                 raw_deltas = 0
@@ -2532,6 +2535,7 @@ class ThinAgentLoop:
                             # 原样下发（2026-10-09 occamy"回复两遍"的直接原因；此前
                             # 方言模型恰好走"缓冲≠当前块"分支，把这个 bug 遮住了）
                             evt = dict(evt, content=_emit)
+                            self._round_delivered_any = True
                         elif evt.get("reasoning") and t_first_token is None:
                             t_first_token = time.monotonic()
                         raw_deltas += 1
@@ -2543,6 +2547,7 @@ class ThinAgentLoop:
                             # 任务型思考轮的残余（think 标签尾巴等）同样进缓冲
                             self._think_hold.append(_leftover)
                         else:
+                            self._round_delivered_any = True
                             yield {"content": _leftover}
                     if result is None:
                         return
@@ -3025,26 +3030,34 @@ class ThinAgentLoop:
                     # 不得静默交付——未收口过 → 走一次收口重采（tools=空+关思考，
                     # 现有机制，专治复读）；收口轮仍被扣 → 原文交付并注明，
                     # 宁可让用户看到一段复读也不能没有终答。
-                    if (not tool_calls and getattr(self, "_round_dup", False)
-                            and (body_text or "").strip()
+                    # 2026-10-24 两起真机静默断流：①复读闸整轮扣留（151/149 字
+                    # 逐字复读）②思考轮正文被 think_hold 判"计划"丢弃（46 字）。
+                    # 共同点：终轮正文从未到达前端，而交付瀑布假定"已流出"→
+                    # events=0 静默结束。兜底判据统一为"正文非空且从未下发"：
+                    # 未收口过 → 收口重采一次；收口轮仍未到达 → 原文交付并注明，
+                    # 宁可重复也不能没有终答。
+                    _held = self._release_think_hold()
+                    if _held.strip():
+                        yield {"content": _held}
+                    _body_lost = ((body_text or "").strip()
+                                  and not getattr(self, "_round_delivered_any", True)
+                                  and not _held.strip())
+                    if (not tool_calls and _body_lost
                             and not self._finalize_round):
                         self._finalize_round = True
                         self._retry_temp, self._retry_freq = 0.6, 1.5
                         if self.steps >= self.max_steps:
                             self.steps = self.max_steps - 1
-                        self._step_log("复读扣留兜底",
-                                       f"终轮 {len((body_text or '').strip())} 字被判复读扣留"
-                                       "且无工具调用 → 收口重采（tools=空、关思考、升温）")
+                        self._step_log("正文丢失兜底",
+                                       f"终轮 {len((body_text or '').strip())} 字从未到达前端"
+                                       "（复读扣留/思考轮丢弃）且无工具调用"
+                                       " → 收口重采（tools=空、关思考、升温）")
                         yield {"event": "heartbeat"}
                         continue
-                    _held = self._release_think_hold()
-                    if _held.strip():
-                        yield {"content": _held}
-                    if (not tool_calls and getattr(self, "_round_dup", False)
-                            and (body_text or "").strip() and self._finalize_round):
+                    if (not tool_calls and _body_lost and self._finalize_round):
                         yield {"content": body_text}
                         yield {"content": "\n\n" + _msg("repeat_calls", self.user_lang)}
-                        self._step_log("复读扣留兜底", "收口轮仍被扣 → 原文交付（附说明）")
+                        self._step_log("正文丢失兜底", "收口轮正文仍未到达 → 原文交付（附说明）")
                         return
                     payload = {
                         "text": body_text, "streamed": streamed,

@@ -283,10 +283,13 @@ _SRC = Path(__file__).resolve().parents[1].joinpath("agent", "loop.py").read_tex
 
 def test_dup_suppressed_final_round_has_fallback():
     """终轮被复读闸扣留后不得静默交付：必须先收口重采、收口仍扣则原文交付。"""
-    idx = _SRC.find('if (not tool_calls and getattr(self, "_round_dup", False)')
+    idx = _SRC.find("_body_lost = ((body_text or \"\").strip()")
     assert idx > 0, "兜底分支缺失"
-    seg = _SRC[idx:idx + 1800]
-    assert "复读扣留兜底" in seg
+    seg = _SRC[idx:idx + 2200]
+    assert "正文丢失兜底" in seg
+    assert "_round_delivered_any" in _SRC, "必须有'正文是否到达前端'的跟踪标志"
+    # 两起事故都要覆盖：复读扣留（_round_dup）与思考轮丢弃（think_hold）
+    assert "_round_delivered_any = True" in _SRC, "流式/leftover 放出处置标志"
     assert "self._finalize_round = True" in seg, "未收口过 → 必须转收口重采"
     assert "continue" in seg, "转收口后必须 continue 进收口轮"
     assert "_msg(\"repeat_calls\"" in seg, "收口轮仍被扣 → 原文交付并附说明"
