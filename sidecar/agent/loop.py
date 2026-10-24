@@ -3017,9 +3017,35 @@ class ThinAgentLoop:
                     # 的正文已实时流出；思考轮的正文在此前刚经 _release_think_hold
                     # 一次性放出（不实时下发，防"闪现"），两种情况对瀑布的契约
                     # 相同：进入瀑布前正文都已完整到达前端。
+                    # 2026-10-24 真机事故（"第二个任务中途停了"）：终轮被复读闸
+                    # 整轮扣留（151/149 字逐字复读，扣得对）后，三方机制全缺席——
+                    # 停滞闸门只看工具维度（本轮 tool_calls=0 够不着）、空转闸
+                    # 不认复读式空转、交付瀑布又假定"正文已流出"→ events=0
+                    # 静默断流，前端永远停在工具卡片后。兜底：终轮正文被扣留时
+                    # 不得静默交付——未收口过 → 走一次收口重采（tools=空+关思考，
+                    # 现有机制，专治复读）；收口轮仍被扣 → 原文交付并注明，
+                    # 宁可让用户看到一段复读也不能没有终答。
+                    if (not tool_calls and getattr(self, "_round_dup", False)
+                            and (body_text or "").strip()
+                            and not self._finalize_round):
+                        self._finalize_round = True
+                        self._retry_temp, self._retry_freq = 0.6, 1.5
+                        if self.steps >= self.max_steps:
+                            self.steps = self.max_steps - 1
+                        self._step_log("复读扣留兜底",
+                                       f"终轮 {len((body_text or '').strip())} 字被判复读扣留"
+                                       "且无工具调用 → 收口重采（tools=空、关思考、升温）")
+                        yield {"event": "heartbeat"}
+                        continue
                     _held = self._release_think_hold()
                     if _held.strip():
                         yield {"content": _held}
+                    if (not tool_calls and getattr(self, "_round_dup", False)
+                            and (body_text or "").strip() and self._finalize_round):
+                        yield {"content": body_text}
+                        yield {"content": "\n\n" + _msg("repeat_calls", self.user_lang)}
+                        self._step_log("复读扣留兜底", "收口轮仍被扣 → 原文交付（附说明）")
+                        return
                     payload = {
                         "text": body_text, "streamed": streamed,
                         "client": client, "api_url": self.api_url,

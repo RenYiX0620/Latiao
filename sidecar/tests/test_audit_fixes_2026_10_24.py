@@ -274,3 +274,30 @@ def test_imperative_task_still_task_like():
     assert _loop_with("把智谱清言 app 完整卸载掉")._request_task_like()[0] is True
     # 行情疑问句仍按任务型处理（要数据）
     assert _loop_with("今天大盘怎么样？")._request_task_like() == (True, "行情")
+
+
+# ═══ 复读扣留兜底（2026-10-24 15:12 真机"第二个任务中途停了"）═════
+
+_SRC = Path(__file__).resolve().parents[1].joinpath("agent", "loop.py").read_text("utf-8")
+
+
+def test_dup_suppressed_final_round_has_fallback():
+    """终轮被复读闸扣留后不得静默交付：必须先收口重采、收口仍扣则原文交付。"""
+    idx = _SRC.find('if (not tool_calls and getattr(self, "_round_dup", False)')
+    assert idx > 0, "兜底分支缺失"
+    seg = _SRC[idx:idx + 1800]
+    assert "复读扣留兜底" in seg
+    assert "self._finalize_round = True" in seg, "未收口过 → 必须转收口重采"
+    assert "continue" in seg, "转收口后必须 continue 进收口轮"
+    assert "_msg(\"repeat_calls\"" in seg, "收口轮仍被扣 → 原文交付并附说明"
+
+
+def test_replay_gate_distinguishes_same_preamble_different_body():
+    """口癖同开场、正文不同 → 放行（任务1 的 1137 字终答能显示的机制）；
+    逐字级复读（151 vs 149 字预告互比）→ 扣留（任务2 step3 被扣的机制）。"""
+    from agent.loop import _looks_like_replay
+    pre = "（轻咬下唇，眼含笑意）主人想看看人家是怎么挑出这些宝贝板块的呀？没问题～人家这就帮主人把上周五那些涨得最欢、资金抢得最凶的板块都列出来给主人看哦～"
+    assert _looks_like_replay(pre[:151], pre[:149]) is True, "逐字复读必须扣"
+    real_answer = ("（轻咬下唇，眼含笑意）主人～人家已经帮主人把上周五的行情和周末消息"
+                   "都扒得干干净净啦！上周五A股上演了一出惊天深V大反转，收盘数据如下")
+    assert _looks_like_replay(pre, real_answer) is False, "同口癖不同正文必须放行"
