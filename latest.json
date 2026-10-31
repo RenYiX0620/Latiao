@@ -1,11 +1,11 @@
 {
-  "version": "0.3.92",
+  "version": "0.3.93",
   "notes": "",
-  "pub_date": "2026-10-24T15:13:28+00:00",
+  "pub_date": "2026-10-31T16:08:31+00:00",
   "platforms": {
     "darwin-aarch64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSNlJGdmtETXY3WkpjbFlXbUVsTS94dTQ3WFFvN2VQUHpncFlZVjVLOVEzYnFxN1JrVXk4VGlXSlY1UTNwdElQam53djgranFmSmFIZEQxN21EWjY3NExOT2s2WGI3ZkFvPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyODU0ODA4CWZpbGU6TGF0aWFvXzAuMy45Ml9hYXJjaDY0LmFwcC50YXIuZ3oKc0NEZS9VVGRuSE9hbkl2ZmltRGUwQlY2SlB2Z0x5SUltaW41UUQ1R1NXMW90RVVPRXF3SWVWaEQvMGxUTW1reFQxWUZtQWVvNXhadmtYVFVjNTU2QlE9PQo=",
-      "url": "https://github.com/RenYiX0620/Latiao/releases/download/v0.3.92/Latiao_0.3.92_aarch64.app.tar.gz"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSNlJGdmtETXY3WkdJZjNSK1ZxVFpSYzd1Y2FUZlVleWh2Qk5Ud21HUFlrUHVoMmtIQkRLUlc4WFNmSmFHK3lmOFV6M3dRUkJ4ekNRZ016SWVxelV6RnJ2MjZuT2JJOEFjPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzNDYyOTEwCWZpbGU6TGF0aWFvXzAuMy45M19hYXJjaDY0LmFwcC50YXIuZ3oKTW9ZRGZTU3czR1pBR1pkRDg1MjcrYVlNdFpQbFBSRTNrTmszWDJrTXhvOGpCbmgyTlV2emRkVU9LVEFQZUU0ZVdPSDBkSkRSai9MNE93OEIrY3FRRHc9PQo=",
+      "url": "https://github.com/RenYiX0620/Latiao/releases/download/v0.3.93/Latiao_0.3.93_aarch64.app.tar.gz"
     }
   }
 }
