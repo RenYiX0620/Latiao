@@ -28,6 +28,12 @@ interface Capability {
   enabled: boolean;
   source: string;
   usage_count: number;
+  // 技能专属（C1/C2）：资产与声明工具元数据
+  has_scripts?: boolean;
+  assets_count?: number;
+  version?: string;
+  allowed_tools?: string[];
+  suggested_permission?: string;
 }
 
 interface MarketPlugin {
@@ -67,11 +73,22 @@ interface DiscoverState {
   entries?: number;
 }
 
+interface SkillPreview {
+  name: string;
+  description?: string;
+  security_level?: string;
+  allowed_tools?: string[];
+  suggested_permission?: string;
+  has_scripts?: boolean;
+  scripts?: string[];
+}
+
 interface InstallPreview {
   name?: string;
   version?: string;
   file_count?: number;
   permissions?: string[];
+  skills?: SkillPreview[];
   digest?: string;
 }
 
@@ -108,8 +125,11 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
   const [confirming, setConfirming] = useState<{ source: string; sha256: string; permissions: string[]; githubItem?: MarketPlugin; isGitHubItem?: boolean } | null>(null);
   // ⑦ 服务端预览：stage 之后的待确认安装（pending_id + 预览），用户点"确认安装"才落盘
   const [staged, setStaged] = useState<{ pendingId: string; preview: InstallPreview; source: string } | null>(null);
-  // ── 市场 ──
-  const [marketTab, setMarketTab] = useState<"market" | "installed">("market");
+  // ── 顶层双 tab（DSH 顺序：已安装在前，发现次之） ──
+  const [marketTab, setMarketTab] = useState<"installed" | "discover">("installed");
+  // ── 能力行展开详情（key = kind:name；详情从 /v1/capabilities/{name} 懒取） ──
+  const [expandedCap, setExpandedCap] = useState<string | null>(null);
+  const [capDetails, setCapDetails] = useState<Record<string, Capability & { meta?: { assets_dir?: string; assets?: string[]; allowed_tools?: string[]; version?: string; suggested_permission?: string } }>>({});
   const [marketPlugins, setMarketPlugins] = useState<MarketPlugin[]>([]);
   const [marketLoading, setMarketLoading] = useState(false);
   const [marketErr, setMarketErr] = useState("");
@@ -132,10 +152,6 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
   const [newSkillName, setNewSkillName] = useState("");
   const [newSkillContent, setNewSkillContent] = useState("");
   const [skillFormOpen, setSkillFormOpen] = useState(false);
-  // ── Tavily key 配置 ──
-  const [tavilyKey, setTavilyKey] = useState({ hasKey: false, masked: null as string | null, loading: false });
-  const [keyInput, setKeyInput] = useState("");
-  const [showKeyInput, setShowKeyInput] = useState(false);
 
   const refreshMarket = useCallback(async () => {
     setMarketLoading(true);
@@ -220,17 +236,7 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
     } catch { /* 静默 */ }
   }, [setCapabilities]);
 
-  // Tavily key 状态（tavily_search 能力存在时展示配置区）
-  useEffect(() => {
-    if (!capabilities.some(c => c.name === "tavily_search")) return;
-    (async () => {
-      try {
-        const resp = await authFetch("/v1/settings/tavily-key");
-        const data = await resp.json();
-        if (data.status === "ok") setTavilyKey({ hasKey: data.has_key, masked: data.masked, loading: false });
-      } catch { /* 静默 */ }
-    })();
-  }, [capabilities]);
+  // Tavily key 已迁至设置页（服务凭据分组）——这里只留能力表本体。
 
   // ⑦ 第一阶段：服务端取回内容 → 返回预览（名称/版本/权限/文件数/sha256），**不写盘**
   const doInstall = async (source: string, sha256: string) => {
@@ -424,38 +430,33 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
     } catch (e) { console.error(e); showToast(t("tools.create_fail"), "warn"); }
   };
 
-  const saveTavilyKey = async (key: string) => {
-    if (!key.trim()) { showToast(t("skills.tavily_fill_key"), "warn"); return; }
-    setTavilyKey(prev => ({ ...prev, loading: true }));
-    try {
-      const resp = await authFetch("/v1/settings/tavily-key", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ key }),
-      });
-      const data = await resp.json();
-      if (data.status === "ok") {
-        setTavilyKey({ hasKey: true, masked: data.masked, loading: false });
-        showToast(t("skills.tavily_saved"));
-      } else {
-        setTavilyKey(prev => ({ ...prev, loading: false }));
-        showToast(data.message || t("skills.save_fail"), "warn");
-      }
-    } catch (e) { console.error(e); setTavilyKey(prev => ({ ...prev, loading: false })); showToast(t("skills.save_fail"), "warn"); }
+  // ── 能力行展开详情 + 建议权限采纳（C1/C2 前端呈现） ──
+  const toggleExpandCap = async (cap: Capability) => {
+    const key = `${cap.kind}:${cap.name}`;
+    if (expandedCap === key) { setExpandedCap(null); return; }
+    setExpandedCap(key);
+    if (cap.kind === "skill" && !capDetails[cap.name]) {
+      try {
+        const resp = await authFetch(`/v1/capabilities/${encodeURIComponent(cap.name)}`);
+        const data = await resp.json();
+        if (data.status === "ok" && data.capability) {
+          setCapDetails(prev => ({ ...prev, [cap.name]: data.capability }));
+        }
+      } catch { /* 详情拉不到时行内徽标仍在 */ }
+    }
   };
 
-  const deleteTavilyKey = async () => {
-    setTavilyKey(prev => ({ ...prev, loading: true }));
+  const applySuggestPerm = async (cap: Capability, perm: string) => {
     try {
-      const resp = await authFetch("/v1/settings/tavily-key", { method: "DELETE" });
+      const resp = await authFetch(`/v1/capabilities/${encodeURIComponent(cap.name)}/permission`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ permission: perm }),
+      });
       const data = await resp.json();
-      if (data.status === "ok") {
-        setTavilyKey({ hasKey: false, masked: null, loading: false });
-        showToast(t("skills.tavily_deleted"));
-      } else {
-        setTavilyKey(prev => ({ ...prev, loading: false }));
-        showToast(data.message || t("skills.delete_fail"), "warn");
-      }
-    } catch (e) { console.error(e); setTavilyKey(prev => ({ ...prev, loading: false })); showToast(t("skills.delete_fail"), "warn"); }
+      if (data.status !== "ok") { showToast(data.message || t("tools.op_fail"), "warn"); return; }
+      setCapabilities(prev => prev.map(c => c.name === cap.name ? { ...c, permission: perm } : c));
+      showToast(`${cap.name} → ${CAP_PERM_LABEL[perm] ? t(CAP_PERM_LABEL[perm]) : perm}`);
+    } catch (e) { console.error(e); showToast(t("tools.op_fail"), "warn"); }
   };
 
   const authorName = (a: ExtensionInfo["author"]) =>
@@ -488,21 +489,20 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
 
   return (
     <div>
-      {/* ═══ 扩展市场 ═══ */}
+      {/* 顶层双 tab（DSH 顺序）：已安装在前、发现在后 */}
+      <div className="tab-bar" style={{ marginBottom: 12 }}>
+        <button className={`tab-btn${marketTab === "installed" ? " active" : ""}`}
+          onClick={() => setMarketTab("installed")}>{t("tools.installed_tab")}</button>
+        <button className={`tab-btn${marketTab === "discover" ? " active" : ""}`}
+          onClick={() => setMarketTab("discover")}>{t("tools.tab_market")}</button>
+      </div>
+
+      {marketTab === "discover" && (
+      <>
       <div className="card-desc" style={{ marginBottom: 12 }}>
         {t("tools.market_desc")}
       </div>
 
-      {/* 市场 / 已装 tab */}
-      <div className="tab-bar" style={{ marginBottom: 12 }}>
-        <button className={`tab-btn${marketTab === "market" ? " active" : ""}`}
-          onClick={() => setMarketTab("market")}>{t("tools.market_tab")}</button>
-        <button className={`tab-btn${marketTab === "installed" ? " active" : ""}`}
-          onClick={() => setMarketTab("installed")}>{t("tools.installed_tab")}</button>
-      </div>
-
-      {marketTab === "market" && (
-      <>
         {/* 市场源管理 */}
         <div className="card" style={{ marginBottom: 14 }}>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
@@ -700,6 +700,137 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
         </div>
       </div>
 
+      {/* ═══ 统一能力列表（工具与技能一张表；C1/C2：分组+徽标+行内详情） ═══ */}
+      <div className="page-header" style={{ margin: "14px 0 8px" }}>
+        <div className="card-title" style={{ fontSize: 14 }}>{t("tools.capability")}</div>
+        <div className="card-desc" style={{ marginTop: 2, fontSize: 11 }}>
+          {t("tools.caps_desc")}
+        </div>
+      </div>
+
+      {([
+        ["builtin", t("tools.group_builtin"), (cs: Capability[]) => cs.filter(c => c.source === "builtin")],
+        ["ext", t("tools.group_ext"), (cs: Capability[]) => cs.filter(c => c.source.startsWith("extension:"))],
+        ["user", t("tools.group_user"), (cs: Capability[]) => cs.filter(c => c.source === "user")],
+      ] as [string, string, (cs: Capability[]) => Capability[]][]).map(([gkey, glabel, pick]) => {
+        const items = pick(capabilities);
+        if (items.length === 0) return null;
+        return (
+        <div key={gkey} style={{ marginBottom: 10 }}>
+          <div className="card-title" style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 4 }}>
+            {glabel} <span className="badge badge-safe">{items.length}</span>
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+            {items.map((cap) => {
+              const isTool = cap.kind === "tool";
+              const capKey = `${cap.kind}:${cap.name}`;
+              const expanded = expandedCap === capKey;
+              const detail = cap.kind === "skill" ? capDetails[cap.name] : undefined;
+              const meta = detail?.meta;
+              const permBadge = cap.permission === "safe" ? "badge-safe"
+                : cap.permission === "confirm" ? "badge-confirm" : "badge-inactive";
+              return (
+              <div key={capKey}>
+                <div onClick={() => void toggleExpandCap(cap)} style={{
+                  display: "flex", alignItems: "center", gap: 8, padding: "4px 8px",
+                  borderRadius: "var(--radius-sm)", cursor: "pointer",
+                  background: cap.enabled ? "transparent" : "color-mix(in srgb, var(--bg-card) 55%, transparent)",
+                  opacity: cap.enabled ? 1 : 0.55,
+                }}>
+                  <span style={{ fontSize: 13, flexShrink: 0 }}>{isTool ? "⚙️" : "🧠"}</span>
+                  <span style={{ fontWeight: 600, fontSize: 12, flexShrink: 0, minWidth: 110, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                    {cap.display_name || cap.name}
+                  </span>
+                  <span className={`badge ${permBadge}`} style={{ flexShrink: 0 }}>
+                    {CAP_PERM_LABEL[cap.permission] ? t(CAP_PERM_LABEL[cap.permission]) : cap.permission}
+                  </span>
+                  {cap.kind === "skill" && cap.has_scripts && (
+                    <span className="badge badge-confirm" style={{ flexShrink: 0 }}
+                      title={t("tools.has_scripts_hint")}>{t("tools.has_scripts_badge")}</span>
+                  )}
+                  {cap.kind === "skill" && cap.version && (
+                    <span className="badge badge-safe" style={{ flexShrink: 0, fontFamily: "var(--font-mono)" }}>v{cap.version}</span>
+                  )}
+                  {!cap.enabled && <span className="badge badge-confirm" style={{ flexShrink: 0 }}>{t("tools.disabled")}</span>}
+                  <span style={{ flex: 1, minWidth: 0, fontSize: 11, color: "var(--text-muted)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {(() => {
+                      // 描述来自后端（同时是给模型的工具说明，不能动）→ 显示层优先用 i18n 摘要；
+                      // t() 找不到键时会原样返回键名，正好用来判断"有没有本地化版本"。
+                      const k = `cap.desc.${cap.name}`;
+                      const localized = t(k);
+                      return localized !== k ? localized : cap.description;
+                    })()}
+                  </span>
+                  <span style={{ flexShrink: 0, fontSize: 10, color: "var(--text-muted)" }}>
+                    {t("tools.calls", { count: cap.usage_count })} · {sourceLabel(cap.source)}
+                  </span>
+                  <span style={{ display: "flex", gap: 4, flexShrink: 0, alignItems: "center" }}
+                    onClick={(e) => e.stopPropagation()}>
+                    <button className="btn btn-xs btn-ghost"
+                      onClick={() => toggleCap(cap)}>{cap.enabled ? t("common.disable") : t("common.enable")}</button>
+                    {isTool && (
+                      <button className="btn btn-xs btn-ghost" onClick={() => togglePerm(cap)}>
+                        {cap.permission === "safe" ? t("tools.set_confirm") : t("tools.set_safe")}
+                      </button>
+                    )}
+                    {!isTool && cap.source === "user" && (
+                      <button className="btn btn-xs btn-ghost" style={{ color: "var(--danger)" }}
+                        onClick={() => deleteCap(cap)}>{t("common.delete")}</button>
+                    )}
+                  </span>
+                </div>
+                {expanded && (
+                  <div style={{
+                    margin: "0 0 6px 26px", padding: "8px 10px",
+                    background: "var(--bg-card)", border: "1px solid var(--border-default)",
+                    borderRadius: "var(--radius-sm)", fontSize: 11,
+                  }}>
+                    <div className="card-desc" style={{ whiteSpace: "pre-wrap" }}>
+                      {cap.description || "—"}
+                    </div>
+                    {cap.kind === "skill" && (
+                      <>
+                        {(detail?.version || cap.version) && (
+                          <div className="card-meta" style={{ marginTop: 4 }}>
+                            版本: {detail?.version || cap.version}
+                          </div>
+                        )}
+                        {(cap.allowed_tools?.length || 0) > 0 && (
+                          <div className="card-meta" style={{ marginTop: 2 }}>
+                            {t("tools.allowed_tools_label")}: {(cap.allowed_tools || []).join(", ")}
+                          </div>
+                        )}
+                        {cap.suggested_permission && cap.suggested_permission !== cap.permission && (
+                          <div className="card-meta" style={{ marginTop: 2, display: "flex", alignItems: "center", gap: 6 }}>
+                            {t("tools.suggest_perm")}: {CAP_PERM_LABEL[cap.suggested_permission] ? t(CAP_PERM_LABEL[cap.suggested_permission]) : cap.suggested_permission}
+                            <button className="btn btn-xs btn-ghost"
+                              onClick={(e) => { e.stopPropagation(); applySuggestPerm(cap, cap.suggested_permission!); }}>
+                              {t("tools.apply_suggest")}
+                            </button>
+                          </div>
+                        )}
+                        {meta?.assets_dir && (
+                          <div className="card-meta" style={{ marginTop: 4 }}>
+                            {t("tools.assets_label")}（{(meta.assets || []).length}）
+                            <div style={{ fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--text-muted)", marginTop: 2, wordBreak: "break-all" }}>
+                              {(meta.assets || []).join(" · ") || "—"}
+                            </div>
+                          </div>
+                        )}
+                      </>
+                    )}
+                  </div>
+                )}
+              </div>
+            );})}
+          </div>
+        </div>
+        );
+      })}
+      {capabilities.length === 0 && (
+        <div className="card-desc">{t("tools.no_capability")}</div>
+      )}
+
       <div className="card-grid">
         {extensions.map((ext) => (
           <div key={ext.name} className="card" style={ext.enabled ? {} : { opacity: 0.55 }}>
@@ -730,6 +861,26 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
               {t("tools.no_ext_installed")}
             </div>
           </div>
+        )}
+      </div>
+
+      {/* ── 新建技能 ── */}
+      <div style={{ marginTop: 16, padding: 14, background: "var(--bg-card)", border: "1px solid var(--border-default)", borderRadius: "var(--radius-lg)" }}>
+        {!skillFormOpen ? (
+          <button className="btn btn-sm btn-ghost" onClick={() => setSkillFormOpen(true)}>＋ {t("skills.new")}</button>
+        ) : (
+          <>
+            <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 10 }}>{t("skills.new")}</div>
+            <input className="form-input" style={{ fontSize: 11, marginBottom: 6 }} placeholder={t("skills.name_placeholder")}
+              value={newSkillName} onChange={e => setNewSkillName(e.target.value)} />
+            <textarea className="form-input" style={{ fontSize: 11, minHeight: 80, resize: "vertical", fontFamily: "var(--font-mono)" }}
+              placeholder={t("skills.content_placeholder")}
+              value={newSkillContent} onChange={e => setNewSkillContent(e.target.value)} />
+            <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
+              <button className="btn btn-sm btn-primary" onClick={createSkill}>{t("skills.create")}</button>
+              <button className="btn btn-sm btn-ghost" onClick={() => setSkillFormOpen(false)}>{t("skills.tavily_cancel")}</button>
+            </div>
+          </>
         )}
       </div>
       </>
@@ -775,6 +926,30 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
                 <div className="card-desc" style={{ marginTop: 4, fontSize: 11 }}>
                   {t("tools.install_preview_hint")}
                 </div>
+                {(staged.preview?.skills || []).length > 0 && (
+                  <div style={{ marginTop: 8 }}>
+                    <div className="card-desc" style={{ fontWeight: 600 }}>{t("tools.preview_skills")}</div>
+                    {(staged.preview!.skills || []).map(s => (
+                      <div key={s.name} className="card-desc" style={{ marginTop: 3, fontSize: 11 }}>
+                        <b>{s.name}</b>
+                        {s.has_scripts && <span className="badge badge-confirm" style={{ marginLeft: 6 }}>{t("tools.has_scripts_badge")}</span>}
+                        {" — "}{s.description || ""}
+                        {(s.scripts || []).length > 0 && (
+                          <div style={{ color: "var(--warning)", marginLeft: 14, fontFamily: "var(--font-mono)", fontSize: 10 }}>
+                            ⌨ {s.scripts!.join(", ")}
+                          </div>
+                        )}
+                        {(s.allowed_tools || []).length > 0 && (
+                          <div style={{ marginLeft: 14, fontSize: 10 }}>
+                            {t("tools.allowed_tools_label")}: {s.allowed_tools!.join(", ")}
+                            {s.suggested_permission && s.suggested_permission !== s.security_level
+                              ? ` · ${t("tools.suggest_perm")}: ${s.suggested_permission}` : ""}
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             )}
             <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
@@ -791,129 +966,6 @@ export default function ToolsView({ capabilities, setCapabilities, showToast }: 
         </div>
       )}
 
-      {/* ═══ 统一能力列表（工具与技能，一个列表不分栏） ═══ */}
-      <div className="page-header" style={{ margin: "14px 0 8px" }}>
-        <div className="card-title" style={{ fontSize: 14 }}>{t("tools.capability")}</div>
-        <div className="card-desc" style={{ marginTop: 2, fontSize: 11 }}>
-          {t("tools.caps_desc")}
-        </div>
-      </div>
-
-      <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-        {capabilities.map((cap) => {
-          const isTool = cap.kind === "tool";
-          const permBadge = cap.permission === "safe" ? "badge-safe"
-            : cap.permission === "confirm" ? "badge-confirm" : "badge-inactive";
-          return (
-          <div key={`${cap.kind}:${cap.name}`} style={{
-            display: "flex", alignItems: "center", gap: 8, padding: "4px 8px",
-            borderRadius: "var(--radius-sm)",
-            background: cap.enabled ? "transparent" : "color-mix(in srgb, var(--bg-card) 55%, transparent)",
-            opacity: cap.enabled ? 1 : 0.55,
-          }}>
-            <span style={{ fontSize: 13, flexShrink: 0 }}>⚙️</span>
-            <span style={{ fontWeight: 600, fontSize: 12, flexShrink: 0, minWidth: 110, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-              {cap.display_name || cap.name}
-            </span>
-            <span className={`badge ${permBadge}`} style={{ flexShrink: 0 }}>
-              {CAP_PERM_LABEL[cap.permission] ? t(CAP_PERM_LABEL[cap.permission]) : cap.permission}
-            </span>
-            {!cap.enabled && <span className="badge badge-confirm" style={{ flexShrink: 0 }}>{t("tools.disabled")}</span>}
-            <span style={{ flex: 1, minWidth: 0, fontSize: 11, color: "var(--text-muted)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-              {(() => {
-                // 描述来自后端（同时是给模型的工具说明，不能动）→ 显示层优先用 i18n 摘要；
-                // t() 找不到键时会原样返回键名，正好用来判断"有没有本地化版本"。
-                const k = `cap.desc.${cap.name}`;
-                const localized = t(k);
-                return localized !== k ? localized : cap.description;
-              })()}
-            </span>
-            <span style={{ flexShrink: 0, fontSize: 10, color: "var(--text-muted)" }}>
-              {t("tools.calls", { count: cap.usage_count })} · {sourceLabel(cap.source)}
-            </span>
-            <span style={{ display: "flex", gap: 4, flexShrink: 0, alignItems: "center" }}>
-              <button className="btn btn-xs btn-ghost"
-                onClick={() => toggleCap(cap)}>{cap.enabled ? t("common.disable") : t("common.enable")}</button>
-              {isTool && (
-                <button className="btn btn-xs btn-ghost" onClick={() => togglePerm(cap)}>
-                  {cap.permission === "safe" ? t("tools.set_confirm") : t("tools.set_safe")}
-                </button>
-              )}
-              {!isTool && cap.source === "user" && (
-                <button className="btn btn-xs btn-ghost" style={{ color: "var(--danger)" }}
-                  onClick={() => deleteCap(cap)}>{t("common.delete")}</button>
-              )}
-            </span>
-          </div>
-        )})}
-        {capabilities.length === 0 && (
-          <div className="card-desc">{t("tools.no_capability")}</div>
-        )}
-      </div>
-
-      {/* ── 新建技能 ── */}
-      <div style={{ marginTop: 16, padding: 14, background: "var(--bg-card)", border: "1px solid var(--border-default)", borderRadius: "var(--radius-lg)" }}>
-        {!skillFormOpen ? (
-          <button className="btn btn-sm btn-ghost" onClick={() => setSkillFormOpen(true)}>＋ {t("skills.new")}</button>
-        ) : (
-          <>
-            <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 10 }}>{t("skills.new")}</div>
-            <input className="form-input" style={{ fontSize: 11, marginBottom: 6 }} placeholder={t("skills.name_placeholder")}
-              value={newSkillName} onChange={e => setNewSkillName(e.target.value)} />
-            <textarea className="form-input" style={{ fontSize: 11, minHeight: 80, resize: "vertical", fontFamily: "var(--font-mono)" }}
-              placeholder={t("skills.content_placeholder")}
-              value={newSkillContent} onChange={e => setNewSkillContent(e.target.value)} />
-            <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
-              <button className="btn btn-sm btn-primary" onClick={createSkill}>{t("skills.create")}</button>
-              <button className="btn btn-sm btn-ghost" onClick={() => setSkillFormOpen(false)}>{t("skills.tavily_cancel")}</button>
-            </div>
-          </>
-        )}
-      </div>
-
-      {/* ── Tavily API Key 配置（tavily_search 能力存在时） ── */}
-      {capabilities.some(c => c.name === "tavily_search") && (
-        <div style={{ marginTop: 16, padding: 12, background: "var(--bg-card)", border: "1px solid var(--border-default)", borderRadius: "var(--radius-lg)" }}>
-          <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 8 }}>{t("skills.tavily_title")}</div>
-          <div style={{ fontSize: 10, color: "var(--text-muted)", marginBottom: 8 }}>
-            {t("skills.tavily_desc")}
-          </div>
-          {!showKeyInput && !tavilyKey.hasKey && (
-            <button className="btn btn-sm btn-primary" onClick={() => setShowKeyInput(true)}>
-              {t("skills.tavily_configure")}
-            </button>
-          )}
-          {!showKeyInput && tavilyKey.hasKey && (
-            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-              <span style={{ fontSize: 11, fontFamily: "var(--font-mono)", color: "var(--success)" }}>
-                🔑 {tavilyKey.masked}
-              </span>
-              <button className="btn btn-sm btn-ghost" onClick={() => { setKeyInput(""); setShowKeyInput(true); }}>
-                {t("skills.tavily_modify")}
-              </button>
-              <button className="btn btn-sm btn-ghost" style={{ color: "var(--danger)" }}
-                onClick={deleteTavilyKey} disabled={tavilyKey.loading}>
-                {t("skills.tavily_delete")}
-              </button>
-            </div>
-          )}
-          {showKeyInput && (
-            <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
-              <input className="form-input" style={{ flex: 1, margin: 0, fontSize: 11, padding: "6px 10px", fontFamily: "var(--font-mono)" }}
-                type="password" placeholder="tvly-..." value={keyInput}
-                onChange={e => setKeyInput(e.target.value)}
-                onKeyDown={e => { if (e.key === "Enter") { saveTavilyKey(keyInput); setShowKeyInput(false); } }}
-                autoFocus />
-              <button className="btn btn-sm btn-primary"
-                onClick={() => { saveTavilyKey(keyInput); setShowKeyInput(false); }}
-                disabled={tavilyKey.loading || !keyInput.trim()}>
-                {tavilyKey.loading ? "..." : t("skills.tavily_save")}
-              </button>
-              <button className="btn btn-sm btn-ghost" onClick={() => setShowKeyInput(false)}>{t("skills.tavily_cancel")}</button>
-            </div>
-          )}
-        </div>
-      )}
     </div>
   );
 }

@@ -29,7 +29,7 @@ import UsageStatsView from "./components/UsageStatsView";
 import SettingsView from "./components/SettingsView";
 import RecoveryView from "./components/RecoveryView";
 import LogsView from "./components/LogsView";
-import { MessageSquare, Brain, Wrench, Clock, Radio, Bot, BarChart3, Settings, ScrollText } from "lucide-react";
+import { MessageSquare, Brain, Puzzle, Clock, Radio, Bot, BarChart3, Settings, ScrollText } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import "./App.css";
 
@@ -76,7 +76,7 @@ interface Capability {
 const NAV_ITEMS: { id: ViewId; icon: LucideIcon; key: string }[] = [
   { id: "chat", icon: MessageSquare, key: "nav.chat" },
   { id: "models", icon: Brain, key: "nav.models" },
-  { id: "tools", icon: Wrench, key: "nav.tools" },
+  { id: "tools", icon: Puzzle, key: "nav.tools" },
   { id: "cron", icon: Clock, key: "nav.cron" },
   { id: "channels", icon: Radio, key: "nav.channels" },
   { id: "agents", icon: Bot, key: "nav.agents" },

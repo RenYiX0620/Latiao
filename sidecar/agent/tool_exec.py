@@ -660,12 +660,64 @@ def _dispatch_use_skill(args: dict) -> str:
         catalog = capability_registry.skill_catalog()
         names = "、".join(s["name"] for s in catalog) or "(空)"
         return f"技能 {name!r} 不存在或已禁用。当前可用技能: {names}"
+    # 多文件技能：正文之外还有随包资产（scripts/、references/ 等）——
+    # 把绝对路径交给模型，否则 SKILL.md 里"运行 scripts/x.py"无从执行。
+    meta = skill.get("meta") or {}
+    extra = ""
+    assets_dir = str(meta.get("assets_dir") or "")
+    if assets_dir:
+        assets = [str(a) for a in (meta.get("assets") or [])]
+        shown = ", ".join(assets[:12]) + (" …" if len(assets) > 12 else "")
+        extra = (
+            f"\n\n## 技能资产\n"
+            f"资产目录: {assets_dir}\n"
+            f"文件: {shown or '(空)'}\n"
+            f"SKILL.md 中提到的相对路径都相对上述目录；引用时用绝对路径。"
+            f"执行脚本一律经过命令闸门（按权限档确认），不要内联重写脚本逻辑。"
+        )
     return (
         f"# 技能: {skill['name']}\n"
         f"描述: {skill['description'] or '(无)'}\n"
         f"安全等级: {skill['permission']}\n\n"
         f"{skill['content']}"
+        f"{extra}"
     )
+
+def _dispatch_market_search(args: dict) -> str:
+    """market_search 分发：只读查询可安装的技能/扩展（发现索引缓存，不发网络）。
+    DSH plugin_market 工具的同形物——模型可以帮用户找技能，安装仍走人的确认。"""
+    query = str(args.get("query") or "").strip().lower()
+    try:
+        from discovery import get_discovered_entries
+        entries = get_discovered_entries() or []
+    except Exception:
+        entries = []
+    try:
+        from capability_registry import list_capabilities
+        installed = {c["name"] for c in list_capabilities("skill")}
+    except Exception:
+        installed = set()
+    items = []
+    for e in entries:
+        name = str(e.get("name") or e.get("display_name") or "")
+        desc = str(e.get("description") or "")
+        if query and query not in name.lower() and query not in desc.lower():
+            continue
+        items.append(e)
+    if not items:
+        return ("市场索引当前为空（发现器尚未运行或无缓存）。"
+                "请用户在「插件与技能 → 发现」里刷新列表后重试；"
+                "或让用户直接提供 GitHub 技能仓库地址。")
+    lines = []
+    for e in items[:10]:
+        name = str(e.get("name") or e.get("display_name") or "")
+        flag = "（已安装）" if name in installed else ""
+        desc = str(e.get("description") or "")[:120]
+        url = str(e.get("source_url") or "")
+        lines.append(f"- {name}{flag} [{e.get('category', '')}] {desc}\n  来源: {url}")
+    head = (f"市场条目共 {len(items)} 个（显示前 {min(10, len(items))}；"
+            f"本工具只读，安装需用户在应用内确认）：\n")
+    return head + "\n".join(lines)
 
 def _stamp_time_sensitive() -> str:
     """生成当前时刻锚行，注入时间敏感工具结果头部（截断后追加，不会被截掉）。

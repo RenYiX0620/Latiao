@@ -69,6 +69,7 @@ from agent.session_events import (  # noqa: F401  —— re-export（旧导入�
 )
 from agent.tool_exec import (  # noqa: F401  —— re-export（旧导入路径继续可用）
     _dispatch_delegate,
+    _dispatch_market_search,
     _dispatch_update_todos,
     _dispatch_use_skill,
     _get_agent_tools,
@@ -436,12 +437,29 @@ _use_skill_def = {
     },
 }
 TOOLS.append(_use_skill_def)
-
-
-
-
 TOOL_DISPATCH["use_skill"] = _dispatch_use_skill
 TOOL_PERMISSIONS["use_skill"] = "safe"
+
+# ── market_search：插件与技能市场的只读 agent 工具（DSH plugin_market 同形）──
+# 模型可以帮用户逛市场、找技能；安装仍必须走应用内的 stage→confirm 人工确认流，
+# 本工具零执行面（读发现索引缓存，不发网络请求），权限固定 safe。
+_market_search_def = {
+    "type": "function",
+    "function": {
+        "name": "market_search",
+        "description": "搜索插件与技能市场（只读）。按关键词返回可安装的技能/扩展条目（名称、描述、来源链接）。用户想要新能力但不知道装什么时，先用本工具找候选，再让用户在「插件与技能 → 发现」里确认安装。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "关键词，匹配条目名称与描述"},
+            },
+            "required": ["query"],
+        },
+    },
+}
+TOOLS.append(_market_search_def)
+TOOL_DISPATCH["market_search"] = _dispatch_market_search
+TOOL_PERMISSIONS["market_search"] = "safe"
 
 # 工具列表顺序 = 模型看到的"优先级"：搜索类模型明显倾向选靠前的工具。
 # 插件按文件名排序加载（bing_search.py < tavily_search.py），导致 tavily 永远排在
@@ -455,7 +473,7 @@ _TOOL_PRIORITY = (
     "screen_capture", "control_list_processes", "control_process_log", "control_audit",
     "control_wait", "control_launch", "control_mouse_move", "control_mouse_click",
     "control_keyboard_type", "control_keyboard_press", "control_kill_process",
-    "use_skill", "delegate_task", "create_cron",
+    "use_skill", "delegate_task", "create_cron", "market_search",
 )
 _TOOL_RANK = {_name: _rank for _rank, _name in enumerate(_TOOL_PRIORITY)}
 TOOLS.sort(key=lambda _t: _TOOL_RANK.get(_t.get("function", {}).get("name", ""), len(_TOOL_RANK)))

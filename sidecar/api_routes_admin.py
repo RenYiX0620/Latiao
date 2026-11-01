@@ -645,6 +645,17 @@ async def get_capabilities(request: Request):
     return {"status": "ok", "capabilities": capabilities, "health": _env_health()}
 
 
+@router.get("/v1/capabilities/{name}")
+async def get_capability_detail(name: str):
+    """单能力详情（技能含 meta：资产目录/清单、allowed-tools、版本）。
+    前端能力行展开时懒取；404 语义用 status=error 表达（与既有路由一致）。"""
+    import capability_registry
+    row = capability_registry.get_capability(name)
+    if row is None:
+        return {"status": "error", "message": "Capability not found"}
+    return {"status": "ok", "capability": row}
+
+
 @router.post("/v1/capabilities/{name}/toggle")
 async def toggle_capability(name: str):
     """启用/禁用任意能力（工具或技能），状态存 capabilities 表。"""

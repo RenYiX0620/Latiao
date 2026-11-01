@@ -146,6 +146,103 @@ function PersonaCard({ active, sidecarReady }: { active: boolean; sidecarReady: 
   );
 }
 
+// ── 服务凭据：Tavily API Key（2026-10-31 从能力面板迁来——API 钥匙属设置域，
+//    不与工具/技能管理混在一页；i18n 复用原 skills.tavily_* 键，零新增翻译） ──
+function TavilyKeyGroup() {
+  const { t } = useTranslation();
+  const [tavilyKey, setTavilyKey] = useState({ hasKey: false, masked: null as string | null, loading: false });
+  const [keyInput, setKeyInput] = useState("");
+  const [showKeyInput, setShowKeyInput] = useState(false);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const resp = await authFetch("/v1/settings/tavily-key");
+        const data = await resp.json();
+        if (data.status === "ok") setTavilyKey({ hasKey: data.has_key, masked: data.masked, loading: false });
+      } catch { /* 静默 */ }
+    })();
+  }, []);
+
+  const saveTavilyKey = async (key: string) => {
+    if (!key.trim()) { return; }
+    setTavilyKey(prev => ({ ...prev, loading: true }));
+    try {
+      const resp = await authFetch("/v1/settings/tavily-key", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ key }),
+      });
+      const data = await resp.json();
+      if (data.status === "ok") {
+        setTavilyKey({ hasKey: true, masked: data.masked, loading: false });
+      } else {
+        setTavilyKey(prev => ({ ...prev, loading: false }));
+      }
+    } catch { setTavilyKey(prev => ({ ...prev, loading: false })); }
+  };
+
+  const deleteTavilyKey = async () => {
+    setTavilyKey(prev => ({ ...prev, loading: true }));
+    try {
+      const resp = await authFetch("/v1/settings/tavily-key", { method: "DELETE" });
+      const data = await resp.json();
+      if (data.status === "ok") {
+        setTavilyKey({ hasKey: false, masked: null, loading: false });
+      } else {
+        setTavilyKey(prev => ({ ...prev, loading: false }));
+      }
+    } catch { setTavilyKey(prev => ({ ...prev, loading: false })); }
+  };
+
+  return (
+    <div className="settings-group">
+      <div className="settings-group-header">{t("skills.tavily_title")}</div>
+      <div className="settings-row">
+        <div>
+          <div className="settings-row-label">{t("skills.tavily_title")}</div>
+          <div className="settings-row-desc">{t("skills.tavily_desc")}</div>
+        </div>
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          {!showKeyInput && !tavilyKey.hasKey && (
+            <button className="btn btn-sm btn-primary" onClick={() => setShowKeyInput(true)}>
+              {t("skills.tavily_configure")}
+            </button>
+          )}
+          {!showKeyInput && tavilyKey.hasKey && (<>
+            <span style={{ fontSize: 11, fontFamily: "var(--font-mono)", color: "var(--success)" }}>
+              🔑 {tavilyKey.masked}
+            </span>
+            <button className="btn btn-sm btn-ghost" onClick={() => { setKeyInput(""); setShowKeyInput(true); }}>
+              {t("skills.tavily_modify")}
+            </button>
+            <button className="btn btn-sm btn-ghost" style={{ color: "var(--danger)" }}
+              onClick={deleteTavilyKey} disabled={tavilyKey.loading}>
+              {t("skills.tavily_delete")}
+            </button>
+          </>)}
+        </div>
+      </div>
+      {showKeyInput && (
+        <div className="settings-row">
+          <div style={{ flex: 1, display: "flex", gap: 6, alignItems: "center" }}>
+            <input className="form-input" style={{ flex: 1, margin: 0, fontSize: 11, padding: "6px 10px", fontFamily: "var(--font-mono)" }}
+              type="password" placeholder="tvly-..." value={keyInput}
+              onChange={e => setKeyInput(e.target.value)}
+              onKeyDown={e => { if (e.key === "Enter") { saveTavilyKey(keyInput); setShowKeyInput(false); } }}
+              autoFocus />
+            <button className="btn btn-sm btn-primary"
+              onClick={() => { saveTavilyKey(keyInput); setShowKeyInput(false); }}
+              disabled={tavilyKey.loading || !keyInput.trim()}>
+              {tavilyKey.loading ? "..." : t("skills.tavily_save")}
+            </button>
+            <button className="btn btn-sm btn-ghost" onClick={() => setShowKeyInput(false)}>{t("skills.tavily_cancel")}</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function SettingsView({
   theme, setTheme,
   sidecarStatus, restartingSidecar, onRestartSidecar, active,
@@ -382,6 +479,8 @@ export default function SettingsView({
           {/* 2026-10-24 审计：autoStartGateway 同为假开关——sidecar 由 Rust 侧
               start_sidecar() 无条件拉起，checkbox 无任何消费方。已移除。 */}
         </div>
+
+        <TavilyKeyGroup />
 
         <div className="settings-group">
           <div className="settings-group-header">{t("settings.anonymous")}</div>

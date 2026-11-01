@@ -208,6 +208,76 @@ def _first_desc_line(body: str) -> str:
     return ""
 
 
+_SCRIPT_EXTS = {".py", ".sh", ".bash", ".js", ".mjs", ".cjs", ".ts", ".rb", ".pl", ".ps1", ".sql"}
+_MAX_ASSET_ENTRIES = 50   # definition 里最多记录的资产条数（防巨包撑表）
+
+
+def _parse_allowed_tools(meta: dict) -> list[str]:
+    """frontmatter allowed-tools：兼容 list 与逗号分隔字符串（Claude 两种写法）。"""
+    raw = meta.get("allowed-tools") or meta.get("allowed_tools")
+    if isinstance(raw, str):
+        items = [s.strip() for s in raw.split(",")]
+    elif isinstance(raw, list):
+        items = [str(s).strip() for s in raw]
+    else:
+        items = []
+    return [s for s in items if s][:20]
+
+
+def _severity(permission: str) -> int:
+    return _VALID_PERMS.index(permission) if permission in _VALID_PERMS else 0
+
+
+def _suggested_permission(allowed_tools: list[str]) -> str:
+    """按技能声明引用的工具推导建议权限：取被引用工具的最高档。
+    引用的工具不在表里（未注册/写错名）则忽略该名——建议档只收紧不放开。"""
+    worst = 0
+    for t in allowed_tools:
+        try:
+            rows = _query(
+                "SELECT permission FROM capabilities WHERE kind='tool' AND name=?", (t,))
+            if rows:
+                worst = max(worst, _severity(rows[0][0]))
+        except Exception:
+            continue
+    return _VALID_PERMS[worst]
+
+
+def _skill_assets(skill_dir: Path, skill_md: Path) -> dict:
+    """技能目录资产盘点：SKILL.md 之外的所有文件（含子目录），脚本类打标。
+    assets_dir 是绝对路径——模型经 use_skill 拿到后可径直引用/执行（过命令闸门）。"""
+    out: dict = {"assets_dir": "", "assets": [], "has_scripts": False}
+    try:
+        if not (skill_dir.is_dir() and skill_md.exists()):
+            return out
+        rels = sorted(
+            str(p.relative_to(skill_dir)) for p in skill_dir.rglob("*")
+            if p.is_file() and p != skill_md
+        )
+    except OSError:
+        return out
+    if not rels:
+        return out
+    out["assets_dir"] = str(skill_dir)
+    out["assets"] = rels[:_MAX_ASSET_ENTRIES]
+    out["has_scripts"] = any(
+        Path(r).suffix.lower() in _SCRIPT_EXTS or r.lower().startswith("scripts/")
+        for r in rels
+    )
+    return out
+
+
+def _skill_definition(meta: dict, assets: dict) -> dict:
+    """技能行的 definition 载荷：资产 + allowed-tools + 建议权限 + 版本。"""
+    allowed = _parse_allowed_tools(meta)
+    return {
+        **assets,
+        "allowed_tools": allowed,
+        "suggested_permission": _suggested_permission(allowed) if allowed else "",
+        "version": str(meta.get("version") or ""),
+    }
+
+
 def sync_skills() -> int:
     """三来源技能统一入表：内置子目录 SKILL.md / 扩展包 skills/*.md / 用户目录 *.md。"""
     seen: set[str] = set()
@@ -235,6 +305,7 @@ def sync_skills() -> int:
                     display_name=str(meta.get("name") or skill_dir.name.replace("-", " ").title()),
                     description=str(meta.get("description") or _first_desc_line(body)),
                     content=body, permission=perm,
+                    definition=_skill_definition(meta, _skill_assets(skill_dir, skill_md)),
                     source="builtin", source_path=str(skill_md), perm_override=override,
                 )
             except Exception:
@@ -265,11 +336,16 @@ def sync_skills() -> int:
                     else:
                         perm = str(meta.get("security_level") or "safe")
                         override = 0
+                    # 资产只在"目录式技能"（<skills>/<dir>/SKILL.md）下成立；
+                    # 平铺 <skills>/foo.md 的兄弟文件属于别的技能，不能算资产。
+                    assets = (_skill_assets(f.parent, f) if f.name == "SKILL.md"
+                              else {"assets_dir": "", "assets": [], "has_scripts": False})
                     _upsert_row(
                         name=name, kind="skill",
                         display_name=str(meta.get("name") or f.stem.replace("-", " ").title()),
                         description=str(meta.get("description") or _first_desc_line(body)),
                         content=body, permission=perm,
+                        definition=_skill_definition(meta, assets),
                         source=f"extension:{ext_name}", source_path=str(f), perm_override=override,
                     )
                 except Exception:
@@ -285,11 +361,15 @@ def sync_skills() -> int:
             try:
                 name = f.stem
                 seen.add(name)
-                body = f.read_text(encoding="utf-8").strip()
+                # 用户技能也走 frontmatter 解析（有则取 description/allowed-tools，
+                # 正文剥掉 frontmatter；无则整文即正文——与另两源同构）
+                meta, body = _parse_frontmatter(f.read_text(encoding="utf-8"))
                 _upsert_row(
                     name=name, kind="skill",
-                    display_name=name.replace("-", " ").title(),
-                    description=_first_desc_line(body), content=body,
+                    display_name=str(meta.get("name") or name.replace("-", " ").title()),
+                    description=str(meta.get("description") or _first_desc_line(body)),
+                    content=body,
+                    definition=_skill_definition(meta, {"assets_dir": "", "assets": [], "has_scripts": False}),
                     permission="safe", source="user", source_path=str(f),
                 )
             except Exception:
@@ -328,6 +408,22 @@ def initialize(tools: list[dict], permissions: dict[str, str], dispatch: dict) -
 #  查询 / 开关 / 权限 / 计数
 # ═══════════════════════════════════════════════════════
 
+def _skill_meta_map() -> dict[str, dict]:
+    """{技能名: definition 解析}——技能行的 definition 存资产/allowed-tools 等元数据。"""
+    out: dict[str, dict] = {}
+    try:
+        rows = _query("SELECT name, definition FROM capabilities WHERE kind='skill'")
+    except Exception:
+        return out
+    for name, d in rows:
+        try:
+            m = json.loads(d or "{}")
+            out[name] = m if isinstance(m, dict) else {}
+        except Exception:
+            out[name] = {}
+    return out
+
+
 def list_capabilities(kind: str | None = None) -> list[dict]:
     sql = "SELECT name, kind, display_name, description, permission, enabled, source, usage_count FROM capabilities"
     params: tuple = ()
@@ -341,26 +437,44 @@ def list_capabilities(kind: str | None = None) -> list[dict]:
     except Exception:
         logger.warning("list capabilities failed", exc_info=True)
         return []
-    return [
-        {"name": r[0], "kind": r[1], "display_name": r[2], "description": r[3],
-         "permission": r[4], "enabled": bool(r[5]), "source": r[6], "usage_count": r[7]}
-        for r in rows
-    ]
+    metas = _skill_meta_map()
+    out = []
+    for r in rows:
+        item = {"name": r[0], "kind": r[1], "display_name": r[2], "description": r[3],
+                "permission": r[4], "enabled": bool(r[5]), "source": r[6], "usage_count": r[7]}
+        if r[1] == "skill":
+            m = metas.get(r[0]) or {}
+            item.update({
+                "has_scripts": bool(m.get("has_scripts")),
+                "assets_count": len(m.get("assets") or []),
+                "version": str(m.get("version") or ""),
+                "allowed_tools": m.get("allowed_tools") or [],
+                "suggested_permission": str(m.get("suggested_permission") or ""),
+            })
+        out.append(item)
+    return out
 
 
 def get_capability(name: str) -> dict | None:
     try:
         rows = _query(
             "SELECT name, kind, display_name, description, permission, enabled, source, "
-            "source_path, usage_count FROM capabilities WHERE name=?", (name,))
+            "source_path, usage_count, definition FROM capabilities WHERE name=?", (name,))
     except Exception:
         return None
     if not rows:
         return None
     r = rows[0]
-    return {"name": r[0], "kind": r[1], "display_name": r[2], "description": r[3],
-            "permission": r[4], "enabled": bool(r[5]), "source": r[6],
-            "source_path": r[7] or "", "usage_count": r[8]}
+    out = {"name": r[0], "kind": r[1], "display_name": r[2], "description": r[3],
+           "permission": r[4], "enabled": bool(r[5]), "source": r[6],
+           "source_path": r[7] or "", "usage_count": r[8]}
+    if r[1] == "skill":
+        try:
+            m = json.loads(r[9] or "{}")
+            out["meta"] = m if isinstance(m, dict) else {}
+        except Exception:
+            out["meta"] = {}
+    return out
 
 
 def get_permission(name: str) -> str | None:
@@ -398,17 +512,25 @@ def bump_usage(name: str) -> None:
 
 
 def get_skill_content(name: str) -> dict | None:
-    """运行时取技能全文。返回 {name, description, content, permission}；未启用/不存在返回 None。"""
+    """运行时取技能全文。返回 {name, description, content, permission, meta}；未启用/不存在返回 None。
+    meta 含资产目录/清单与 allowed-tools（use_skill 分发负责转述给模型）。"""
     try:
         rows = _query(
-            "SELECT content, description, permission FROM capabilities "
+            "SELECT content, description, permission, definition FROM capabilities "
             "WHERE kind='skill' AND name=? AND enabled=1", (name,))
     except Exception:
         return None
     if not rows:
         return None
     r = rows[0]
-    return {"name": name, "description": r[1] or "", "content": r[0] or "", "permission": r[2] or "safe"}
+    try:
+        meta = json.loads(r[3] or "{}")
+        if not isinstance(meta, dict):
+            meta = {}
+    except Exception:
+        meta = {}
+    return {"name": name, "description": r[1] or "", "content": r[0] or "",
+            "permission": r[2] or "safe", "meta": meta}
 
 
 def skill_catalog() -> list[dict]:

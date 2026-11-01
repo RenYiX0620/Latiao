@@ -232,11 +232,138 @@ def _load_source_bytes(source: str) -> tuple[bytes | None, str, str | None]:
         return None, "", f"下载失败: {e}"
 
 
+def _zip_names(zip_bytes: bytes) -> list[str]:
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        return [i.filename.replace("\\", "/") for i in zf.infolist()]
+
+
+def _skill_slug_from_md(content: str, fallback: str) -> str:
+    """从 SKILL.md frontmatter 取 name 归一成 manifest 合法名；取不到用 fallback。"""
+    try:
+        from capability_registry import _parse_frontmatter
+        meta, _ = _parse_frontmatter(content)
+        raw = str(meta.get("name") or "").strip()
+    except Exception:
+        raw = ""
+    cand = (raw or fallback or "").lower()
+    cand = re.sub(r"[^a-z0-9._-]+", "-", cand).strip("-._") or ""
+    if not re.match(r"^[a-z0-9]", cand):
+        cand = "skill-" + cand
+    cand = cand[:63].strip("-._") or "skill"
+    return cand
+
+
+def _normalize_skill_zip(zip_bytes: bytes) -> bytes | None:
+    """纯技能 zip（无 manifest.yaml，含 ≥1 个 SKILL.md）→ 归一化成扩展包。
+
+    布局归一：skills/<slug>/SKILL.md + 同目录资产；仓库根的 README/LICENSE 等留在根。
+    manifest 由首技能的 frontmatter 合成，version 取内容摘要前 8 位——
+    同内容幂等、内容变了版本就变（老版本"同名同版拒绝重装"的坑不再挡更新）。
+    返回 None 表示不是纯技能包（交回原校验流程报错）。
+    """
+    names = _zip_names(zip_bytes)
+    if any(n.rsplit("/", 1)[-1].lower() in ("manifest.yaml", "manifest.yml") for n in names):
+        return None
+    skill_md_paths = [n for n in names
+                      if n.rsplit("/", 1)[-1].lower() == "skill.md" and not n.endswith("/")]
+    if not skill_md_paths:
+        return None
+    # GitHub codeload zip 的单层仓库包装目录：全部条目共享首段时剥掉
+    firsts = {n.split("/", 1)[0] for n in names if "/" in n}
+    strip = ""
+    if firsts and len(firsts) == 1 and all("/" in n for n in names):
+        strip = next(iter(firsts)) + "/"
+
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zin:
+        infos = [i for i in zin.infolist() if not i.is_dir()]
+        # zip 炸弹防护必须先于整读：_safe_extract 的 50MB 上限管不到这里，
+        # 归一化是全量进内存——超限直接放弃归一化，回落到 _safe_extract 的正规报错。
+        total = sum(i.file_size for i in infos)
+        if total > _MAX_EXTRACT_BYTES:
+            return None
+        contents = {i.filename: zin.read(i) for i in infos}
+
+    # 第一遍：解析每个 SKILL.md 的 frontmatter，定 slug（防重名）与描述
+    skill_roots: list[tuple[str, str]] = []   # (目录前缀（""=zip 根）, slug)
+    used_slugs: set[str] = set()
+    first_desc = ""
+    try:
+        from capability_registry import _parse_frontmatter
+    except Exception:
+        _parse_frontmatter = None   # type: ignore[assignment]
+    for md_path in skill_md_paths:
+        rel = md_path[len(strip):] if strip and md_path.startswith(strip) else md_path
+        parent = rel.rsplit("/", 1)[0] if "/" in rel else ""
+        text = contents.get(md_path, b"").decode("utf-8", "replace")
+        fallback = parent.rsplit("/", 1)[-1] if parent else "skill"
+        meta: dict = {}
+        if _parse_frontmatter is not None:
+            try:
+                meta, _ = _parse_frontmatter(text)
+            except Exception:
+                meta = {}
+        if not first_desc:
+            first_desc = str((meta or {}).get("description") or "")[:200]
+        slug = _skill_slug_from_md(text, fallback)
+        base, k = slug, 2
+        while slug in used_slugs:
+            slug = f"{base}-{k}"
+            k += 1
+        used_slugs.add(slug)
+        skill_roots.append((parent, slug, rel))
+
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
+        # 第二遍：单次分派。目录式技能（parent 非空）：目录内文件归 skills/<slug>/；
+        # 根级技能（parent 为空）：zip 根即技能目录，**全部**文件随包——
+        # 不分派会把它旁边的 scripts/ 当孤儿丢掉（首版实测踩过）。
+        # 含 ".." 段的条目直接丢弃：归一化产物本身不该携带逃逸路径
+        # （_safe_extract 的 resolve 检查仍是最终防线，这里是纵深）。
+        for name, data in contents.items():
+            rel_n = name[len(strip):] if strip and name.startswith(strip) else name
+            if not rel_n or rel_n.endswith("/"):
+                continue
+            if any(seg == ".." for seg in rel_n.split("/")):
+                continue
+            matched = False
+            for parent, slug, rel in skill_roots:
+                if parent:
+                    if rel_n == rel or rel_n.startswith(parent + "/"):
+                        zout.writestr(f"skills/{slug}/" + rel_n[len(parent) + 1:], data)
+                        matched = True
+                        break
+                else:
+                    zout.writestr(f"skills/{slug}/{rel_n}", data)
+                    matched = True
+                    break
+            if not matched and "/" not in rel_n:
+                zout.writestr(rel_n, data)
+        manifest = {
+            "name": sorted(used_slugs)[0] if used_slugs else "skill-pack",
+            "version": "1.0." + hashlib.sha256(zip_bytes).hexdigest()[:8],
+            "description": first_desc or "技能包（由纯技能来源自动归一化）",
+            "permissions": ["readonly"],
+        }
+        zout.writestr("manifest.yaml",
+                      json.dumps(manifest, ensure_ascii=False, indent=2))
+    return out.getvalue()
+
+
 def _extract_and_validate(zip_bytes: bytes, tmp: Path) -> tuple[Path | None, dict, dict | None]:
     """安全解压 + manifest 定位校验 + 内容检查 → (pkg_root, manifest, error)。
 
     预览（stage）与落盘（install）共用这一份判定，避免"预览放行、安装又拒绝"漂移。
+    纯技能来源（GitHub 技能子目录/整仓，无 manifest）先经 _normalize_skill_zip
+    归一化再走同一套校验——发现页的一键安装由此复用整条确认管线。
     """
+    try:
+        if not any(n.rsplit("/", 1)[-1].lower() in ("manifest.yaml", "manifest.yml")
+                   for n in _zip_names(zip_bytes)):
+            normalized = _normalize_skill_zip(zip_bytes)
+            if normalized is not None:
+                zip_bytes = normalized
+    except zipfile.BadZipFile:
+        return None, {}, {"status": "error", "message": "包校验失败: 不是有效的 zip"}
     try:
         _safe_extract(zip_bytes, tmp)
     except ValueError as e:
@@ -285,6 +412,44 @@ def _extract_and_validate(zip_bytes: bytes, tmp: Path) -> tuple[Path | None, dic
     return pkg_root, {**manifest, "name": name, "version": version, "permissions": perms}, None
 
 
+def _preview_skills(pkg_root: Path) -> list[dict]:
+    """装前预览的技能摘要：与 capability_registry 的入表口径同源（同一 frontmatter
+    解析），把"装进来的是什么、带不带脚本、声明用哪些工具"在确认前摊开给用户。"""
+    skills_d = pkg_root / "skills"
+    if not skills_d.is_dir():
+        return []
+    try:
+        from capability_registry import (_parse_allowed_tools, _parse_frontmatter,
+                                         _skill_assets, _suggested_permission)
+    except Exception:
+        logger.warning("preview skills: capability_registry helpers unavailable", exc_info=True)
+        return []
+    out = []
+    for f in sorted(skills_d.rglob("*.md")):
+        try:
+            meta, body = _parse_frontmatter(f.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not meta or not meta.get("name"):
+            continue   # 非技能文档（09-12 同口径）
+        allowed = _parse_allowed_tools(meta)
+        assets = (_skill_assets(f.parent, f) if f.name == "SKILL.md"
+                  else {"assets_dir": "", "assets": [], "has_scripts": False})
+        scripts = [a for a in assets.get("assets", [])
+                   if Path(a).suffix.lower() in {".py", ".sh", ".bash", ".js",
+                                                 ".mjs", ".cjs", ".ts", ".rb", ".pl", ".ps1", ".sql"}]
+        out.append({
+            "name": str(meta.get("name")),
+            "description": str(meta.get("description") or "")[:200],
+            "security_level": str(meta.get("security_level") or "safe"),
+            "allowed_tools": allowed,
+            "suggested_permission": _suggested_permission(allowed) if allowed else "",
+            "has_scripts": bool(assets.get("has_scripts")),
+            "scripts": scripts[:20],
+        })
+    return out
+
+
 def _package_preview(zip_bytes: bytes) -> tuple[dict | None, dict | None]:
     """只读预检 → (preview, error)。不落任何文件、不改任何状态。"""
     digest = hashlib.sha256(zip_bytes).hexdigest()
@@ -299,6 +464,7 @@ def _package_preview(zip_bytes: bytes) -> tuple[dict | None, dict | None]:
             "permissions": list(manifest.get("permissions") or ["readonly"]),
             "files": files[:200],
             "file_count": len(files),
+            "skills": _preview_skills(pkg_root),
             "digest": digest,
             "size": len(zip_bytes),
         }, None
