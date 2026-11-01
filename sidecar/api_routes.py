@@ -255,7 +255,13 @@ async def chat_completion(request: Request):
                 logger.info("请求中的云端模型未在配置中（%s）：不新增条目，请到设置页添加",
                             _ep[:80])
             else:
-                _hit["key"] = str(cloud_config.get("key", ""))[:500]
+                # key 只在请求**非空**时回写：前端聊天请求携带的是会话启动时加载的
+                # 旧 key（设置页存新 key 不会刷新聊天页状态）——无条件回写会把
+                # 刚存的新 key 反向抹掉（2026-11-01 实测：用户存 key 后一次聊天
+                # 即被打回空值，表现为"更新了 key 还是 401"）。
+                _req_key = str(cloud_config.get("key", ""))[:500]
+                if _req_key:
+                    _hit["key"] = _req_key
                 _hit["protocol"] = str(cloud_config.get("protocol", "openai"))[:30]
                 CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
                 save_config(_cfg)   # ⑤ 0600 + 原子写（唯一入口）

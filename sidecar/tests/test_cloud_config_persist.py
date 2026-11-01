@@ -77,6 +77,17 @@ def test_known_endpoint_updates_key(app_client):
     assert cfg["mx_api_key"] == "mkt_real"
 
 
+def test_empty_request_key_does_not_wipe_stored_key(app_client):
+    """2026-11-01 事故回归：聊天请求携带**空 key**（前端会话启动时加载的旧状态）
+    不得把设置页刚存的新 key 反向抹掉——实测用户存 key 后一次聊天即被打回空值，
+    表现为"更新了 key 还是 401"。空 key = 不碰 key 字段。"""
+    client, cfgfile = app_client
+    _post_chat(client, "https://api.xiaomimimo.com/v1", "")
+    cfg = json.loads(cfgfile.read_text(encoding="utf-8"))
+    assert cfg["cloud_models"][0]["key"] == "sk-real", "空 key 不得覆盖已存 key"
+    assert cfg["mx_api_key"] == "mkt_real"
+
+
 def test_no_cloud_config_no_write(app_client):
     """不带 cloud_config 的普通请求不该碰配置文件（mtime/内容都不变）。"""
     client, cfgfile = app_client
