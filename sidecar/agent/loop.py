@@ -2675,16 +2675,16 @@ class ThinAgentLoop:
                     return
                 except httpx.HTTPStatusError as e:
                     status = getattr(e.response, "status_code", 0)
+                    # 流式响应未读完时访问 .text 会抛 ResponseNotRead——取 body
+                    # 必须独立于日志调用，否则取 body 失败连 error 日志一起吞
+                    # （2026-11-01 云端 401：UI 有提示、sidecar.log 无痕的根因）
+                    _full = ""
                     try:
-                        logger.error("thin loop HTTP %s body: %s", status,
-                                     (e.response.text or "")[:500])
+                        _full = e.response.text or ""
                     except Exception:
                         pass
-                    _body = ""
-                    try:
-                        _body = (e.response.text or "").lower()
-                    except Exception:
-                        pass
+                    logger.error("thin loop HTTP %s body: %s", status, _full[:500] or "<空>")
+                    _body = _full.lower()
                     # 识图 400 优先判定（mmproj 未挂/不支持 image_url）——
                     # 不能落进下面的「tools 参数被拒」回退，否则重跑一遍仍然 400
                     _img_in_msgs = any(
