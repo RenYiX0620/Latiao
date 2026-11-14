@@ -286,6 +286,38 @@ class _UnauthorizedError(Exception):
     """401 sentinel raised by _check_auth — 由全局 handler 渲染为统一 JSON。"""
 
 
+# ---------------------------------------------------------------------------
+# 手机桥第二凭据（2026-11-14）：官方 OpenClaw 安卓 app 经桥接网关访问辣条，
+# 桥进程持有自己的 token 而非主 token（主 token 只在 Rust/webview 内存）。
+# 文件 ~/.local-ai-os/bridge_token（0600，≥32 字符 hex）存在且权限合规时，
+# 作为**第二合法凭据**；文件缺失或权限过宽 → 行为与改动前完全一致。
+# 与 MX key 落 config.json 0600 同级别风险面（本机文件读取者）。
+# ---------------------------------------------------------------------------
+_BRIDGE_TOKEN_PATH = Path.home() / ".local-ai-os" / "bridge_token"
+def _read_bridge_token() -> str | None:
+    """读手机桥 token。文件缺失/权限不符/内容无效返回 None（=功能关闭）。
+
+    2026-11-14 复审修订：删掉 mtime 缓存——小文件每次读成本可忽略，而缓存
+    在 1s 粒度文件系统上会让"内容变了但 mtime 不变"的轮换永久读到旧值
+    （凭据换不掉）。同时补 UnicodeDecodeError：坏字节内容曾让全部端点 500。
+    """
+    try:
+        st = _BRIDGE_TOKEN_PATH.stat()
+    except OSError:
+        return None
+    if st.st_mode & 0o077:  # 0600 纪律：组/其他一律不可读写
+        logger.warning("bridge_token 权限过宽（应为 0600），已忽略： %s", _BRIDGE_TOKEN_PATH)
+        return None
+    try:
+        tok = _BRIDGE_TOKEN_PATH.read_text(encoding="utf-8").strip()
+    except (OSError, ValueError):
+        return None
+    val = tok if len(tok) >= 32 else None
+    if val is None:
+        logger.warning("bridge_token 内容无效（需 ≥32 字符），已忽略")
+    return val
+
+
 def _check_auth(request: Request) -> None:
     """本地 token 认证依赖（应用级，覆盖全部路由）。
 
@@ -311,8 +343,16 @@ def _check_auth(request: Request) -> None:
         if auth.startswith("Bearer "):
             token = auth[7:]
     # 常数时间比较（审计 P2-24）：普通不等比较可被计时侧信道探测 token
-    if not secrets.compare_digest(token, AUTH_TOKEN):
-        raise _UnauthorizedError()
+    if secrets.compare_digest(token, AUTH_TOKEN):
+        return
+    # 手机桥第二凭据：文件缺失/权限不符时 _read_bridge_token() 恒为 None，
+    # 此分支恒 False —— 行为与无文件时完全一致。
+    bridge_tok = _read_bridge_token()
+    if bridge_tok and secrets.compare_digest(token, bridge_tok):
+        logger.info("[bridge] 手机桥 token 认证通过: %s %s",
+                        getattr(request, "method", "-"), request.url.path)
+        return
+    raise _UnauthorizedError()
 
 # Log key lifecycle events
 logger.info("Sidecar 启动")
