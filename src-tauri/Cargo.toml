@@ -1,6 +1,6 @@
 [package]
 name = "local-ai-os"
-version = "0.3.94"
+version = "0.3.95"
 description = "Integrated Local AI Agent + Local Model"
 authors = ["RenYiX0620"]
 license = "MIT"
