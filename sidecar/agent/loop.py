@@ -155,7 +155,7 @@ def _local_thinking_first_enabled() -> bool:
         if isinstance(sec, dict) and sec.get("local_thinking_first") is not None:
             return bool(sec.get("local_thinking_first"))
     except Exception:
-        pass
+        logger.warning("local_thinking_first 配置读取失败，回退默认：开", exc_info=True)
     return True
 
 
@@ -403,6 +403,7 @@ def _quota_exhausted_today(tool: str) -> bool:
         data = json.loads(_quota_state_file().read_text(encoding="utf-8"))
         return isinstance(data, dict) and data.get(tool) == datetime.date.today().isoformat()
     except Exception:
+        logger.warning("配额状态文件读取失败，本日限额视为未用尽", exc_info=True)
         return False
 
 
@@ -438,8 +439,11 @@ def _clear_quota_marker(tool: str) -> None:
 # 短正文的最后一句话同时含意图词与数据动词 = 承诺收尾。动词扩到单字
 # （查/搜/拉/读/调/找）——单字不会误伤"我查了，明天休市"这类过去式汇报
 # （它们没有意图词）。
+# 单字"试"必须排除（2026-11-02 真机）：闲聊"测试"的回复末句"人家会等得发烫的"
+# 被"测**试**"里的试命中 → 空转闸门把一句完整闲聊判成承诺，催出第 2 轮，用户
+# 看到同一个问题回了两遍。改成只认"试试/试着/试一下"这类真正的动作。
 _PLAN_VERB_RE = re.compile(
-    r"查|搜|拉|读|调|找|看|试|汇总|整理|复盘|调取|检索|获取|抓取|分析"
+    r"查|搜|拉|读|调|找|看|试试|试着|试一下|汇总|整理|复盘|调取|检索|获取|抓取|分析"
     r"|挖|扒|捋|梳理"            # 10-08 三号现场："让我再深挖一下…"
     r"|改|修|换|更新|调整|替换|补|加上|删掉|重做|重画")   # 10-10 现场："我马上改过来～"
 _PLAN_INTENT_RE = re.compile(
@@ -504,6 +508,12 @@ def _plan_tail(text: str) -> str:
     return segs[-1] if segs else ""
 
 
+# 承诺碎片长度口径——空转闸门(_looks_like_plan_only)与交付哨兵(_delivery_fragment_suspect)
+# 必须同数（ub-mode: one decision lives in one place）。2026-10-20 曾因哨兵 240 / 闸门 600
+# 两套口径漂移漏掉 253 字承诺句；收口成常量后改这里即两处同时变。
+_PROMISE_FRAGMENT_MAX_CHARS = 600
+
+
 def _looks_like_plan_only(text: str, has_tools: bool) -> bool:
     """正文是否只是"声明打算做什么"（无实质内容）——空转闸门的判定。
 
@@ -520,7 +530,7 @@ def _looks_like_plan_only(text: str, has_tools: bool) -> bool:
     # 长度上限 200 → 600（2026-10-20）：人设化的承诺句实测 253 字（"主人想看今天
     # 的大盘呀……人家这就帮主人查一下"），被 200 字护栏整条挡在门外；与思考轮另一道
     # 闸门的 600 口径对齐。600 以上（真汇报动辄上千字）仍走"长正文放行"。
-    if not t or len(t) > 600:
+    if not t or len(t) > _PROMISE_FRAGMENT_MAX_CHARS:
         return False
     tail = _plan_tail(t)
     if not tail or len(tail) > 120:   # 末句太长：不是一句轻飘飘的承诺
@@ -581,6 +591,20 @@ def _prose_data_fact_count(text: str) -> int:
 # 计划信号推进执行轮（真正的执行由第 2 轮的原生调用完成，这里只是别当终答交付）。
 _TOOL_CODE_RE = re.compile(r"<tool_code\b", re.I)
 
+# 「我马上/这就/按下回车」类**行动承诺**（2026-11-01 真机）：思考轮没有工具表，
+# 模型把"我要去查"写成散文，同一段还引用了上一轮的涨跌百分比 → 数据信号判据先
+# 命中、计划被当终答交付。承诺词与工具名同时出现才算信号（工具名单独出现可能只是
+# 结果汇报，如"ak_finance 返回：…"），所以这条只在与在册工具名共现时使用。
+_PLAN_PROMISE_RE = re.compile(
+    r"(?:我(?:马上|这就|现在|立刻|先)?(?:去|来|要)?(?:查|拉|调|搜|取|看一下)"
+    r"|(?:马上|这就|立刻)(?:用|去|来|查|拉|调|搜)"
+    r"|现在(?:就)?(?:去|来)(?:查|拉|调|搜)"
+    r"|让我(?:来|去)?(?:查|拉|调|搜)"
+    r"|我来(?:查|拉|调|搜)"
+    r"|正在(?:查|拉|调|搜)"
+    r"|按下回车|调出(?:查询|工具))"
+)
+
 # 栅栏里的"工具调用形状"（2026-10-20）：```json {"tool": "<在册工具>", "params": {...}} ```
 # —— 计划信号（思考轮里是"我要动手"的声明，不是终答）。
 # 闭合引号**可选**（2026-10-20 17:06 真机）：模型写出过 `"tool": "tavily_search,`
@@ -638,7 +662,7 @@ def _delivery_fragment_suspect(text: str) -> str:
     返回命中的信号名（""=干净），便于日志聚合。
     """
     t = re.sub(r"\s+", " ", (text or "")).strip()
-    if not t or len(t) > 600:
+    if not t or len(t) > _PROMISE_FRAGMENT_MAX_CHARS:
         return ""
     if _FENCED_CALL_RE.search(t):
         return "fenced-call"
@@ -1007,10 +1031,6 @@ def _claim_steer(session_id: str) -> list[str]:
     return msgs
 
 
-def _clear_steer(session_id: str) -> None:
-    _steer_inbox.pop(session_id, None)
-
-
 def _record_engine_usage(session_id: str, line: str, source: str = "main_turn",
                          parent_session_id: str = "") -> None:
     """从原始 SSE 行提取引擎真实用量（云端 usage / llama.cpp timings）→ 上下文统计。
@@ -1306,13 +1326,23 @@ class ThinAgentLoop:
         if not self._thinking_first_round():
             return False
         t = re.sub(r"\s+", " ", (body_text or "")).strip()
-        # 长度护栏 200 → 600（2026-10-13 二连事故）：欧娜的"两步计划"有 267 字
-        # （还点了 mx_query/tavily_search 的名字），被旧的 200 字护栏整条挡在门外 →
-        # 任务再次看起来"断了"。而计划变长的直接原因正是用户刚调的"回复 10～12 句"
-        # ——我的两个改动在打架。"这是汇报不是计划"的主判据交给**数据信号**（下面），
-        # 长度只当宽松的上界（真汇报动辄上千字）。
-        if not t or len(t) > 600:
+        # 长度护栏 200 → 600 → 2000（2026-11-01 三连事故）：欧娜把"计划"写成
+        # 1009–1153 字（人设铺垫 + 步骤），600 字上界直接判成终答 → 正文里的
+        # "我马上用 market_insight 拉…"被交付，执行轮从未发生（整回合 tools=0）。
+        # 长度只当**防呆上限**（真汇报另有数据信号判据），不能再卡在千字级。
+        if not t or len(t) > 2000:
             return False
+        try:
+            from agent_loop import TOOLS as _T
+            _known = {str((x.get("function") or {}).get("name") or "") for x in _T}
+        except Exception:
+            _known = set()
+        # 「承诺 + 在册工具名」优先于数据信号（2026-11-01 真机）：正文引用了上一轮
+        # 的涨跌百分比（"科创50 -5.48%"），下面的 "%" 判据先命中 → 判成真汇报，
+        # 可它其实是在说"我马上用 market_insight 拉支撑压力位"。真正的结果汇报用
+        # "返回/显示/查到"，不用"我马上/这就/按下回车"，所以这条是高精度信号。
+        if _PLAN_PROMISE_RE.search(t) and any(n and n in t for n in _known):
+            return True
         # 栅栏里的"工具调用形状"（2026-10-20 真机）：模型在思考轮把调用写成
         # ```json {"tool": "mx_query", "params": {...}} ```。旧解析器只认
         # name+arguments 这一组键名 → 工具调用=0；而正文带日期数字（"2026-10-20"）
@@ -1321,11 +1351,6 @@ class ThinAgentLoop:
         # （parsing.py），这里留一道**兜底**：栅栏点名在册工具 = 我要动手的计划信号。
         _fm = _FENCED_CALL_RE.search(t)
         if _fm:
-            try:
-                from agent_loop import TOOLS as _T
-                _known = {str((x.get("function") or {}).get("name") or "") for x in _T}
-            except Exception:
-                _known = set()
             if _fm.group(1) in _known:
                 return True
         # 「有数据信号」用比 _DATA_SIGNAL_RE 更严的口径：后者把**单个**数字串也算
@@ -1850,7 +1875,9 @@ class ThinAgentLoop:
                     buf["function"]["arguments"] += fn["arguments"]
             content = delta.get("content", "") or ""
             think = delta.get("reasoning") or delta.get("reasoning_content") or ""
-            if raw % 40 == 0 and _detect_text_loop(streamed + think):
+            # 每 16 个 chunk 检一次（原 40）：真机复读在生成 107 秒后才被发现，
+            # 用户早已看到整段重复；16 在 ~10 tok/s 下约 1.6 秒一次，代价可忽略。
+            if raw % 16 == 0 and _detect_text_loop(streamed + think):
                 streamed = _strip_repeat_tail(streamed)
                 raise _GenerationLoopError("输出复读循环，已截断")
             if think:
@@ -2196,7 +2223,7 @@ class ThinAgentLoop:
             if _ACTION_KW_RE.search(_req):
                 return True, "动作词"
         except Exception:
-            pass
+            logger.warning("任务型判定正则失败，按非任务放行（闸门失效风险）", exc_info=True)
         return False, ""
 
     def _gate_round_content(self, text: str) -> str | None:
@@ -2656,6 +2683,11 @@ class ThinAgentLoop:
                             self._retry_temp, self._retry_freq = 0.6, 1.5
                         self._note_retry("generation_loop")
                         self.steps -= 1
+                        # 只调温度治不住（2026-11-01 真机：重采后仍是 1097/1153 字的
+                        # 大段重复）——必须同时改**提示**：明确"同一段只说一次"。
+                        # 尾部追加，前缀缓存不受影响。
+                        self.current_msgs.append(
+                            _note_msg(_msg("repeat_retry", self.user_lang)))
                         logger.warning("thin loop: %s —— 重采本轮（temp=%s freq=%s）",
                                        e, self._retry_temp, self._retry_freq)
                         # 不再把 "---" 当**正文**下发（2026-10-13 用户实机反馈）：
@@ -2776,6 +2808,15 @@ class ThinAgentLoop:
                         tool_calls = fence_calls
                     else:
                         clean_text = streamed
+                # 整轮正文只有一段工具标记 → 撤回这个气泡（2026-11-02 真机）：
+                # 缺开头 `<tool_call>` 的 `<function=…>` 不在流式标记表里，会先原样
+                # 流进气泡；解析成功后正文被清空，但气泡已经存在，用户看到的是
+                # 一段裸标签 + 随后另起一条答案。这里按本轮撤回（空内容 = 清空
+                # 本轮气泡，历史消息不碰，见前端 content_revised 的 round 定位）。
+                if tool_calls and (body_text or "").strip():
+                    _vis, _ = _parse_prompt_tool_calls(body_text)
+                    if not _vis.strip():
+                        yield {"event": "content_revised", "content": ""}
                 tool_names = {t.get("function", {}).get("name")
                               for t in self._tools_in_scope()}
                 # 空名调用必须放行到执行器（恢复/守卫都在那边）。

@@ -214,6 +214,37 @@ def test_statement_plan_leak_flagged_with_positive_and_negative_controls():
     assert loop._thinking_round_plan_leak("使用 ak_finance 查询贵州茅台（600519）的行情数据。") is False
 
 
+def test_long_persona_plan_with_promise_is_flagged():
+    """2026-11-01 真机：思考轮的"计划"被欧娜人设写成 1009–1153 字，且正文引用了
+    上一轮的涨跌百分比 → 旧口径先命中 "%" 数据判据，整条被当终答交付，执行轮从未
+    发生（整回合 tools=0、工具调用=0，用户拿到的是"我马上用 market_insight 拉…"
+    这种编造出来的查询过程）。判据改成"承诺词 + 在册工具名"优先于数据信号。"""
+    loop = _loop("max")
+    body = (
+        "（凑近屏幕，把查询命令调出来，手指悬在回车键上）主人你看，我手里有现成的"
+        "工具——market_insight，能查大盘支撑压力位，还有涨跌、成交、资金流向这些"
+        "详细指标。但关键数字必须现在去查，不能凭记忆说。\n\n"
+        "（指尖在屏幕上轻轻点了两下，眉头微皱）你看数据：科创50 连跌两天到 -5.48%"
+        "（东方财富指数日线，10/30 收盘），芯片暗盘却在集体拉升。\n\n"
+        "（坐直身子，正经地说）所以我的意思是：反弹到什么程度抛掉筹码？\n\n"
+        "（歪头看你，语气有点得意）主人……你这么问，人家心里还挺开心的。\n\n"
+    ) * 3 + (
+        "（指尖在屏幕上画了个圈，又收回）主人，你手里的筹码先给我捂着，别丢。"
+        "要是怕了，随时报个代码给人家——我马上用 market_insight 拉支撑压力位，"
+        "看它什么时候出现。 😏"
+    )
+    assert len(body) > 600, "必须真的长过旧护栏（复现 1009–1153 字的现场）"
+    assert loop._thinking_round_plan_leak(body) is True
+
+    # 反控：同样长、同样带 % 与工具名的**真汇报**（"返回"，无承诺词）不得误判
+    report = (
+        "ak_finance 返回：科创50 收于 1160.84 点，跌 5.48%，成交 8300 亿。\n\n"
+        "创业板指 2413.63 点，跌 4.13%；上证 3599.02 点，跌 1.44%。\n\n"
+    ) * 8
+    assert len(report) > 600
+    assert loop._thinking_round_plan_leak(report) is False
+
+
 def test_off_level_never_gated():
     """关闭档：首轮就带全套工具（旧行为不变）。"""
     body = _loop("off")._build_request("m")

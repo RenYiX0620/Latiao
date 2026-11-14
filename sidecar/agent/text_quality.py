@@ -40,6 +40,15 @@ def _detect_text_loop(text: str) -> bool:
         return False
     tail = text[-1200:]
     n = len(tail)
+    # 段落级重复（2026-11-01 真机）：重复单元是 4–6 段、500–900 字（人设长句 +
+    # 结论段整块复述），超过下面 plen ≤ 400 的上限 → 旧检测器整块漏检：用户看到
+    # 同一段话重复三四遍，守卫一声不响。按空行切段做整段比对，代价 O(段数²)。
+    paras = [p.strip() for p in re.split(r"\n\s*\n", tail) if p.strip()]
+    if len(paras) >= 4:
+        for k in range(1, min(6, len(paras) // 2) + 1):
+            if (paras[-k:] == paras[-2 * k:-k]
+                    and sum(len(p) for p in paras[-k:]) >= 80):
+                return True
     # 尝试所有可能的循环片段长度（12 ~ 400 字符）
     for plen in range(12, min(400, n // 3) + 1):
         piece = tail[-plen:]

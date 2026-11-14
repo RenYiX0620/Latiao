@@ -228,8 +228,13 @@ _TOOLCALL_XML_RE = re.compile(
 # Qwen2.5/Qwen3 另一支 XML 方言：<tool_call><function=NAME><parameter=K>V</parameter></function></tool_call>
 # 09-19 实测（Qwen3.8-27B-UD-Q6_K_M GGUF）：此前四层解析器都不认 → 整段 XML 被当回答
 # 交付给用户，还因拉丁字符占多触发语言闸门的误判提示，工具一次都没执行。
+# 2026-11-02 真机（BAAI_AREX-2）：模型只写 `<function=NAME>` + `</function>` +
+# 结尾一个孤立 `</tool_call>`，**没有开头的 `<tool_call>`** → 旧正则要求首尾齐全，
+# 整段被当正文交付（`工具解析 | 原生=0`、`工具调用=0`，用户看到裸标签）。外层标签
+# 改为可选：开、闭任一缺失都能认出来，也能把孤立的收尾标记一起剥掉。
 _TOOLCALL_FN_XML_RE = re.compile(
-    r"<tool_call>\s*<function=([^>\s]+)\s*>(.*?)</function>\s*</tool_call>", re.DOTALL)
+    r"(?:<\s*tool_call\s*>\s*)?<function=([^>\s]+)\s*>(.*?)</function>\s*(?:<\s*/\s*tool_call\s*>)?",
+    re.DOTALL)
 _TOOLCALL_PARAM_RE = re.compile(r"<parameter=([^>\s]+)\s*>(.*?)</parameter>", re.DOTALL)
 # 任何未被识别的 <tool_call> 块（兜底：不把标记原样交付用户）
 _TOOLCALL_ANY_RE = re.compile(r"<tool_call>.*?</tool_call>", re.DOTALL)

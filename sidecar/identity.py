@@ -299,20 +299,6 @@ def _apply_user_name_change(new_name: str):
         logger.warning("Failed to record user name in USER.md", exc_info=True)
 
 
-def _apply_style_change(value: str):
-    """Append style preference to SOUL.md (no duplicates).
-
-    ⚠️ 09-21 起 `style` 意图不再走这里：语气要落到 `## 语气风格` 下并**替换**，
-    所以映射到 `_apply_tone_change`。本函数保留给"只追加一行备注"的调用方。
-    """
-    filepath = PROGRESS_DIR / "SOUL.md"
-    line = f"- {value}\n"
-    if filepath.exists() and line in filepath.read_text(encoding="utf-8"):
-        return
-    with open(filepath, "a", encoding="utf-8") as f:
-        f.write(line)
-
-
 def _apply_rule_change(value: str):
     """Append rule to AGENTS.md (no duplicates)."""
     filepath = PROGRESS_DIR / "AGENTS.md"

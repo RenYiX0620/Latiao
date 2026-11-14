@@ -40,12 +40,16 @@ def test_surface_requires_surface_op(log):
 
 def test_surface_ok_with_op_and_sources(log):
     user = log.append("user/message", {"message": {}}, surface_op="append")
-    log.append(
+    assistant = log.append(
         "assistant/message",
         {"message": {"content": "hi"}},
         surface_op="append",
         source_seqs=[user.seq],
     )
+    # 假测试判据修复（2026-11-04）：此前零断言，append 返回 None 也能过。
+    # 断言调用方所见的公开契约：顺序递增 + 溯源以元组落库（_freeze 的形状）。
+    assert assistant.seq > user.seq
+    assert assistant.source_seqs == (user.seq,)
 
 
 def test_nan_rejected(log):
